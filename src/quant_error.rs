@@ -2,10 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum QuantError {
-    #[error("RPC server error: {0}")]
-    Rpc(#[from] mrpc::RpcError),
-    #[error("Deserialization error: {0}")]
-    Serde(#[from] rmp_serde::decode::Error),
+    #[error("Symbol({0}) not founded")]
+    SymbolNotFound(String),
+    #[error(transparent)]
+    CTraderError(#[from] cfix::types::Error),
     #[error("Channel send error")]
     Channel,
     #[error("Other error: {0}")]
@@ -14,14 +14,12 @@ pub enum QuantError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
-    #[error("Msgpack decode error : {0}")]
-    MsgpackDecodeError(#[from] rmpv::decode::Error),
-    #[error("Msgpack encode error: {0}")]
-    MsgpackEncodeError(#[from] rmpv::encode::Error),
+    #[error("TOML error: {0}")]
+    TomlError(#[from] toml::de::Error),
     #[error("Send error: {0}")]
     SendError(String),
-
+    #[error("gRPC status error: {0}")]
+    GrpcStatus(#[from] tonic::Status),
 }
-
 
 pub type Result<T> = std::result::Result<T, QuantError>;

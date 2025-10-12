@@ -1,0 +1,18 @@
+# Market Data Service Configuration
+
+[ctrader]
+# cTrader FIX connection settings
+sendercompid = "demo.ctrader.12345"
+server = "demo.ctrader.com"
+username = "12345"
+password = "your_password"
+ssl = false
+
+# Market Data Service settings
+[market_data]
+host = "localhost"
+port = 8980
+
+# Logging configuration
+[logging]
+level = "info"

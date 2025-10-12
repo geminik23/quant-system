@@ -1,0 +1,99 @@
+syntax = "proto3";
+package quant;
+
+message SubscribePricesRequest { repeated string symbols = 1; }
+message UnsubscribePricesRequest { repeated string symbols = 1; }
+message ClearSubscriptionRequest {}
+message Empty {}
+
+message SetAlertRequest {
+  string alert_id = 1; // optional: if empty server generates
+  string symbol = 2;
+  double price = 3;    // threshold
+  string kind = 4;      // ABOVE / BELOW
+}
+
+message RemoveAlertRequest { string alert_id = 1; }
+
+message AlertResult {
+  string alert_id = 1;
+  string status = 2;    // UPDATED / TRIGGERED / REMOVED
+  string symbol = 3;
+  double ref_price = 4; // price related to alert state
+  int64 ts_ms = 5;
+}
+
+message PriceTick {
+  string symbol = 1;
+  double bid = 2;
+  double ask = 3;
+  int64 ts_ms = 4;
+}
+
+message CommandAck {
+  string kind = 1; // ALERT_SET / ALERT_REMOVED / SUBSCRIBED / PONG / ERROR
+  string reference = 2;  // alert_id or detail
+}
+
+// Query current latest bid/ask for a symbol.
+message GetPriceRequest { string symbol = 1; }
+message GetPriceResponse {
+  string symbol = 1;
+  double bid = 2;
+  double ask = 3;
+  int64 ts_ms = 4; // timestamp of snapshot (server current time)
+  bool found = 5;  // false if symbol unknown or no price yet
+}
+
+// Batch price query
+message GetPricesRequest { repeated string symbols = 1; }
+message PriceSnapshot {
+  string symbol = 1;
+  double bid = 2;
+  double ask = 3;
+  int64 ts_ms = 4;
+  bool found = 5;
+}
+message GetPricesResponse { repeated PriceSnapshot prices = 1; }
+
+// Get list of available symbols
+message GetSymbolListRequest {}
+message GetSymbolListResponse { repeated string symbols = 1; }
+
+// Get market connection state
+message GetStateRequest {}
+message GetStateResponse {
+  string state = 1;      // CONNECTED / DISCONNECTED / CONNECTING / LOGON
+  int64 ts_ms = 2;       // timestamp of state
+}
+
+message StreamCommand {
+  oneof cmd {
+    SubscribePricesRequest subscribe_prices = 1;
+    SetAlertRequest set_alert = 2;
+    RemoveAlertRequest remove_alert = 3;
+    Empty ping = 4;
+    UnsubscribePricesRequest unsubscribe_prices = 5;
+    ClearSubscriptionRequest clear_subscription = 6;
+  }
+}
+
+message StreamEvent {
+  oneof evt {
+    PriceTick price_tick = 1;
+    AlertResult alert = 2;
+    CommandAck ack = 3;
+  }
+}
+
+service MarketStream {
+  // Bidirectional stream: client sends commands, server sends events.
+  rpc Stream (stream StreamCommand) returns (stream StreamEvent);
+  // Unary price snapshot
+  rpc GetPrice (GetPriceRequest) returns (GetPriceResponse);
+  rpc GetPrices (GetPricesRequest) returns (GetPricesResponse);
+  // Get available symbol list
+  rpc GetSymbolList (GetSymbolListRequest) returns (GetSymbolListResponse);
+  // Get market connection state
+  rpc GetState (GetStateRequest) returns (GetStateResponse);
+}

@@ -1,35 +1,31 @@
-use tokio::sync::mpsc::Receiver;
-use async_trait::async_trait;
+pub mod ctrader_type;
+use nanoid::nanoid;
+use serde::{Deserialize, Serialize};
 
-#[async_trait]
-pub trait CommandHandler<T: Send + 'static> {
-    async fn handle(&mut self, cmd: T);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AlertSet {
+    High(f64),
+    Low(f64),
 }
 
-pub struct CommandRunner<T, H>
-where
-    T: Send + 'static,
-    H: CommandHandler<T> + Send + 'static,
-{
-    pub(crate) msg_rx: Receiver<T>,
-    pub(crate) handler: H,
-}
+// Make abstraction for Ids. for TradeId and OrderId and AlertId
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Id(pub String);
 
-impl<T, H> CommandRunner<T, H>
-where
-    T: Send + 'static,
-    H: CommandHandler<T> + Send + 'static,
-{
-    pub fn new(msg_rx: Receiver<T>, handler: H) -> Self {
-        CommandRunner { msg_rx, handler }
-    }
-
-    pub async fn run(mut self) {
-        log::info!("CommandRunner started.");
-        while let Some(msg) = self.msg_rx.recv().await {
-            self.handler.handle(msg).await;
-        }
-        log::info!("CommandRunner stopped: channel closed.");
+impl Id {
+    pub fn new() -> Self {
+        Id(nanoid!())
     }
 }
 
+impl Default for Id {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
