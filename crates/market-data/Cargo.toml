@@ -26,6 +26,8 @@ toml = "0.8"
 
 ctrader-fix = { version = "0.5" }
 xrpc-rs = "0.2.1"
+
+[dev-dependencies]
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"

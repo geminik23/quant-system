@@ -2,10 +2,11 @@
 //!
 //! Connects to the xrpc market data server and provides an interactive menu
 //! for all unary RPC commands: ping, get state, get symbols, get price,
-//! set alert, remove alert, etc.
+//! set alert, remove alert, get alerts, etc.
 //!
 //! Usage:
-//!   cargo run --example command_client -- --shm-name market-data
+//!   cargo run -p market-data --example command_client
+//!   cargo run -p market-data --example command_client -- --shm-name market-data
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -81,6 +82,7 @@ enum MenuItem {
     GetPrices,
     SetAlert,
     RemoveAlert,
+    GetAlerts,
     Quit,
 }
 
@@ -93,6 +95,7 @@ impl MenuItem {
         Self::GetPrices,
         Self::SetAlert,
         Self::RemoveAlert,
+        Self::GetAlerts,
         Self::Quit,
     ];
 
@@ -105,6 +108,7 @@ impl MenuItem {
             Self::GetPrices => "Get Prices",
             Self::SetAlert => "Set Alert",
             Self::RemoveAlert => "Remove Alert",
+            Self::GetAlerts => "Get Alerts",
             Self::Quit => "Quit",
         }
     }
@@ -341,6 +345,21 @@ async fn execute_rpc(client: &MarketClient, item: MenuItem, inputs: Vec<String>)
                 Err(e) => format!("ERROR: {e}"),
             }
         }
+        MenuItem::GetAlerts => match client.call::<_, GetAlertsResponse>("get_alerts", &()).await {
+            Ok(r) if r.alerts.is_empty() => "No active alerts".to_string(),
+            Ok(r) => r
+                .alerts
+                .iter()
+                .map(|a| {
+                    format!(
+                        "  [{}] {} {} @ {:.5}",
+                        a.alert_id, a.symbol, a.kind, a.price
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("ERROR: {e}"),
+        },
         MenuItem::Quit => unreachable!(),
     }
 }
@@ -692,7 +711,7 @@ async fn run(
         }
     }
 
-    let _ = client.close().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), client.close()).await;
     Ok(())
 }
 

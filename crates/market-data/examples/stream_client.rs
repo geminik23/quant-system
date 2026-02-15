@@ -4,7 +4,8 @@
 //! alert notifications, and displays them in a live-updating terminal UI.
 //!
 //! Usage:
-//!   cargo run --example stream_client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p market-data --example stream_client
+//!   cargo run -p market-data --example stream_client -- --shm-name market-data --symbols eurusd,xauusd
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -167,6 +168,36 @@ impl App {
         }
         self.tick_count += 1;
         self.last_update = ts;
+    }
+
+    fn on_stream_event(&mut self, event: StreamEvent) {
+        match event.event_type.as_str() {
+            "PRICE" => {
+                if let (Some(symbol), Some(bid), Some(ask)) = (event.symbol, event.bid, event.ask) {
+                    self.on_price_tick(PriceTick {
+                        symbol,
+                        bid,
+                        ask,
+                        ts_ms: event.ts_ms,
+                    });
+                }
+            }
+            "STATE" => {
+                if let Some(state_str) = &event.state {
+                    self.update_conn_status(state_str);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn update_conn_status(&mut self, state: &str) {
+        self.conn_status = match state {
+            "CONNECTED" => ConnStatus::Connected,
+            "CONNECTING" | "LOGON" => ConnStatus::Connecting,
+            "DISCONNECTED" => ConnStatus::Error("FIX DISCONNECTED".into()),
+            other => ConnStatus::Error(format!("Unknown: {}", other)),
+        };
     }
 
     fn on_alert(&mut self, alert: AlertResult) {
@@ -391,9 +422,9 @@ async fn run(
         )
         .await?;
 
-    // Start streams
-    let mut price_stream = client
-        .call_server_stream::<_, PriceTick>("stream_prices", &())
+    // Start streams — use stream_events for prices + state changes
+    let mut event_stream = client
+        .call_server_stream::<_, StreamEvent>("stream_events", &())
         .await?;
     let mut alert_stream = client
         .call_server_stream::<_, AlertResult>("stream_alerts", &())
@@ -430,9 +461,9 @@ async fn run(
                 if app.should_quit { break; }
             }
 
-            maybe_tick = price_stream.recv() => {
-                match maybe_tick {
-                    Some(Ok(tick)) => app.on_price_tick(tick),
+            maybe_event = event_stream.recv() => {
+                match maybe_event {
+                    Some(Ok(event)) => app.on_stream_event(event),
                     Some(Err(e)) => {
                         app.conn_status = ConnStatus::Error(e.to_string());
                         break;

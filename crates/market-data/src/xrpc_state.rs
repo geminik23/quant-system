@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 /// Shared state for managing client connections and alert ownership across xrpc clients.
 pub struct XrpcState {
     alerts_owner: RwLock<HashMap<String, usize>>, // alert_id -> client_id
-    alert_meta: RwLock<HashMap<String, (String, f64)>>, // alert_id -> (symbol, ref_price)
+    alert_meta: RwLock<HashMap<String, (String, f64, String)>>, // alert_id -> (symbol, ref_price, kind)
     client_seq: RwLock<usize>,
 }
 
@@ -56,15 +56,31 @@ impl XrpcState {
         self.alerts_owner.read().await.get(alert_id).copied()
     }
 
-    pub async fn set_alert_meta(&self, alert_id: &str, symbol: &str, ref_price: f64) {
-        self.alert_meta
-            .write()
-            .await
-            .insert(alert_id.to_string(), (symbol.to_string(), ref_price));
+    pub async fn set_alert_meta(&self, alert_id: &str, symbol: &str, ref_price: f64, kind: &str) {
+        self.alert_meta.write().await.insert(
+            alert_id.to_string(),
+            (symbol.to_string(), ref_price, kind.to_string()),
+        );
     }
 
-    pub async fn take_alert_meta(&self, alert_id: &str) -> Option<(String, f64)> {
+    pub async fn take_alert_meta(&self, alert_id: &str) -> Option<(String, f64, String)> {
         self.alert_meta.write().await.remove(alert_id)
+    }
+
+    /// Returns all alerts owned by a client as Vec<(alert_id, symbol, ref_price, kind)>.
+    pub async fn alerts_of(&self, client_id: usize) -> Vec<(String, String, f64, String)> {
+        let owners = self.alerts_owner.read().await;
+        let meta = self.alert_meta.read().await;
+
+        owners
+            .iter()
+            .filter(|(_, owner)| **owner == client_id)
+            .filter_map(|(alert_id, _)| {
+                meta.get(alert_id).map(|(symbol, price, kind)| {
+                    (alert_id.clone(), symbol.clone(), *price, kind.clone())
+                })
+            })
+            .collect()
     }
 
     pub async fn release_alert(&self, alert_id: &str) {

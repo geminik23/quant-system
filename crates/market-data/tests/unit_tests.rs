@@ -90,6 +90,68 @@ fn command_ack_constructors() {
     assert_eq!(err.reference, "something went wrong");
 }
 
+#[test]
+fn rpc_types_alert_info_serde() {
+    let resp = GetAlertsResponse {
+        alerts: vec![
+            AlertInfo {
+                alert_id: "a1".into(),
+                symbol: "EURUSD".into(),
+                price: 1.12,
+                kind: "ABOVE".into(),
+            },
+            AlertInfo {
+                alert_id: "a2".into(),
+                symbol: "XAUUSD".into(),
+                price: 2000.0,
+                kind: "BELOW".into(),
+            },
+        ],
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let back: GetAlertsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.alerts.len(), 2);
+    assert_eq!(back.alerts[0].alert_id, "a1");
+    assert_eq!(back.alerts[0].kind, "ABOVE");
+    assert_eq!(back.alerts[1].alert_id, "a2");
+    assert_eq!(back.alerts[1].kind, "BELOW");
+    assert!((back.alerts[1].price - 2000.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn rpc_types_stream_event_serde() {
+    // Price event
+    let price_event = StreamEvent {
+        event_type: "PRICE".into(),
+        symbol: Some("EURUSD".into()),
+        bid: Some(1.1234),
+        ask: Some(1.1236),
+        state: None,
+        ts_ms: 1700000000000,
+    };
+    let json = serde_json::to_string(&price_event).unwrap();
+    let back: StreamEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.event_type, "PRICE");
+    assert_eq!(back.symbol.as_deref(), Some("EURUSD"));
+    assert!(back.state.is_none());
+
+    // State event
+    let state_event = StreamEvent {
+        event_type: "STATE".into(),
+        symbol: None,
+        bid: None,
+        ask: None,
+        state: Some("CONNECTED".into()),
+        ts_ms: 1700000000000,
+    };
+    let json = serde_json::to_string(&state_event).unwrap();
+    let back: StreamEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.event_type, "STATE");
+    assert_eq!(back.state.as_deref(), Some("CONNECTED"));
+    assert!(back.symbol.is_none());
+    assert!(back.bid.is_none());
+}
+
 // ── xrpc_state: client id, alert ownership, cleanup ──
 
 #[tokio::test]
@@ -108,9 +170,15 @@ async fn xrpc_state_alert_ownership_lifecycle() {
     state.own_alert("alert-1", 1).await;
     state.own_alert("alert-2", 1).await;
     state.own_alert("alert-3", 2).await;
-    state.set_alert_meta("alert-1", "EURUSD", 1.12).await;
-    state.set_alert_meta("alert-2", "XAUUSD", 2000.0).await;
-    state.set_alert_meta("alert-3", "GBPUSD", 1.27).await;
+    state
+        .set_alert_meta("alert-1", "EURUSD", 1.12, "ABOVE")
+        .await;
+    state
+        .set_alert_meta("alert-2", "XAUUSD", 2000.0, "BELOW")
+        .await;
+    state
+        .set_alert_meta("alert-3", "GBPUSD", 1.27, "ABOVE")
+        .await;
 
     // Verify ownership
     assert_eq!(state.owner_of("alert-1").await, Some(1));
@@ -138,14 +206,59 @@ async fn xrpc_state_alert_ownership_lifecycle() {
 #[tokio::test]
 async fn xrpc_state_alert_meta() {
     let state = XrpcState::new();
-    state.set_alert_meta("a1", "EURUSD", 1.12).await;
+    state.set_alert_meta("a1", "EURUSD", 1.12, "ABOVE").await;
 
     // take_alert_meta removes it
     let meta = state.take_alert_meta("a1").await;
-    assert_eq!(meta, Some(("EURUSD".to_string(), 1.12)));
+    assert_eq!(
+        meta,
+        Some(("EURUSD".to_string(), 1.12, "ABOVE".to_string()))
+    );
 
     // Second take returns None
     assert!(state.take_alert_meta("a1").await.is_none());
+}
+
+#[tokio::test]
+async fn xrpc_state_alerts_of() {
+    let state = XrpcState::new();
+
+    state.own_alert("a1", 1).await;
+    state.set_alert_meta("a1", "EURUSD", 1.12, "ABOVE").await;
+    state.own_alert("a2", 1).await;
+    state.set_alert_meta("a2", "XAUUSD", 2000.0, "BELOW").await;
+    state.own_alert("a3", 2).await;
+    state.set_alert_meta("a3", "GBPUSD", 1.27, "ABOVE").await;
+
+    // Client 1 has 2 alerts
+    let mut alerts = state.alerts_of(1).await;
+    alerts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(alerts.len(), 2);
+    assert_eq!(alerts[0].0, "a1");
+    assert_eq!(alerts[0].1, "EURUSD");
+    assert!((alerts[0].2 - 1.12).abs() < f64::EPSILON);
+    assert_eq!(alerts[0].3, "ABOVE");
+    assert_eq!(alerts[1].0, "a2");
+    assert_eq!(alerts[1].1, "XAUUSD");
+    assert_eq!(alerts[1].3, "BELOW");
+
+    // Client 2 only sees their own
+    let alerts2 = state.alerts_of(2).await;
+    assert_eq!(alerts2.len(), 1);
+    assert_eq!(alerts2[0].0, "a3");
+    assert_eq!(alerts2[0].1, "GBPUSD");
+
+    // Non-existent client
+    let empty = state.alerts_of(99).await;
+    assert!(empty.is_empty());
+
+    // After releasing client 1's alerts, alerts_of returns empty
+    state.release_alerts_of(1).await;
+    let after = state.alerts_of(1).await;
+    assert!(after.is_empty());
+
+    // Client 2 unaffected
+    assert_eq!(state.alerts_of(2).await.len(), 1);
 }
 
 // ── price_alert: core alert triggering logic ──

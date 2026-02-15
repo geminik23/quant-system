@@ -8,8 +8,8 @@ use clap::Parser;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
+use tokio::task::JoinHandle;
 
 use market_data::Result;
 use market_data::core::AlertSet;
@@ -26,6 +26,34 @@ use xrpc::{
     MessageChannelAdapter, RpcServer, ServerStreamSender, SharedMemoryConfig,
     SharedMemoryFrameTransport,
 };
+
+// ── SHM Cleanup ──
+
+/// !!! this is only for unix. for the windows, needs to update later.
+///
+/// Remove stale shared memory files from `/dev/shm/` that match the given base name.
+/// Each xrpc-rs SHM endpoint creates two files: `{name}_c2s` and `{name}_s2c`.
+/// This cleans up leftovers from previous crashes so the address can be reused.
+fn cleanup_shm(base_name: &str) {
+    let shm_dir = std::path::Path::new("/dev/shm");
+    if !shm_dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(shm_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str.starts_with(base_name) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => tracing::info!("Cleaned up stale SHM file: {}", name_str),
+                Err(e) => tracing::warn!("Failed to clean up SHM file {}: {}", name_str, e),
+            }
+        }
+    }
+}
 
 // ── Config ──
 
@@ -64,7 +92,8 @@ fn spawn_client_handler(
     shm_config: SharedMemoryConfig,
     state: Arc<XrpcState>,
     handles: MarketManagerHandles,
-) {
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let transport = match SharedMemoryFrameTransport::create_server(&slot_name, shm_config) {
             Ok(t) => t,
@@ -239,7 +268,7 @@ fn spawn_client_handler(
                         .await;
                     state.own_alert(&alert_id, client_id).await;
                     state
-                        .set_alert_meta(&alert_id, &req.symbol, req.price)
+                        .set_alert_meta(&alert_id, &req.symbol, req.price, &req.kind)
                         .await;
                     Ok(CommandAck::ok("ALERT_SET", alert_id))
                 }
@@ -269,6 +298,27 @@ fn spawn_client_handler(
                     } else {
                         Ok(CommandAck::error("alert not found"))
                     }
+                }
+            });
+        }
+
+        // ── Register: get_alerts ──
+        {
+            let state = state.clone();
+            server.register_typed("get_alerts", move |_req: ()| {
+                let state = state.clone();
+                async move {
+                    let entries = state.alerts_of(client_id).await;
+                    let alerts = entries
+                        .into_iter()
+                        .map(|(alert_id, symbol, price, kind)| AlertInfo {
+                            alert_id,
+                            symbol,
+                            price,
+                            kind,
+                        })
+                        .collect();
+                    Ok(GetAlertsResponse { alerts })
                 }
             });
         }
@@ -334,7 +384,7 @@ fn spawn_client_handler(
                         let mut alert_rx = handles.subscribe_alerts();
                         while let Ok(event) = alert_rx.recv().await {
                             if state.owner_of(&event.alert_id).await == Some(client_id) {
-                                let (symbol, ref_price) = state
+                                let (symbol, ref_price, _kind) = state
                                     .take_alert_meta(&event.alert_id)
                                     .await
                                     .unwrap_or_default();
@@ -359,12 +409,82 @@ fn spawn_client_handler(
             );
         }
 
+        // ── Register: stream_events (server streaming — prices + state changes) ──
+        {
+            let handles = handles.clone();
+            let filter = filter.clone();
+            server.register_stream_fn(
+                "stream_events",
+                move |_msg, sender: ServerStreamSender<_>| {
+                    let handles = handles.clone();
+                    let filter = filter.clone();
+                    async move {
+                        let mut price_rx = handles.subscribe_price_ticks();
+                        let mut state_rx = handles.subscribe_state_changes();
+
+                        loop {
+                            tokio::select! {
+                                result = price_rx.recv() => {
+                                    let Ok(tick) = result else { break };
+                                    let f = filter.read().await;
+                                    let should_send = match &*f {
+                                        None => false,
+                                        Some(set) if set.is_empty() => true,
+                                        Some(set) => set.contains(&tick.symbol),
+                                    };
+                                    drop(f);
+                                    if should_send {
+                                        let event = StreamEvent {
+                                            event_type: "PRICE".into(),
+                                            symbol: Some(tick.symbol),
+                                            bid: Some(tick.bid),
+                                            ask: Some(tick.ask),
+                                            state: None,
+                                            ts_ms: tick.ts_ms,
+                                        };
+                                        if sender.send(event).is_err() { break; }
+                                    }
+                                }
+                                result = state_rx.recv() => {
+                                    let Ok(new_state) = result else { break };
+                                    let state_str = match new_state {
+                                        ConnectionState::Connected => "CONNECTED",
+                                        ConnectionState::Disconnected => "DISCONNECTED",
+                                        ConnectionState::Connecting => "CONNECTING",
+                                        ConnectionState::Logon => "LOGON",
+                                    };
+                                    let event = StreamEvent {
+                                        event_type: "STATE".into(),
+                                        symbol: None,
+                                        bid: None,
+                                        ask: None,
+                                        state: Some(state_str.to_string()),
+                                        ts_ms: Utc::now().timestamp_millis(),
+                                    };
+                                    if sender.send(event).is_err() { break; }
+                                }
+                            }
+                        }
+                        let _ = sender.end();
+                        Ok(())
+                    }
+                },
+            );
+        }
+
         tracing::info!("Client {} connected on slot {}", client_id, slot_name);
 
-        // Serve until client disconnects
+        // Serve until client disconnects or shutdown is signalled
         let channel = Arc::new(channel);
-        if let Err(e) = server.serve(channel).await {
-            tracing::warn!("Client {} session ended: {:?}", client_id, e);
+        tokio::select! {
+            result = server.serve(channel) => {
+                if let Err(e) = result {
+                    tracing::warn!("Client {} session ended: {:?}", client_id, e);
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                tracing::info!("Client {} handler stopping due to shutdown", client_id);
+            }
         }
 
         // Cleanup: release owned alerts from both state and MarketHandler
@@ -381,7 +501,7 @@ fn spawn_client_handler(
         } else {
             tracing::info!("Client {} disconnected", client_id);
         }
-    });
+    })
 }
 
 // ── Main ──
@@ -403,6 +523,11 @@ async fn main() -> Result<()> {
     }
     market_data::utils::setup();
 
+    let shm_base = &cfg.market_data.shm_name;
+
+    // Clean up stale SHM files from a previous crash so the address can be reused
+    cleanup_shm(shm_base);
+
     // Build shared memory config for per-client slots (long read timeout for idle clients)
     let buffer_size = cfg.market_data.shm_buffer_size.unwrap_or(4 * 1024 * 1024);
     let shm_config = SharedMemoryConfig::new()
@@ -411,9 +536,10 @@ async fn main() -> Result<()> {
         .with_write_timeout(Duration::from_secs(30));
 
     // Smaller config for the acceptor endpoint (only handles a single connect RPC)
+    // Short read timeout so the acceptor loop can check for shutdown frequently
     let acceptor_shm_config = SharedMemoryConfig::new()
         .with_buffer_size(64 * 1024)
-        .with_read_timeout(Duration::from_secs(300))
+        .with_read_timeout(Duration::from_secs(2))
         .with_write_timeout(Duration::from_secs(30));
 
     // Initialize market subsystem
@@ -425,33 +551,30 @@ async fn main() -> Result<()> {
     let handles = market_manager.shared_handles();
 
     // Spawn MarketManager in background (owns the FIX connection + reconnect loop)
-    tokio::spawn(async move {
+    let mm_handle = tokio::spawn(async move {
         if let Err(e) = market_manager.run_forever().await {
             tracing::error!("MarketManager run_forever error: {:?}", e);
         }
     });
 
     let state = Arc::new(XrpcState::new());
-    let accept_name = format!("{}-accept", cfg.market_data.shm_name);
+    let accept_name = format!("{}-accept", shm_base);
 
     tracing::info!(
         "Starting xrpc market data server (acceptor: shm://{})",
         accept_name
     );
 
-    // Spawn a Ctrl-C watcher
-    let shutdown = tokio::spawn(async {
-        let _ = signal::ctrl_c().await;
-        tracing::info!("Shutdown signal received");
-    });
+    // Shutdown signalling: watch channel shared with all client handlers
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Acceptor loop: wait for client connections
+    // Track client handler tasks so we can abort them on shutdown
+    let mut client_handles: Vec<JoinHandle<()>> = Vec::new();
+
+    // Acceptor loop: wait for client connections, interruptible by Ctrl-C
     loop {
-        // Check if shutdown was requested
-        if shutdown.is_finished() {
-            tracing::info!("Shutting down acceptor loop");
-            break;
-        }
+        // Prune finished client handles
+        client_handles.retain(|h| !h.is_finished());
 
         // Create the acceptor shm endpoint
         let acceptor_transport = match SharedMemoryFrameTransport::create_server(
@@ -473,12 +596,21 @@ async fn main() -> Result<()> {
         let handles_clone = handles.clone();
         let shm_config_clone = shm_config.clone();
         let shm_name = cfg.market_data.shm_name.clone();
+        let shutdown_rx_clone = shutdown_rx.clone();
+
+        // We need to collect the JoinHandle from inside the connect handler.
+        // Use a shared vec behind a mutex to hand it back.
+        let spawned: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let spawned_inner = spawned.clone();
 
         acceptor_server.register_typed("connect", move |req: ConnectRequest| {
             let state = state_clone.clone();
             let handles = handles_clone.clone();
             let shm_config = shm_config_clone.clone();
             let shm_name = shm_name.clone();
+            let shutdown_rx = shutdown_rx_clone.clone();
+            let spawned = spawned_inner.clone();
             async move {
                 let client_id = state.next_client_id().await;
                 let slot_name = format!("{}-client-{}", shm_name, client_id);
@@ -490,7 +622,15 @@ async fn main() -> Result<()> {
                     slot_name
                 );
 
-                spawn_client_handler(client_id, slot_name.clone(), shm_config, state, handles);
+                let handle = spawn_client_handler(
+                    client_id,
+                    slot_name.clone(),
+                    shm_config,
+                    state,
+                    handles,
+                    shutdown_rx,
+                );
+                spawned.lock().await.push(handle);
 
                 // Small delay to let the server-side shm be created before client connects
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -502,13 +642,50 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Serve this single acceptor connection, then loop
+        // Serve this single acceptor connection, racing against Ctrl-C
         let acceptor_channel = Arc::new(acceptor_channel);
-        if let Err(e) = acceptor_server.serve(acceptor_channel).await {
-            // Client disconnected from acceptor — this is expected
-            tracing::debug!("Acceptor session ended: {:?}", e);
+        tokio::select! {
+            result = acceptor_server.serve(acceptor_channel) => {
+                // Client finished the connect handshake (or timed out / errored)
+                if let Err(e) = result {
+                    tracing::debug!("Acceptor session ended: {:?}", e);
+                }
+                // Collect any JoinHandles spawned during this accept cycle
+                let mut new_handles = spawned.lock().await;
+                client_handles.append(&mut new_handles);
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Shutdown signal received (Ctrl-C)");
+                break;
+            }
         }
     }
 
+    // ── Graceful Shutdown ──
+
+    tracing::info!("Shutting down...");
+
+    // Signal all client handlers to stop
+    let _ = shutdown_tx.send(true);
+
+    // Give client handlers a moment to exit cleanly
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Abort any client handlers that haven't stopped yet
+    let active = client_handles.iter().filter(|h| !h.is_finished()).count();
+    if active > 0 {
+        tracing::info!("Aborting {} remaining client handler(s)", active);
+        for handle in &client_handles {
+            handle.abort();
+        }
+    }
+
+    // Abort the MarketManager background task
+    mm_handle.abort();
+
+    // Clean up SHM files so the address can be reused on next startup
+    cleanup_shm(shm_base);
+
+    tracing::info!("Server shut down cleanly");
     Ok(())
 }

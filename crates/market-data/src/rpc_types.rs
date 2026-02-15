@@ -86,6 +86,21 @@ pub struct RemoveAlertRequest {
     pub alert_id: String,
 }
 
+// ── Alert Query ──
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlertInfo {
+    pub alert_id: String,
+    pub symbol: String,
+    pub price: f64,
+    pub kind: String, // "ABOVE" / "BELOW"
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GetAlertsResponse {
+    pub alerts: Vec<AlertInfo>,
+}
+
 // ── Streaming Events (server -> client) ──
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -102,6 +117,21 @@ pub struct AlertResult {
     pub status: String,
     pub symbol: String,
     pub ref_price: f64,
+    pub ts_ms: i64,
+}
+
+// ── Combined Stream Event (prices + state changes) ──
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StreamEvent {
+    pub event_type: String, // "PRICE" | "STATE"
+    // Price fields (present when event_type = "PRICE")
+    pub symbol: Option<String>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    // State fields (present when event_type = "STATE")
+    pub state: Option<String>, // "CONNECTED" | "DISCONNECTED" | "CONNECTING" | "LOGON"
+    // Common
     pub ts_ms: i64,
 }
 

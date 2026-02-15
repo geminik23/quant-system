@@ -8,6 +8,11 @@ username = "12345"
 password = "your_password"
 ssl = false
 
+# Reconnection retry settings (optional — defaults shown below)
+# retry_max_attempts = 0       # 0 = infinite retries
+# retry_base_delay_secs = 2    # initial backoff delay in seconds
+# retry_max_delay_secs = 60    # maximum backoff cap in seconds
+
 # Market Data Service settings (xrpc shared memory)
 [market_data]
 shm_name = "market-data"

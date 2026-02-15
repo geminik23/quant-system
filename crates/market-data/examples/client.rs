@@ -1,11 +1,11 @@
-//! Example xrpc market data client.
+//! Basic CLI client for the market data service.
 //!
 //! Connects to the market data server via shared memory, subscribes to
 //! price ticks, sets a price alert, and streams prices.
 //!
 //! Usage:
-//!   cargo run --example client
-//!   cargo run --example client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p market-data --example client
+//!   cargo run -p market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
 
 use std::sync::Arc;
 
