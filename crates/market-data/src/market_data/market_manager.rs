@@ -40,6 +40,29 @@ pub struct AlertTriggeredEvent {
     pub ts_ms: i64,
 }
 
+/// Shared handles extracted from MarketManager for lock-free access by client handlers.
+#[derive(Clone)]
+pub struct MarketManagerHandles {
+    pub market_handler: Arc<MarketHandler>,
+    pub price_broadcast_tx: broadcast::Sender<PriceTickEvent>,
+    pub alert_broadcast_tx: broadcast::Sender<AlertTriggeredEvent>,
+    pub connection_state: Arc<tokio::sync::RwLock<ConnectionState>>,
+}
+
+impl MarketManagerHandles {
+    pub fn subscribe_price_ticks(&self) -> broadcast::Receiver<PriceTickEvent> {
+        self.price_broadcast_tx.subscribe()
+    }
+
+    pub fn subscribe_alerts(&self) -> broadcast::Receiver<AlertTriggeredEvent> {
+        self.alert_broadcast_tx.subscribe()
+    }
+
+    pub async fn get_connection_state(&self) -> ConnectionState {
+        *self.connection_state.read().await
+    }
+}
+
 pub struct MarketManager {
     config: CTraderFixConfig,
     market_handler: Arc<MarketHandler>,
@@ -96,6 +119,17 @@ impl MarketManager {
         *self.connection_state.read().await
     }
 
+    /// Get the shared handles that client handlers need — no mutex required.
+    /// Call this *before* `run_forever()` so clients don't need to lock the manager.
+    pub fn shared_handles(&self) -> MarketManagerHandles {
+        MarketManagerHandles {
+            market_handler: self.market_handler.clone(),
+            price_broadcast_tx: self.price_broadcast_tx.clone(),
+            alert_broadcast_tx: self.alert_broadcast_tx.clone(),
+            connection_state: self.connection_state.clone(),
+        }
+    }
+
     async fn initialize(&mut self) -> Result<()> {
         *self.connection_state.write().await = ConnectionState::Connecting;
         let mut ctrader_market = CTraderMarket::new(self.config.clone());
@@ -103,11 +137,11 @@ impl MarketManager {
             .client
             .register_market_handler_arc(self.market_handler.clone());
 
-        log::info!("Initializing CTrader market connection...");
+        tracing::info!("Initializing CTrader market connection...");
         ctrader_market.initialize(false).await?;
 
         *self.connection_state.write().await = ConnectionState::Logon;
-        log::info!("Successfully connected to CTrader market!");
+        tracing::info!("Successfully connected to CTrader market!");
 
         // Get symbol mappings and set them in the market handler
         let symbol_map = ctrader_market.get_symbol_str2id().await;
@@ -119,7 +153,7 @@ impl MarketManager {
     }
 
     async fn reconnect(&mut self) -> Result<()> {
-        log::info!("Attempting to reconnect...");
+        tracing::info!("Attempting to reconnect...");
 
         let mut new_ctrader_market = CTraderMarket::new(self.config.clone());
         new_ctrader_market
@@ -129,7 +163,7 @@ impl MarketManager {
         // Try to reinitialize the connection
         new_ctrader_market.initialize(false).await?;
 
-        log::info!("Successfully reconnected to CTrader market!");
+        tracing::info!("Successfully reconnected to CTrader market!");
 
         // Update symbol mappings
         let symbol_map = new_ctrader_market.get_symbol_str2id().await;
@@ -138,7 +172,7 @@ impl MarketManager {
         // Replace the old market client with the new one
         self.ctrader_market = Some(new_ctrader_market);
 
-        log::info!("Market reconnection completed!");
+        tracing::info!("Market reconnection completed!");
         Ok(())
     }
 
@@ -155,7 +189,7 @@ impl MarketManager {
             while let Ok(message) = receiver.recv().await {
                 match message {
                     MarketMessage::OnPriceAlert(alert_id) => {
-                        log::info!("Price alert triggered! Alert ID: {}", alert_id);
+                        tracing::info!("Price alert triggered! Alert ID: {}", alert_id);
 
                         // Send to legacy alert result channel if set
                         let alert_result = AlertResultCommand::AlertTriggered {
@@ -186,22 +220,22 @@ impl MarketManager {
                         }
                     }
                     MarketMessage::MarketConnected => {
-                        log::info!("Market connected!");
+                        tracing::info!("Market connected!");
                         *connection_state.write().await = ConnectionState::Connected;
                     }
                     MarketMessage::MarketDisconnected => {
-                        log::warn!("Market disconnected! Sending reconnect signal...");
+                        tracing::warn!("Market disconnected! Sending reconnect signal...");
                         *connection_state.write().await = ConnectionState::Disconnected;
                         if let Err(e) = reconnect_tx.send(ReconnectSignal::Reconnect).await {
-                            log::error!("Failed to send reconnect signal: {:?}", e);
+                            tracing::error!("Failed to send reconnect signal: {:?}", e);
                         }
                     }
                     MarketMessage::MarketLogon => {
-                        log::info!("Market logged on!");
+                        tracing::info!("Market logged on!");
                         *connection_state.write().await = ConnectionState::Logon;
                     }
                     MarketMessage::RejectedSpot(symbol_id, error) => {
-                        log::warn!(
+                        tracing::warn!(
                             "Spot subscription rejected for symbol {}: {}",
                             symbol_id,
                             error
@@ -221,8 +255,8 @@ impl MarketManager {
             match signal {
                 ReconnectSignal::Reconnect => {
                     if let Err(e) = self.reconnect().await {
-                        log::info!("Failed to reconnect: {:?}", e);
-                        log::info!("Will retry on next disconnection event...");
+                        tracing::info!("Failed to reconnect: {:?}", e);
+                        tracing::info!("Will retry on next disconnection event...");
                     }
                 }
             }
@@ -235,12 +269,12 @@ impl MarketManager {
     pub async fn run_forever(&mut self) -> Result<()> {
         // Try to initialize the market connection
         if let Err(e) = self.initialize().await {
-            log::info!("Failed to initialize market connection: {:?}", e);
-            log::info!("Market manager will still run and attempt reconnection when possible");
+            tracing::info!("Failed to initialize market connection: {:?}", e);
+            tracing::info!("Market manager will still run and attempt reconnection when possible");
         }
 
         // Run the market manager (this will handle reconnections automatically)
-        log::info!("Starting market manager with automatic reconnection...");
+        tracing::info!("Starting market manager with automatic reconnection...");
         self.run().await
     }
 }

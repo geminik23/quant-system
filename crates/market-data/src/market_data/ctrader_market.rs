@@ -95,7 +95,9 @@ impl CTraderMarket {
     pub async fn initialize(&mut self, disonnect: bool) -> Result<()> {
         if disonnect {
             if let Err(err) = self.client.disconnect().await {
-                log::error!("[CtraderMakret] Failed to disconnect on intiailize method - {err:?}",);
+                tracing::error!(
+                    "[CtraderMakret] Failed to disconnect on intiailize method - {err:?}",
+                );
             }
         }
 
@@ -120,13 +122,13 @@ impl CTraderMarket {
                 .await
                 .expect("CtraderMarket::initialize - the result of fetch_security_list");
             self.symbol_info.parse_symbol_infos(data);
-            log::info!("Subscribe market datas");
+            tracing::info!("Subscribe market datas");
 
             trade.disconnect().await?;
         }
 
         {
-            log::info!("Start market subscription...");
+            tracing::info!("Start market subscription...");
             let symbols = self
                 .get_all_symbol_ids()
                 .into_iter()
@@ -140,7 +142,7 @@ impl CTraderMarket {
             // let rejected_list = self.client.spot_subscription_list().await;
         }
 
-        log::info!("Success to subscribe market datas");
+        tracing::info!("Success to subscribe market datas");
 
         Ok(())
     }

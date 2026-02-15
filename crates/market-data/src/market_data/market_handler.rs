@@ -36,7 +36,7 @@ pub struct MarketHandler {
 
 impl MarketHandler {
     pub fn new() -> Self {
-        let (tx, rx) = channel(1);
+        let (tx, rx) = channel(4096);
         Self {
             sender: tx,
             recv: rx,
@@ -78,7 +78,7 @@ impl MarketHandler {
     }
 
     pub async fn get_price_of(&self, symbol: &str) -> Option<f64> {
-        log::info!("{:?}", self.symbol_str2id.read().await);
+        tracing::info!("{:?}", self.symbol_str2id.read().await);
         match self.get_symbol_id(symbol).await {
             Some(symbol_id) => self.price_alert.read().await.get_price(symbol_id),
             None => None,
@@ -116,7 +116,7 @@ impl MarketHandler {
         match self.get_symbol_id(symbol.as_str()).await {
             Some(sym_id) => Some(self.set_price_alert_id(sym_id, set, alert_id).await),
             None => {
-                log::error!("Cannot find the symbol id - {symbol:?}");
+                tracing::error!("Cannot find the symbol id - {symbol:?}");
                 None
             }
         }

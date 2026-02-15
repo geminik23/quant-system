@@ -18,8 +18,8 @@ pub enum QuantError {
     TomlError(#[from] toml::de::Error),
     #[error("Send error: {0}")]
     SendError(String),
-    #[error("gRPC status error: {0}")]
-    GrpcStatus(#[from] tonic::Status),
+    #[error("RPC error: {0}")]
+    RpcError(#[from] xrpc::RpcError),
 }
 
 pub type Result<T> = std::result::Result<T, QuantError>;

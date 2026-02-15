@@ -10,3 +10,4 @@ pub type AlertId = Id;
 
 // Re-export commonly used types
 pub use market_manager::ConnectionState;
+pub use market_manager::MarketManagerHandles;
