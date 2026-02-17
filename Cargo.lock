@@ -2983,9 +2983,9 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "xrpc-rs"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c05073e1523aa7301f2d1b0c67847c0afd89902c65f29f8f47a603715a3886bd"
+checksum = "b68b3c62f87e209398c311b5621bf07a618f1d50daa770f61c4cd1d4995e0793"
 dependencies = [
  "arc-swap",
  "async-trait",

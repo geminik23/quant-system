@@ -668,20 +668,25 @@ async fn main() -> Result<()> {
     // Signal all client handlers to stop
     let _ = shutdown_tx.send(true);
 
-    // Give client handlers a moment to exit cleanly
+    // Abort the MarketManager background task (this also aborts its
+    // internal message handler task, preventing a task leak on shutdown)
+    mm_handle.abort();
+    let _ = mm_handle.await;
+
+    // Give client handlers a moment to exit cleanly, then abort stragglers
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Abort any client handlers that haven't stopped yet
     let active = client_handles.iter().filter(|h| !h.is_finished()).count();
     if active > 0 {
         tracing::info!("Aborting {} remaining client handler(s)", active);
         for handle in &client_handles {
             handle.abort();
         }
+        // Wait for aborted tasks to actually terminate
+        for handle in client_handles {
+            let _ = handle.await;
+        }
     }
-
-    // Abort the MarketManager background task
-    mm_handle.abort();
 
     // Clean up SHM files so the address can be reused on next startup
     cleanup_shm(shm_base);

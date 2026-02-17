@@ -3,3 +3,44 @@ resolver = "3"
 members = [
     "crates/market-data",
 ]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/geminik23/quant-system"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# CLI & config
+clap = { version = "4.5", features = ["derive"] }
+dotenv = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "2.0"
+
+# Time & IDs
+chrono = { version = "0.4", features = ["serde"] }
+nanoid = "0.4"
+
+# IPC / RPC
+xrpc-rs = "0.2.1"
+
+# CTrader FIX protocol
+ctrader-fix = "0.5"
+
+# TUI (optional, used by tui-client feature)
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }

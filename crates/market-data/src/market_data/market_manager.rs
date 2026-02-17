@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::{
     Result,
@@ -260,7 +261,7 @@ impl MarketManager {
         }
     }
 
-    fn start_message_handler(&self) {
+    fn start_message_handler(&self) -> JoinHandle<()> {
         let mut receiver = self.market_handler.alert_receiver();
         let reconnect_tx = self.reconnect_tx.clone();
         let alert_result_tx = self.alert_result_tx.clone();
@@ -270,7 +271,7 @@ impl MarketManager {
         let state_broadcast_tx = self.state_broadcast_tx.clone();
         let connection_state = self.connection_state.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Ok(message) = receiver.recv().await {
                 match message {
                     MarketMessage::OnPriceAlert(alert_id) => {
@@ -332,6 +333,8 @@ impl MarketManager {
                 }
             }
         });
+
+        handle
     }
 
     /// Initialize the connection and run the market manager forever in the background.
@@ -340,7 +343,7 @@ impl MarketManager {
     /// CTraderMarket instance) rather than attempting to reuse old connections.
     pub async fn run_forever(&mut self) -> Result<()> {
         // Start the message handler (processes MarketMessage → broadcast events)
-        self.start_message_handler();
+        let msg_handler = self.start_message_handler();
 
         // Initial connection attempt with retry on failure
         if let Err(e) = self.initialize().await {
@@ -363,6 +366,11 @@ impl MarketManager {
                 }
             }
         }
+
+        // Abort the message handler task so it doesn't leak on shutdown.
+        // This task holds Arc clones of MarketHandler (which owns the broadcast
+        // Sender), so it would block forever on recv() if left running.
+        msg_handler.abort();
 
         Ok(())
     }

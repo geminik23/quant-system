@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{core::AlertSet, market_data::AlertId};
 
+// TODO: Remove the legacy commands
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SystemCommand {
     Ping { uid: String },

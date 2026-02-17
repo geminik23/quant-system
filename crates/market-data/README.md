@@ -11,45 +11,6 @@ Real-time market data service that connects to **CTrader FIX API** for live fore
 - Automatic CTrader reconnection on disconnect
 - Alert ownership tracking and cleanup on client disconnect
 
-## Project Structure
-
-```
-crates/market-data/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs                        # module declarations, re-exports
-│   ├── bin/market_data.rs            # server binary (acceptor loop + per-client RPC)
-│   ├── rpc_types.rs                  # request/response message structs (serde)
-│   ├── xrpc_state.rs                 # shared state: client IDs, alert ownership
-│   ├── quant_error.rs                # QuantError enum, Result alias
-│   ├── utils.rs                      # TOML config loader, tracing setup
-│   ├── commands.rs                   # internal command/event enums
-│   ├── core/
-│   │   ├── mod.rs                    # AlertSet enum, Id type
-│   │   └── ctrader_type.rs           # CTraderFixConfig (serde struct for TOML)
-│   └── market_data/
-│       ├── mod.rs                    # sub-module declarations, type aliases
-│       ├── market_handler.rs         # price cache, alert engine, FIX callbacks
-│       ├── market_manager.rs         # CTrader lifecycle, reconnection, broadcast
-│       ├── price_alert.rs            # threshold-based alert trigger logic
-│       ├── ctrader_market.rs         # FIX client wrapper
-│       └── utils.rs                  # symbol name normalization
-├── examples/
-│   ├── client.rs                     # basic CLI client
-│   ├── stream_client.rs              # ratatui streaming TUI
-│   └── command_client.rs             # ratatui command TUI
-└── tests/
-    └── unit_tests.rs
-```
-
-Example clients use `[dev-dependencies]` (`ratatui`, `crossterm`, `futures`) which are only compiled for examples and tests — not for the library or server binary.
-
-| Example | Description |
-|---------|-------------|
-| `client` | Basic CLI client — connect, ping, get prices, stream |
-| `stream_client` | TUI streaming client — live price table + alert panel with state change notifications |
-| `command_client` | TUI command client — interactive menu for all unary RPCs including `get_alerts` |
-
 ## Quick Start
 
 ```bash
@@ -57,15 +18,26 @@ Example clients use `[dev-dependencies]` (`ratatui`, `crossterm`, `futures`) whi
 cargo build -p market-data
 
 # Run the server
-cargo run -p market-data --bin market_data -- --config path/to/config.toml
+cargo run -p market-data --bin ctrader_market_data -- --config path/to/config.toml
 
 # Run tests
 cargo test -p market-data
 
-# Run example clients
+# Run the TUI client (streaming + commands)
+cargo run -p market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
+
+# Run the minimal example client
 cargo run -p market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
-cargo run -p market-data --example stream_client -- --shm-name market-data --symbols eurusd,xauusd
-cargo run -p market-data --example command_client -- --shm-name market-data
+```
+
+### Install via cargo
+
+```bash
+# Install the CTrader server binary
+cargo install market-data --bin ctrader_market_data
+
+# Install the TUI client
+cargo install market-data --bin market_data_client --features tui-client
 ```
 
 ## Configuration
@@ -123,21 +95,15 @@ level = "info"
 | `stream_alerts` | `()` | `AlertResult` | Alert trigger notifications (filtered by ownership) |
 | `stream_events` | `()` | `StreamEvent` | Price ticks + connection state changes (recommended) |
 
-## Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `xrpc-rs` | Shared memory RPC transport |
-| `ctrader-fix` | CTrader FIX protocol client |
-| `tokio` | Async runtime |
-| `serde` / `serde_json` | Message serialization |
-| `tracing` / `tracing-subscriber` | Structured logging |
-| `clap` | CLI argument parsing |
-| `chrono` | Timestamps |
-| `toml` | Config file parsing |
-| `nanoid` | Unique ID generation |
-| `thiserror` | Error type derivation |
-
 ## Wire Format
 
 All RPC types derive `serde::{Serialize, Deserialize}`. The xrpc-rs transport uses **Bincode** encoding by default (not JSON). The `serde_json` dependency is only used in tests and error types.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](../../LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
