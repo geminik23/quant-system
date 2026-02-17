@@ -4,8 +4,8 @@
 //! in a single tabbed terminal interface.
 //!
 //! Usage:
-//!   cargo run -p market-data --features tui-client --bin market_data_client
-//!   cargo run -p market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p qs-market-data --features tui-client --bin market_data_client
+//!   cargo run -p qs-market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

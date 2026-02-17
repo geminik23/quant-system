@@ -15,29 +15,29 @@ Real-time market data service that connects to **CTrader FIX API** for live fore
 
 ```bash
 # Build the server
-cargo build -p market-data
+cargo build -p qs-market-data
 
 # Run the server
-cargo run -p market-data --bin ctrader_market_data -- --config path/to/config.toml
+cargo run -p qs-market-data --bin ctrader_market_data -- --config path/to/config.toml
 
 # Run tests
-cargo test -p market-data
+cargo test -p qs-market-data
 
 # Run the TUI client (streaming + commands)
-cargo run -p market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
+cargo run -p qs-market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
 
 # Run the minimal example client
-cargo run -p market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
+cargo run -p qs-market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
 ```
 
 ### Install via cargo
 
 ```bash
 # Install the CTrader server binary
-cargo install market-data --bin ctrader_market_data
+cargo install qs-market-data --bin ctrader_market_data
 
 # Install the TUI client
-cargo install market-data --bin market_data_client --features tui-client
+cargo install qs-market-data --bin market_data_client --features tui-client
 ```
 
 ## Configuration

@@ -4,8 +4,8 @@
 //! price ticks, sets a price alert, and streams prices.
 //!
 //! Usage:
-//!   cargo run -p market-data --example client
-//!   cargo run -p market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p qs-market-data --example client
+//!   cargo run -p qs-market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
 
 use std::sync::Arc;
 

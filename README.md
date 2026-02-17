@@ -6,7 +6,7 @@ A modular workspace for algorithmic trading — real-time market data, strategy 
 
 | Crate | Description |
 |-------|-------------|
-| [`market-data`](crates/market-data/) | Real-time price streaming from CTrader FIX API, exposed to local clients via shared memory IPC (`xrpc-rs`). Supports per-client subscriptions, price alerts, and automatic reconnection. |
+| [`qs-market-data`](crates/market-data/) | Real-time price streaming from CTrader FIX API, exposed to local clients via shared memory IPC (`xrpc-rs`). Supports per-client subscriptions, price alerts, and automatic reconnection. |
 
 ## License
 

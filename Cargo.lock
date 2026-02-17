@@ -1276,29 +1276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "market-data"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "clap",
- "crossterm",
- "ctrader-fix",
- "dotenv",
- "futures",
- "nanoid",
- "ratatui",
- "serde",
- "serde_json",
- "thiserror 2.0.12",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "xrpc-rs",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1719,6 +1696,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "qs-market-data"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "clap",
+ "crossterm",
+ "ctrader-fix",
+ "dotenv",
+ "futures",
+ "nanoid",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xrpc-rs",
 ]
 
 [[package]]
