@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/market-data",
+    "crates/data-preprocess",
 ]
 
 [workspace.package]
@@ -21,7 +22,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # CLI & config
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 dotenv = "0.15"
 
 # Logging
@@ -37,6 +38,10 @@ nanoid = "0.4"
 
 # IPC / RPC
 xrpc-rs = "0.2.1"
+
+# Data storage & parsing
+duckdb = { version = "1.2", features = ["bundled"] }
+csv = "1.3"
 
 # CTrader FIX protocol
 ctrader-fix = "0.5"

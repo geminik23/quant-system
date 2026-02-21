@@ -1,0 +1,26 @@
+[package]
+name = "qs-data-preprocess"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Historical market data storage and preprocessing CLI"
+keywords = ["market-data", "duckdb", "preprocessing", "ohlcv"]
+categories = ["finance"]
+
+[lib]
+name = "data_preprocess"
+
+[[bin]]
+name = "data-preprocess"
+path = "src/main.rs"
+
+[dependencies]
+duckdb = { workspace = true }
+csv = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
