@@ -1,0 +1,20 @@
+[package]
+name = "qs-symbols"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Symbol registry — canonical names, aliases, precision metadata, and lot specification"
+keywords = ["symbols", "normalization", "config", "trading"]
+categories = ["finance"]
+
+[lib]
+name = "qs_symbols"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

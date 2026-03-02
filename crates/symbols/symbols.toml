@@ -1,0 +1,917 @@
+# symbols.toml — Symbol Registry
+# Each [[symbol]] entry defines a canonical name, its aliases,
+# price precision metadata, and lot specification.
+
+# ─── Forex (major & minor) ───────────────────────────────────
+
+[[symbol]]
+canonical = "eurusd"
+aliases = ["eur/usd", "eur-usd", "eurusdx", "eur_usd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdjpy"
+aliases = ["usd/jpy", "usd-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpusd"
+aliases = ["gbp/usd", "gbp-usd", "cable"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audusd"
+aliases = ["aud/usd", "aud-usd", "aussie"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "nzdusd"
+aliases = ["nzd/usd", "nzd-usd", "kiwi"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdcad"
+aliases = ["usd/cad", "usd-cad"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdchf"
+aliases = ["usd/chf", "usd-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurgbp"
+aliases = ["eur/gbp", "eur-gbp"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurjpy"
+aliases = ["eur/jpy", "eur-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpjpy"
+aliases = ["gbp/jpy", "gbp-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "euraud"
+aliases = ["eur/aud", "eur-aud"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurchf"
+aliases = ["eur/chf", "eur-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurcad"
+aliases = ["eur/cad", "eur-cad"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurnzd"
+aliases = ["eur/nzd", "eur-nzd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audcad"
+aliases = ["aud/cad", "aud-cad"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audchf"
+aliases = ["aud/chf", "aud-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audjpy"
+aliases = ["aud/jpy", "aud-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audnzd"
+aliases = ["aud/nzd", "aud-nzd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "cadchf"
+aliases = ["cad/chf", "cad-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "cadjpy"
+aliases = ["cad/jpy", "cad-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "chfjpy"
+aliases = ["chf/jpy", "chf-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "nzdcad"
+aliases = ["nzd/cad", "nzd-cad"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "nzdchf"
+aliases = ["nzd/chf", "nzd-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "nzdjpy"
+aliases = ["nzd/jpy", "nzd-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpaud"
+aliases = ["gbp/aud", "gbp-aud"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpcad"
+aliases = ["gbp/cad", "gbp-cad"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpchf"
+aliases = ["gbp/chf", "gbp-chf"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpnzd"
+aliases = ["gbp/nzd", "gbp-nzd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eursgd"
+aliases = ["eur/sgd", "eur-sgd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdsgd"
+aliases = ["usd/sgd", "usd-sgd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "sgdjpy"
+aliases = ["sgd/jpy", "sgd-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpsgd"
+aliases = ["gbp/sgd", "gbp-sgd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "audsgd"
+aliases = ["aud/sgd", "aud-sgd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "chfsgd"
+aliases = ["chf/sgd", "chf-sgd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+# ─── Forex (exotic / non-standard pip) ──────────────────────
+
+[[symbol]]
+canonical = "eurnok"
+aliases = ["eur/nok", "eur-nok"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurhkd"
+aliases = ["eur/hkd", "eur-hkd"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurdkk"
+aliases = ["eur/dkk", "eur-dkk"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurpln"
+aliases = ["eur/pln", "eur-pln"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eursek"
+aliases = ["eur/sek", "eur-sek"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurtry"
+aliases = ["eur/try", "eur-try"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurzar"
+aliases = ["eur/zar", "eur-zar"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurmxn"
+aliases = ["eur/mxn", "eur-mxn"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurczk"
+aliases = ["eur/czk", "eur-czk"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurhuf"
+aliases = ["eur/huf", "eur-huf"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "eurrub"
+aliases = ["eur/rub", "eur-rub"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdcnh"
+aliases = ["usd/cnh", "usd-cnh"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usddkk"
+aliases = ["usd/dkk", "usd-dkk"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdmxn"
+aliases = ["usd/mxn", "usd-mxn"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdnok"
+aliases = ["usd/nok", "usd-nok"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdpln"
+aliases = ["usd/pln", "usd-pln"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdsek"
+aliases = ["usd/sek", "usd-sek"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdtry"
+aliases = ["usd/try", "usd-try"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdzar"
+aliases = ["usd/zar", "usd-zar"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdhuf"
+aliases = ["usd/huf", "usd-huf"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdczk"
+aliases = ["usd/czk", "usd-czk"]
+pip_position = 3
+digits = 4
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdhkd"
+aliases = ["usd/hkd", "usd-hkd"]
+pip_position = 3
+digits = 4
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdils"
+aliases = ["usd/ils", "usd-ils"]
+pip_position = 3
+digits = 4
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdkrw"
+aliases = ["usd/krw", "usd-krw"]
+pip_position = 1
+digits = 2
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "usdrub"
+aliases = ["usd/rub", "usd-rub"]
+pip_position = 3
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "chfpln"
+aliases = ["chf/pln", "chf-pln"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbphkd"
+aliases = ["gbp/hkd", "gbp-hkd"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpdkk"
+aliases = ["gbp/dkk", "gbp-dkk"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpnok"
+aliases = ["gbp/nok", "gbp-nok"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpsek"
+aliases = ["gbp/sek", "gbp-sek"]
+pip_position = 3
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbptry"
+aliases = ["gbp/try", "gbp-try"]
+pip_position = 2
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "nokjpy"
+aliases = ["nok/jpy", "nok-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "noksek"
+aliases = ["nok/sek", "nok-sek"]
+pip_position = 4
+digits = 5
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "sekjpy"
+aliases = ["sek/jpy", "sek-jpy"]
+pip_position = 1
+digits = 2
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+# ─── Metals ──────────────────────────────────────────────────
+
+[[symbol]]
+canonical = "xauusd"
+aliases = ["gold", "xau/usd", "xau-usd"]
+pip_position = 1
+digits = 2
+category = "metal"
+lot_base_units = 100
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "xagusd"
+aliases = ["silver", "xag/usd", "xag-usd"]
+pip_position = 2
+digits = 3
+category = "metal"
+lot_base_units = 1000
+lot_step_units = 10
+lot_min_steps = 1
+lot_max_steps = 0
+
+# ─── Commodities ─────────────────────────────────────────────
+
+[[symbol]]
+canonical = "xtiusd"
+aliases = ["oil", "usoil", "wti", "crude", "xti/usd"]
+pip_position = 2
+digits = 3
+category = "commodity"
+lot_base_units = 100
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "xbrusd"
+aliases = ["brent", "ukoil", "xbr/usd"]
+pip_position = 2
+digits = 2
+category = "commodity"
+lot_base_units = 100
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "xngusd"
+aliases = ["natgas", "ngas", "xng/usd"]
+pip_position = 3
+digits = 3
+category = "commodity"
+lot_base_units = 1000
+lot_step_units = 10
+lot_min_steps = 1
+lot_max_steps = 0
+
+# ─── Indices ─────────────────────────────────────────────────
+
+[[symbol]]
+canonical = "usdx"
+aliases = ["dx", "dxy", "dollar-index"]
+pip_position = 2
+digits = 3
+category = "index"
+lot_base_units = 1
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "us100"
+aliases = ["nas100", "nasdaq", "us tech 100", "ustech100", "ndaq", "ustec"]
+pip_position = 1
+digits = 2
+category = "index"
+lot_base_units = 1
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "us500"
+aliases = ["spx500", "sp500", "s&p500", "sp"]
+pip_position = 1
+digits = 2
+category = "index"
+lot_base_units = 1
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "us30"
+aliases = ["djia", "dow30", "dow jones", "dow"]
+pip_position = 1
+digits = 2
+category = "index"
+lot_base_units = 1
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "de40"
+aliases = ["ger40", "ger30", "de30", "dax", "dax40"]
+pip_position = 1
+digits = 2
+category = "index"
+lot_base_units = 1
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+# ─── Crypto ──────────────────────────────────────────────────
+
+[[symbol]]
+canonical = "btcusd"
+aliases = ["bitcoin", "btc/usd", "btc-usd"]
+pip_position = 1
+digits = 2
+category = "crypto"
+lot_base_units = 100000000
+lot_step_units = 100000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "ethusd"
+aliases = ["ethereum", "eth/usd", "eth-usd"]
+pip_position = 1
+digits = 2
+category = "crypto"
+lot_base_units = 100000000
+lot_step_units = 100000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "solusd"
+aliases = ["solana", "sol/usd", "sol-usd"]
+pip_position = 2
+digits = 3
+category = "crypto"
+lot_base_units = 1000000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "dotusd"
+aliases = ["polkadot", "dot/usd", "dot-usd"]
+pip_position = 2
+digits = 3
+category = "crypto"
+lot_base_units = 10000000000
+lot_step_units = 10000000
+lot_min_steps = 1
+lot_max_steps = 0
