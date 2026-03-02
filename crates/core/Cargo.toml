@@ -1,0 +1,21 @@
+[package]
+name = "qs-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core trade engine — position management, composable rules, and execution"
+keywords = ["trading", "engine", "position", "backtest"]
+categories = ["finance"]
+
+[lib]
+name = "qs_core"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+nanoid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

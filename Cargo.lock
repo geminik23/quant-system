@@ -2605,6 +2605,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-backtest"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "qs-core",
+ "qs-data-preprocess",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "qs-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nanoid",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "qs-data-preprocess"
 version = "0.1.0"
 dependencies = [
@@ -2630,6 +2652,7 @@ dependencies = [
  "dotenv",
  "futures",
  "nanoid",
+ "qs-symbols",
  "ratatui",
  "serde",
  "serde_json",
@@ -2639,6 +2662,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xrpc-rs",
+]
+
+[[package]]
+name = "qs-symbols"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
