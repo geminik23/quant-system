@@ -2612,6 +2612,7 @@ dependencies = [
  "qs-core",
  "qs-data-preprocess",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

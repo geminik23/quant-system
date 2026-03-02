@@ -31,6 +31,9 @@ pub mod strategy;
 
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
 pub use executor::BacktestExecutor;
-pub use report::{BacktestResult, TradeResult};
+pub use report::{
+    BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
+    StreakStats, SubsetStats, TradeResult,
+};
 pub use runner::BacktestRunner;
 pub use strategy::Strategy;

@@ -3,7 +3,7 @@
 //! `PositionManager` owns all positions and provides query/filter methods
 //! used by the [`TradeEngine`](crate::engine::TradeEngine).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::position::Position;
 use crate::types::{GroupId, PositionId, PositionStatus, Side};
@@ -20,6 +20,8 @@ pub struct PositionGroup {
 pub struct PositionManager {
     positions: HashMap<PositionId, Position>,
     groups: HashMap<GroupId, PositionGroup>,
+    /// Secondary index: symbol → position IDs (all statuses).
+    symbol_index: HashMap<String, HashSet<PositionId>>,
 }
 
 impl PositionManager {
@@ -32,12 +34,26 @@ impl PositionManager {
     /// Insert a position.  Overwrites if the id already exists.
     pub fn add(&mut self, position: Position) {
         let id = position.data.id.clone();
+        let symbol = position.data.symbol.clone();
+        self.symbol_index
+            .entry(symbol)
+            .or_default()
+            .insert(id.clone());
         self.positions.insert(id, position);
     }
 
     /// Remove a position by id.
     pub fn remove(&mut self, id: &str) -> Option<Position> {
-        self.positions.remove(id)
+        let pos = self.positions.remove(id);
+        if let Some(ref p) = pos {
+            if let Some(set) = self.symbol_index.get_mut(&p.data.symbol) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.symbol_index.remove(&p.data.symbol);
+                }
+            }
+        }
+        pos
     }
 
     /// Immutable lookup.
@@ -130,12 +146,34 @@ impl PositionManager {
 
     /// Collect ids of all open positions on a given symbol.
     pub fn open_ids_by_symbol(&self, symbol: &str) -> Vec<PositionId> {
-        self.ids_by_symbol_status(symbol, PositionStatus::Open)
+        self.ids_for_symbol(symbol)
+            .into_iter()
+            .filter(|id| {
+                self.positions
+                    .get(id)
+                    .map_or(false, |p| p.data.status == PositionStatus::Open)
+            })
+            .collect()
     }
 
     /// Collect ids of all pending positions on a given symbol.
     pub fn pending_ids_by_symbol(&self, symbol: &str) -> Vec<PositionId> {
-        self.ids_by_symbol_status(symbol, PositionStatus::Pending)
+        self.ids_for_symbol(symbol)
+            .into_iter()
+            .filter(|id| {
+                self.positions
+                    .get(id)
+                    .map_or(false, |p| p.data.status == PositionStatus::Pending)
+            })
+            .collect()
+    }
+
+    /// All position IDs for a symbol (any status), via the symbol index.
+    pub fn ids_for_symbol(&self, symbol: &str) -> Vec<PositionId> {
+        self.symbol_index
+            .get(symbol)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     // ── Groups ──────────────────────────────────────────────────────────

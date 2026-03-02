@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 use nanoid::nanoid;
 
+use crate::alert_register::{AlertKind, PriceAlertRegister, TriggeredAlert};
 use crate::error::{CoreError, Result};
 use crate::position::Position;
 use crate::position_manager::PositionManager;
@@ -42,6 +43,9 @@ pub struct TradeEngine {
     ///
     /// Defaults to [`FillModel::BidAsk`] (the most realistic model).
     pub fill_model: FillModel,
+    /// Optional BTreeMap-indexed alert register for O(log N + K) rule evaluation.
+    /// When `None`, the engine uses tick-by-tick evaluation for all rules.
+    alert_register: Option<PriceAlertRegister>,
 }
 
 impl Default for TradeEngine {
@@ -51,11 +55,13 @@ impl Default for TradeEngine {
 }
 
 impl TradeEngine {
+    /// Standard engine (tick-by-tick, no alert register). Best for backtesting.
     pub fn new() -> Self {
         Self {
             manager: PositionManager::new(),
             last_quotes: HashMap::new(),
             fill_model: FillModel::default(),
+            alert_register: None,
         }
     }
 
@@ -65,6 +71,27 @@ impl TradeEngine {
             manager: PositionManager::new(),
             last_quotes: HashMap::new(),
             fill_model,
+            alert_register: None,
+        }
+    }
+
+    /// Engine with alert register for indexed evaluation. Best for real-time with many positions.
+    pub fn with_alert_register() -> Self {
+        Self {
+            manager: PositionManager::new(),
+            last_quotes: HashMap::new(),
+            fill_model: FillModel::default(),
+            alert_register: Some(PriceAlertRegister::new()),
+        }
+    }
+
+    /// Engine with both alert register and custom fill model.
+    pub fn with_alert_register_and_fill_model(fill_model: FillModel) -> Self {
+        Self {
+            manager: PositionManager::new(),
+            last_quotes: HashMap::new(),
+            fill_model,
+            alert_register: Some(PriceAlertRegister::new()),
         }
     }
 
@@ -108,39 +135,73 @@ impl TradeEngine {
         self.last_quotes.insert(quote.symbol.clone(), quote.clone());
 
         let mut all_effects = Vec::new();
-
-        // ── 1. Check pending fills ──────────────────────────────────────
-        let pending_ids = self.manager.pending_ids_by_symbol(&quote.symbol);
-
         let fill_model = self.fill_model;
 
-        for id in pending_ids {
-            if let Some(pos) = self.manager.get_mut(&id) {
-                if pos.try_fill(quote, fill_model) {
-                    all_effects.push(Effect::PositionOpened { id: id.clone() });
+        // ── 1. Check pending fills ──────────────────────────────────────
+        if self.alert_register.is_some() {
+            // Alert register path: pending fills are handled as alerts.
+            // (registered when the pending order is placed)
+        } else {
+            let pending_ids = self.manager.pending_ids_by_symbol(&quote.symbol);
+            for id in pending_ids {
+                if let Some(pos) = self.manager.get_mut(&id) {
+                    if pos.try_fill(quote, fill_model) {
+                        all_effects.push(Effect::PositionOpened { id: id.clone() });
+                    }
                 }
             }
         }
 
-        // ── 2. Evaluate rules for open positions ────────────────────────
-        let open_ids = self.manager.open_ids_by_symbol(&quote.symbol);
+        // ── 2. Check alert register (static thresholds) ─────────────────
+        if let Some(ref mut register) = self.alert_register {
+            let triggered = register.check(quote, fill_model);
+            // Collect triggered alerts, then apply them below (avoids borrow conflict).
+            let triggered_alerts: Vec<TriggeredAlert> = triggered;
 
-        for id in open_ids {
-            // Evaluate rules (borrows pos mutably for rule-internal state).
-            let effects = {
-                let pos = match self.manager.get_mut(&id) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                pos.evaluate_rules(quote, fill_model)
-            };
-
-            // Apply each effect to internal state.
-            for effect in &effects {
-                self.apply_effect(effect, quote);
+            for alert in triggered_alerts {
+                let effects = self.apply_triggered_alert(&alert, quote);
+                all_effects.extend(effects);
             }
+        }
 
-            all_effects.extend(effects);
+        // ── 3. Evaluate rules for open positions ────────────────────────
+        if self.alert_register.is_some() {
+            // Alert register path: only tick-evaluate stateful positions.
+            let tick_ids = self
+                .alert_register
+                .as_ref()
+                .unwrap()
+                .tick_eval_ids(&quote.symbol);
+
+            for id in tick_ids {
+                let effects = {
+                    let pos = match self.manager.get_mut(&id) {
+                        Some(p) if p.data.status == PositionStatus::Open => p,
+                        _ => continue,
+                    };
+                    pos.evaluate_stateful_rules(quote, fill_model)
+                };
+                for effect in &effects {
+                    self.apply_effect(effect, quote);
+                }
+                all_effects.extend(effects);
+            }
+        } else {
+            // Tick-by-tick path: evaluate all rules on all open positions.
+            let open_ids = self.manager.open_ids_by_symbol(&quote.symbol);
+            for id in open_ids {
+                let effects = {
+                    let pos = match self.manager.get_mut(&id) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    pos.evaluate_rules(quote, fill_model)
+                };
+                for effect in &effects {
+                    self.apply_effect(effect, quote);
+                }
+                all_effects.extend(effects);
+            }
         }
 
         all_effects
@@ -290,7 +351,8 @@ impl TradeEngine {
                     size,
                     ts,
                 };
-                let mut pos = Position::new_market(id.clone(), symbol, side, fill, live_rules);
+                let mut pos =
+                    Position::new_market(id.clone(), symbol.clone(), side, fill, live_rules);
                 // Assign group if specified.
                 if let Some(ref gid) = group {
                     pos.data.group = Some(gid.clone());
@@ -305,6 +367,8 @@ impl TradeEngine {
                 } else {
                     self.manager.add(pos);
                 }
+                // Register alerts if alert register is active.
+                self.register_alerts_for_position(&id, &symbol, side);
                 Ok(vec![Effect::PositionOpened { id }])
             }
             OrderType::Limit | OrderType::Stop => {
@@ -313,7 +377,7 @@ impl TradeEngine {
                 })?;
                 let mut pos = Position::new_pending(
                     id.clone(),
-                    symbol,
+                    symbol.clone(),
                     side,
                     order_type,
                     pending_price,
@@ -334,6 +398,16 @@ impl TradeEngine {
                     self.manager.add_to_group(gid, id.clone());
                 } else {
                     self.manager.add(pos);
+                }
+                // Register pending fill alert if alert register is active.
+                if self.alert_register.is_some() {
+                    self.alert_register.as_mut().unwrap().register(
+                        &symbol,
+                        pending_price,
+                        id.clone(),
+                        side,
+                        AlertKind::PendingFill { order_type, side },
+                    );
                 }
                 Ok(vec![Effect::OrderPlaced { id }])
             }
@@ -407,6 +481,11 @@ impl TradeEngine {
 
         pos.data.apply_full_close(CloseReason::Manual, ts);
 
+        // Deregister all alerts for this position.
+        if let Some(ref mut register) = self.alert_register {
+            register.deregister_position(position_id);
+        }
+
         Ok(vec![Effect::PositionClosed {
             id: position_id.to_owned(),
             reason: CloseReason::Manual,
@@ -478,6 +557,11 @@ impl TradeEngine {
         pos.data.close_ts = Some(ts);
         pos.data.records.push((PositionRecord::Cancelled, ts));
 
+        // Deregister pending fill alert.
+        if let Some(ref mut register) = self.alert_register {
+            register.deregister_position(position_id);
+        }
+
         Ok(vec![Effect::OrderCancelled {
             id: position_id.to_owned(),
         }])
@@ -489,25 +573,48 @@ impl TradeEngine {
         new_price: f64,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
-        let pos = self
-            .manager
-            .get_mut(position_id)
-            .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
+        let (symbol, side, old_price_val) = {
+            let pos = self
+                .manager
+                .get_mut(position_id)
+                .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
 
-        let old = pos.set_stoploss(new_price);
-        let old_price = old.unwrap_or(0.0);
+            let old = pos.set_stoploss(new_price);
+            let old_price = old.unwrap_or(0.0);
 
-        pos.data.records.push((
-            PositionRecord::StoplossModified {
-                from: old,
-                to: new_price,
-            },
-            ts,
-        ));
+            pos.data.records.push((
+                PositionRecord::StoplossModified {
+                    from: old,
+                    to: new_price,
+                },
+                ts,
+            ));
+            (pos.data.symbol.clone(), pos.data.side, old_price)
+        };
+
+        // Re-register SL alert: deregister old, register new.
+        if let Some(ref mut register) = self.alert_register {
+            if old_price_val != 0.0 {
+                register.deregister_alert(
+                    &symbol,
+                    old_price_val,
+                    position_id,
+                    side,
+                    &AlertKind::Stoploss,
+                );
+            }
+            register.register(
+                &symbol,
+                new_price,
+                position_id.to_owned(),
+                side,
+                AlertKind::Stoploss,
+            );
+        }
 
         Ok(vec![Effect::StoplossModified {
             id: position_id.to_owned(),
-            old_price,
+            old_price: old_price_val,
             new_price,
         }])
     }
@@ -548,15 +655,29 @@ impl TradeEngine {
         close_ratio: f64,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
-        let pos = self
-            .manager
-            .get_mut(position_id)
-            .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
+        let (symbol, side) = {
+            let pos = self
+                .manager
+                .get_mut(position_id)
+                .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
 
-        pos.rules.push(Rule::take_profit(price, close_ratio));
-        pos.data
-            .records
-            .push((PositionRecord::TargetAdded { price, close_ratio }, ts));
+            pos.rules.push(Rule::take_profit(price, close_ratio));
+            pos.data
+                .records
+                .push((PositionRecord::TargetAdded { price, close_ratio }, ts));
+            (pos.data.symbol.clone(), pos.data.side)
+        };
+
+        // Register TP alert if alert register is active.
+        if let Some(ref mut register) = self.alert_register {
+            register.register(
+                &symbol,
+                price,
+                position_id.to_owned(),
+                side,
+                AlertKind::TakeProfit { close_ratio },
+            );
+        }
 
         Ok(vec![])
     }
@@ -567,27 +688,44 @@ impl TradeEngine {
         price: f64,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
-        let pos = self
-            .manager
-            .get_mut(position_id)
-            .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
+        let (symbol, side, removed) = {
+            let pos = self
+                .manager
+                .get_mut(position_id)
+                .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
 
-        let before = pos.rules.len();
-        pos.rules.retain(|r| {
-            if let Rule::TakeProfit {
-                price: tp_price, ..
-            } = r
-            {
-                (*tp_price - price).abs() > f64::EPSILON
-            } else {
-                true
+            let before = pos.rules.len();
+            pos.rules.retain(|r| {
+                if let Rule::TakeProfit {
+                    price: tp_price, ..
+                } = r
+                {
+                    (*tp_price - price).abs() > f64::EPSILON
+                } else {
+                    true
+                }
+            });
+
+            let did_remove = pos.rules.len() < before;
+            if did_remove {
+                pos.data
+                    .records
+                    .push((PositionRecord::TargetRemoved { price }, ts));
             }
-        });
+            (pos.data.symbol.clone(), pos.data.side, did_remove)
+        };
 
-        if pos.rules.len() < before {
-            pos.data
-                .records
-                .push((PositionRecord::TargetRemoved { price }, ts));
+        // Deregister TP alert if alert register is active.
+        if removed {
+            if let Some(ref mut register) = self.alert_register {
+                register.deregister_alert(
+                    &symbol,
+                    price,
+                    position_id,
+                    side,
+                    &AlertKind::TakeProfit { close_ratio: 0.0 },
+                );
+            }
         }
 
         Ok(vec![])
@@ -599,18 +737,69 @@ impl TradeEngine {
         rule_config: crate::types::RuleConfig,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
-        let pos = self
-            .manager
-            .get_mut(position_id)
-            .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
-
         let rule = Rule::from_config(rule_config);
+        let is_stateful = rule.is_stateful();
         let name = rule.name().to_owned();
-        pos.rules.push(rule);
-        pos.data
-            .records
-            .push((PositionRecord::RuleAdded { rule_name: name }, ts));
 
+        let (symbol, side) = {
+            let pos = self
+                .manager
+                .get_mut(position_id)
+                .ok_or_else(|| CoreError::PositionNotFound(position_id.to_owned()))?;
+
+            let sym = pos.data.symbol.clone();
+            let s = pos.data.side;
+
+            // Register alert for static rules.
+            if let Some(ref mut register) = self.alert_register {
+                if is_stateful {
+                    register.register_tick_eval(&sym, position_id.to_owned());
+                } else {
+                    match &rule {
+                        Rule::FixedStoploss { price } => {
+                            register.register(
+                                &sym,
+                                *price,
+                                position_id.to_owned(),
+                                s,
+                                AlertKind::Stoploss,
+                            );
+                        }
+                        Rule::TakeProfit {
+                            price, close_ratio, ..
+                        } => {
+                            register.register(
+                                &sym,
+                                *price,
+                                position_id.to_owned(),
+                                s,
+                                AlertKind::TakeProfit {
+                                    close_ratio: *close_ratio,
+                                },
+                            );
+                        }
+                        Rule::BreakevenWhen { trigger_price, .. } => {
+                            register.register(
+                                &sym,
+                                *trigger_price,
+                                position_id.to_owned(),
+                                s,
+                                AlertKind::BreakevenTrigger,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            pos.rules.push(rule);
+            pos.data
+                .records
+                .push((PositionRecord::RuleAdded { rule_name: name }, ts));
+            (sym, s)
+        };
+
+        let _ = (symbol, side);
         Ok(vec![])
     }
 
@@ -642,13 +831,19 @@ impl TradeEngine {
     fn action_close_all_of(&mut self, symbol: &str, ts: NaiveDateTime) -> Result<Vec<Effect>> {
         let ids = self.manager.open_ids_by_symbol(symbol);
         let mut effects = Vec::new();
-        for id in ids {
-            if let Some(pos) = self.manager.get_mut(&id) {
+        for id in &ids {
+            if let Some(pos) = self.manager.get_mut(id) {
                 pos.data.apply_full_close(CloseReason::Manual, ts);
                 effects.push(Effect::PositionClosed {
-                    id,
+                    id: id.clone(),
                     reason: CloseReason::Manual,
                 });
+            }
+        }
+        // Deregister alerts for all closed positions.
+        if let Some(ref mut register) = self.alert_register {
+            for id in &ids {
+                register.deregister_position(id);
             }
         }
         Ok(effects)
@@ -666,18 +861,28 @@ impl TradeEngine {
                 });
             }
         }
+        // Clear all alerts.
+        if let Some(ref mut register) = self.alert_register {
+            register.clear_all();
+        }
         Ok(effects)
     }
 
     fn action_cancel_all_pending(&mut self, ts: NaiveDateTime) -> Result<Vec<Effect>> {
         let ids = self.manager.all_pending_ids();
         let mut effects = Vec::new();
-        for id in ids {
-            if let Some(pos) = self.manager.get_mut(&id) {
+        for id in &ids {
+            if let Some(pos) = self.manager.get_mut(id) {
                 pos.data.status = PositionStatus::Cancelled;
                 pos.data.close_ts = Some(ts);
                 pos.data.records.push((PositionRecord::Cancelled, ts));
-                effects.push(Effect::OrderCancelled { id });
+                effects.push(Effect::OrderCancelled { id: id.clone() });
+            }
+        }
+        // Deregister pending fill alerts.
+        if let Some(ref mut register) = self.alert_register {
+            for id in &ids {
+                register.deregister_position(id);
             }
         }
         Ok(effects)
@@ -720,15 +925,21 @@ impl TradeEngine {
     ) -> Result<Vec<Effect>> {
         let ids = self.manager.open_ids_by_group(group_id);
         let mut effects = Vec::new();
-        for id in ids {
-            if let Some(pos) = self.manager.get_mut(&id) {
+        for id in &ids {
+            if let Some(pos) = self.manager.get_mut(id) {
                 if pos.data.status == PositionStatus::Open {
                     pos.data.apply_full_close(CloseReason::GroupRule, ts);
                     effects.push(Effect::PositionClosed {
-                        id,
+                        id: id.clone(),
                         reason: CloseReason::GroupRule,
                     });
                 }
+            }
+        }
+        // Deregister alerts for all closed positions.
+        if let Some(ref mut register) = self.alert_register {
+            for id in &ids {
+                register.deregister_position(id);
             }
         }
         Ok(effects)
@@ -781,6 +992,10 @@ impl TradeEngine {
                     }
                     pos.data.apply_full_close(*reason, quote.ts);
                 }
+                // Deregister all alerts for this position.
+                if let Some(ref mut register) = self.alert_register {
+                    register.deregister_position(id);
+                }
             }
             Effect::PartialClose { id, ratio, reason } => {
                 if let Some(pos) = self.manager.get_mut(id) {
@@ -793,7 +1008,7 @@ impl TradeEngine {
                 }
             }
             Effect::StoplossModified { id, new_price, .. } => {
-                if let Some(pos) = self.manager.get_mut(id) {
+                let old_and_info = if let Some(pos) = self.manager.get_mut(id) {
                     let old = pos.set_stoploss(*new_price);
                     pos.data.records.push((
                         PositionRecord::StoplossModified {
@@ -802,12 +1017,246 @@ impl TradeEngine {
                         },
                         quote.ts,
                     ));
+                    Some((old, pos.data.symbol.clone(), pos.data.side))
+                } else {
+                    None
+                };
+
+                // Re-register SL alert if alert register is active.
+                if let Some((old, symbol, side)) = old_and_info {
+                    if let Some(ref mut register) = self.alert_register {
+                        if let Some(old_price) = old {
+                            register.deregister_alert(
+                                &symbol,
+                                old_price,
+                                id,
+                                side,
+                                &AlertKind::Stoploss,
+                            );
+                        }
+                        register.register(
+                            &symbol,
+                            *new_price,
+                            id.clone(),
+                            side,
+                            AlertKind::Stoploss,
+                        );
+                    }
                 }
             }
             // Other effects are informational — no internal state change needed.
             _ => {}
         }
     }
+
+    // ── Alert register helpers ──────────────────────────────────────────
+
+    /// Register all static rule alerts for a position (called after open/fill).
+    fn register_alerts_for_position(&mut self, position_id: &str, symbol: &str, side: Side) {
+        if self.alert_register.is_none() {
+            return;
+        }
+
+        let rules_snapshot: Vec<Rule> = {
+            let pos = match self.manager.get(position_id) {
+                Some(p) => p,
+                None => return,
+            };
+            pos.rules.clone()
+        };
+
+        let register = self.alert_register.as_mut().unwrap();
+        let mut has_stateful = false;
+
+        for rule in &rules_snapshot {
+            match rule {
+                Rule::FixedStoploss { price } => {
+                    register.register(
+                        symbol,
+                        *price,
+                        position_id.to_owned(),
+                        side,
+                        AlertKind::Stoploss,
+                    );
+                }
+                Rule::TakeProfit {
+                    price,
+                    close_ratio,
+                    triggered,
+                } => {
+                    if !triggered {
+                        register.register(
+                            symbol,
+                            *price,
+                            position_id.to_owned(),
+                            side,
+                            AlertKind::TakeProfit {
+                                close_ratio: *close_ratio,
+                            },
+                        );
+                    }
+                }
+                Rule::BreakevenWhen {
+                    trigger_price,
+                    triggered,
+                } => {
+                    if !triggered {
+                        register.register(
+                            symbol,
+                            *trigger_price,
+                            position_id.to_owned(),
+                            side,
+                            AlertKind::BreakevenTrigger,
+                        );
+                    }
+                }
+                Rule::TrailingStop { .. }
+                | Rule::TimeExit { .. }
+                | Rule::BreakevenAfterTargets { .. } => {
+                    has_stateful = true;
+                }
+            }
+        }
+
+        if has_stateful {
+            register.register_tick_eval(symbol, position_id.to_owned());
+        }
+    }
+
+    /// Apply a triggered alert — convert it into effects and apply them.
+    fn apply_triggered_alert(&mut self, alert: &TriggeredAlert, quote: &PriceQuote) -> Vec<Effect> {
+        match &alert.kind {
+            AlertKind::Stoploss => {
+                let pos = match self.manager.get_mut(&alert.position_id) {
+                    Some(p) if p.data.status == PositionStatus::Open => p,
+                    _ => return vec![],
+                };
+                pos.data.apply_full_close(CloseReason::Stoploss, quote.ts);
+                // Deregister all remaining alerts for this position.
+                if let Some(ref mut register) = self.alert_register {
+                    register.deregister_position(&alert.position_id);
+                }
+                vec![Effect::PositionClosed {
+                    id: alert.position_id.clone(),
+                    reason: CloseReason::Stoploss,
+                }]
+            }
+            AlertKind::TakeProfit { close_ratio } => {
+                let pos = match self.manager.get_mut(&alert.position_id) {
+                    Some(p) if p.data.status == PositionStatus::Open => p,
+                    _ => return vec![],
+                };
+
+                let remaining = pos.data.remaining_ratio;
+                let actual_ratio = close_ratio.min(remaining);
+
+                // Mark the corresponding TakeProfit rule as triggered.
+                for rule in &mut pos.rules {
+                    if let Rule::TakeProfit {
+                        price, triggered, ..
+                    } = rule
+                    {
+                        if !*triggered
+                            && (price_to_micros_static(*price)
+                                == price_to_micros_static(alert.trigger_price))
+                        {
+                            *triggered = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (remaining - actual_ratio).abs() < f64::EPSILON {
+                    // Full close via TP.
+                    let close_price = quote.close_price(alert.side);
+                    pos.data.apply_partial_close(
+                        actual_ratio,
+                        close_price,
+                        CloseReason::Target,
+                        quote.ts,
+                    );
+                    if let Some(ref mut register) = self.alert_register {
+                        register.deregister_position(&alert.position_id);
+                    }
+                    vec![Effect::PositionClosed {
+                        id: alert.position_id.clone(),
+                        reason: CloseReason::Target,
+                    }]
+                } else {
+                    // Partial close via TP.
+                    let close_price = quote.close_price(alert.side);
+                    pos.data.apply_partial_close(
+                        actual_ratio,
+                        close_price,
+                        CloseReason::Target,
+                        quote.ts,
+                    );
+                    vec![Effect::PartialClose {
+                        id: alert.position_id.clone(),
+                        ratio: actual_ratio,
+                        reason: CloseReason::Target,
+                    }]
+                }
+            }
+            AlertKind::BreakevenTrigger => {
+                let (entry_price, _symbol, _side) = {
+                    let pos = match self.manager.get_mut(&alert.position_id) {
+                        Some(p) if p.data.status == PositionStatus::Open => p,
+                        _ => return vec![],
+                    };
+
+                    // Mark breakeven rule as triggered.
+                    for rule in &mut pos.rules {
+                        if let Rule::BreakevenWhen { triggered, .. } = rule {
+                            *triggered = true;
+                            break;
+                        }
+                    }
+
+                    (
+                        pos.data.average_entry(),
+                        pos.data.symbol.clone(),
+                        pos.data.side,
+                    )
+                };
+
+                // Move SL to entry — produces a StoplossModified effect.
+                let effect = Effect::StoplossModified {
+                    id: alert.position_id.clone(),
+                    old_price: 0.0,
+                    new_price: entry_price,
+                };
+                self.apply_effect(&effect, quote);
+                vec![effect]
+            }
+            AlertKind::PendingFill { .. } => {
+                // Fill the pending order.
+                let pos = match self.manager.get_mut(&alert.position_id) {
+                    Some(p) if p.data.status == PositionStatus::Pending => p,
+                    _ => return vec![],
+                };
+
+                let fill_model = self.fill_model;
+                if pos.try_fill(quote, fill_model) {
+                    let symbol = pos.data.symbol.clone();
+                    let side = pos.data.side;
+                    let id = alert.position_id.clone();
+
+                    // Now register alerts for the newly opened position.
+                    self.register_alerts_for_position(&id, &symbol, side);
+
+                    vec![Effect::PositionOpened { id }]
+                } else {
+                    vec![]
+                }
+            }
+        }
+    }
+}
+
+/// Helper to convert price to micros (standalone function usable in non-method contexts).
+fn price_to_micros_static(price: f64) -> i64 {
+    (price * 1_000_000.0).round() as i64
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2166,6 +2615,555 @@ mod tests {
             (sl.unwrap() - 1.0848).abs() < 1e-10,
             "SL should be at average_entry=1.0848, got {:?}",
             sl
+        );
+    }
+
+    // ── Alert register integration tests ────────────────────────────────
+
+    #[test]
+    fn engine_with_register_open_registers_alerts() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![TargetSpec {
+                        price: 1.0900,
+                        close_ratio: 1.0,
+                    }],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::PositionOpened { .. }));
+
+        // SL triggers via register when price drops.
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        let effects = engine.on_price(&quote("EURUSD", 1.0800, 1.0802, ts(10, 1, 0)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn engine_with_register_sl_triggers_via_register() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Price above SL — no trigger.
+        let effects = engine.on_price(&quote("EURUSD", 1.0840, 1.0842, ts(10, 0, 1)));
+        assert!(effects.is_empty());
+
+        // Price at SL — triggers.
+        let effects = engine.on_price(&quote("EURUSD", 1.0800, 1.0802, ts(10, 0, 2)));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        ));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn engine_with_register_tp_triggers_via_register() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![
+                        TargetSpec {
+                            price: 1.0900,
+                            close_ratio: 0.5,
+                        },
+                        TargetSpec {
+                            price: 1.0950,
+                            close_ratio: 0.5,
+                        },
+                    ],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // TP1 hit — partial close.
+        let effects = engine.on_price(&quote("EURUSD", 1.0900, 1.0902, ts(10, 1, 0)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PartialClose {
+                reason: CloseReason::Target,
+                ..
+            }
+        )));
+        let pos = engine.get_position(&id).unwrap();
+        assert!((pos.data.remaining_ratio - 0.5).abs() < f64::EPSILON);
+
+        // TP2 hit — full close via stoploss (remaining ratio exhausted).
+        let effects = engine.on_price(&quote("EURUSD", 1.0950, 1.0952, ts(10, 2, 0)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Target,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn engine_with_register_trailing_stop_works() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: None,
+                    targets: vec![],
+                    rules: vec![RuleConfig::TrailingStop { distance: 0.0020 }],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Price rises — peak updates but no trigger.
+        let effects = engine.on_price(&quote("EURUSD", 1.0870, 1.0872, ts(10, 0, 1)));
+        assert!(effects.is_empty());
+        let effects = engine.on_price(&quote("EURUSD", 1.0890, 1.0892, ts(10, 0, 2)));
+        assert!(effects.is_empty());
+
+        // Price drops within distance — no trigger (peak=1.0890, trail=1.0870).
+        let effects = engine.on_price(&quote("EURUSD", 1.0875, 1.0877, ts(10, 0, 3)));
+        assert!(effects.is_empty());
+
+        // Price drops to trail level — triggers (peak=1.0890, trail=1.0870).
+        let effects = engine.on_price(&quote("EURUSD", 1.0870, 1.0872, ts(10, 0, 4)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::TrailingStop,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn engine_with_register_modify_sl_reregisters() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Modify SL to 1.0820.
+        engine
+            .apply_action(
+                Action::ModifyStoploss {
+                    position_id: id.clone(),
+                    price: 1.0820,
+                },
+                ts(10, 0, 1),
+            )
+            .unwrap();
+
+        // Price above new SL — no trigger.
+        let effects = engine.on_price(&quote("EURUSD", 1.0830, 1.0832, ts(10, 0, 2)));
+        assert!(effects.is_empty());
+
+        // New SL at 1.0820 — triggers.
+        let effects = engine.on_price(&quote("EURUSD", 1.0820, 1.0822, ts(10, 0, 3)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn engine_with_register_close_deregisters() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![TargetSpec {
+                        price: 1.0900,
+                        close_ratio: 1.0,
+                    }],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Close manually.
+        engine
+            .apply_action(
+                Action::ClosePosition {
+                    position_id: id.clone(),
+                },
+                ts(10, 0, 1),
+            )
+            .unwrap();
+
+        // SL and TP prices — nothing triggers (deregistered on close).
+        let effects = engine.on_price(&quote("EURUSD", 1.0750, 1.0752, ts(10, 0, 2)));
+        assert!(effects.is_empty());
+        let effects = engine.on_price(&quote("EURUSD", 1.0950, 1.0952, ts(10, 0, 3)));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn engine_with_register_pending_fill() {
+        let mut engine = TradeEngine::with_alert_register();
+        // Place a Limit Buy at 1.0800.
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    price: Some(1.0800),
+                    size: 1.0,
+                    stoploss: Some(1.0750),
+                    targets: vec![TargetSpec {
+                        price: 1.0900,
+                        close_ratio: 1.0,
+                    }],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        assert!(matches!(effects[0], Effect::OrderPlaced { .. }));
+        let id = match &effects[0] {
+            Effect::OrderPlaced { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Price above limit — no fill.
+        let effects = engine.on_price(&quote("EURUSD", 1.0848, 1.0850, ts(10, 0, 1)));
+        assert!(effects.is_empty());
+
+        // Price drops to limit — fills.
+        let effects = engine.on_price(&quote("EURUSD", 1.0798, 1.0800, ts(10, 0, 2)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PositionOpened { .. }))
+        );
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Open
+        );
+
+        // Now SL/TP should be registered — SL triggers.
+        let effects = engine.on_price(&quote("EURUSD", 1.0750, 1.0752, ts(10, 0, 3)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn engine_with_register_close_all_deregisters() {
+        let mut engine = TradeEngine::with_alert_register();
+        // Open 3 positions with SL.
+        for i in 0..3 {
+            engine
+                .apply_action(
+                    Action::Open {
+                        symbol: "EURUSD".into(),
+                        side: Side::Buy,
+                        order_type: OrderType::Market,
+                        price: Some(1.0850),
+                        size: 1.0,
+                        stoploss: Some(1.0800),
+                        targets: vec![],
+                        rules: vec![],
+                        group: None,
+                    },
+                    ts(10, 0, i),
+                )
+                .unwrap();
+        }
+
+        // Close all.
+        engine.apply_action(Action::CloseAll, ts(10, 1, 0)).unwrap();
+
+        // SL price — nothing triggers (all deregistered).
+        let effects = engine.on_price(&quote("EURUSD", 1.0750, 1.0752, ts(10, 2, 0)));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn engine_with_register_breakeven_reregisters_sl() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![],
+                    rules: vec![RuleConfig::BreakevenWhen {
+                        trigger_price: 1.0900,
+                    }],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Price hits breakeven trigger — SL should move to entry (1.0850).
+        let effects = engine.on_price(&quote("EURUSD", 1.0900, 1.0902, ts(10, 1, 0)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::StoplossModified { new_price, .. } if (*new_price - 1.0850).abs() < 1e-10
+        )));
+
+        // Price above new SL (entry=1.0850) — no trigger. Old SL at 1.0800 is deregistered.
+        let effects = engine.on_price(&quote("EURUSD", 1.0860, 1.0862, ts(10, 2, 0)));
+        assert!(effects.is_empty());
+
+        // New SL at entry (1.0850) — triggers.
+        let effects = engine.on_price(&quote("EURUSD", 1.0850, 1.0852, ts(10, 3, 0)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn engine_with_register_matches_tickbytick_results() {
+        // Run the same sequence through both engine modes and verify identical results.
+        let actions_and_prices: Vec<(Option<Action>, Option<PriceQuote>)> = vec![
+            // Open a buy with SL + 2 TPs.
+            (
+                Some(Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0800),
+                    targets: vec![
+                        TargetSpec {
+                            price: 1.0900,
+                            close_ratio: 0.5,
+                        },
+                        TargetSpec {
+                            price: 1.0950,
+                            close_ratio: 0.5,
+                        },
+                    ],
+                    rules: vec![],
+                    group: None,
+                }),
+                None,
+            ),
+            // Price moves up — no trigger.
+            (None, Some(quote("EURUSD", 1.0860, 1.0862, ts(10, 0, 1)))),
+            (None, Some(quote("EURUSD", 1.0870, 1.0872, ts(10, 0, 2)))),
+            // TP1 hit.
+            (None, Some(quote("EURUSD", 1.0900, 1.0902, ts(10, 0, 3)))),
+            // Continue up.
+            (None, Some(quote("EURUSD", 1.0920, 1.0922, ts(10, 0, 4)))),
+            // TP2 hit — full close.
+            (None, Some(quote("EURUSD", 1.0950, 1.0952, ts(10, 0, 5)))),
+        ];
+
+        let mut engine_tick = TradeEngine::new();
+        let mut engine_reg = TradeEngine::with_alert_register();
+
+        let mut effects_tick_all = Vec::new();
+        let mut effects_reg_all = Vec::new();
+
+        for (action, price) in &actions_and_prices {
+            if let Some(a) = action {
+                let e1 = engine_tick.apply_action(a.clone(), ts(10, 0, 0)).unwrap();
+                let e2 = engine_reg.apply_action(a.clone(), ts(10, 0, 0)).unwrap();
+                effects_tick_all.extend(e1);
+                effects_reg_all.extend(e2);
+            }
+            if let Some(q) = price {
+                let e1 = engine_tick.on_price(q);
+                let e2 = engine_reg.on_price(q);
+                effects_tick_all.extend(e1);
+                effects_reg_all.extend(e2);
+            }
+        }
+
+        // Both engines should produce the same number of effects.
+        assert_eq!(
+            effects_tick_all.len(),
+            effects_reg_all.len(),
+            "Effect count mismatch: tick={}, reg={}\ntick: {:?}\nreg: {:?}",
+            effects_tick_all.len(),
+            effects_reg_all.len(),
+            effects_tick_all,
+            effects_reg_all,
+        );
+
+        // Both engines' positions should have the same final status.
+        let tick_positions: Vec<_> = engine_tick.closed_positions();
+        let reg_positions: Vec<_> = engine_reg.closed_positions();
+        assert_eq!(tick_positions.len(), reg_positions.len());
+    }
+
+    #[test]
+    fn engine_with_register_sell_sl_triggers() {
+        let mut engine = TradeEngine::with_alert_register();
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Sell,
+                    order_type: OrderType::Market,
+                    price: Some(1.0850),
+                    size: 1.0,
+                    stoploss: Some(1.0900),
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            _ => panic!(),
+        };
+
+        // Price rises to SL — triggers (sell SL checks ask).
+        let effects = engine.on_price(&quote("EURUSD", 1.0898, 1.0900, ts(10, 0, 1)));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::PositionClosed {
+                reason: CloseReason::Stoploss,
+                ..
+            }
+        )));
+        assert_eq!(
+            engine.get_position(&id).unwrap().data.status,
+            PositionStatus::Closed
         );
     }
 }

@@ -353,6 +353,27 @@ impl Position {
         self.rules.retain(|r| r.name() != name);
         self.rules.len() < before
     }
+
+    /// Evaluate only stateful rules (trailing stop, time exit, breakeven-after-targets).
+    /// Used when static rules are handled by the alert register.
+    pub fn evaluate_stateful_rules(&mut self, quote: &PriceQuote, model: FillModel) -> Vec<Effect> {
+        if self.data.status != PositionStatus::Open {
+            return vec![];
+        }
+        let view = self.data.view();
+        let mut effects = Vec::new();
+        for rule in &mut self.rules {
+            if rule.is_stateful() {
+                effects.extend(rule.evaluate(&view, quote, model));
+            }
+        }
+        effects
+    }
+
+    /// Whether this position has any stateful rules requiring tick-by-tick evaluation.
+    pub fn has_stateful_rules(&self) -> bool {
+        self.rules.iter().any(|r| r.is_stateful())
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

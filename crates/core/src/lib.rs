@@ -22,6 +22,7 @@
 //! (`Action`, `PriceQuote`) and returns `Vec<Effect>`.  The caller decides how
 //! to handle effects (simulate fills for backtest, send broker orders for live).
 
+pub mod alert_register;
 pub mod engine;
 pub mod error;
 pub mod position;
@@ -31,11 +32,12 @@ pub mod types;
 
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
+pub use alert_register::PriceAlertRegister;
 pub use engine::TradeEngine;
 pub use error::{CoreError, Result};
 pub use position::Position;
 pub use rules::Rule;
 pub use types::{
-    Action, CloseReason, Effect, Fill, FillModel, GroupId, OrderType, PositionId, PositionRecord,
-    PositionStatus, PriceQuote, RuleConfig, Side, Signal, TargetSpec,
+    Action, CloseReason, Effect, Fill, FillModel, FixedPrice, GroupId, Lots, OrderType, PositionId,
+    PositionRecord, PositionStatus, PriceQuote, RuleConfig, Side, Signal, TargetSpec,
 };

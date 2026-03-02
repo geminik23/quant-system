@@ -135,6 +135,14 @@ impl Rule {
 // ─── Evaluation ─────────────────────────────────────────────────────────────
 
 impl Rule {
+    /// Whether this rule requires tick-by-tick evaluation (not indexable as a static alert).
+    pub fn is_stateful(&self) -> bool {
+        matches!(
+            self,
+            Rule::TrailingStop { .. } | Rule::TimeExit { .. } | Rule::BreakevenAfterTargets { .. }
+        )
+    }
+
     /// Human-readable name used for logging, record keeping, and `RemoveRule`.
     pub fn name(&self) -> &'static str {
         match self {
