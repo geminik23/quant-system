@@ -39,6 +39,7 @@ nanoid = { workspace = true }
 toml = { workspace = true }
 ctrader-fix = { workspace = true }
 xrpc-rs = { workspace = true }
+qs-symbols = { path = "../symbols" }
 
 # Optional — only pulled in by the tui-client feature
 ratatui = { workspace = true, optional = true }
