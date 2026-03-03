@@ -1,0 +1,75 @@
+# Management Profile Definitions
+#
+# Each [[profile]] entry defines a named trade management strategy that
+# transforms raw signals into fully-specified Action::Open calls.
+#
+# Fields:
+#   name            — unique profile identifier
+#   use_targets     — which signal targets to use (1-indexed)
+#   close_ratios    — fraction to close at each target (must match use_targets length, sum <= 1.0)
+#   stoploss_mode   — how to handle the stoploss: FromSignal, None, FixedDistance, FixedPrice
+#   rules           — additional management rules to attach
+#   group_override  — if set, overrides the signal's group tag
+#   let_remainder_run — when true and ratios sum < 1.0, remainder rides with SL/rules only
+
+[[profile]]
+name = "conservative"
+use_targets = [1]
+close_ratios = [1.0]
+stoploss_mode = { type = "FromSignal" }
+let_remainder_run = false
+
+[[profile]]
+name = "aggressive"
+use_targets = [1, 2]
+close_ratios = [0.5, 0.5]
+stoploss_mode = { type = "FromSignal" }
+let_remainder_run = false
+
+[[profile.rules]]
+type = "BreakevenAfterTargets"
+after_n = 1
+
+[[profile.rules]]
+type = "TrailingStop"
+distance = 0.0020
+
+[[profile]]
+name = "runner"
+use_targets = [1]
+close_ratios = [0.3]
+stoploss_mode = { type = "FromSignal" }
+let_remainder_run = true
+
+[[profile.rules]]
+type = "BreakevenAfterTargets"
+after_n = 1
+
+[[profile.rules]]
+type = "TrailingStop"
+distance = 0.0030
+
+[[profile]]
+name = "scalp_tight"
+use_targets = [1]
+close_ratios = [1.0]
+let_remainder_run = false
+
+[profile.stoploss_mode]
+type = "FixedDistance"
+distance = 0.0010
+
+[[profile]]
+name = "time_limited"
+use_targets = [1, 2]
+close_ratios = [0.5, 0.5]
+stoploss_mode = { type = "FromSignal" }
+let_remainder_run = false
+
+[[profile.rules]]
+type = "TimeExit"
+max_seconds = 3600
+
+[[profile.rules]]
+type = "BreakevenWhenOffset"
+trigger_price_offset = 0.0020
