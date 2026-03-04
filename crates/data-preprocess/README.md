@@ -240,6 +240,13 @@ Both backends provide the same logical operations with identical return types:
 | Stats | `stats(ex?, sym?) -> Vec<StatRow>` | `stats(ex?, sym?) -> Vec<StatRow>` |
 | Size | `total_size() -> Option<u64>` | `file_size() -> Option<u64>` |
 
+## Used By
+
+| Crate | How |
+|-------|-----|
+| `qs-backtest` | `default-features = false` — imports `Tick`, `Bar`, `Timeframe`, `QueryOpts`, `BarQueryOpts` model types only (no Polars/DuckDB). Uses `ticks_to_feed()` / `bars_to_feed()` converters. |
+| `qs-backtest-server` | Full `parquet` feature — opens `ParquetStore` at runtime to query ticks/bars for backtest requests. Uses `stats()` for the `list_symbols` RPC. |
+
 ## License
 
 Licensed under either of
