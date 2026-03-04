@@ -2,11 +2,16 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DataError {
+    #[cfg(feature = "duckdb-backend")]
     #[error("DuckDB error: {0}")]
     DuckDb(#[from] duckdb::Error),
 
     #[error("CSV error: {0}")]
     Csv(#[from] csv::Error),
+
+    #[cfg(feature = "parquet")]
+    #[error("Polars error: {0}")]
+    Polars(#[from] polars::error::PolarsError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

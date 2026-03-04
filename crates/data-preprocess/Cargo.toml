@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Historical market data storage and preprocessing CLI"
-keywords = ["market-data", "duckdb", "preprocessing", "ohlcv"]
+keywords = ["market-data", "parquet", "preprocessing", "ohlcv"]
 categories = ["finance"]
 
 [lib]
@@ -15,12 +15,22 @@ name = "data_preprocess"
 name = "data-preprocess"
 path = "src/main.rs"
 
+[features]
+default = ["parquet"]
+parquet = ["dep:polars"]
+duckdb-backend = ["dep:duckdb"]
+
 [dependencies]
-duckdb = { workspace = true }
-csv = { workspace = true }
-clap = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+csv = { workspace = true }
+
+# Parquet backend (default)
+polars = { workspace = true, optional = true }
+
+# DuckDB backend (opt-in)
+duckdb = { workspace = true, optional = true }

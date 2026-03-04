@@ -27,29 +27,6 @@ pub struct Database {
     db_path: Option<String>,
 }
 
-/// Query parameters for tick view commands.
-pub struct QueryOpts {
-    pub exchange: String,
-    pub symbol: String,
-    pub from: Option<NaiveDateTime>,
-    pub to: Option<NaiveDateTime>,
-    pub limit: usize,
-    pub tail: bool,
-    pub descending: bool,
-}
-
-/// Query parameters for bar view commands.
-pub struct BarQueryOpts {
-    pub exchange: String,
-    pub symbol: String,
-    pub timeframe: String,
-    pub from: Option<NaiveDateTime>,
-    pub to: Option<NaiveDateTime>,
-    pub limit: usize,
-    pub tail: bool,
-    pub descending: bool,
-}
-
 impl Database {
     /// Open (or create) a DuckDB database at the given path.
     pub fn open(path: &Path) -> Result<Self> {

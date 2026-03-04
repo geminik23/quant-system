@@ -1,23 +1,36 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
-use data_preprocess::db::{BarQueryOpts, Database, QueryOpts};
 use data_preprocess::display::{
     print_bars, print_delete_result, print_import_result, print_stats, print_ticks,
 };
-use data_preprocess::models::{ImportResult, Timeframe};
+use data_preprocess::models::{BarQueryOpts, ImportResult, QueryOpts, Timeframe};
 use data_preprocess::parser::bar_csv::parse_bar_csv;
 use data_preprocess::parser::tick_csv::parse_tick_csv;
 use data_preprocess::parser::{
     extract_symbol_from_filename, normalize_exchange, parse_datetime_arg, parse_tz_offset,
 };
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Backend {
+    Parquet,
+    Duckdb,
+}
+
 #[derive(Parser)]
 #[command(name = "data-preprocess", about = "Historical market data CLI")]
 struct Cli {
-    /// Path to DuckDB database file
+    /// Storage backend to use
+    #[arg(long, default_value = "parquet", value_enum)]
+    backend: Backend,
+
+    /// Root directory for Parquet files (parquet backend)
+    #[arg(long, default_value = "market_data", env = "DATA_PREPROCESS_DIR")]
+    data_dir: PathBuf,
+
+    /// Path to DuckDB database file (duckdb backend)
     #[arg(long, default_value = "market_data.duckdb", env = "DATA_PREPROCESS_DB")]
     db: PathBuf,
 
@@ -171,18 +184,262 @@ enum ViewType {
 fn main() -> data_preprocess::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let db = Database::open(&cli.db)?;
 
-    match cli.command {
-        Commands::Input { data_type } => handle_input(&db, data_type)?,
-        Commands::Remove { data_type } => handle_remove(&db, data_type)?,
-        Commands::Stats { exchange, symbol } => handle_stats(&db, exchange, symbol)?,
-        Commands::View { data_type } => handle_view(&db, data_type)?,
+    match cli.backend {
+        #[cfg(feature = "parquet")]
+        Backend::Parquet => {
+            let store = data_preprocess::ParquetStore::open(&cli.data_dir)?;
+            match cli.command {
+                Commands::Input { data_type } => handle_input_parquet(&store, data_type)?,
+                Commands::Remove { data_type } => handle_remove_parquet(&store, data_type)?,
+                Commands::Stats { exchange, symbol } => {
+                    handle_stats_parquet(&store, exchange, symbol)?
+                }
+                Commands::View { data_type } => handle_view_parquet(&store, data_type)?,
+            }
+        }
+
+        #[cfg(not(feature = "parquet"))]
+        Backend::Parquet => {
+            eprintln!("Error: parquet backend not compiled. Rebuild with `--features parquet`.");
+            std::process::exit(1);
+        }
+
+        #[cfg(feature = "duckdb-backend")]
+        Backend::Duckdb => {
+            let db = data_preprocess::Database::open(&cli.db)?;
+            match cli.command {
+                Commands::Input { data_type } => handle_input_duckdb(&db, data_type)?,
+                Commands::Remove { data_type } => handle_remove_duckdb(&db, data_type)?,
+                Commands::Stats { exchange, symbol } => handle_stats_duckdb(&db, exchange, symbol)?,
+                Commands::View { data_type } => handle_view_duckdb(&db, data_type)?,
+            }
+        }
+
+        #[cfg(not(feature = "duckdb-backend"))]
+        Backend::Duckdb => {
+            eprintln!(
+                "Error: duckdb backend not compiled. Rebuild with `--features duckdb-backend`."
+            );
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Parquet backend handlers
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "parquet")]
+fn handle_input_parquet(
+    store: &data_preprocess::ParquetStore,
+    data_type: InputType,
+) -> data_preprocess::Result<()> {
+    match data_type {
+        InputType::Tick {
+            files,
+            exchange,
+            symbol,
+            tz_offset,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let offset = parse_tz_offset(&tz_offset)?;
+            for file in &files {
+                let start = Instant::now();
+                let sym = match &symbol {
+                    Some(s) => s.to_uppercase(),
+                    None => extract_symbol_from_filename(file)?,
+                };
+                let (ticks, warnings) = parse_tick_csv(file, &exchange, &sym, &offset)?;
+                for w in &warnings {
+                    tracing::warn!("{}: {}", file.display(), w);
+                }
+                let inserted = store.insert_ticks(&ticks)?;
+                print_import_result(&ImportResult {
+                    file: file.display().to_string(),
+                    exchange: exchange.clone(),
+                    symbol: sym,
+                    rows_parsed: ticks.len(),
+                    rows_inserted: inserted,
+                    rows_skipped: ticks.len().saturating_sub(inserted),
+                    elapsed: start.elapsed(),
+                });
+            }
+        }
+        InputType::Bar {
+            files,
+            exchange,
+            timeframe,
+            symbol,
+            tz_offset,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let tf = Timeframe::parse(&timeframe)?;
+            let offset = parse_tz_offset(&tz_offset)?;
+            for file in &files {
+                let start = Instant::now();
+                let sym = match &symbol {
+                    Some(s) => s.to_uppercase(),
+                    None => extract_symbol_from_filename(file)?,
+                };
+                let (bars, warnings) = parse_bar_csv(file, &exchange, &sym, tf, &offset)?;
+                for w in &warnings {
+                    tracing::warn!("{}: {}", file.display(), w);
+                }
+                let inserted = store.insert_bars(&bars)?;
+                print_import_result(&ImportResult {
+                    file: file.display().to_string(),
+                    exchange: exchange.clone(),
+                    symbol: sym,
+                    rows_parsed: bars.len(),
+                    rows_inserted: inserted,
+                    rows_skipped: bars.len().saturating_sub(inserted),
+                    elapsed: start.elapsed(),
+                });
+            }
+        }
     }
     Ok(())
 }
 
-fn handle_input(db: &Database, data_type: InputType) -> data_preprocess::Result<()> {
+#[cfg(feature = "parquet")]
+fn handle_remove_parquet(
+    store: &data_preprocess::ParquetStore,
+    data_type: RemoveType,
+) -> data_preprocess::Result<()> {
+    match data_type {
+        RemoveType::Tick {
+            exchange,
+            symbol,
+            from,
+            to,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let symbol = symbol.to_uppercase();
+            let from = from.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let to = to.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let count = store.delete_ticks(&exchange, &symbol, from, to)?;
+            print_delete_result("tick", &exchange, &symbol, count);
+        }
+        RemoveType::Bar {
+            exchange,
+            symbol,
+            timeframe,
+            from,
+            to,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let symbol = symbol.to_uppercase();
+            let from = from.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let to = to.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let count = store.delete_bars(&exchange, &symbol, &timeframe, from, to)?;
+            print_delete_result("bar", &exchange, &format!("{symbol} ({timeframe})"), count);
+        }
+        RemoveType::Symbol { exchange, symbol } => {
+            let exchange = normalize_exchange(&exchange);
+            let symbol = symbol.to_uppercase();
+            let (t, b) = store.delete_symbol(&exchange, &symbol)?;
+            println!(
+                "Removed {} ticks + {} bars for {}/{}",
+                t, b, exchange, symbol
+            );
+        }
+        RemoveType::Exchange { exchange } => {
+            let exchange = normalize_exchange(&exchange);
+            let (t, b) = store.delete_exchange(&exchange)?;
+            println!(
+                "Removed {} ticks + {} bars for exchange '{}'",
+                t, b, exchange
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parquet")]
+fn handle_stats_parquet(
+    store: &data_preprocess::ParquetStore,
+    exchange: Option<String>,
+    symbol: Option<String>,
+) -> data_preprocess::Result<()> {
+    let exchange = exchange.map(|e| normalize_exchange(&e));
+    let symbol = symbol.map(|s| s.to_uppercase());
+    let rows = store.stats(exchange.as_deref(), symbol.as_deref())?;
+    print_stats(&rows, store.total_size());
+    Ok(())
+}
+
+#[cfg(feature = "parquet")]
+fn handle_view_parquet(
+    store: &data_preprocess::ParquetStore,
+    data_type: ViewType,
+) -> data_preprocess::Result<()> {
+    match data_type {
+        ViewType::Tick {
+            exchange,
+            symbol,
+            from,
+            to,
+            limit,
+            tail,
+            desc,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let symbol = symbol.to_uppercase();
+            let from = from.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let to = to.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let (ticks, total) = store.query_ticks(&QueryOpts {
+                exchange: exchange.clone(),
+                symbol: symbol.clone(),
+                from,
+                to,
+                limit,
+                tail,
+                descending: desc,
+            })?;
+            print_ticks(&exchange, &symbol, &ticks, total);
+        }
+        ViewType::Bar {
+            exchange,
+            symbol,
+            timeframe,
+            from,
+            to,
+            limit,
+            tail,
+            desc,
+        } => {
+            let exchange = normalize_exchange(&exchange);
+            let symbol = symbol.to_uppercase();
+            let from = from.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let to = to.map(|s| parse_datetime_arg(&s)).transpose()?;
+            let (bars, total) = store.query_bars(&BarQueryOpts {
+                exchange: exchange.clone(),
+                symbol: symbol.clone(),
+                timeframe: timeframe.clone(),
+                from,
+                to,
+                limit,
+                tail,
+                descending: desc,
+            })?;
+            print_bars(&exchange, &symbol, &timeframe, &bars, total);
+        }
+    }
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  DuckDB backend handlers
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "duckdb-backend")]
+fn handle_input_duckdb(
+    db: &data_preprocess::Database,
+    data_type: InputType,
+) -> data_preprocess::Result<()> {
     match data_type {
         InputType::Tick {
             files,
@@ -250,7 +507,11 @@ fn handle_input(db: &Database, data_type: InputType) -> data_preprocess::Result<
     Ok(())
 }
 
-fn handle_remove(db: &Database, data_type: RemoveType) -> data_preprocess::Result<()> {
+#[cfg(feature = "duckdb-backend")]
+fn handle_remove_duckdb(
+    db: &data_preprocess::Database,
+    data_type: RemoveType,
+) -> data_preprocess::Result<()> {
     match data_type {
         RemoveType::Tick {
             exchange,
@@ -300,8 +561,9 @@ fn handle_remove(db: &Database, data_type: RemoveType) -> data_preprocess::Resul
     Ok(())
 }
 
-fn handle_stats(
-    db: &Database,
+#[cfg(feature = "duckdb-backend")]
+fn handle_stats_duckdb(
+    db: &data_preprocess::Database,
     exchange: Option<String>,
     symbol: Option<String>,
 ) -> data_preprocess::Result<()> {
@@ -312,7 +574,11 @@ fn handle_stats(
     Ok(())
 }
 
-fn handle_view(db: &Database, data_type: ViewType) -> data_preprocess::Result<()> {
+#[cfg(feature = "duckdb-backend")]
+fn handle_view_duckdb(
+    db: &data_preprocess::Database,
+    data_type: ViewType,
+) -> data_preprocess::Result<()> {
     match data_type {
         ViewType::Tick {
             exchange,

@@ -1,22 +1,37 @@
 # data-preprocess
 
-Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar data from CSV files into a local DuckDB database, with support for multiple exchanges, deduplication, querying, and management.
+Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar data from CSV files into Parquet (default) or DuckDB storage, with support for multiple exchanges, deduplication, querying, and management.
 
-## Features
+## Storage Backends
 
-- Import tick (bid/ask/last) and bar (OHLCV) data from tab-delimited CSV files
-- DuckDB embedded storage — single-file, no server required
-- Exchange-partitioned data — same symbol on different exchanges stored independently
-- Automatic deduplication on import (idempotent re-imports)
-- Timezone conversion from source offset to UTC
-- Symbol auto-extraction from filenames
-- Query and display stored data with filtering, pagination, and sort options
-- Delete by exchange, symbol, timeframe, or date range
+| Backend | Feature Flag | Default | Build Time | Description |
+|---------|-------------|---------|------------|-------------|
+| **Parquet + Polars** | `parquet` | ✅ Yes | ~30s | Hive-partitioned Parquet files. No C++ compilation. zstd compressed. |
+| **DuckDB** | `duckdb-backend` | No | ~150s | Embedded columnar database. Opt-in for SQL exploration. |
+
+### Parquet Directory Layout (Hive-Style Partitioning)
+
+```
+{data_dir}/
+├── ticks/
+│   └── exchange={exchange}/
+│       └── symbol={symbol}/
+│           ├── 2026-01-15.parquet
+│           └── 2026-01-16.parquet
+└── bars/
+    └── exchange={exchange}/
+        └── symbol={symbol}/
+            └── timeframe={timeframe}/
+                ├── 2026-01-15.parquet
+                └── 2026-01-16.parquet
+```
+
+Each file covers one date for one exchange+symbol (or exchange+symbol+timeframe for bars). Files are sorted by timestamp ascending and compressed with zstd.
 
 ## Quick Start
 
 ```bash
-# Build
+# Build (default: parquet backend)
 cargo build -p qs-data-preprocess
 
 # Import tick data (symbol extracted from filename, UTC+2 default)
@@ -39,18 +54,27 @@ data-preprocess remove tick --exchange ctrader --symbol BTCUSD --from 2026-02-16
 data-preprocess remove symbol --exchange ctrader BTCUSD
 data-preprocess remove exchange binance
 
-# Run tests
+# Run tests (parquet only, default)
 cargo test -p qs-data-preprocess
+
+# Run tests (both backends)
+cargo test -p qs-data-preprocess --features duckdb-backend
+
+# Use DuckDB backend at runtime
+data-preprocess --backend duckdb --db market_data.duckdb stats
 ```
 
 ## CLI Reference
 
 ```
-data-preprocess [--db <PATH>] <COMMAND>
+data-preprocess [OPTIONS] <COMMAND>
 
 Global options:
-  --db <PATH>    Path to DuckDB file [default: market_data.duckdb]
-                 Also reads DATA_PREPROCESS_DB env var
+  --backend <parquet|duckdb>   Storage backend [default: parquet]
+  --data-dir <PATH>            Root directory for Parquet files [default: market_data]
+                               Also reads DATA_PREPROCESS_DIR env var
+  --db <PATH>                  Path to DuckDB file (duckdb backend only) [default: market_data.duckdb]
+                               Also reads DATA_PREPROCESS_DB env var
 
 Commands:
   input          Import market data from CSV file(s)
@@ -127,16 +151,47 @@ Tab-delimited, with header. Filename convention: `{SYMBOL}_*.csv`
 - **Exchanges** are always stored lowercase (`ctrader`, `binance`)
 - **Symbols** are always stored uppercase (`BTCUSD`, `EURUSD`)
 - **Timestamps** are stored in UTC — source timezone is converted on import
-- **Deduplication** uses `INSERT OR IGNORE` on `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
-
-For full schema details, query examples, and client integration guides (Python, Rust), see [db-details.md](db-details.md).
+- **Deduplication** uses `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
+  - Parquet: read-merge-write per date partition file (bounded to one file per dedup operation)
+  - DuckDB: `INSERT OR IGNORE` with UNIQUE constraints
 
 ## Library Usage
 
-The crate also exposes a library for programmatic access:
+### Parquet backend (default)
 
 ```rust
-use data_preprocess::{Database, db::QueryOpts};
+use data_preprocess::{ParquetStore, models::{QueryOpts, BarQueryOpts}};
+
+let store = ParquetStore::open("market_data")?;
+
+// Import ticks
+let inserted = store.insert_ticks(&ticks)?;
+
+// Query ticks
+let (ticks, total) = store.query_ticks(&QueryOpts {
+    exchange: "ctrader".into(),
+    symbol: "BTCUSD".into(),
+    from: None,
+    to: None,
+    limit: 1000,
+    tail: false,
+    descending: false,
+})?;
+
+// Stats
+let stats = store.stats(None, None)?;
+
+// Delete
+let deleted = store.delete_ticks("ctrader", "BTCUSD", None, None)?;
+let (tick_count, bar_count) = store.delete_symbol("ctrader", "BTCUSD")?;
+```
+
+### DuckDB backend (opt-in)
+
+Requires `features = ["duckdb-backend"]` in your `Cargo.toml`.
+
+```rust
+use data_preprocess::{Database, models::{QueryOpts, BarQueryOpts}};
 
 let db = Database::open("market_data.duckdb".as_ref())?;
 let (ticks, total) = db.query_ticks(&QueryOpts {
@@ -149,6 +204,41 @@ let (ticks, total) = db.query_ticks(&QueryOpts {
     descending: false,
 })?;
 ```
+
+### Consumer crates (models only, no backend)
+
+For crates that only need the type definitions (`Tick`, `Bar`, `Timeframe`, `QueryOpts`), disable default features to avoid pulling in Polars:
+
+```toml
+[dependencies]
+qs-data-preprocess = { path = "../data-preprocess", default-features = false }
+```
+
+## Feature Flags
+
+| Feature | Dependencies | Use Case |
+|---------|-------------|----------|
+| `parquet` (default) | `polars` | Parquet read/write with Polars |
+| `duckdb-backend` | `duckdb` | DuckDB embedded database |
+| _(none)_ | — | Model types + parsers only (fastest build) |
+
+## API Parity
+
+Both backends provide the same logical operations with identical return types:
+
+| Operation | `ParquetStore` | `Database` |
+|-----------|---------------|-----------|
+| Open | `open(root_dir)` | `open(file_path)` |
+| Insert ticks | `insert_ticks(&[Tick]) -> usize` | `insert_ticks(&[Tick]) -> usize` |
+| Insert bars | `insert_bars(&[Bar]) -> usize` | `insert_bars(&[Bar]) -> usize` |
+| Query ticks | `query_ticks(&QueryOpts) -> (Vec<Tick>, u64)` | `query_ticks(&QueryOpts) -> (Vec<Tick>, u64)` |
+| Query bars | `query_bars(&BarQueryOpts) -> (Vec<Bar>, u64)` | `query_bars(&BarQueryOpts) -> (Vec<Bar>, u64)` |
+| Delete ticks | `delete_ticks(ex, sym, from, to) -> usize` | `delete_ticks(ex, sym, from, to) -> usize` |
+| Delete bars | `delete_bars(ex, sym, tf, from, to) -> usize` | `delete_bars(ex, sym, tf, from, to) -> usize` |
+| Delete symbol | `delete_symbol(ex, sym) -> (usize, usize)` | `delete_symbol(ex, sym) -> (usize, usize)` |
+| Delete exchange | `delete_exchange(ex) -> (usize, usize)` | `delete_exchange(ex) -> (usize, usize)` |
+| Stats | `stats(ex?, sym?) -> Vec<StatRow>` | `stats(ex?, sym?) -> Vec<StatRow>` |
+| Size | `total_size() -> Option<u64>` | `file_size() -> Option<u64>` |
 
 ## License
 

@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DataError, Result};
 
+/// Query parameters for tick view/query commands.
+pub struct QueryOpts {
+    pub exchange: String,
+    pub symbol: String,
+    pub from: Option<NaiveDateTime>,
+    pub to: Option<NaiveDateTime>,
+    pub limit: usize,
+    pub tail: bool,
+    pub descending: bool,
+}
+
+/// Query parameters for bar view/query commands.
+pub struct BarQueryOpts {
+    pub exchange: String,
+    pub symbol: String,
+    pub timeframe: String,
+    pub from: Option<NaiveDateTime>,
+    pub to: Option<NaiveDateTime>,
+    pub limit: usize,
+    pub tail: bool,
+    pub descending: bool,
+}
+
 /// Supported bar timeframes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Timeframe {

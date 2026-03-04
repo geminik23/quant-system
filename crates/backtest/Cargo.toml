@@ -13,7 +13,7 @@ name = "qs_backtest"
 
 [dependencies]
 qs-core = { path = "../core" }
-qs-data-preprocess = { path = "../data-preprocess" }
+qs-data-preprocess = { path = "../data-preprocess", default-features = false }
 chrono = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
