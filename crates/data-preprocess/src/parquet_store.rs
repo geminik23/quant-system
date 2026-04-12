@@ -713,7 +713,8 @@ fn apply_pagination(
     tail: bool,
     descending: bool,
 ) -> Result<DataFrame> {
-    let result = if tail {
+    // limit == 0 means "no limit" — return all rows.
+    let result = if tail && limit > 0 {
         // Take last N rows, then optionally reverse for descending
         let n = limit.min(df.height());
         let tailed = df.tail(Some(n));
@@ -726,14 +727,19 @@ fn apply_pagination(
             tailed
         }
     } else if descending {
-        // Take first N from descending sort
         let sorted = df.sort(
             ["ts"],
             SortMultipleOptions::default().with_order_descending(true),
         )?;
-        sorted.head(Some(limit))
-    } else {
+        if limit > 0 {
+            sorted.head(Some(limit))
+        } else {
+            sorted
+        }
+    } else if limit > 0 {
         df.head(Some(limit))
+    } else {
+        df
     };
     Ok(result)
 }

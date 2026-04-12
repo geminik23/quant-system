@@ -1,0 +1,30 @@
+# Backtest Server — Example Configuration
+#
+# Copy this file to config.toml and adjust paths for your environment.
+
+[server]
+# Base name for shared memory endpoints.
+# Acceptor listens on shm://{shm_name}-accept
+# Clients get dedicated slots: shm://{shm_name}-client-{id}
+shm_name = "backtest"
+
+# Per-client SHM buffer size in bytes (default: 16 MB).
+# Increase if backtest results with large trade logs exceed the buffer.
+shm_buffer_size = 16777216
+
+[database]
+# Root directory for Parquet-partitioned market data.
+# Must be populated via `data-preprocess input` before use.
+data_dir = "market_data"
+
+[symbols]
+# Path to the symbol registry TOML (qs-symbols / F06).
+registry_path = "crates/symbols/symbols.toml"
+
+[profiles]
+# Path to the management profiles TOML (qs-backtest / F09).
+profiles_path = "crates/backtest/profiles.toml"
+
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"

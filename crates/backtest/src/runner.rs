@@ -14,11 +14,14 @@
 //!    A pre-sorted `Vec<Signal>` is merged with the market data timeline.
 //!    Signals are injected at the correct timestamps.
 
+use std::collections::HashMap;
+
 use qs_core::TradeEngine;
-use qs_core::types::{Action, FillModel, PriceQuote, Signal};
+use qs_core::types::{Action, FillModel, PositionId, PositionStatus, PriceQuote, Side, Signal};
 
 use crate::data_feed::DataFeed;
 use crate::executor::BacktestExecutor;
+use crate::profile::{ManagementProfile, PositionRef, PositionResolver, RawSignal, resolve_signal};
 use crate::report::BacktestResult;
 use crate::strategy::Strategy;
 
@@ -35,6 +38,15 @@ pub struct BacktestConfig {
     /// Defaults to [`FillModel::BidAsk`] — the most realistic model that
     /// uses the appropriate side of the spread for each operation.
     pub fill_model: FillModel,
+    /// Per-symbol contract size (point value) for P&L calculation.
+    ///
+    /// Maps symbol name → contract size.  For forex, this is typically
+    /// `lot_base_units` from [`SymbolSpec`] (e.g. 100_000 for majors).
+    /// For gold (XAUUSD) it's 100 (1 lot = 100 oz).
+    ///
+    /// When a symbol is absent from this map the multiplier defaults to `1.0`,
+    /// which preserves backward compatibility with all existing tests.
+    pub contract_sizes: HashMap<String, f64>,
 }
 
 impl Default for BacktestConfig {
@@ -43,6 +55,7 @@ impl Default for BacktestConfig {
             initial_balance: 10_000.0,
             close_on_finish: true,
             fill_model: FillModel::default(),
+            contract_sizes: HashMap::new(),
         }
     }
 }
@@ -57,9 +70,10 @@ pub struct BacktestRunner {
 impl BacktestRunner {
     /// Create a new runner with the given configuration.
     pub fn new(config: BacktestConfig) -> Self {
+        let executor = BacktestExecutor::new(config.initial_balance, config.contract_sizes.clone());
         Self {
             engine: TradeEngine::with_fill_model(config.fill_model),
-            executor: BacktestExecutor::new(config.initial_balance),
+            executor,
             config,
         }
     }
@@ -234,6 +248,109 @@ impl BacktestRunner {
         None
     }
 
+    // ── Mode 3: Raw signal replay ───────────────────────────────────────
+
+    /// Run a raw-signal-replay backtest.
+    ///
+    /// `raw_signals` must be **sorted by timestamp** (ascending).  Entry
+    /// signals are optionally transformed through a [`ManagementProfile`],
+    /// while management signals are resolved against live engine state and
+    /// passed through directly.
+    pub fn run_raw_signals<F: DataFeed>(
+        mut self,
+        feed: &mut F,
+        raw_signals: Vec<RawSignal>,
+        profile: Option<&ManagementProfile>,
+    ) -> BacktestResult {
+        let mut sig_idx = 0;
+
+        while let Some(event) = feed.next_event() {
+            let quote = event.to_quote();
+
+            // 1. Inject raw signals that should fire at or before this event's ts.
+            while sig_idx < raw_signals.len() && raw_signals[sig_idx].ts() <= event.ts() {
+                self.process_raw_signal(&raw_signals[sig_idx], profile, &quote);
+                sig_idx += 1;
+            }
+
+            // 2. Feed price to engine.
+            let effects = self.engine.on_price(&quote);
+            self.executor
+                .process_effects(&effects, &self.engine, &quote);
+        }
+
+        // 3. Inject remaining signals (if any) after data is exhausted.
+        if sig_idx < raw_signals.len() {
+            if let Some(last_quote) = self.last_available_quote() {
+                while sig_idx < raw_signals.len() {
+                    self.process_raw_signal(&raw_signals[sig_idx], profile, &last_quote);
+                    sig_idx += 1;
+                }
+                // One final price evaluation.
+                let effects = self.engine.on_price(&last_quote);
+                self.executor
+                    .process_effects(&effects, &self.engine, &last_quote);
+            }
+        }
+
+        // 4. Force-close remaining if configured.
+        self.close_remaining_if_configured();
+
+        BacktestResult::from_trade_log(self.config.initial_balance, self.executor.trade_log)
+    }
+
+    /// Process a single raw signal: entry signals go through profile transform,
+    /// management signals are resolved against live engine state.
+    fn process_raw_signal(
+        &mut self,
+        signal: &RawSignal,
+        profile: Option<&ManagementProfile>,
+        quote: &PriceQuote,
+    ) {
+        let ts = signal.ts();
+
+        if signal.is_entry() {
+            // Entry path: optionally apply profile, then convert to Action::Open.
+            if let Some(entry) = signal.as_entry() {
+                let action = if let Some(prof) = profile {
+                    prof.apply(&entry)
+                } else {
+                    // No profile — convert directly to Action::Open.
+                    Some(Action::Open {
+                        symbol: entry.symbol,
+                        side: entry.side,
+                        order_type: entry.order_type,
+                        price: entry.price,
+                        size: entry.size,
+                        stoploss: entry.stoploss,
+                        targets: entry
+                            .targets
+                            .into_iter()
+                            .map(|p| qs_core::types::TargetSpec {
+                                price: p,
+                                close_ratio: 1.0,
+                            })
+                            .collect(),
+                        rules: vec![],
+                        group: entry.group,
+                    })
+                };
+                if let Some(act) = action {
+                    self.apply_single_action(act, ts, quote);
+                }
+            }
+        } else {
+            // Management path: resolve against engine state.
+            let actions = resolve_signal(signal, &self.engine);
+            for action in actions {
+                self.apply_single_action(action, ts, quote);
+            }
+        }
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────
+    // (continued)
+
     /// If `close_on_finish` is set, close all remaining open positions at
     /// their last known price.
     fn close_remaining_if_configured(&mut self) {
@@ -271,12 +388,61 @@ impl BacktestRunner {
     }
 }
 
+// ─── PositionResolver for TradeEngine ───────────────────────────────────────
+
+impl PositionResolver for TradeEngine {
+    fn resolve(&self, pr: &PositionRef) -> Vec<PositionId> {
+        match pr {
+            PositionRef::Id { id } => {
+                if self.get_position(id).is_some() {
+                    vec![id.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            PositionRef::LastOnSymbol { symbol } => {
+                let mut candidates: Vec<_> = self
+                    .open_positions()
+                    .into_iter()
+                    .filter(|p| p.data.symbol == *symbol)
+                    .collect();
+                candidates.sort_by_key(|p| p.data.open_ts);
+                candidates
+                    .last()
+                    .map(|p| vec![p.data.id.clone()])
+                    .unwrap_or_default()
+            }
+            PositionRef::LastInGroup { group_id } => {
+                let ids = self.manager.open_ids_by_group(group_id);
+                ids.into_iter()
+                    .filter_map(|id| self.get_position(&id))
+                    .max_by_key(|p| p.data.open_ts)
+                    .map(|p| vec![p.data.id.clone()])
+                    .unwrap_or_default()
+            }
+            PositionRef::AllOnSymbol { symbol } => self.manager.open_ids_by_symbol(symbol),
+            PositionRef::AllInGroup { group_id } => self.manager.open_ids_by_group(group_id),
+        }
+    }
+
+    fn position_entry_info(&self, id: &PositionId) -> Option<(f64, Side)> {
+        self.get_position(id).and_then(|pos| {
+            if pos.data.status == PositionStatus::Open {
+                Some((pos.data.average_entry(), pos.data.side))
+            } else {
+                None
+            }
+        })
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data_feed::{MarketEvent, VecFeed};
+    use crate::profile::{ManagementProfile, PositionRef, RawSignal, StoplossMode};
     use chrono::NaiveDate;
     use qs_core::types::{CloseReason, OrderType, RuleConfig, Side, TargetSpec};
 
@@ -432,6 +598,426 @@ mod tests {
         let result = runner.run_strategy(&mut feed, &mut strategy);
 
         // Position left open — no trades recorded.
+        assert_eq!(result.total_trades, 0);
+    }
+
+    // ── Raw signal replay tests ─────────────────────────────────────────
+
+    #[test]
+    fn run_raw_signals_entry_only() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 2)),
+            tick("EURUSD", 1.0900, 1.0902, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "EURUSD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900],
+            group: None,
+        }];
+
+        let runner = BacktestRunner::with_defaults();
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 1);
+        assert_eq!(result.winning_trades, 1);
+    }
+
+    #[test]
+    fn run_raw_signals_open_then_close() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 2)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::Close {
+                ts: ts(10, 0, 2),
+                position: PositionRef::LastOnSymbol {
+                    symbol: "EURUSD".into(),
+                },
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: false,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 1);
+        assert_eq!(result.trade_log[0].close_reason, CloseReason::Manual);
+    }
+
+    #[test]
+    fn run_raw_signals_open_then_modify_sl() {
+        // Open a position, then move SL closer. If price drops to new SL, it triggers.
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 1)),
+            // SL modify happens at ts(10,0,2)
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 2)),
+            // Price drops to modified SL at 1.0840
+            tick("EURUSD", 1.0838, 1.0840, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: Some(1.0800),
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::ModifyStoploss {
+                ts: ts(10, 0, 2),
+                position: PositionRef::LastOnSymbol {
+                    symbol: "EURUSD".into(),
+                },
+                price: 1.0840,
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: true,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 1);
+        assert_eq!(result.trade_log[0].close_reason, CloseReason::Stoploss);
+    }
+
+    #[test]
+    fn run_raw_signals_open_then_partial_close() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 1)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 2)),
+            tick("EURUSD", 1.0880, 1.0882, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::ClosePartial {
+                ts: ts(10, 0, 1),
+                position: PositionRef::LastOnSymbol {
+                    symbol: "EURUSD".into(),
+                },
+                ratio: 0.5,
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: true,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        // At least 1 trade closed (partial close + close_on_finish for remainder)
+        assert!(result.total_trades >= 1);
+    }
+
+    #[test]
+    fn run_raw_signals_group_workflow() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 2)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 3)),
+            tick("EURUSD", 1.0880, 1.0882, ts(10, 0, 4)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            // Open 2 positions in same group
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: Some("grp1".into()),
+            },
+            RawSignal::Entry {
+                ts: ts(10, 0, 1),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0857),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: Some("grp1".into()),
+            },
+            // Close entire group
+            RawSignal::CloseAllInGroup {
+                ts: ts(10, 0, 3),
+                group_id: "grp1".into(),
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: false,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 2);
+    }
+
+    #[test]
+    fn run_raw_signals_close_all_of_symbol() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 2)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 0.5,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::CloseAllOf {
+                ts: ts(10, 0, 2),
+                symbol: "EURUSD".into(),
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: false,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 2);
+    }
+
+    #[test]
+    fn run_raw_signals_with_profile() {
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0900, 1.0902, ts(10, 0, 2)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let profile = ManagementProfile {
+            name: "test".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+
+        let raw_signals = vec![RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "EURUSD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900],
+            group: None,
+        }];
+
+        let runner = BacktestRunner::with_defaults();
+        let result = runner.run_raw_signals(&mut feed, raw_signals, Some(&profile));
+
+        assert_eq!(result.total_trades, 1);
+        assert_eq!(result.winning_trades, 1);
+        assert_eq!(result.trade_log[0].close_reason, CloseReason::Target);
+    }
+
+    #[test]
+    fn run_raw_signals_no_profile() {
+        // Without a profile, entry signals are converted directly.
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 2)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "EURUSD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+        }];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: true,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 1);
+    }
+
+    #[test]
+    fn run_raw_signals_last_on_symbol_resolution() {
+        // Open two positions, then close the last one by symbol ref.
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+            tick("EURUSD", 1.0860, 1.0862, ts(10, 0, 2)),
+            tick("EURUSD", 1.0870, 1.0872, ts(10, 0, 3)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            RawSignal::Entry {
+                ts: ts(10, 0, 1),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0857),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+            },
+            // Close only the last opened position
+            RawSignal::Close {
+                ts: ts(10, 0, 2),
+                position: PositionRef::LastOnSymbol {
+                    symbol: "EURUSD".into(),
+                },
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: true,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        // 2 trades total: one closed by signal, one by close_on_finish
+        assert_eq!(result.total_trades, 2);
+    }
+
+    #[test]
+    fn run_raw_signals_unresolved_ref_skipped() {
+        // Try to close a position that doesn't exist — should be silently skipped.
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0855, 1.0857, ts(10, 0, 1)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![RawSignal::Close {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id {
+                id: "nonexistent".into(),
+            },
+        }];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: false,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        // No positions were opened or closed.
         assert_eq!(result.total_trades, 0);
     }
 

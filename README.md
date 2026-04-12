@@ -11,6 +11,7 @@ A modular workspace for algorithmic trading — real-time market data, strategy 
 | [`qs-market-data`](crates/market-data/) | Real-time price streaming from CTrader FIX API, exposed to local clients via shared memory IPC (`xrpc-rs`). Supports per-client subscriptions, price alerts, and automatic reconnection. |
 | [`qs-data-preprocess`](crates/data-preprocess/) | Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar CSVs into a local DuckDB database with exchange partitioning, deduplication, and query/management commands. |
 | [`qs-symbols`](crates/symbols/) | Symbol registry — TOML-driven canonical name normalization, price precision metadata (pip/digit), and lot specification. Shared across all crates to replace hardcoded symbol mappings. |
+| [`qs-backtest-server`](crates/backtest-server/) | Backtest RPC server over shared memory (xrpc-rs). Accepts signals + profile + date range, loads Parquet data, runs backtests, and returns serialized results. Multi-client via acceptor pattern. |
 
 ## License
 

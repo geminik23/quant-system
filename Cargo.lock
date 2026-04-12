@@ -3409,10 +3409,31 @@ dependencies = [
  "chrono",
  "qs-core",
  "qs-data-preprocess",
+ "qs-symbols",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "qs-backtest-server"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "qs-backtest",
+ "qs-core",
+ "qs-data-preprocess",
+ "qs-symbols",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xrpc-rs",
 ]
 
 [[package]]
@@ -3428,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "qs-data-preprocess"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3463,6 +3484,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xrpc-rs",
+]
+
+[[package]]
+name = "qs-signal-parser"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "qs-backtest",
+ "qs-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

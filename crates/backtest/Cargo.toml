@@ -21,3 +21,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+qs-data-preprocess = { path = "../data-preprocess", features = ["parquet"] }
+qs-symbols = { path = "../symbols" }

@@ -1,0 +1,37 @@
+[package]
+name = "qs-backtest-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backtest server with shared memory IPC via xrpc-rs"
+keywords = ["backtest", "server", "ipc", "trading"]
+categories = ["finance"]
+
+[lib]
+name = "backtest_server"
+
+[[bin]]
+name = "backtest_server"
+path = "src/bin/backtest_server.rs"
+
+[[bin]]
+name = "tg_backtest"
+path = "src/bin/tg_backtest.rs"
+
+[dependencies]
+qs-core = { path = "../core" }
+qs-backtest = { path = "../backtest" }
+qs-data-preprocess = { path = "../data-preprocess" }
+qs-symbols = { path = "../symbols" }
+
+tokio = { workspace = true }
+xrpc-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }

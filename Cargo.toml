@@ -6,6 +6,8 @@ members = [
     "crates/market-data",
     "crates/data-preprocess",
     "crates/symbols",
+    "crates/backtest-server",
+    "crates/signal-parser",
 ]
 
 [workspace.package]
@@ -45,6 +47,7 @@ xrpc-rs = "0.2.2"
 # Data storage & parsing
 duckdb = { version = "1.2", features = ["bundled"] }
 csv = "1.3"
+regex = "1"
 polars = { version = "0.46", features = ["parquet", "lazy", "dtype-datetime"] }
 
 # CTrader FIX protocol

@@ -1,0 +1,29 @@
+[package]
+name = "qs-signal-parser"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-channel Telegram signal parser for the quant-system"
+keywords = ["telegram", "parser", "signals", "trading"]
+
+[lib]
+name = "signal_parser"
+
+[[bin]]
+name = "parse_signals"
+path = "src/bin/parse_signals.rs"
+
+[dependencies]
+qs-core = { path = "../core" }
+qs-backtest = { path = "../backtest" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+regex = { workspace = true }

@@ -11,7 +11,9 @@ use std::path::Path;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use qs_core::types::{Action, GroupId, OrderType, RuleConfig, Side, Signal, TargetSpec};
+use qs_core::types::{
+    Action, GroupId, OrderType, PositionId, RuleConfig, Side, Signal, TargetSpec,
+};
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
@@ -78,6 +80,369 @@ pub struct RawSignalEntry {
     pub group: Option<String>,
 }
 
+// ─── PositionRef ────────────────────────────────────────────────────────────
+
+/// How a management signal references its target position(s).
+///
+/// Resolved at runtime by the backtest runner, which has access to
+/// engine state for lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PositionRef {
+    /// Explicit position ID (for strategy mode or known IDs).
+    Id { id: PositionId },
+    /// The most recently opened position on this symbol.
+    LastOnSymbol { symbol: String },
+    /// The most recently opened position in this group.
+    LastInGroup { group_id: GroupId },
+    /// All open positions on this symbol.
+    AllOnSymbol { symbol: String },
+    /// All open positions in this group.
+    AllInGroup { group_id: GroupId },
+}
+
+// ─── RawSignal ──────────────────────────────────────────────────────────────
+
+/// A raw signal from an external source — entry or management.
+///
+/// Covers both entry signals (which can be profile-transformed) and
+/// management signals (which pass through to the engine as-is after
+/// position resolution).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action")]
+pub enum RawSignal {
+    // ── Entry (profile-transformable) ───────────────────────────────
+    Entry {
+        ts: NaiveDateTime,
+        symbol: String,
+        side: Side,
+        order_type: OrderType,
+        price: Option<f64>,
+        size: f64,
+        stoploss: Option<f64>,
+        #[serde(default)]
+        targets: Vec<f64>,
+        #[serde(default)]
+        group: Option<String>,
+    },
+
+    // ── Per-position management ─────────────────────────────────────
+    Close {
+        ts: NaiveDateTime,
+        position: PositionRef,
+    },
+    ClosePartial {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        ratio: f64,
+    },
+    ModifyStoploss {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        price: f64,
+    },
+    MoveStoplossToEntry {
+        ts: NaiveDateTime,
+        position: PositionRef,
+    },
+    AddTarget {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        price: f64,
+        close_ratio: f64,
+    },
+    RemoveTarget {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        price: f64,
+    },
+    AddRule {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        rule: RuleConfigDef,
+    },
+    RemoveRule {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        rule_name: String,
+    },
+    ScaleIn {
+        ts: NaiveDateTime,
+        position: PositionRef,
+        price: Option<f64>,
+        size: f64,
+    },
+    CancelPending {
+        ts: NaiveDateTime,
+        position: PositionRef,
+    },
+
+    // ── Bulk actions ────────────────────────────────────────────────
+    CloseAllOf {
+        ts: NaiveDateTime,
+        symbol: String,
+    },
+    CloseAll {
+        ts: NaiveDateTime,
+    },
+    CancelAllPending {
+        ts: NaiveDateTime,
+    },
+    ModifyAllStoploss {
+        ts: NaiveDateTime,
+        symbol: String,
+        price: f64,
+    },
+    CloseAllInGroup {
+        ts: NaiveDateTime,
+        group_id: GroupId,
+    },
+    ModifyAllStoplossInGroup {
+        ts: NaiveDateTime,
+        group_id: GroupId,
+        price: f64,
+    },
+}
+
+impl RawSignal {
+    /// Extract the timestamp from any signal variant.
+    pub fn ts(&self) -> NaiveDateTime {
+        match self {
+            Self::Entry { ts, .. } => *ts,
+            Self::Close { ts, .. } => *ts,
+            Self::ClosePartial { ts, .. } => *ts,
+            Self::ModifyStoploss { ts, .. } => *ts,
+            Self::MoveStoplossToEntry { ts, .. } => *ts,
+            Self::AddTarget { ts, .. } => *ts,
+            Self::RemoveTarget { ts, .. } => *ts,
+            Self::AddRule { ts, .. } => *ts,
+            Self::RemoveRule { ts, .. } => *ts,
+            Self::ScaleIn { ts, .. } => *ts,
+            Self::CancelPending { ts, .. } => *ts,
+            Self::CloseAllOf { ts, .. } => *ts,
+            Self::CloseAll { ts, .. } => *ts,
+            Self::CancelAllPending { ts, .. } => *ts,
+            Self::ModifyAllStoploss { ts, .. } => *ts,
+            Self::CloseAllInGroup { ts, .. } => *ts,
+            Self::ModifyAllStoplossInGroup { ts, .. } => *ts,
+        }
+    }
+
+    /// Returns `true` if this is an `Entry` variant.
+    pub fn is_entry(&self) -> bool {
+        matches!(self, Self::Entry { .. })
+    }
+
+    /// Convert to a `RawSignalEntry` if this is an `Entry` variant.
+    pub fn as_entry(&self) -> Option<RawSignalEntry> {
+        match self {
+            Self::Entry {
+                ts,
+                symbol,
+                side,
+                order_type,
+                price,
+                size,
+                stoploss,
+                targets,
+                group,
+            } => Some(RawSignalEntry {
+                ts: *ts,
+                symbol: symbol.clone(),
+                side: *side,
+                order_type: *order_type,
+                price: *price,
+                size: *size,
+                stoploss: *stoploss,
+                targets: targets.clone(),
+                group: group.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl From<RawSignalEntry> for RawSignal {
+    fn from(e: RawSignalEntry) -> Self {
+        RawSignal::Entry {
+            ts: e.ts,
+            symbol: e.symbol,
+            side: e.side,
+            order_type: e.order_type,
+            price: e.price,
+            size: e.size,
+            stoploss: e.stoploss,
+            targets: e.targets,
+            group: e.group,
+        }
+    }
+}
+
+// ─── Position Resolution ────────────────────────────────────────────────────
+
+/// Resolves a `PositionRef` to concrete position ID(s) using engine state.
+pub trait PositionResolver {
+    /// Resolve a position reference to zero or more concrete position IDs.
+    fn resolve(&self, pr: &PositionRef) -> Vec<PositionId>;
+    /// Get entry info (average_entry, side) for an open position.
+    fn position_entry_info(&self, id: &PositionId) -> Option<(f64, Side)>;
+}
+
+/// Resolve a non-entry `RawSignal` into concrete `Action`(s).
+///
+/// Entry signals are not handled here — they go through the profile path.
+/// Returns an empty vec for `Entry` variants.
+pub fn resolve_signal(signal: &RawSignal, resolver: &impl PositionResolver) -> Vec<Action> {
+    match signal {
+        RawSignal::Entry { .. } => vec![],
+
+        RawSignal::Close { position, .. } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::ClosePosition { position_id: id })
+            .collect(),
+
+        RawSignal::ClosePartial {
+            position, ratio, ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::ClosePartial {
+                position_id: id,
+                ratio: *ratio,
+            })
+            .collect(),
+
+        RawSignal::ModifyStoploss {
+            position, price, ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::ModifyStoploss {
+                position_id: id,
+                price: *price,
+            })
+            .collect(),
+
+        RawSignal::MoveStoplossToEntry { position, .. } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::MoveStoplossToEntry { position_id: id })
+            .collect(),
+
+        RawSignal::AddTarget {
+            position,
+            price,
+            close_ratio,
+            ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::AddTarget {
+                position_id: id,
+                price: *price,
+                close_ratio: *close_ratio,
+            })
+            .collect(),
+
+        RawSignal::RemoveTarget {
+            position, price, ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::RemoveTarget {
+                position_id: id,
+                price: *price,
+            })
+            .collect(),
+
+        RawSignal::AddRule { position, rule, .. } => {
+            resolver
+                .resolve(position)
+                .into_iter()
+                .filter_map(|id| {
+                    let info = resolver.position_entry_info(&id);
+                    let (entry_price, side) = match info {
+                        Some((ep, s)) => (Some(ep), s),
+                        None => (None, Side::Buy), // fallback side; resolve may return None
+                    };
+                    rule.resolve(entry_price, side)
+                        .map(|resolved_rule| Action::AddRule {
+                            position_id: id,
+                            rule: resolved_rule,
+                        })
+                })
+                .collect()
+        }
+
+        RawSignal::RemoveRule {
+            position,
+            rule_name,
+            ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::RemoveRule {
+                position_id: id,
+                rule_name: rule_name.clone(),
+            })
+            .collect(),
+
+        RawSignal::ScaleIn {
+            position,
+            price,
+            size,
+            ..
+        } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::ScaleIn {
+                position_id: id,
+                price: *price,
+                size: *size,
+            })
+            .collect(),
+
+        RawSignal::CancelPending { position, .. } => resolver
+            .resolve(position)
+            .into_iter()
+            .map(|id| Action::CancelPending { position_id: id })
+            .collect(),
+
+        // ── Bulk actions — no resolution needed ─────────────────────
+        RawSignal::CloseAllOf { symbol, .. } => {
+            vec![Action::CloseAllOf {
+                symbol: symbol.clone(),
+            }]
+        }
+        RawSignal::CloseAll { .. } => {
+            vec![Action::CloseAll]
+        }
+        RawSignal::CancelAllPending { .. } => {
+            vec![Action::CancelAllPending]
+        }
+        RawSignal::ModifyAllStoploss { symbol, price, .. } => {
+            vec![Action::ModifyAllStoploss {
+                symbol: symbol.clone(),
+                price: *price,
+            }]
+        }
+        RawSignal::CloseAllInGroup { group_id, .. } => {
+            vec![Action::CloseAllInGroup {
+                group_id: group_id.clone(),
+            }]
+        }
+        RawSignal::ModifyAllStoplossInGroup {
+            group_id, price, ..
+        } => {
+            vec![Action::ModifyAllStoplossInGroup {
+                group_id: group_id.clone(),
+                price: *price,
+            }]
+        }
+    }
+}
+
 // ─── StoplossMode ───────────────────────────────────────────────────────────
 
 /// How the profile handles the stoploss from the raw signal.
@@ -126,7 +491,7 @@ impl RuleConfigDef {
     /// For offset-based variants, `entry_price` and `side` are needed
     /// to compute the absolute trigger price. Returns `None` when the
     /// offset variant is used but no entry price is available.
-    fn resolve(&self, entry_price: Option<f64>, side: Side) -> Option<RuleConfig> {
+    pub fn resolve(&self, entry_price: Option<f64>, side: Side) -> Option<RuleConfig> {
         match self {
             Self::FixedStoploss { price } => Some(RuleConfig::FixedStoploss { price: *price }),
             Self::TrailingStop { distance } => Some(RuleConfig::TrailingStop {
@@ -197,6 +562,11 @@ fn default_stoploss_mode() -> StoplossMode {
 }
 
 impl ManagementProfile {
+    /// Validate this profile's configuration.
+    pub fn validate(&self) -> Result<(), ProfileError> {
+        ProfileRegistry::validate_profile(self)
+    }
+
     /// Transform a raw signal into a fully-specified `Action::Open`.
     pub fn apply(&self, signal: &RawSignalEntry) -> Option<Action> {
         // 1. Build target specs from selected targets + close ratios.
@@ -256,6 +626,32 @@ impl ManagementProfile {
         raw_signals
             .iter()
             .filter_map(|raw| self.apply(raw).map(|action| Signal { ts: raw.ts, action }))
+            .collect()
+    }
+
+    /// Transform a `RawSignal` — entry signals are profile-transformed,
+    /// management signals pass through unchanged.
+    pub fn apply_raw(&self, signal: &RawSignal) -> Option<RawSignal> {
+        match signal {
+            RawSignal::Entry { .. } => {
+                // Convert to RawSignalEntry, apply profile, then wrap back.
+                // If apply() returns None we filter it out.
+                let entry = signal.as_entry()?;
+                let _action = self.apply(&entry)?;
+                // Profile accepted it — return the original entry signal
+                // (the actual Action conversion happens later in the runner).
+                Some(signal.clone())
+            }
+            _ => Some(signal.clone()),
+        }
+    }
+
+    /// Transform a batch of `RawSignal`s — entry signals are profile-filtered,
+    /// management signals pass through unchanged.
+    pub fn apply_batch_raw(&self, raw_signals: &[RawSignal]) -> Vec<RawSignal> {
+        raw_signals
+            .iter()
+            .filter_map(|s| self.apply_raw(s))
             .collect()
     }
 }
@@ -327,8 +723,8 @@ impl ProfileRegistry {
         self.profiles.is_empty()
     }
 
-    /// Validate a single profile at load time.
-    fn validate(p: &ManagementProfile) -> Result<(), ProfileError> {
+    /// Validate a single profile's configuration (public static method).
+    pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileError> {
         // use_targets and close_ratios must be same length.
         if p.use_targets.len() != p.close_ratios.len() {
             return Err(ProfileError::TargetRatioMismatch {
@@ -363,6 +759,31 @@ impl ProfileRegistry {
 
         Ok(())
     }
+
+    /// Validate a single profile at load time (delegates to public method).
+    fn validate(p: &ManagementProfile) -> Result<(), ProfileError> {
+        Self::validate_profile(p)
+    }
+
+    /// Insert a profile into the registry. If `overwrite` is false, returns
+    /// an error when a profile with the same name already exists.
+    pub fn insert(
+        &mut self,
+        profile: ManagementProfile,
+        overwrite: bool,
+    ) -> Result<(), ProfileError> {
+        Self::validate_profile(&profile)?;
+        if !overwrite && self.profiles.contains_key(&profile.name) {
+            return Err(ProfileError::DuplicateName(profile.name.clone()));
+        }
+        self.profiles.insert(profile.name.clone(), profile);
+        Ok(())
+    }
+
+    /// Remove a profile by name. Returns `true` if the profile existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.profiles.remove(name).is_some()
+    }
 }
 
 impl std::fmt::Debug for ProfileRegistry {
@@ -380,7 +801,7 @@ impl std::fmt::Debug for ProfileRegistry {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-    use qs_core::types::{CloseReason, OrderType, Side, TargetSpec};
+    use qs_core::types::{CloseReason, OrderType, PositionId, Side, TargetSpec};
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1643,6 +2064,139 @@ close_ratios = [0.5, 0.5]
         assert!((targets[1].price - 1.0750).abs() < f64::EPSILON);
     }
 
+    // ── Phase 2: insert / remove / validate_profile ─────────────────
+
+    #[test]
+    fn insert_new_profile() {
+        let mut reg = ProfileRegistry::empty();
+        let p = ManagementProfile {
+            name: "new".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        assert!(reg.insert(p, false).is_ok());
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("new").is_some());
+    }
+
+    #[test]
+    fn insert_duplicate_no_overwrite() {
+        let mut reg = ProfileRegistry::empty();
+        let p = ManagementProfile {
+            name: "dup".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        reg.insert(p.clone(), false).unwrap();
+        let result = reg.insert(p, false);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProfileError::DuplicateName(n) => assert_eq!(n, "dup"),
+            other => panic!("Expected DuplicateName, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_duplicate_with_overwrite() {
+        let mut reg = ProfileRegistry::empty();
+        let p1 = ManagementProfile {
+            name: "ow".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        reg.insert(p1, false).unwrap();
+
+        let p2 = ManagementProfile {
+            name: "ow".into(),
+            use_targets: vec![1, 2],
+            close_ratios: vec![0.5, 0.5],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        assert!(reg.insert(p2, true).is_ok());
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.get("ow").unwrap().use_targets, vec![1, 2]);
+    }
+
+    #[test]
+    fn insert_validates_profile() {
+        let mut reg = ProfileRegistry::empty();
+        let bad = ManagementProfile {
+            name: "bad".into(),
+            use_targets: vec![1, 2],
+            close_ratios: vec![1.0], // mismatch
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        assert!(reg.insert(bad, false).is_err());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn remove_existing() {
+        let mut reg = ProfileRegistry::empty();
+        let p = ManagementProfile {
+            name: "rm".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        reg.insert(p, false).unwrap();
+        assert!(reg.remove("rm"));
+        assert_eq!(reg.len(), 0);
+        assert!(reg.get("rm").is_none());
+    }
+
+    #[test]
+    fn remove_nonexistent() {
+        let mut reg = ProfileRegistry::empty();
+        assert!(!reg.remove("nope"));
+    }
+
+    #[test]
+    fn validate_profile_public() {
+        let good = ManagementProfile {
+            name: "ok".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        assert!(good.validate().is_ok());
+
+        let bad = ManagementProfile {
+            name: "bad".into(),
+            use_targets: vec![0], // zero index
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
+        assert!(bad.validate().is_err());
+    }
+
     // ── Default stoploss_mode when omitted from TOML ────────────────────
 
     #[test]
@@ -1660,5 +2214,673 @@ close_ratios = [1.0]
         let action = profile.apply(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         assert_eq!(sl, Some(1.0800));
+    }
+
+    // ── Phase 1: RawSignal & PositionRef tests ──────────────────────────
+
+    #[test]
+    fn raw_signal_entry_has_correct_ts() {
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900],
+            group: None,
+        };
+        assert_eq!(sig.ts(), ts(10, 0, 0));
+    }
+
+    #[test]
+    fn raw_signal_close_has_correct_ts() {
+        let sig = RawSignal::Close {
+            ts: ts(11, 30, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+        };
+        assert_eq!(sig.ts(), ts(11, 30, 0));
+    }
+
+    #[test]
+    fn raw_signal_is_entry_true() {
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+        };
+        assert!(sig.is_entry());
+    }
+
+    #[test]
+    fn raw_signal_is_entry_false_for_close() {
+        let sig = RawSignal::Close {
+            ts: ts(10, 0, 0),
+            position: PositionRef::LastOnSymbol {
+                symbol: "eurusd".into(),
+            },
+        };
+        assert!(!sig.is_entry());
+    }
+
+    #[test]
+    fn raw_signal_as_entry_converts() {
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: Some(1.0850),
+            size: 2.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900, 1.0950],
+            group: Some("grp1".into()),
+        };
+        let entry = sig.as_entry().unwrap();
+        assert_eq!(entry.ts, ts(10, 0, 0));
+        assert_eq!(entry.symbol, "eurusd");
+        assert_eq!(entry.side, Side::Buy);
+        assert_eq!(entry.order_type, OrderType::Limit);
+        assert_eq!(entry.price, Some(1.0850));
+        assert!((entry.size - 2.0).abs() < f64::EPSILON);
+        assert_eq!(entry.stoploss, Some(1.0800));
+        assert_eq!(entry.targets, vec![1.0900, 1.0950]);
+        assert_eq!(entry.group, Some("grp1".into()));
+    }
+
+    #[test]
+    fn raw_signal_as_entry_returns_none_for_non_entry() {
+        let sig = RawSignal::CloseAll { ts: ts(10, 0, 0) };
+        assert!(sig.as_entry().is_none());
+    }
+
+    #[test]
+    fn from_raw_signal_entry_converts() {
+        let entry = RawSignalEntry {
+            ts: ts(10, 0, 0),
+            symbol: "gbpusd".into(),
+            side: Side::Sell,
+            order_type: OrderType::Market,
+            price: Some(1.2500),
+            size: 1.5,
+            stoploss: Some(1.2550),
+            targets: vec![1.2450],
+            group: Some("g1".into()),
+        };
+        let sig: RawSignal = entry.into();
+        assert!(sig.is_entry());
+        assert_eq!(sig.ts(), ts(10, 0, 0));
+        let back = sig.as_entry().unwrap();
+        assert_eq!(back.symbol, "gbpusd");
+        assert_eq!(back.side, Side::Sell);
+        assert!((back.size - 1.5).abs() < f64::EPSILON);
+        assert_eq!(back.group, Some("g1".into()));
+    }
+
+    #[test]
+    fn serde_roundtrip_raw_signal_entry_variant() {
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900],
+            group: None,
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: RawSignal = serde_json::from_str(&json).unwrap();
+        assert!(back.is_entry());
+        assert_eq!(back.ts(), ts(10, 0, 0));
+    }
+
+    #[test]
+    fn serde_roundtrip_raw_signal_close() {
+        let sig = RawSignal::Close {
+            ts: ts(11, 0, 0),
+            position: PositionRef::Id {
+                id: "pos123".into(),
+            },
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: RawSignal = serde_json::from_str(&json).unwrap();
+        assert!(!back.is_entry());
+        assert_eq!(back.ts(), ts(11, 0, 0));
+    }
+
+    #[test]
+    fn serde_roundtrip_position_ref_all_variants() {
+        let variants: Vec<PositionRef> = vec![
+            PositionRef::Id { id: "abc".into() },
+            PositionRef::LastOnSymbol {
+                symbol: "eurusd".into(),
+            },
+            PositionRef::LastInGroup {
+                group_id: "g1".into(),
+            },
+            PositionRef::AllOnSymbol {
+                symbol: "gbpusd".into(),
+            },
+            PositionRef::AllInGroup {
+                group_id: "g2".into(),
+            },
+        ];
+        for pr in &variants {
+            let json = serde_json::to_string(pr).unwrap();
+            let back: PositionRef = serde_json::from_str(&json).unwrap();
+            // Just verify it round-trips without panic
+            let _debug = format!("{:?}", back);
+        }
+    }
+
+    // ── Phase 2: resolve_signal tests ───────────────────────────────────
+
+    /// A mock resolver for unit testing resolve_signal.
+    struct MockResolver {
+        ids: Vec<PositionId>,
+        entry_info: Option<(f64, Side)>,
+    }
+
+    impl MockResolver {
+        fn with_ids(ids: Vec<&str>) -> Self {
+            Self {
+                ids: ids.into_iter().map(String::from).collect(),
+                entry_info: None,
+            }
+        }
+
+        fn with_ids_and_info(ids: Vec<&str>, entry_price: f64, side: Side) -> Self {
+            Self {
+                ids: ids.into_iter().map(String::from).collect(),
+                entry_info: Some((entry_price, side)),
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                ids: vec![],
+                entry_info: None,
+            }
+        }
+    }
+
+    impl PositionResolver for MockResolver {
+        fn resolve(&self, _pr: &PositionRef) -> Vec<PositionId> {
+            self.ids.clone()
+        }
+
+        fn position_entry_info(&self, _id: &PositionId) -> Option<(f64, Side)> {
+            self.entry_info
+        }
+    }
+
+    #[test]
+    fn resolve_signal_entry_returns_empty() {
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn resolve_signal_close_single() {
+        let sig = RawSignal::Close {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::ClosePosition { position_id } if position_id == "pos1"
+        ));
+    }
+
+    #[test]
+    fn resolve_signal_close_multiple() {
+        let sig = RawSignal::Close {
+            ts: ts(10, 0, 0),
+            position: PositionRef::AllOnSymbol {
+                symbol: "eurusd".into(),
+            },
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1", "pos2", "pos3"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 3);
+    }
+
+    #[test]
+    fn resolve_signal_close_empty_resolver() {
+        let sig = RawSignal::Close {
+            ts: ts(10, 0, 0),
+            position: PositionRef::LastOnSymbol {
+                symbol: "eurusd".into(),
+            },
+        };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn resolve_signal_close_partial() {
+        let sig = RawSignal::ClosePartial {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            ratio: 0.5,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::ClosePartial { position_id, ratio } => {
+                assert_eq!(position_id, "pos1");
+                assert!((ratio - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected ClosePartial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_modify_stoploss() {
+        let sig = RawSignal::ModifyStoploss {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            price: 1.0820,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::ModifyStoploss { position_id, price } => {
+                assert_eq!(position_id, "pos1");
+                assert!((price - 1.0820).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected ModifyStoploss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_move_sl_to_entry() {
+        let sig = RawSignal::MoveStoplossToEntry {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::MoveStoplossToEntry { position_id } if position_id == "pos1"
+        ));
+    }
+
+    #[test]
+    fn resolve_signal_add_target() {
+        let sig = RawSignal::AddTarget {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            price: 1.0950,
+            close_ratio: 0.5,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::AddTarget {
+                position_id,
+                price,
+                close_ratio,
+            } => {
+                assert_eq!(position_id, "pos1");
+                assert!((price - 1.0950).abs() < f64::EPSILON);
+                assert!((close_ratio - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected AddTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_remove_target() {
+        let sig = RawSignal::RemoveTarget {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            price: 1.0950,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::RemoveTarget { position_id, price } => {
+                assert_eq!(position_id, "pos1");
+                assert!((price - 1.0950).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected RemoveTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_add_rule_with_entry_info() {
+        let sig = RawSignal::AddRule {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            rule: RuleConfigDef::BreakevenWhenOffset {
+                trigger_price_offset: 0.0050,
+            },
+        };
+        let resolver = MockResolver::with_ids_and_info(vec!["pos1"], 1.0850, Side::Buy);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::AddRule { position_id, rule } => {
+                assert_eq!(position_id, "pos1");
+                match rule {
+                    RuleConfig::BreakevenWhen { trigger_price } => {
+                        assert!((trigger_price - 1.0900).abs() < 1e-10);
+                    }
+                    other => panic!("Expected BreakevenWhen, got {other:?}"),
+                }
+            }
+            other => panic!("Expected AddRule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_add_rule_no_entry_info_skips() {
+        let sig = RawSignal::AddRule {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            rule: RuleConfigDef::BreakevenWhenOffset {
+                trigger_price_offset: 0.0050,
+            },
+        };
+        // Resolver returns an ID but no entry info — offset can't resolve
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn resolve_signal_add_rule_trailing_stop() {
+        let sig = RawSignal::AddRule {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            rule: RuleConfigDef::TrailingStop { distance: 0.0030 },
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::AddRule { rule, .. } => {
+                assert!(
+                    matches!(rule, RuleConfig::TrailingStop { distance } if (*distance - 0.0030).abs() < f64::EPSILON)
+                );
+            }
+            other => panic!("Expected AddRule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_remove_rule() {
+        let sig = RawSignal::RemoveRule {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            rule_name: "TrailingStop".into(),
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::RemoveRule {
+                position_id,
+                rule_name,
+            } => {
+                assert_eq!(position_id, "pos1");
+                assert_eq!(rule_name, "TrailingStop");
+            }
+            other => panic!("Expected RemoveRule, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_scale_in() {
+        let sig = RawSignal::ScaleIn {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+            price: Some(1.0860),
+            size: 0.5,
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::ScaleIn {
+                position_id,
+                price,
+                size,
+            } => {
+                assert_eq!(position_id, "pos1");
+                assert_eq!(*price, Some(1.0860));
+                assert!((size - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected ScaleIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_cancel_pending() {
+        let sig = RawSignal::CancelPending {
+            ts: ts(10, 0, 0),
+            position: PositionRef::Id { id: "pos1".into() },
+        };
+        let resolver = MockResolver::with_ids(vec!["pos1"]);
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::CancelPending { position_id } if position_id == "pos1"
+        ));
+    }
+
+    #[test]
+    fn resolve_signal_bulk_close_all_of() {
+        let sig = RawSignal::CloseAllOf {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+        };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::CloseAllOf { symbol } if symbol == "eurusd"
+        ));
+    }
+
+    #[test]
+    fn resolve_signal_bulk_close_all() {
+        let sig = RawSignal::CloseAll { ts: ts(10, 0, 0) };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::CloseAll));
+    }
+
+    #[test]
+    fn resolve_signal_bulk_cancel_all_pending() {
+        let sig = RawSignal::CancelAllPending { ts: ts(10, 0, 0) };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], Action::CancelAllPending));
+    }
+
+    #[test]
+    fn resolve_signal_bulk_modify_all_stoploss() {
+        let sig = RawSignal::ModifyAllStoploss {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            price: 1.0780,
+        };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::ModifyAllStoploss { symbol, price } => {
+                assert_eq!(symbol, "eurusd");
+                assert!((price - 1.0780).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected ModifyAllStoploss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signal_bulk_close_all_in_group() {
+        let sig = RawSignal::CloseAllInGroup {
+            ts: ts(10, 0, 0),
+            group_id: "g1".into(),
+        };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::CloseAllInGroup { group_id } if group_id == "g1"
+        ));
+    }
+
+    #[test]
+    fn resolve_signal_bulk_modify_all_sl_in_group() {
+        let sig = RawSignal::ModifyAllStoplossInGroup {
+            ts: ts(10, 0, 0),
+            group_id: "g1".into(),
+            price: 1.0780,
+        };
+        let resolver = MockResolver::empty();
+        let actions = resolve_signal(&sig, &resolver);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::ModifyAllStoplossInGroup { group_id, price } => {
+                assert_eq!(group_id, "g1");
+                assert!((price - 1.0780).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected ModifyAllStoplossInGroup, got {other:?}"),
+        }
+    }
+
+    // ── Phase 3: apply_raw / apply_batch_raw tests ──────────────────────
+
+    #[test]
+    fn apply_raw_entry_transforms() {
+        let toml = r#"
+[[profile]]
+name = "test"
+use_targets = [1]
+close_ratios = [1.0]
+"#;
+        let reg = ProfileRegistry::from_toml(toml).unwrap();
+        let profile = reg.get("test").unwrap();
+
+        let sig = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0850),
+            size: 1.0,
+            stoploss: Some(1.0800),
+            targets: vec![1.0900],
+            group: None,
+        };
+        let result = profile.apply_raw(&sig);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_entry());
+    }
+
+    #[test]
+    fn apply_raw_close_passes_through() {
+        let toml = r#"
+[[profile]]
+name = "test"
+use_targets = [1]
+close_ratios = [1.0]
+"#;
+        let reg = ProfileRegistry::from_toml(toml).unwrap();
+        let profile = reg.get("test").unwrap();
+
+        let sig = RawSignal::Close {
+            ts: ts(10, 30, 0),
+            position: PositionRef::LastOnSymbol {
+                symbol: "eurusd".into(),
+            },
+        };
+        let result = profile.apply_raw(&sig);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(!result.is_entry());
+        assert_eq!(result.ts(), ts(10, 30, 0));
+    }
+
+    #[test]
+    fn apply_batch_raw_mixed() {
+        let toml = r#"
+[[profile]]
+name = "test"
+use_targets = [1]
+close_ratios = [1.0]
+"#;
+        let reg = ProfileRegistry::from_toml(toml).unwrap();
+        let profile = reg.get("test").unwrap();
+
+        let signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "eurusd".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: Some(1.0800),
+                targets: vec![1.0900],
+                group: None,
+            },
+            RawSignal::Close {
+                ts: ts(10, 30, 0),
+                position: PositionRef::LastOnSymbol {
+                    symbol: "eurusd".into(),
+                },
+            },
+            RawSignal::ModifyStoploss {
+                ts: ts(10, 15, 0),
+                position: PositionRef::Id { id: "pos1".into() },
+                price: 1.0820,
+            },
+        ];
+
+        let result = profile.apply_batch_raw(&signals);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].is_entry());
+        assert!(!result[1].is_entry());
+        assert!(!result[2].is_entry());
     }
 }

@@ -4,6 +4,17 @@
 //! and translates them into simulated trade results (entries, exits, P&L).
 //! It maintains a map of open entries so that when a position closes it can
 //! compute realised profit/loss.
+//!
+//! ## Contract sizes
+//!
+//! P&L is calculated as `(exit - entry) * close_size * contract_size`.
+//! The `contract_size` (also called "point value") converts lot-denominated
+//! sizes into monetary units.  For forex, 1 standard lot = 100,000 base
+//! currency units, so the contract size is 100,000.  For gold (XAUUSD),
+//! 1 lot = 100 troy ounces, so the contract size is 100.
+//!
+//! When no contract size is provided for a symbol the multiplier defaults
+//! to `1.0`, preserving backward compatibility with existing tests.
 
 use std::collections::HashMap;
 
@@ -48,16 +59,23 @@ pub struct BacktestExecutor {
     pub trade_log: Vec<TradeResult>,
     /// Currently tracked open entries (position_id → entry snapshot).
     open_entries: HashMap<PositionId, OpenEntry>,
+    /// Per-symbol contract size (point value) for P&L calculation.
+    /// Missing symbols default to 1.0.
+    contract_sizes: HashMap<String, f64>,
 }
 
 impl BacktestExecutor {
-    /// Create a new executor with the given starting balance.
-    pub fn new(initial_balance: f64) -> Self {
+    /// Create a new executor with the given starting balance and contract sizes.
+    ///
+    /// `contract_sizes` maps symbol name → contract size (e.g. 100_000 for forex).
+    /// Pass an empty map to get the legacy behaviour (multiplier = 1.0).
+    pub fn new(initial_balance: f64, contract_sizes: HashMap<String, f64>) -> Self {
         Self {
             initial_balance,
             balance: initial_balance,
             trade_log: Vec::new(),
             open_entries: HashMap::new(),
+            contract_sizes,
         }
     }
 
@@ -170,9 +188,15 @@ impl BacktestExecutor {
             entry.original_size * close_ratio
         };
 
+        let cs = self
+            .contract_sizes
+            .get(&entry.symbol)
+            .copied()
+            .unwrap_or(1.0);
+
         let pnl = match entry.side {
-            Side::Buy => (exit_price - entry.entry_price) * close_size,
-            Side::Sell => (entry.entry_price - exit_price) * close_size,
+            Side::Buy => (exit_price - entry.entry_price) * close_size * cs,
+            Side::Sell => (entry.entry_price - exit_price) * close_size * cs,
         };
 
         self.balance += pnl;
@@ -210,6 +234,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use qs_core::types::{Action, OrderType, Side, TargetSpec};
+    use std::collections::HashMap;
 
     fn ts(h: u32, m: u32, s: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 1, 1)
@@ -230,7 +255,7 @@ mod tests {
     #[test]
     fn tracks_open_and_full_close_pnl() {
         let mut engine = TradeEngine::new();
-        let mut exec = BacktestExecutor::new(10_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
 
         // Open a buy
         let open_quote = make_quote("EURUSD", 1.0848, 1.0850, ts(10, 0, 0));
@@ -271,7 +296,7 @@ mod tests {
     #[test]
     fn tracks_partial_close() {
         let mut engine = TradeEngine::new();
-        let mut exec = BacktestExecutor::new(10_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
 
         let open_quote = make_quote("EURUSD", 1.0848, 1.0850, ts(10, 0, 0));
         let effects = engine
@@ -328,7 +353,7 @@ mod tests {
         // TP2: price=1.0950, close_ratio=0.3  → close 0.6 lots
         // SL:  price=1.0800                    → close remaining 0.8 lots
         let mut engine = TradeEngine::new();
-        let mut exec = BacktestExecutor::new(10_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
 
         let open_quote = make_quote("EURUSD", 1.0848, 1.0850, ts(10, 0, 0));
         let effects = engine
@@ -442,7 +467,7 @@ mod tests {
     #[test]
     fn sell_position_pnl() {
         let mut engine = TradeEngine::new();
-        let mut exec = BacktestExecutor::new(10_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
 
         let open_quote = make_quote("XAUUSD", 1999.0, 2000.0, ts(10, 0, 0));
         let effects = engine
@@ -484,7 +509,7 @@ mod tests {
     #[test]
     fn scale_in_updates_entry() {
         let mut engine = TradeEngine::new();
-        let mut exec = BacktestExecutor::new(10_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
 
         let q1 = make_quote("EURUSD", 1.0848, 1.0850, ts(10, 0, 0));
         let effects = engine

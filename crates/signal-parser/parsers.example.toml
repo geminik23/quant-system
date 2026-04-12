@@ -1,0 +1,14 @@
+# Example parser configuration for qs-signal-parser.
+# Each [[parser]] block registers a channel parser by name and type.
+
+[[parser]]
+name = "wave-trader"
+type = "template"
+channel_ids = [2331249584]
+default_size = 0.01
+
+[[parser]]
+name = "gold-signals"
+type = "template"
+channel_ids = [1890843109, 1735292110]
+default_size = 0.05
