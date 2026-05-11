@@ -40,7 +40,7 @@ pub fn parse_tz_offset(s: &str) -> Result<FixedOffset> {
         _ => {
             return Err(DataError::InvalidTimestamp(format!(
                 "tz offset must start with +/-: {s}"
-            )))
+            )));
         }
     };
     let rest = &s[1..];

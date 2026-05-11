@@ -27,4 +27,3 @@ pub trait ChannelParser: Send + Sync {
         ctx: &ParseContext,
     ) -> ParsedAction;
 }
-

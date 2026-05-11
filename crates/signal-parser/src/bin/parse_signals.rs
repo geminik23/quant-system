@@ -1,11 +1,11 @@
 //! CLI binary: reads raw Telegram JSONL, parses via configured channel parsers,
 //! and outputs parsed signal JSONL to stdout or a file.
-
-use std::io::{self, BufRead, Write};
+//!
+//! This is a thin wrapper around `OfflineRunner` for TOML-configured parsers.
 
 use clap::Parser;
 
-use signal_parser::{RawTgMessage, SignalParserError, load_parsers, parse_messages};
+use signal_parser::{OfflineArgs, OfflineRunner, SignalParserError, load_parsers};
 
 #[derive(Parser)]
 #[command(
@@ -13,7 +13,7 @@ use signal_parser::{RawTgMessage, SignalParserError, load_parsers, parse_message
     about = "Parse raw Telegram JSONL into trade signals"
 )]
 struct Cli {
-    /// Path to the raw messages JSONL file.
+    /// Path to the raw messages JSONL file (or "-" for stdin).
     #[arg(short, long)]
     input: String,
 
@@ -34,39 +34,9 @@ fn main() -> Result<(), SignalParserError> {
     // Load parser registry from TOML config.
     let registry = load_parsers(&cli.parsers_config)?;
 
-    // Read raw messages from JSONL input.
-    let file = std::fs::File::open(&cli.input)?;
-    let reader = io::BufReader::new(file);
-    let mut messages = Vec::new();
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg: RawTgMessage = serde_json::from_str(trimmed)
-            .map_err(|e| SignalParserError::Config(format!("line {}: {e}", i + 1)))?;
-        messages.push(msg);
-    }
-
-    tracing::info!(count = messages.len(), "loaded raw messages");
-
-    // Parse all messages through the registry pipeline.
-    let entries = parse_messages(&registry, &messages)?;
-
-    tracing::info!(count = entries.len(), "parsed signal entries");
-
-    // Write output as JSONL.
-    let mut writer: Box<dyn Write> = match &cli.output {
-        Some(path) => Box::new(io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(io::BufWriter::new(io::stdout().lock())),
-    };
-
-    for entry in &entries {
-        serde_json::to_writer(&mut writer, entry)?;
-        writeln!(writer)?;
-    }
-
-    writer.flush()?;
-    Ok(())
+    // Delegate to OfflineRunner with pre-built args.
+    OfflineRunner::new(registry).run_with_args(OfflineArgs {
+        input: cli.input,
+        output: cli.output,
+    })
 }

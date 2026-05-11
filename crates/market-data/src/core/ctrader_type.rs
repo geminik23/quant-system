@@ -13,4 +13,3 @@ pub struct CTraderFixConfig {
     pub retry_base_delay_secs: Option<u64>, // default: 2
     pub retry_max_delay_secs: Option<u64>, // default: 60
 }
-

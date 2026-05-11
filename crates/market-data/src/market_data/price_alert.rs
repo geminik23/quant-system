@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-use nanoid::nanoid;
 use crate::core::AlertSet;
-
+use nanoid::nanoid;
+use std::collections::HashMap;
 
 /// A `PriceAlert` struct for setting up price alerts on trading symbols.
 ///

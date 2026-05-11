@@ -22,7 +22,9 @@ pub enum SymbolError {
     #[error("Symbol not found: '{0}'")]
     NotFound(String),
 
-    #[error("Invalid lot spec for '{symbol}': lot_step_units ({step}) must be > 0 and <= lot_base_units ({base})")]
+    #[error(
+        "Invalid lot spec for '{symbol}': lot_step_units ({step}) must be > 0 and <= lot_base_units ({base})"
+    )]
     InvalidLotSpec {
         symbol: String,
         step: i64,

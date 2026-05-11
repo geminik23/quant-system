@@ -14,6 +14,11 @@ name = "signal_parser"
 name = "parse_signals"
 path = "src/bin/parse_signals.rs"
 
+[features]
+default = ["offline"]
+offline = []
+online = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+
 [dependencies]
 qs-core = { path = "../core" }
 qs-backtest = { path = "../backtest" }
@@ -27,3 +32,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 regex = { workspace = true }
+
+# Online-only (feature-gated)
+tokio = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }

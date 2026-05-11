@@ -5,6 +5,7 @@
 //! returns a response message. Errors are captured in the response rather
 //! than crashing the server.
 
+use std::path::Path;
 use std::sync::RwLock;
 use std::time::Instant;
 
@@ -12,7 +13,7 @@ use chrono::NaiveDateTime;
 use data_preprocess::ParquetStore;
 use data_preprocess::models::{BarQueryOpts, QueryOpts, Timeframe};
 use qs_backtest::BacktestResult;
-use qs_backtest::data_feed::{DataFeed, VecFeed, bars_to_feed, ticks_to_feed};
+use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
 use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RawSignal, RawSignalEntry};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
 use qs_core::types::{Action, OrderType, Side, Signal};
@@ -661,14 +662,22 @@ fn load_market_events(
     timeframe: Option<&str>,
     from: Option<NaiveDateTime>,
     to: Option<NaiveDateTime>,
-) -> Result<Vec<qs_backtest::data_feed::MarketEvent>> {
+) -> Result<Vec<MarketEvent>> {
     let store = ParquetStore::open(data_dir)?;
     let dt = data_type.to_lowercase();
 
     if dt == "tick" {
+        let disk_exchange = resolve_partition_value(data_dir, "ticks", "exchange", exchange, "");
+        let disk_symbol = resolve_partition_value(
+            data_dir,
+            "ticks",
+            "symbol",
+            symbol,
+            &format!("exchange={disk_exchange}"),
+        );
         let opts = QueryOpts {
-            exchange: exchange.into(),
-            symbol: symbol.into(),
+            exchange: disk_exchange.clone(),
+            symbol: disk_symbol.clone(),
             from,
             to,
             limit: 0,
@@ -678,15 +687,16 @@ fn load_market_events(
         let (ticks, _total) = store.query_ticks(&opts)?;
         if ticks.is_empty() {
             return Err(BacktestServerError::NoDataFound {
-                symbol: symbol.into(),
-                exchange: exchange.into(),
+                symbol: disk_symbol,
+                exchange: disk_exchange,
                 data_type: "tick".into(),
             });
         }
         let feed = ticks_to_feed(ticks);
-        // Extract the events from the VecFeed via clone to get the inner vec.
-        // VecFeed::new sorts nothing, so we just need the events.
-        Ok(feed_to_events(feed))
+        Ok(canonicalize_market_event_symbols(
+            feed_to_events(feed),
+            symbol,
+        ))
     } else if dt == "bar" {
         let tf_str = timeframe.ok_or_else(|| {
             BacktestServerError::InvalidRequest("timeframe is required for bar data".into())
@@ -694,10 +704,25 @@ fn load_market_events(
         let tf = Timeframe::parse(tf_str).map_err(|_| {
             BacktestServerError::InvalidRequest(format!("Invalid timeframe: '{tf_str}'"))
         })?;
+        let disk_exchange = resolve_partition_value(data_dir, "bars", "exchange", exchange, "");
+        let disk_symbol = resolve_partition_value(
+            data_dir,
+            "bars",
+            "symbol",
+            symbol,
+            &format!("exchange={disk_exchange}"),
+        );
+        let disk_timeframe = resolve_partition_value(
+            data_dir,
+            "bars",
+            "timeframe",
+            tf.as_str(),
+            &format!("exchange={disk_exchange}/symbol={disk_symbol}"),
+        );
         let opts = BarQueryOpts {
-            exchange: exchange.into(),
-            symbol: symbol.into(),
-            timeframe: tf.as_str().to_string(),
+            exchange: disk_exchange.clone(),
+            symbol: disk_symbol.clone(),
+            timeframe: disk_timeframe.clone(),
             from,
             to,
             limit: 0,
@@ -707,13 +732,16 @@ fn load_market_events(
         let (bars, _total) = store.query_bars(&opts)?;
         if bars.is_empty() {
             return Err(BacktestServerError::NoDataFound {
-                symbol: symbol.into(),
-                exchange: exchange.into(),
-                data_type: format!("bar({})", tf_str),
+                symbol: disk_symbol,
+                exchange: disk_exchange,
+                data_type: format!("bar({})", disk_timeframe),
             });
         }
         let feed = bars_to_feed(bars);
-        Ok(feed_to_events(feed))
+        Ok(canonicalize_market_event_symbols(
+            feed_to_events(feed),
+            symbol,
+        ))
     } else {
         Err(BacktestServerError::InvalidRequest(format!(
             "Invalid data_type: '{}'. Must be 'tick' or 'bar'.",
@@ -722,8 +750,58 @@ fn load_market_events(
     }
 }
 
+/// Resolve a Hive partition value by scanning child directories case-insensitively.
+fn resolve_partition_value(
+    data_dir: &str,
+    data_subdir: &str,
+    key: &str,
+    requested: &str,
+    parent: &str,
+) -> String {
+    let dir = if parent.is_empty() {
+        Path::new(data_dir).join(data_subdir)
+    } else {
+        Path::new(data_dir).join(data_subdir).join(parent)
+    };
+    let prefix = format!("{key}=");
+    let mut case_insensitive_match = None;
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(value) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if value == requested {
+                return value.to_string();
+            }
+            if case_insensitive_match.is_none() && value.eq_ignore_ascii_case(requested) {
+                case_insensitive_match = Some(value.to_string());
+            }
+        }
+    }
+
+    case_insensitive_match.unwrap_or_else(|| requested.to_string())
+}
+
+/// Rewrite loaded market events to the canonical symbol used by signals.
+fn canonicalize_market_event_symbols(
+    mut events: Vec<MarketEvent>,
+    canonical_symbol: &str,
+) -> Vec<MarketEvent> {
+    for event in &mut events {
+        match event {
+            MarketEvent::Tick { symbol, .. } | MarketEvent::Bar { symbol, .. } => {
+                *symbol = canonical_symbol.to_string();
+            }
+        }
+    }
+    events
+}
+
 /// Drain a VecFeed into its underlying Vec<MarketEvent>.
-fn feed_to_events(mut feed: VecFeed) -> Vec<qs_backtest::data_feed::MarketEvent> {
+fn feed_to_events(mut feed: VecFeed) -> Vec<MarketEvent> {
     let mut events = Vec::with_capacity(feed.total());
     while let Some(event) = feed.next_event() {
         events.push(event);
@@ -1091,6 +1169,113 @@ mod tests {
         let resp = handle_ping(&state);
         assert_eq!(resp.status, "OK");
         assert_eq!(resp.data_dir, "/tmp/test");
+    }
+
+    fn temp_data_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "qs_backtest_server_{name}_{}_{}",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    #[test]
+    fn resolve_partition_value_matches_case_insensitive_symbol() {
+        let root = temp_data_dir("partition_symbol");
+        let symbol_dir = root
+            .join("ticks")
+            .join("exchange=icmarkets")
+            .join("symbol=AUDCAD");
+        std::fs::create_dir_all(&symbol_dir).unwrap();
+        let root_str = root.to_string_lossy().to_string();
+
+        let resolved =
+            resolve_partition_value(&root_str, "ticks", "symbol", "audcad", "exchange=icmarkets");
+
+        assert_eq!(resolved, "AUDCAD");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_market_events_resolves_uppercase_tick_partition() {
+        let root = temp_data_dir("tick_partition");
+        let store = ParquetStore::open(&root).unwrap();
+        let ts = parse_datetime("2026-01-15T10:00:00").unwrap();
+        let ticks = vec![data_preprocess::Tick {
+            exchange: "icmarkets".into(),
+            symbol: "AUDCAD".into(),
+            ts,
+            bid: Some(0.9000),
+            ask: Some(0.9002),
+            last: None,
+            volume: None,
+            flags: None,
+        }];
+        store.insert_ticks(&ticks).unwrap();
+        let root_str = root.to_string_lossy().to_string();
+
+        let events =
+            load_market_events(&root_str, "icmarkets", "audcad", "tick", None, None, None).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            MarketEvent::Tick {
+                symbol, bid, ask, ..
+            } => {
+                assert_eq!(symbol, "audcad");
+                assert_eq!(*bid, 0.9000);
+                assert_eq!(*ask, 0.9002);
+            }
+            MarketEvent::Bar { .. } => panic!("expected tick event"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_market_events_resolves_uppercase_bar_partition() {
+        let root = temp_data_dir("bar_partition");
+        let store = ParquetStore::open(&root).unwrap();
+        let ts = parse_datetime("2026-01-15T10:00:00").unwrap();
+        let bars = vec![data_preprocess::Bar {
+            exchange: "icmarkets".into(),
+            symbol: "AUDCAD".into(),
+            timeframe: Timeframe::M1,
+            ts,
+            open: 0.9000,
+            high: 0.9010,
+            low: 0.8990,
+            close: 0.9005,
+            tick_vol: 10,
+            volume: 0,
+            spread: 2,
+        }];
+        store.insert_bars(&bars).unwrap();
+        let root_str = root.to_string_lossy().to_string();
+
+        let events = load_market_events(
+            &root_str,
+            "icmarkets",
+            "audcad",
+            "bar",
+            Some("1m"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            MarketEvent::Bar { symbol, close, .. } => {
+                assert_eq!(symbol, "audcad");
+                assert_eq!(*close, 0.9005);
+            }
+            MarketEvent::Tick { .. } => panic!("expected bar event"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
