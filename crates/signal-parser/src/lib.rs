@@ -19,6 +19,7 @@ pub use handler::{LoggingHandler, NoopHandler, SignalContext, SignalHandler};
 pub use offline::{OfflineArgs, OfflineRunner};
 pub use parser::ChannelParser;
 pub use pipeline::{parse_messages, parse_messages_with_context};
+pub use qs_backtest::{PositionRef, RawSignal};
 pub use registry::ParserRegistry;
 pub use template::TemplateParser;
 pub use types::{LlmClient, MarketQuote, ParseContext, ParsedAction, RawTgMessage};

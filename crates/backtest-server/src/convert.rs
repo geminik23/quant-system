@@ -28,7 +28,7 @@ fn ndt_to_string(ts: NaiveDateTime) -> String {
     ts.format(TS_FMT).to_string()
 }
 
-// ── BacktestConfigMsg → BacktestConfig ──────────────────────────────────────
+// ── BacktestConfigMsg -> BacktestConfig ──────────────────────────────────────
 
 /// Convert the wire config message into the internal `BacktestConfig`.
 pub fn config_from_msg(msg: &BacktestConfigMsg) -> BacktestConfig {
@@ -157,7 +157,7 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
     }
 }
 
-// ── BacktestResult → BacktestResultMsg ──────────────────────────────────────
+// ── BacktestResult -> BacktestResultMsg ──────────────────────────────────────
 
 /// Convert the full backtest result into its wire-safe message form.
 pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
@@ -333,12 +333,8 @@ fn sanitize_f64(v: f64) -> f64 {
 /// Convert a wire-safe `PositionRefMsg` into the internal `PositionRef`.
 pub fn position_ref_from_msg(msg: &PositionRefMsg, registry: &SymbolRegistry) -> PositionRef {
     match msg {
-        PositionRefMsg::Id { id } => PositionRef::Id { id: id.clone() },
-        PositionRefMsg::LastOnSymbol { symbol } => PositionRef::LastOnSymbol {
-            symbol: registry.normalize_or_passthrough(symbol),
-        },
-        PositionRefMsg::LastInGroup { group_id } => PositionRef::LastInGroup {
-            group_id: group_id.clone(),
+        PositionRefMsg::ByTradeId { trade_id } => PositionRef::ByTradeId {
+            trade_id: trade_id.clone(),
         },
         PositionRefMsg::AllOnSymbol { symbol } => PositionRef::AllOnSymbol {
             symbol: registry.normalize_or_passthrough(symbol),
@@ -369,6 +365,7 @@ pub fn raw_signal_from_msg(
             stoploss,
             targets,
             group,
+            trade_id,
         } => {
             let parsed_ts = parse_datetime_internal(ts)?;
             let parsed_symbol = if symbol.is_empty() {
@@ -388,6 +385,7 @@ pub fn raw_signal_from_msg(
                 stoploss: *stoploss,
                 targets: targets.clone(),
                 group: group.clone(),
+                trade_id: trade_id.clone(),
             })
         }
         RawSignalMsg::Close { ts, position } => Ok(RawSignal::Close {
@@ -570,8 +568,6 @@ fn parse_order_type_internal(s: &str) -> crate::error::Result<OrderType> {
         ))),
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -849,22 +845,22 @@ mod tests {
     #[test]
     fn position_ref_from_msg_id() {
         let reg = qs_symbols::SymbolRegistry::empty();
-        let msg = PositionRefMsg::Id {
-            id: "pos_123".into(),
+        let msg = PositionRefMsg::ByTradeId {
+            trade_id: "pos_123".into(),
         };
         let result = position_ref_from_msg(&msg, &reg);
-        assert!(matches!(result, PositionRef::Id { id } if id == "pos_123"));
+        assert!(matches!(result, PositionRef::ByTradeId { trade_id } if trade_id == "pos_123"));
     }
 
     #[test]
-    fn position_ref_from_msg_last_on_symbol_normalizes() {
+    fn position_ref_from_msg_all_on_symbol_normalizes() {
         let reg = qs_symbols::SymbolRegistry::empty();
-        let msg = PositionRefMsg::LastOnSymbol {
+        let msg = PositionRefMsg::AllOnSymbol {
             symbol: "EUR/USD".into(),
         };
         let result = position_ref_from_msg(&msg, &reg);
         // empty registry normalizes via passthrough: lowercase + strip separators
-        assert!(matches!(result, PositionRef::LastOnSymbol { symbol } if symbol == "eurusd"));
+        assert!(matches!(result, PositionRef::AllOnSymbol { symbol } if symbol == "eurusd"));
     }
 
     #[test]
@@ -890,17 +886,33 @@ mod tests {
             stoploss: Some(1.0800),
             targets: vec![1.0900],
             group: Some("grp".into()),
+            trade_id: Some("t1".into()),
         };
         let result = raw_signal_from_msg(&msg, "default", &reg).unwrap();
         assert!(result.is_entry());
-        let entry = result.as_entry().unwrap();
-        assert_eq!(entry.symbol, "eurusd");
-        assert_eq!(entry.side, Side::Buy);
-        assert_eq!(entry.order_type, OrderType::Market);
-        assert_eq!(entry.size, 0.02);
-        assert_eq!(entry.stoploss, Some(1.0800));
-        assert_eq!(entry.targets, vec![1.0900]);
-        assert_eq!(entry.group, Some("grp".into()));
+        match &result {
+            RawSignal::Entry {
+                symbol,
+                side,
+                order_type,
+                size,
+                stoploss,
+                targets,
+                group,
+                trade_id,
+                ..
+            } => {
+                assert_eq!(symbol, "eurusd");
+                assert_eq!(*side, Side::Buy);
+                assert_eq!(*order_type, OrderType::Market);
+                assert_eq!(*size, 0.02);
+                assert_eq!(*stoploss, Some(1.0800));
+                assert_eq!(*targets, vec![1.0900]);
+                assert_eq!(*group, Some("grp".into()));
+                assert_eq!(trade_id.as_deref(), Some("t1"));
+            }
+            _ => panic!("Expected Entry"),
+        }
     }
 
     #[test]
@@ -908,8 +920,8 @@ mod tests {
         let reg = qs_symbols::SymbolRegistry::empty();
         let msg = RawSignalMsg::ClosePartial {
             ts: "2026-01-15T10:30:00".into(),
-            position: PositionRefMsg::LastOnSymbol {
-                symbol: "eurusd".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "t1".into(),
             },
             ratio: 0.5,
         };
@@ -920,7 +932,7 @@ mod tests {
             } => {
                 assert!((ratio - 0.5).abs() < f64::EPSILON);
                 assert!(
-                    matches!(position, PositionRef::LastOnSymbol { symbol } if symbol == "eurusd")
+                    matches!(position, PositionRef::ByTradeId { trade_id } if trade_id == "t1")
                 );
             }
             _ => panic!("Expected ClosePartial"),
@@ -932,7 +944,9 @@ mod tests {
         let reg = qs_symbols::SymbolRegistry::empty();
         let msg = RawSignalMsg::AddRule {
             ts: "2026-01-15T10:30:00".into(),
-            position: PositionRefMsg::Id { id: "p1".into() },
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "p1".into(),
+            },
             rule: RuleConfigDefMsg::TrailingStop { distance: 0.0020 },
         };
         let result = raw_signal_from_msg(&msg, "eurusd", &reg).unwrap();
@@ -951,8 +965,8 @@ mod tests {
         let reg = qs_symbols::SymbolRegistry::empty();
         let msg = RawSignalMsg::ScaleIn {
             ts: "2026-01-15T10:30:00".into(),
-            position: PositionRefMsg::LastInGroup {
-                group_id: "g1".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "g1-trade-1".into(),
             },
             price: Some(1.0850),
             size: 0.01,
@@ -968,7 +982,7 @@ mod tests {
                 assert_eq!(price, Some(1.0850));
                 assert_eq!(size, 0.01);
                 assert!(
-                    matches!(position, PositionRef::LastInGroup { group_id } if group_id == "g1")
+                    matches!(position, PositionRef::ByTradeId { trade_id } if trade_id == "g1-trade-1")
                 );
             }
             _ => panic!("Expected ScaleIn"),
@@ -1000,6 +1014,7 @@ mod tests {
             side: "WRONG".into(),
             order_type: "Market".into(),
             price: None,
+            trade_id: None,
             size: 0.01,
             stoploss: None,
             targets: vec![],
@@ -1029,11 +1044,15 @@ mod tests {
             size: 0.01,
             stoploss: None,
             targets: vec![],
+            trade_id: None,
             group: None,
         };
         let result = raw_signal_from_msg(&msg, "xauusd", &reg).unwrap();
-        let entry = result.as_entry().unwrap();
-        assert_eq!(entry.symbol, "xauusd");
+        assert!(result.is_entry());
+        match &result {
+            RawSignal::Entry { symbol, .. } => assert_eq!(symbol, "xauusd"),
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]

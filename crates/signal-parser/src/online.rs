@@ -244,11 +244,11 @@ fn process_relay(
 
             // Call handler based on event type and parse result.
             match action {
-                ParsedAction::Entries(entries) => {
+                ParsedAction::Signals(signals) => {
                     if relay.t == "EDIT" {
-                        handler.on_signal_edit(entries, &signal_ctx);
+                        handler.on_signal_edit(signals, &signal_ctx);
                     } else {
-                        handler.on_signals(entries, &signal_ctx);
+                        handler.on_signals(signals, &signal_ctx);
                     }
                 }
                 ParsedAction::Skip => {
@@ -297,7 +297,7 @@ fn process_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qs_backtest::RawSignalEntry;
+    use qs_backtest::RawSignal;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     //
@@ -310,7 +310,7 @@ mod tests {
         delete_count: AtomicUsize,
         skip_count: AtomicUsize,
         unregistered_count: AtomicUsize,
-        last_signals: std::sync::Mutex<Vec<RawSignalEntry>>,
+        last_signals: std::sync::Mutex<Vec<RawSignal>>,
         last_del_ids: std::sync::Mutex<Vec<i64>>,
     }
 
@@ -329,13 +329,13 @@ mod tests {
     }
 
     impl SignalHandler for TestHandler {
-        fn on_signals(&self, entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {
+        fn on_signals(&self, signals: Vec<RawSignal>, _ctx: &SignalContext) {
             self.new_count.fetch_add(1, Ordering::Relaxed);
-            *self.last_signals.lock().unwrap() = entries;
+            *self.last_signals.lock().unwrap() = signals;
         }
-        fn on_signal_edit(&self, entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {
+        fn on_signal_edit(&self, signals: Vec<RawSignal>, _ctx: &SignalContext) {
             self.edit_count.fetch_add(1, Ordering::Relaxed);
-            *self.last_signals.lock().unwrap() = entries;
+            *self.last_signals.lock().unwrap() = signals;
         }
         fn on_signal_delete(&self, _chat_id: i64, msg_ids: Vec<i64>) {
             self.delete_count.fetch_add(1, Ordering::Relaxed);
@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(handler.new_count.load(Ordering::Relaxed), 1);
         let signals = handler.last_signals.lock().unwrap();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].symbol, "eurusd");
+        assert_eq!(signals[0].as_entry().unwrap().symbol, "eurusd");
     }
 
     #[test]

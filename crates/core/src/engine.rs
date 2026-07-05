@@ -226,8 +226,10 @@ impl TradeEngine {
                 targets,
                 rules,
                 group,
+                trade_id,
             } => self.action_open(
-                symbol, side, order_type, price, size, stoploss, targets, rules, group, ts,
+                symbol, side, order_type, price, size, stoploss, targets, rules, group, trade_id,
+                ts,
             ),
 
             // ── Scale in ────────────────────────────────────────────
@@ -235,7 +237,8 @@ impl TradeEngine {
                 position_id,
                 price,
                 size,
-            } => self.action_scale_in(&position_id, price, size, ts),
+                trade_id,
+            } => self.action_scale_in(&position_id, price, size, trade_id, ts),
 
             // ── Close position ──────────────────────────────────────
             Action::ClosePosition { position_id } => self.action_close_position(&position_id, ts),
@@ -316,6 +319,7 @@ impl TradeEngine {
         targets: Vec<TargetSpec>,
         rules: Vec<crate::types::RuleConfig>,
         group: Option<String>,
+        trade_id: Option<crate::types::TradeId>,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
         let id = gen_id();
@@ -362,8 +366,14 @@ impl TradeEngine {
                         },
                         ts,
                     ));
+                }
+                if let Some(ref tid) = trade_id {
+                    pos.set_trade_id(Some(tid.clone()));
+                }
+                if group.is_some() {
+                    let gid = group.as_ref().unwrap().clone();
                     self.manager.add(pos);
-                    self.manager.add_to_group(gid, id.clone());
+                    self.manager.add_to_group(&gid, id.clone());
                 } else {
                     self.manager.add(pos);
                 }
@@ -394,8 +404,14 @@ impl TradeEngine {
                         },
                         ts,
                     ));
+                }
+                if let Some(ref tid) = trade_id {
+                    pos.set_trade_id(Some(tid.clone()));
+                }
+                if group.is_some() {
+                    let gid = group.as_ref().unwrap().clone();
                     self.manager.add(pos);
-                    self.manager.add_to_group(gid, id.clone());
+                    self.manager.add_to_group(&gid, id.clone());
                 } else {
                     self.manager.add(pos);
                 }
@@ -419,6 +435,7 @@ impl TradeEngine {
         position_id: &str,
         price: Option<f64>,
         size: f64,
+        trade_id: Option<crate::types::TradeId>,
         ts: NaiveDateTime,
     ) -> Result<Vec<Effect>> {
         let pos = self
@@ -454,6 +471,13 @@ impl TradeEngine {
         pos.data
             .records
             .push((PositionRecord::Filled { fill: fill.clone() }, ts));
+
+        // Allow scale-in to attach a trade id if the position did not have one.
+        if pos.data.trade_id.is_none() && trade_id.is_some() {
+            let tid = trade_id.clone().unwrap();
+            pos.set_trade_id(Some(tid.clone()));
+            self.manager.set_trade_id(position_id, tid);
+        }
 
         Ok(vec![Effect::ScaledIn {
             id: position_id.to_owned(),
@@ -1301,6 +1325,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1340,6 +1365,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1368,6 +1394,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -1412,6 +1439,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1459,6 +1487,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1508,6 +1537,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1523,6 +1553,7 @@ mod tests {
                     position_id: id.clone(),
                     price: Some(1.0900),
                     size: 1.0,
+                    trade_id: None,
                 },
                 ts(10, 5, 0),
             )
@@ -1551,6 +1582,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1597,6 +1629,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -1637,6 +1670,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1684,6 +1718,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1723,6 +1758,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1739,6 +1775,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1755,6 +1792,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1791,6 +1829,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -1807,6 +1846,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -1839,6 +1879,7 @@ mod tests {
                         trigger_price: 1.0900,
                     }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1881,6 +1922,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![RuleConfig::TrailingStop { distance: 0.0020 }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1929,6 +1971,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -1997,6 +2040,7 @@ mod tests {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         );
@@ -2027,6 +2071,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2074,6 +2119,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2111,6 +2157,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2148,6 +2195,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2193,6 +2241,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -2239,6 +2288,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(9, 0, 0),
             )
@@ -2274,6 +2324,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![RuleConfig::TrailingStop { distance: 0.0020 }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2330,6 +2381,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2370,6 +2422,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2420,6 +2473,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2480,6 +2534,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2516,6 +2571,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2534,6 +2590,7 @@ mod tests {
                     position_id: id.clone(),
                     price: None,
                     size: 1.0,
+                    trade_id: None,
                 },
                 ts(10, 5, 0),
             )
@@ -2577,6 +2634,7 @@ mod tests {
                         trigger_price: 1.0800,
                     }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2638,6 +2696,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2680,6 +2739,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2733,6 +2793,7 @@ mod tests {
                     ],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2784,6 +2845,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![RuleConfig::TrailingStop { distance: 0.0020 }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2833,6 +2895,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2886,6 +2949,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2931,6 +2995,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -2985,6 +3050,7 @@ mod tests {
                         targets: vec![],
                         rules: vec![],
                         group: None,
+                        trade_id: None,
                     },
                     ts(10, 0, i),
                 )
@@ -3016,6 +3082,7 @@ mod tests {
                         trigger_price: 1.0900,
                     }],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -3076,6 +3143,7 @@ mod tests {
                     ],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 }),
                 None,
             ),
@@ -3143,6 +3211,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )

@@ -91,42 +91,23 @@ pub struct BacktestConfigMsg {
     pub fill_model: Option<String>,
 }
 
-// ── Raw Signal Entry (RPC transport version) ────────────────────────────────
-
-/// A raw trade signal as sent over the wire.
-///
-/// Uses strings for enums (side, order_type) and ISO strings for timestamps.
-/// The server converts these to the internal typed representations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawSignalEntryMsg {
-    pub ts: String,
-    pub symbol: String,
-    pub side: String,
-    pub order_type: String,
-    pub price: Option<f64>,
-    pub size: f64,
-    pub stoploss: Option<f64>,
-    #[serde(default)]
-    pub targets: Vec<f64>,
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
 // ── Run Backtest ────────────────────────────────────────────────────────────
 
-/// Request to execute a single backtest run.
+/// Request to execute a single backtest run. Only `raw_signals` is accepted
+/// as signal input (the legacy `signals` field has been removed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBacktestRequest {
     pub symbol: String,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub all_symbols: bool,
     pub exchange: String,
     pub data_type: String,
     pub timeframe: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
-    pub signals: Vec<RawSignalEntryMsg>,
-    /// Full signal stream (entry + management). When non-empty, takes
-    /// precedence over `signals`. Backward-compatible: existing clients
-    /// that omit this field get an empty vec via `#[serde(default)]`.
+    /// Full signal stream (entry + management).
     #[serde(default)]
     pub raw_signals: Vec<RawSignalMsg>,
     pub profile: Option<String>,
@@ -150,14 +131,16 @@ pub struct RunBacktestResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBacktestMultiRequest {
     pub symbol: String,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub all_symbols: bool,
     pub exchange: String,
     pub data_type: String,
     pub timeframe: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
-    pub signals: Vec<RawSignalEntryMsg>,
-    /// Full signal stream (entry + management). When non-empty, takes
-    /// precedence over `signals`.
+    /// Full signal stream (entry + management).
     #[serde(default)]
     pub raw_signals: Vec<RawSignalMsg>,
     pub profiles: Vec<ProfileRef>,
@@ -403,6 +386,9 @@ pub enum RawSignalMsg {
         targets: Vec<f64>,
         #[serde(default)]
         group: Option<String>,
+        /// Application-defined trade id. Required for `ByTradeId` resolution.
+        #[serde(default)]
+        trade_id: Option<String>,
     },
     /// Close position(s) at market.
     Close {
@@ -489,12 +475,8 @@ pub enum RawSignalMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PositionRefMsg {
-    /// Explicit position ID.
-    Id { id: String },
-    /// The most recently opened position on this symbol.
-    LastOnSymbol { symbol: String },
-    /// The most recently opened position in this group.
-    LastInGroup { group_id: String },
+    /// Target the position with the given application-defined trade id.
+    ByTradeId { trade_id: String },
     /// All open positions on this symbol.
     AllOnSymbol { symbol: String },
     /// All open positions in this group.

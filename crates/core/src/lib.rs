@@ -39,5 +39,5 @@ pub use position::Position;
 pub use rules::Rule;
 pub use types::{
     Action, CloseReason, Effect, Fill, FillModel, FixedPrice, GroupId, Lots, OrderType, PositionId,
-    PositionRecord, PositionStatus, PriceQuote, RuleConfig, Side, Signal, TargetSpec,
+    PositionRecord, PositionStatus, PriceQuote, RuleConfig, Side, Signal, TargetSpec, TradeId,
 };

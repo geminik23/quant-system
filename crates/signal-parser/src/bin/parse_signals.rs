@@ -1,5 +1,5 @@
 //! CLI binary: reads raw Telegram JSONL, parses via configured channel parsers,
-//! and outputs parsed signal JSONL to stdout or a file.
+//! and outputs parsed raw signal JSONL to stdout or a file.
 //!
 //! This is a thin wrapper around `OfflineRunner` for TOML-configured parsers.
 
@@ -10,7 +10,7 @@ use signal_parser::{OfflineArgs, OfflineRunner, SignalParserError, load_parsers}
 #[derive(Parser)]
 #[command(
     name = "parse_signals",
-    about = "Parse raw Telegram JSONL into trade signals"
+    about = "Parse raw Telegram JSONL into raw trade signals"
 )]
 struct Cli {
     /// Path to the raw messages JSONL file (or "-" for stdin).

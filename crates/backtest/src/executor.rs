@@ -271,6 +271,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -314,6 +315,7 @@ mod tests {
                     }],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -377,6 +379,7 @@ mod tests {
                     ],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -482,6 +485,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -524,6 +528,7 @@ mod tests {
                     targets: vec![],
                     rules: vec![],
                     group: None,
+                    trade_id: None,
                 },
                 ts(10, 0, 0),
             )
@@ -542,6 +547,7 @@ mod tests {
                     position_id: id.clone(),
                     price: Some(1.0900),
                     size: 1.0,
+                    trade_id: None,
                 },
                 ts(10, 5, 0),
             )

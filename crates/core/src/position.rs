@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::rules::{PositionView, Rule};
 use crate::types::{
     CloseReason, Effect, Fill, FillModel, GroupId, OrderType, PositionId, PositionRecord,
-    PositionStatus, PriceQuote, Side,
+    PositionStatus, PriceQuote, Side, TradeId,
 };
 
 /// Core position data — the pure state without rules.
@@ -57,6 +57,15 @@ pub struct PositionData {
     /// Optional group for per-signal-source tracking and group-level actions.
     #[serde(default)]
     pub group: Option<GroupId>,
+
+    /// Optional application-defined trade identity.
+    ///
+    /// Parsers mint a stable `TradeId` (for example, `chat_id:msg_id`) and
+    /// reference it from later management signals via `PositionRef::ByTradeId`.
+    /// When `None`, management signals must use bulk references or the
+    /// engine's `PositionId`.
+    #[serde(default)]
+    pub trade_id: Option<TradeId>,
 
     /// Immutable audit trail.
     pub records: Vec<(PositionRecord, NaiveDateTime)>,
@@ -199,6 +208,7 @@ impl Position {
                 open_ts: Some(open_ts),
                 close_ts: None,
                 group: None,
+                trade_id: None,
                 records: vec![(
                     PositionRecord::Created {
                         symbol,
@@ -242,6 +252,7 @@ impl Position {
                 open_ts: None,
                 close_ts: None,
                 group: None,
+                trade_id: None,
                 records: vec![(
                     PositionRecord::Created {
                         symbol,
@@ -253,6 +264,11 @@ impl Position {
             },
             rules,
         }
+    }
+
+    /// Attach or replace a `trade_id` on this position.
+    pub fn set_trade_id(&mut self, trade_id: Option<TradeId>) {
+        self.data.trade_id = trade_id;
     }
 
     /// Check if a pending order should fill at the given quote.

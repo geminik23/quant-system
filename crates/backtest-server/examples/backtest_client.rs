@@ -2,7 +2,7 @@
 //!
 //! Connects to the backtest server over shared memory, demonstrates the full
 //! client workflow: handshake → ping → list profiles → list symbols → run
-//! backtest with legacy entry signals → run backtest with F14 raw signals.
+//! backtest with F14 raw signals.
 //!
 //! # Usage
 //!
@@ -121,7 +121,7 @@ async fn connect(
     // Give the server a moment to create the dedicated SHM slot.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Close the acceptor connection — we no longer need it.
+    // Close the acceptor connection - we no longer need it.
     acceptor_client.close().await?;
 
     // Step 2: Connect to the dedicated per-client slot.
@@ -201,13 +201,13 @@ fn print_result_summary(result: &BacktestResultMsg) {
     // Long / Short breakdown
     print_section("Long vs Short");
     println!(
-        "  Long  — trades: {}, pnl: ${:.2}, win rate: {:.1}%",
+        "  Long  - trades: {}, pnl: ${:.2}, win rate: {:.1}%",
         result.long_stats.total_trades,
         result.long_stats.total_pnl,
         result.long_stats.win_rate * 100.0
     );
     println!(
-        "  Short — trades: {}, pnl: ${:.2}, win rate: {:.1}%",
+        "  Short - trades: {}, pnl: ${:.2}, win rate: {:.1}%",
         result.short_stats.total_trades,
         result.short_stats.total_pnl,
         result.short_stats.win_rate * 100.0
@@ -310,60 +310,6 @@ fn print_positions(positions: &[PositionSummaryMsg], max: usize) {
 
 // ── Dummy Signal Generators ─────────────────────────────────────────────────
 
-/// Generate dummy legacy entry signals (`RawSignalEntryMsg`).
-///
-/// These use hardcoded timestamps and prices. In a real scenario you would
-/// generate signals from your strategy logic; the server has the market data
-/// and will match fills against it.
-fn generate_legacy_signals(symbol: &str) -> Vec<RawSignalEntryMsg> {
-    vec![
-        RawSignalEntryMsg {
-            ts: "2024-01-02T10:00:00Z".into(),
-            symbol: symbol.into(),
-            side: "Buy".into(),
-            order_type: "Market".into(),
-            price: None,
-            size: 1.0,
-            stoploss: Some(1.0800),
-            targets: vec![1.1050, 1.1100],
-            group: Some("demo-group-A".into()),
-        },
-        RawSignalEntryMsg {
-            ts: "2024-01-05T14:30:00Z".into(),
-            symbol: symbol.into(),
-            side: "Sell".into(),
-            order_type: "Market".into(),
-            price: None,
-            size: 0.5,
-            stoploss: Some(1.1200),
-            targets: vec![1.0950, 1.0900],
-            group: Some("demo-group-A".into()),
-        },
-        RawSignalEntryMsg {
-            ts: "2024-01-10T09:15:00Z".into(),
-            symbol: symbol.into(),
-            side: "Buy".into(),
-            order_type: "Market".into(),
-            price: None,
-            size: 2.0,
-            stoploss: Some(1.0750),
-            targets: vec![1.1000, 1.1050, 1.1100],
-            group: Some("demo-group-B".into()),
-        },
-        RawSignalEntryMsg {
-            ts: "2024-01-15T16:00:00Z".into(),
-            symbol: symbol.into(),
-            side: "Sell".into(),
-            order_type: "Market".into(),
-            price: None,
-            size: 1.0,
-            stoploss: Some(1.1150),
-            targets: vec![1.0850],
-            group: None,
-        },
-    ]
-}
-
 /// Generate F14 raw signals (`RawSignalMsg`) demonstrating the full signal
 /// action vocabulary: entries, management actions (modify SL, partial close,
 /// move SL to breakeven), and bulk operations.
@@ -373,7 +319,8 @@ fn generate_legacy_signals(symbol: &str) -> Vec<RawSignalEntryMsg> {
 /// over position lifecycle without relying on server-side profiles.
 fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
     vec![
-        // 1. Open a long position with stoploss and targets.
+        // 1. Open a long position with stoploss and targets. Use a stable
+        //    trade_id so later management signals can target this trade.
         RawSignalMsg::Entry {
             ts: "2024-02-01T09:00:00Z".into(),
             symbol: symbol.into(),
@@ -384,28 +331,29 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             stoploss: Some(1.0800),
             targets: vec![1.1050, 1.1100],
             group: Some("f14-demo".into()),
+            trade_id: Some("f14-demo-buy-1".into()),
         },
-        // 2. After some time, tighten the stoploss on the last opened position.
+        // 2. Tighten the stoploss on the trade by trade_id.
         RawSignalMsg::ModifyStoploss {
             ts: "2024-02-01T12:00:00Z".into(),
-            position: PositionRefMsg::LastOnSymbol {
-                symbol: symbol.into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "f14-demo-buy-1".into(),
             },
             price: 1.0850,
         },
-        // 3. Take partial profits — close 50% of the position.
+        // 3. Take partial profits - close 50% of the same trade.
         RawSignalMsg::ClosePartial {
             ts: "2024-02-02T10:00:00Z".into(),
-            position: PositionRefMsg::LastOnSymbol {
-                symbol: symbol.into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "f14-demo-buy-1".into(),
             },
             ratio: 0.5,
         },
         // 4. Move stoploss to entry (breakeven) for the remainder.
         RawSignalMsg::MoveStoplossToEntry {
             ts: "2024-02-02T10:01:00Z".into(),
-            position: PositionRefMsg::LastOnSymbol {
-                symbol: symbol.into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "f14-demo-buy-1".into(),
             },
         },
         // 5. Open a second position (short) in a different group.
@@ -419,21 +367,22 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             stoploss: Some(1.1150),
             targets: vec![1.0900],
             group: Some("f14-hedge".into()),
+            trade_id: Some("f14-hedge-sell-1".into()),
         },
-        // 6. Scale into the short position with additional size.
+        // 6. Scale into the short trade by trade_id.
         RawSignalMsg::ScaleIn {
             ts: "2024-02-06T09:30:00Z".into(),
-            position: PositionRefMsg::LastInGroup {
-                group_id: "f14-hedge".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "f14-hedge-sell-1".into(),
             },
             price: None,
             size: 0.25,
         },
-        // 7. Add a trailing stop rule to the short position.
+        // 7. Add a trailing stop rule to the short trade.
         RawSignalMsg::AddRule {
             ts: "2024-02-06T09:31:00Z".into(),
-            position: PositionRefMsg::LastInGroup {
-                group_id: "f14-hedge".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "f14-hedge-sell-1".into(),
             },
             rule: RuleConfigDefMsg::TrailingStop { distance: 0.0050 },
         },
@@ -448,6 +397,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             stoploss: Some(1.0700),
             targets: vec![1.1000, 1.1050],
             group: Some("f14-demo".into()),
+            trade_id: Some("f14-demo-buy-2".into()),
         },
         // 9. Close all positions in the hedge group.
         RawSignalMsg::CloseAllInGroup {
@@ -552,64 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── 5. Run Backtest — Legacy Signals ────────────────────────────────
-    print_header("Run Backtest — Legacy Entry Signals");
-
-    let legacy_signals = generate_legacy_signals(&args.symbol);
-    println!(
-        "  Sending {} legacy entry signals for {} on {} ({}) ...",
-        legacy_signals.len(),
-        args.symbol,
-        args.exchange,
-        args.data_type
-    );
-
-    let request = RunBacktestRequest {
-        symbol: args.symbol.clone(),
-        exchange: args.exchange.clone(),
-        data_type: args.data_type.clone(),
-        timeframe: args.timeframe.clone(),
-        from: args.from.clone(),
-        to: args.to.clone(),
-        signals: legacy_signals,
-        raw_signals: vec![],
-        profile: args.profile.clone(),
-        profile_def: None,
-        config: BacktestConfigMsg {
-            initial_balance: Some(args.balance),
-            close_on_finish: Some(true),
-            fill_model: Some("BidAsk".into()),
-        },
-    };
-
-    let resp: RunBacktestResponse = client.call("run_backtest", &request).await?;
-    println!("  Elapsed: {}ms", resp.elapsed_ms);
-
-    if resp.success {
-        if let Some(ref result) = resp.result {
-            print_result_summary(result);
-            print_trade_log(&result.trade_log, 20);
-            print_positions(&result.positions, 10);
-
-            // Show a few equity curve points
-            if !result.equity_curve.is_empty() {
-                print_section("Equity Curve (sample)");
-                let step = (result.equity_curve.len() / 5).max(1);
-                for (i, pt) in result.equity_curve.iter().enumerate() {
-                    if i % step == 0 || i == result.equity_curve.len() - 1 {
-                        println!("  {} => ${:.2}", pt.ts, pt.balance);
-                    }
-                }
-            }
-        }
-    } else {
-        println!(
-            "  ✗ Backtest failed: {}",
-            resp.error.as_deref().unwrap_or("unknown error")
-        );
-    }
-
-    // ── 6. Run Backtest — F14 Raw Signals ───────────────────────────────
+    // ── 5. Run Backtest — F14 Raw Signals ───────────────────────────────
     print_header("Run Backtest — F14 Full Signal Actions");
 
     let f14_signals = generate_f14_signals(&args.symbol);
@@ -685,12 +578,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let f14_request = RunBacktestRequest {
         symbol: args.symbol.clone(),
+        symbols: Vec::new(),
+        all_symbols: false,
         exchange: args.exchange.clone(),
         data_type: args.data_type.clone(),
         timeframe: args.timeframe.clone(),
         from: args.from.clone(),
         to: args.to.clone(),
-        signals: vec![], // no legacy signals
         raw_signals: f14_signals,
         profile: None,
         profile_def: Some(inline_profile),

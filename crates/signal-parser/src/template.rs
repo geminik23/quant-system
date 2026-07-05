@@ -1,5 +1,5 @@
 use chrono::NaiveDateTime;
-use qs_backtest::RawSignalEntry;
+use qs_backtest::RawSignal;
 use qs_core::{OrderType, Side};
 
 use crate::parser::ChannelParser;
@@ -138,7 +138,7 @@ impl TemplateParser {
             return ParsedAction::Skip;
         }
 
-        ParsedAction::Entries(vec![RawSignalEntry {
+        ParsedAction::Signals(vec![RawSignal::Entry {
             ts,
             symbol,
             side,
@@ -148,6 +148,7 @@ impl TemplateParser {
             stoploss,
             targets,
             group: Some(self.group_prefix.clone()),
+            trade_id: None,
         }])
     }
 }
@@ -199,10 +200,10 @@ mod tests {
         TemplateParser::new("test-chan", vec![123], 0.01, None)
     }
 
-    fn entries(action: ParsedAction) -> Vec<RawSignalEntry> {
+    fn entries(action: ParsedAction) -> Vec<RawSignal> {
         match action {
-            ParsedAction::Entries(v) => v,
-            ParsedAction::Skip => panic!("expected Entries, got Skip"),
+            ParsedAction::Signals(v) => v,
+            ParsedAction::Skip => panic!("expected Signals, got Skip"),
         }
     }
 
@@ -212,12 +213,25 @@ mod tests {
         let result = parser().parse_root("EURUSD BUY NOW SL 1.0800 TP 1.0900", ts(), &ctx);
         let e = entries(result);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0].symbol, "eurusd");
-        assert_eq!(e[0].side, Side::Buy);
-        assert_eq!(e[0].order_type, OrderType::Market);
-        assert_eq!(e[0].price, None);
-        assert!((e[0].stoploss.unwrap() - 1.08).abs() < 1e-9);
-        assert_eq!(e[0].targets, vec![1.09]);
+        match &e[0] {
+            RawSignal::Entry {
+                symbol,
+                side,
+                order_type,
+                price,
+                stoploss,
+                targets,
+                ..
+            } => {
+                assert_eq!(symbol, "eurusd");
+                assert_eq!(*side, Side::Buy);
+                assert_eq!(*order_type, OrderType::Market);
+                assert_eq!(*price, None);
+                assert!((stoploss.unwrap() - 1.08).abs() < 1e-9);
+                assert_eq!(*targets, vec![1.09]);
+            }
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -226,12 +240,25 @@ mod tests {
         let result = parser().parse_root("XAUUSD SELL LIMIT 2650 SL 2680 TP 2620", ts(), &ctx);
         let e = entries(result);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0].symbol, "xauusd");
-        assert_eq!(e[0].side, Side::Sell);
-        assert_eq!(e[0].order_type, OrderType::Limit);
-        assert!((e[0].price.unwrap() - 2650.0).abs() < 1e-9);
-        assert!((e[0].stoploss.unwrap() - 2680.0).abs() < 1e-9);
-        assert_eq!(e[0].targets, vec![2620.0]);
+        match &e[0] {
+            RawSignal::Entry {
+                symbol,
+                side,
+                order_type,
+                price,
+                stoploss,
+                targets,
+                ..
+            } => {
+                assert_eq!(symbol, "xauusd");
+                assert_eq!(*side, Side::Sell);
+                assert_eq!(*order_type, OrderType::Limit);
+                assert!((price.unwrap() - 2650.0).abs() < 1e-9);
+                assert!((stoploss.unwrap() - 2680.0).abs() < 1e-9);
+                assert_eq!(*targets, vec![2620.0]);
+            }
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -243,7 +270,10 @@ mod tests {
             &ctx,
         );
         let e = entries(result);
-        assert_eq!(e[0].targets, vec![2620.0, 2600.0]);
+        match &e[0] {
+            RawSignal::Entry { targets, .. } => assert_eq!(*targets, vec![2620.0, 2600.0]),
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -251,8 +281,15 @@ mod tests {
         let ctx = ParseContext::empty();
         let result = parser().parse_root("GBPUSD BUY STOP 1.3000 SL 1.2950 TP 1.3100", ts(), &ctx);
         let e = entries(result);
-        assert_eq!(e[0].order_type, OrderType::Stop);
-        assert!((e[0].price.unwrap() - 1.3).abs() < 1e-9);
+        match &e[0] {
+            RawSignal::Entry {
+                order_type, price, ..
+            } => {
+                assert_eq!(*order_type, OrderType::Stop);
+                assert!((price.unwrap() - 1.3).abs() < 1e-9);
+            }
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -274,9 +311,19 @@ mod tests {
         let ctx = ParseContext::empty();
         let result = parser().parse_root("eurusd buy now sl 1.0800 tp 1.0900", ts(), &ctx);
         let e = entries(result);
-        assert_eq!(e[0].symbol, "eurusd");
-        assert_eq!(e[0].side, Side::Buy);
-        assert_eq!(e[0].order_type, OrderType::Market);
+        match &e[0] {
+            RawSignal::Entry {
+                symbol,
+                side,
+                order_type,
+                ..
+            } => {
+                assert_eq!(symbol, "eurusd");
+                assert_eq!(*side, Side::Buy);
+                assert_eq!(*order_type, OrderType::Market);
+            }
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -284,8 +331,15 @@ mod tests {
         let ctx = ParseContext::empty();
         let result = parser().parse_root("EURUSD BUY MARKET SL 1.0800 TP 1.0900", ts(), &ctx);
         let e = entries(result);
-        assert_eq!(e[0].order_type, OrderType::Market);
-        assert_eq!(e[0].price, None);
+        match &e[0] {
+            RawSignal::Entry {
+                order_type, price, ..
+            } => {
+                assert_eq!(*order_type, OrderType::Market);
+                assert_eq!(*price, None);
+            }
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]

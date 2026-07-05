@@ -34,7 +34,7 @@ pub use data_feed::{DataFeed, MarketEvent, VecFeed};
 pub use executor::BacktestExecutor;
 pub use profile::{
     ManagementProfile, PositionRef, PositionResolver, ProfileError, ProfileRegistry, RawSignal,
-    RawSignalEntry, RuleConfigDef, StoplossMode, resolve_signal,
+    RuleConfigDef, StoplossMode, resolve_signal,
 };
 pub use report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,

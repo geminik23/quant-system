@@ -40,6 +40,7 @@ fn open_buy(engine: &mut TradeEngine, symbol: &str, price: f64, size: f64) -> St
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -63,6 +64,7 @@ fn open_sell(engine: &mut TradeEngine, symbol: &str, price: f64, size: f64) -> S
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -99,6 +101,7 @@ fn lifecycle_buy_stoploss() {
                 ],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -151,6 +154,7 @@ fn lifecycle_sell_take_profit() {
                 }],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -196,6 +200,7 @@ fn partial_tp_then_sl() {
                 }],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -254,6 +259,7 @@ fn limit_buy_fills_and_tp_closes() {
                 }],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(9, 0, 0),
         )
@@ -308,6 +314,7 @@ fn stop_buy_fills_on_breakout() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(9, 0, 0),
         )
@@ -348,6 +355,7 @@ fn scale_in_updates_average_entry() {
                 position_id: id.clone(),
                 price: Some(1.0900),
                 size: 1.0,
+                trade_id: None,
             },
             ts(10, 5, 0),
         )
@@ -385,6 +393,7 @@ fn breakeven_after_two_targets() {
                 ],
                 rules: vec![RuleConfig::BreakevenAfterTargets { after_n: 2 }],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -434,6 +443,7 @@ fn time_exit_closes_position() {
                 targets: vec![],
                 rules: vec![RuleConfig::TimeExit { max_seconds: 3600 }],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -484,6 +494,7 @@ fn trailing_stop_follows_price_and_closes() {
                 targets: vec![],
                 rules: vec![RuleConfig::TrailingStop { distance: 0.0030 }],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -541,6 +552,7 @@ fn breakeven_when_moves_sl_to_entry() {
                     trigger_price: 1.0900,
                 }],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -652,6 +664,7 @@ fn cancel_pending_order() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(9, 0, 0),
         )
@@ -730,6 +743,7 @@ fn cancel_all_pending() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(9, 0, 0),
         )
@@ -746,6 +760,7 @@ fn cancel_all_pending() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(9, 0, 0),
         )
@@ -782,6 +797,7 @@ fn modify_stoploss_via_action() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -828,6 +844,7 @@ fn move_stoploss_to_entry() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -922,6 +939,7 @@ fn modify_all_stoploss_on_symbol() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -943,6 +961,7 @@ fn modify_all_stoploss_on_symbol() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -1065,6 +1084,7 @@ fn error_scale_into_closed() {
             position_id: id.clone(),
             price: Some(1.0900),
             size: 1.0,
+            trade_id: None,
         },
         ts(10, 2, 0),
     );
@@ -1088,6 +1108,7 @@ fn price_updates_only_affect_matching_symbol() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -1131,6 +1152,7 @@ fn position_records_audit_trail() {
                 targets: vec![],
                 rules: vec![],
                 group: None,
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -1237,6 +1259,7 @@ fn open_with_group(
                 targets: vec![],
                 rules: vec![],
                 group: group.map(|s| s.to_owned()),
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -1442,6 +1465,7 @@ fn modify_all_stoploss_in_group() {
                 targets: vec![],
                 rules: vec![],
                 group: Some("scalp".into()),
+                trade_id: None,
             },
             ts(10, 0, 0),
         )
@@ -1463,6 +1487,7 @@ fn modify_all_stoploss_in_group() {
                 targets: vec![],
                 rules: vec![],
                 group: Some("scalp".into()),
+                trade_id: None,
             },
             ts(10, 0, 1),
         )
@@ -1662,6 +1687,7 @@ fn pending_order_with_group() {
                 targets: vec![],
                 rules: vec![],
                 group: Some("pending_group".into()),
+                trade_id: None,
             },
             ts(9, 0, 0),
         )

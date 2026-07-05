@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use qs_backtest::RawSignalEntry;
+use qs_backtest::RawSignal;
 
 use crate::error::SignalParserError;
 use crate::registry::ParserRegistry;
@@ -36,18 +36,18 @@ fn parse_iso_datetime(s: &str) -> Result<NaiveDateTime, SignalParserError> {
 pub fn parse_messages(
     registry: &ParserRegistry,
     messages: &[RawTgMessage],
-) -> Result<Vec<RawSignalEntry>, SignalParserError> {
+) -> Result<Vec<RawSignal>, SignalParserError> {
     parse_messages_with_context(registry, messages, None, None)
 }
 
-/// Full-context variant — same as `parse_messages` but accepts optional market quote and LLM client.
+/// Full-context variant - same as `parse_messages` but accepts optional market quote and LLM client.
 pub fn parse_messages_with_context(
     registry: &ParserRegistry,
     messages: &[RawTgMessage],
     market: Option<&MarketQuote>,
     llm: Option<&LlmClient>,
-) -> Result<Vec<RawSignalEntry>, SignalParserError> {
-    let mut entries: Vec<RawSignalEntry> = Vec::new();
+) -> Result<Vec<RawSignal>, SignalParserError> {
+    let mut signals: Vec<RawSignal> = Vec::new();
 
     // Per-channel sliding window of recent messages (oldest-first).
     let mut history: HashMap<i64, VecDeque<RawTgMessage>> = HashMap::new();
@@ -81,7 +81,7 @@ pub fn parse_messages_with_context(
         };
 
         match action {
-            ParsedAction::Entries(batch) => entries.extend(batch),
+            ParsedAction::Signals(batch) => signals.extend(batch),
             ParsedAction::Skip => {}
         }
 
@@ -94,8 +94,8 @@ pub fn parse_messages_with_context(
         }
     }
 
-    entries.sort_by_key(|e| e.ts);
-    Ok(entries)
+    signals.sort_by_key(|s| s.ts());
+    Ok(signals)
 }
 
 #[cfg(test)]
@@ -174,11 +174,24 @@ mod tests {
         ];
         let result = parse_messages(&reg, &messages).unwrap();
         assert_eq!(result.len(), 3);
-        assert!(result[0].ts < result[1].ts);
-        assert!(result[1].ts < result[2].ts);
-        assert_eq!(result[0].symbol, "eurusd");
-        assert_eq!(result[1].symbol, "gbpusd");
-        assert_eq!(result[2].symbol, "xauusd");
+        assert!(result[0].ts() < result[1].ts());
+        assert!(result[1].ts() < result[2].ts());
+        let entries: Vec<_> = result
+            .into_iter()
+            .filter_map(|s| if s.is_entry() { Some(s) } else { None })
+            .collect();
+        match &entries[0] {
+            RawSignal::Entry { symbol, .. } => assert_eq!(symbol, "eurusd"),
+            _ => panic!("expected Entry"),
+        }
+        match &entries[1] {
+            RawSignal::Entry { symbol, .. } => assert_eq!(symbol, "gbpusd"),
+            _ => panic!("expected Entry"),
+        }
+        match &entries[2] {
+            RawSignal::Entry { symbol, .. } => assert_eq!(symbol, "xauusd"),
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -214,7 +227,10 @@ mod tests {
         let result = parse_messages(&reg, &messages).unwrap();
         // Only the root signal is parsed; the reply is skipped.
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].symbol, "eurusd");
+        match &result[0] {
+            RawSignal::Entry { symbol, .. } => assert_eq!(symbol, "eurusd"),
+            _ => panic!("expected Entry"),
+        }
     }
 
     #[test]
@@ -239,5 +255,83 @@ mod tests {
         let result =
             parse_messages_with_context(&reg, &messages, Some(&quote), Some(&llm)).unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_messages_can_emit_reply_management_signal() {
+        use crate::parser::ChannelParser;
+        use chrono::NaiveDateTime;
+        use qs_backtest::PositionRef;
+
+        struct ReplyParser {
+            channels: Vec<i64>,
+        }
+
+        impl ChannelParser for ReplyParser {
+            fn name(&self) -> &str {
+                "reply-parser"
+            }
+
+            fn channel_ids(&self) -> &[i64] {
+                &self.channels
+            }
+
+            fn max_history(&self) -> usize {
+                8
+            }
+
+            fn parse_root(
+                &self,
+                _message: &str,
+                ts: NaiveDateTime,
+                _ctx: &ParseContext,
+            ) -> ParsedAction {
+                ParsedAction::one(RawSignal::Entry {
+                    ts,
+                    symbol: "eurusd".into(),
+                    side: qs_core::Side::Buy,
+                    order_type: qs_core::OrderType::Market,
+                    price: None,
+                    size: 0.01,
+                    stoploss: Some(1.08),
+                    targets: vec![1.09],
+                    group: Some("tg_test".into()),
+                    trade_id: Some("tg_test-trade-1".into()),
+                })
+            }
+
+            fn parse_reply(
+                &self,
+                message: &str,
+                ts: NaiveDateTime,
+                _parent: Option<&RawTgMessage>,
+                _ctx: &ParseContext,
+            ) -> ParsedAction {
+                if message.eq_ignore_ascii_case("close this") {
+                    ParsedAction::one(RawSignal::Close {
+                        ts,
+                        position: PositionRef::ByTradeId {
+                            trade_id: "tg_test-trade-1".into(),
+                        },
+                    })
+                } else {
+                    ParsedAction::Skip
+                }
+            }
+        }
+
+        let mut reg = ParserRegistry::new();
+        reg.register(Box::new(ReplyParser {
+            channels: vec![777],
+        }));
+        let messages = vec![
+            make_msg(777, 1, "2025-01-01T10:00:00Z", "entry"),
+            make_reply(777, 2, "2025-01-01T10:05:00Z", "close this", 1),
+        ];
+
+        let result = parse_messages(&reg, &messages).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], RawSignal::Entry { .. }));
+        assert!(matches!(result[1], RawSignal::Close { .. }));
     }
 }

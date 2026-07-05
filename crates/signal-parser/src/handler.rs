@@ -1,5 +1,5 @@
 use chrono::NaiveDateTime;
-use qs_backtest::RawSignalEntry;
+use qs_backtest::RawSignal;
 
 //
 // Context passed to signal handler callbacks.
@@ -25,11 +25,11 @@ pub struct SignalContext {
 /// The framework (OfflineRunner / OnlineServer) parses messages and calls
 /// these methods with the results.
 pub trait SignalHandler: Send + Sync {
-    /// Called when a NEW message produces one or more entry signals.
-    fn on_signals(&self, entries: Vec<RawSignalEntry>, ctx: &SignalContext);
+    /// Called when a NEW message produces one or more raw signals.
+    fn on_signals(&self, signals: Vec<RawSignal>, ctx: &SignalContext);
 
-    /// Called when an EDIT message produces updated signals.
-    fn on_signal_edit(&self, entries: Vec<RawSignalEntry>, ctx: &SignalContext);
+    /// Called when an EDIT message produces updated raw signals.
+    fn on_signal_edit(&self, signals: Vec<RawSignal>, ctx: &SignalContext);
 
     /// Called when a DELETE event is received.
     /// The framework cannot parse deleted messages (text is gone).
@@ -53,8 +53,8 @@ pub trait SignalHandler: Send + Sync {
 pub struct NoopHandler;
 
 impl SignalHandler for NoopHandler {
-    fn on_signals(&self, _entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {}
-    fn on_signal_edit(&self, _entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {}
+    fn on_signals(&self, _signals: Vec<RawSignal>, _ctx: &SignalContext) {}
+    fn on_signal_edit(&self, _signals: Vec<RawSignal>, _ctx: &SignalContext) {}
     fn on_signal_delete(&self, _chat_id: i64, _msg_ids: Vec<i64>) {}
 }
 
@@ -62,29 +62,24 @@ impl SignalHandler for NoopHandler {
 pub struct LoggingHandler;
 
 impl SignalHandler for LoggingHandler {
-    fn on_signals(&self, entries: Vec<RawSignalEntry>, ctx: &SignalContext) {
-        for entry in &entries {
+    fn on_signals(&self, signals: Vec<RawSignal>, ctx: &SignalContext) {
+        for signal in &signals {
             tracing::info!(
-                "[NEW] [{}] {} {} {} sl={:?} tp={:?}",
+                "[NEW] [{}] msg_id={} signal={:?}",
                 ctx.parser_name,
-                entry.symbol,
-                entry.side,
-                entry.order_type,
-                entry.stoploss,
-                entry.targets,
+                ctx.msg_id,
+                signal,
             );
         }
     }
 
-    fn on_signal_edit(&self, entries: Vec<RawSignalEntry>, ctx: &SignalContext) {
-        for entry in &entries {
+    fn on_signal_edit(&self, signals: Vec<RawSignal>, ctx: &SignalContext) {
+        for signal in &signals {
             tracing::info!(
-                "[EDIT] [{}] msg_id={} {} {} {}",
+                "[EDIT] [{}] msg_id={} signal={:?}",
                 ctx.parser_name,
                 ctx.msg_id,
-                entry.symbol,
-                entry.side,
-                entry.order_type,
+                signal,
             );
         }
     }

@@ -3,7 +3,7 @@
 //! # Usage
 //!
 //! ```bash
-//! # Tick data (direct mode — signals with inline SL/TP/rules)
+//! # Raw-signals mode with entry + management signals (default)
 //! cargo run -p qs-backtest --example dummy_signal_test -- \
 //!     --data-dir /path/to/parquet/root \
 //!     --exchange ctrader \
@@ -11,6 +11,17 @@
 //!     --data-type tick \
 //!     --from "2026-01-15" \
 //!     --to "2026-01-16"
+//!
+//! # With a management profile
+//! cargo run -p qs-backtest --example dummy_signal_test -- \
+//!     --data-dir /path/to/parquet/root \
+//!     --exchange ctrader \
+//!     --symbol eurusd \
+//!     --data-type tick \
+//!     --from "2026-01-15" \
+//!     --to "2026-01-16" \
+//!     --profiles-path crates/backtest/profiles.toml \
+//!     --profile aggressive
 //!
 //! # Bar data (1-minute)
 //! cargo run -p qs-backtest --example dummy_signal_test -- \
@@ -21,68 +32,30 @@
 //!     --timeframe 1m \
 //!     --from "2026-01-15" \
 //!     --to "2026-01-16"
-//!
-//! # With a management profile (profile mode — raw entries transformed by profile)
-//! cargo run -p qs-backtest --example dummy_signal_test -- \
-//!     --data-dir /path/to/parquet/root \
-//!     --exchange ctrader \
-//!     --symbol eurusd \
-//!     --data-type tick \
-//!     --from "2026-01-15" \
-//!     --to "2026-01-16" \
-//!     --profiles-path crates/backtest/profiles.toml \
-//!     --profile aggressive
-//!
-//! # F14 raw-signals mode (full signal actions: entries + management signals)
-//! cargo run -p qs-backtest --example dummy_signal_test -- \
-//!     --data-dir /path/to/parquet/root \
-//!     --exchange ctrader \
-//!     --symbol eurusd \
-//!     --data-type tick \
-//!     --from "2026-01-15" \
-//!     --to "2026-01-16" \
-//!     --mode raw-signals
-//!
-//! # F14 raw-signals with profile (entries transformed by profile, management
-//! # signals pass through untouched)
-//! cargo run -p qs-backtest --example dummy_signal_test -- \
-//!     --data-dir /path/to/parquet/root \
-//!     --exchange ctrader \
-//!     --symbol eurusd \
-//!     --data-type tick \
-//!     --from "2026-01-15" \
-//!     --to "2026-01-16" \
-//!     --mode raw-signals-profile \
-//!     --profiles-path crates/backtest/profiles.toml \
-//!     --profile aggressive
 //! ```
 //!
 //! The example will:
 //! 1. Load data from Parquet store
 //! 2. Print a summary of loaded events (count, time range, price range)
-//! 3. Generate dummy signals from the actual data (buy near the start, sell later)
-//! 4. Run the backtest using the selected mode
+//! 3. Generate dummy raw signals from the actual data (entries + management)
+//! 4. Run the backtest using `run_raw_signals()` (with optional profile)
 //! 5. Print the full BacktestResult report
 //!
 //! ## Modes
 //!
-//! - **direct** (default): Generates `Signal` (Action::Open) with inline SL, TP,
-//!   and trailing stop rules. Uses `run_signals()`.
-//! - **profile**: Generates `RawSignalEntry` with multiple targets, transforms
-//!   them through a management profile. Uses `run_signals()`.
-//! - **raw-signals** (F14): Generates `RawSignal` with full action vocabulary —
-//!   entry signals plus management signals (modify SL, partial close, move SL to
-//!   entry, scale-in, close all in group, etc.). Uses `run_raw_signals()`.
-//! - **raw-signals-profile** (F14 + F09): Same as raw-signals but entry signals
-//!   are transformed through a management profile while management signals pass
+//! - **raw-signals** (default): Generates `RawSignal` with entry signals plus
+//!   management signals (modify SL, partial close, move SL to entry, scale-in,
+//!   close all in group, etc.). Uses `run_raw_signals()`.
+//! - **raw-signals-profile**: Same as raw-signals but entry signals are
+//!   transformed through a management profile while management signals pass
 //!   through untouched. Uses `run_raw_signals()` with a profile.
 
 use chrono::NaiveDateTime;
 use data_preprocess::{BarQueryOpts, ParquetStore, QueryOpts, Timeframe};
 use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
-use qs_backtest::profile::{PositionRef, ProfileRegistry, RawSignal, RawSignalEntry};
+use qs_backtest::profile::{PositionRef, ProfileRegistry, RawSignal};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
-use qs_core::types::{Action, OrderType, RuleConfig, Side, Signal, TargetSpec};
+use qs_core::types::{OrderType, Side};
 use qs_symbols::SymbolRegistry;
 
 use std::collections::HashMap;
@@ -103,7 +76,7 @@ struct Args {
     profile: Option<String>,
     symbols_path: Option<String>,
     initial_balance: f64,
-    mode: String, // "direct", "profile", "raw-signals", "raw-signals-profile"
+    mode: String, // "raw-signals" (default) or "raw-signals-profile"
 }
 
 fn parse_args() -> Args {
@@ -197,16 +170,10 @@ fn parse_args() -> Args {
                 eprintln!("  --balance <AMOUNT>     Initial balance (default: 10000)");
                 eprintln!("  --mode <MODE>          Signal mode:");
                 eprintln!(
-                    "                           direct            - Action::Open with SL/TP/rules (default)"
+                    "                           raw-signals         - entry + management signals (default)"
                 );
                 eprintln!(
-                    "                           profile           - RawSignalEntry + profile transform"
-                );
-                eprintln!(
-                    "                           raw-signals       - F14 full signal actions (entry + management)"
-                );
-                eprintln!(
-                    "                           raw-signals-profile - F14 signals + profile for entries"
+                    "                           raw-signals-profile - raw-signals + profile for entries"
                 );
                 process::exit(0);
             }
@@ -226,29 +193,25 @@ fn parse_args() -> Args {
 
     // Auto-detect mode if not explicitly set
     if mode.is_empty() {
-        if profiles_path.is_some() && profile.is_some() {
-            mode = "profile".into();
-        } else {
-            mode = "direct".into();
-        }
+        mode = "raw-signals".into();
     }
 
     // Validate mode
     match mode.as_str() {
-        "direct" | "profile" | "raw-signals" | "raw-signals-profile" => {}
+        "raw-signals" | "raw-signals-profile" => {}
         other => {
             eprintln!(
-                "Error: invalid --mode '{other}'. Must be one of: direct, profile, raw-signals, raw-signals-profile"
+                "Error: invalid --mode '{other}'. Must be one of: raw-signals, raw-signals-profile"
             );
             process::exit(1);
         }
     }
 
     // Validate mode + profile requirements
-    if (mode == "profile" || mode == "raw-signals-profile")
-        && (profiles_path.is_none() || profile.is_none())
-    {
-        eprintln!("Error: --profiles-path and --profile are required for mode '{mode}'.");
+    if mode == "raw-signals-profile" && (profiles_path.is_none() || profile.is_none()) {
+        eprintln!(
+            "Error: --profiles-path and --profile are required for mode 'raw-signals-profile'."
+        );
         process::exit(1);
     }
 
@@ -436,101 +399,7 @@ fn print_data_summary(events: &[MarketEvent]) {
     println!();
 }
 
-// ── Dummy signal generation: direct mode ────────────────────────────────────
-
-/// Generates dummy signals from the actual loaded data:
-///   - BUY at ~10% into the data, with SL 50 pips below and TP 100 pips above
-///   - SELL at ~60% into the data, with SL 50 pips above and TP 100 pips below
-///
-/// "pips" here are approximated based on the price magnitude.
-fn generate_dummy_signals(events: &[MarketEvent], symbol: &str) -> Vec<Signal> {
-    let n = events.len();
-    if n < 20 {
-        eprintln!(
-            "Warning: very few data points ({}), generating minimal signals",
-            n
-        );
-    }
-
-    // Pick entry points at ~10% and ~60% of the data
-    let buy_idx = n / 10;
-    let sell_idx = n * 6 / 10;
-
-    let buy_event = &events[buy_idx];
-    let sell_event = &events[sell_idx];
-
-    let buy_quote = buy_event.to_quote();
-    let sell_quote = sell_event.to_quote();
-
-    // Estimate pip size from price magnitude
-    let pip = estimate_pip(buy_quote.ask);
-
-    let buy_entry = buy_quote.ask; // buy at ask
-    let buy_sl = buy_entry - 50.0 * pip;
-    let buy_tp = buy_entry + 100.0 * pip;
-
-    let sell_entry = sell_quote.bid; // sell at bid
-    let sell_sl = sell_entry + 50.0 * pip;
-    let sell_tp = sell_entry - 100.0 * pip;
-
-    println!("Generated dummy signals:");
-    println!(
-        "  BUY  at {} | price={:.5} sl={:.5} tp={:.5}",
-        buy_event.ts(),
-        buy_entry,
-        buy_sl,
-        buy_tp
-    );
-    println!(
-        "  SELL at {} | price={:.5} sl={:.5} tp={:.5}",
-        sell_event.ts(),
-        sell_entry,
-        sell_sl,
-        sell_tp
-    );
-    println!();
-
-    vec![
-        Signal {
-            ts: buy_event.ts(),
-            action: Action::Open {
-                symbol: symbol.to_string(),
-                side: Side::Buy,
-                order_type: OrderType::Market,
-                price: None,
-                size: 0.10,
-                stoploss: Some(buy_sl),
-                targets: vec![TargetSpec {
-                    price: buy_tp,
-                    close_ratio: 1.0,
-                }],
-                rules: vec![RuleConfig::TrailingStop {
-                    distance: 30.0 * pip,
-                }],
-                group: Some("dummy_buy".into()),
-            },
-        },
-        Signal {
-            ts: sell_event.ts(),
-            action: Action::Open {
-                symbol: symbol.to_string(),
-                side: Side::Sell,
-                order_type: OrderType::Market,
-                price: None,
-                size: 0.10,
-                stoploss: Some(sell_sl),
-                targets: vec![TargetSpec {
-                    price: sell_tp,
-                    close_ratio: 1.0,
-                }],
-                rules: vec![RuleConfig::TrailingStop {
-                    distance: 30.0 * pip,
-                }],
-                group: Some("dummy_sell".into()),
-            },
-        },
-    ]
-}
+// ── Dummy signal generation ──────────────────────────────────────────
 
 /// Rough pip estimator from price magnitude.
 fn estimate_pip(price: f64) -> f64 {
@@ -546,81 +415,7 @@ fn estimate_pip(price: f64) -> f64 {
     }
 }
 
-// ── Raw signal entries (for profile mode) ───────────────────────────────────
-
-fn generate_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSignalEntry> {
-    let n = events.len();
-    let buy_idx = n / 10;
-    let sell_idx = n * 6 / 10;
-
-    let buy_event = &events[buy_idx];
-    let sell_event = &events[sell_idx];
-
-    let buy_quote = buy_event.to_quote();
-    let sell_quote = sell_event.to_quote();
-
-    let pip = estimate_pip(buy_quote.ask);
-
-    let buy_entry = buy_quote.ask;
-    let buy_sl = buy_entry - 50.0 * pip;
-    let buy_tp1 = buy_entry + 50.0 * pip;
-    let buy_tp2 = buy_entry + 100.0 * pip;
-    let buy_tp3 = buy_entry + 150.0 * pip;
-
-    let sell_entry = sell_quote.bid;
-    let sell_sl = sell_entry + 50.0 * pip;
-    let sell_tp1 = sell_entry - 50.0 * pip;
-    let sell_tp2 = sell_entry - 100.0 * pip;
-    let sell_tp3 = sell_entry - 150.0 * pip;
-
-    println!("Generated raw signals (for profile transform):");
-    println!(
-        "  BUY  at {} | price={:.5} sl={:.5} tp1={:.5} tp2={:.5} tp3={:.5}",
-        buy_event.ts(),
-        buy_entry,
-        buy_sl,
-        buy_tp1,
-        buy_tp2,
-        buy_tp3
-    );
-    println!(
-        "  SELL at {} | price={:.5} sl={:.5} tp1={:.5} tp2={:.5} tp3={:.5}",
-        sell_event.ts(),
-        sell_entry,
-        sell_sl,
-        sell_tp1,
-        sell_tp2,
-        sell_tp3
-    );
-    println!();
-
-    vec![
-        RawSignalEntry {
-            ts: buy_event.ts(),
-            symbol: symbol.to_string(),
-            side: Side::Buy,
-            order_type: OrderType::Market,
-            price: None,
-            size: 0.10,
-            stoploss: Some(buy_sl),
-            targets: vec![buy_tp1, buy_tp2, buy_tp3],
-            group: Some("dummy_buy".into()),
-        },
-        RawSignalEntry {
-            ts: sell_event.ts(),
-            symbol: symbol.to_string(),
-            side: Side::Sell,
-            order_type: OrderType::Market,
-            price: None,
-            size: 0.10,
-            stoploss: Some(sell_sl),
-            targets: vec![sell_tp1, sell_tp2, sell_tp3],
-            group: Some("dummy_sell".into()),
-        },
-    ]
-}
-
-// ── F14 full signal generation (raw-signals mode) ───────────────────────────
+// ── F14 full signal generation ────────────────────────────────────────
 
 /// Generates a full F14 signal stream with entry + management signals.
 ///
@@ -690,7 +485,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
     let tightened_sl = buy_ask - 25.0 * pip;
 
     let signals = vec![
-        // 1. Open BUY in group "alpha"
+        // 1. Open BUY in group "alpha" with trade_id "alpha-buy-1"
         RawSignal::Entry {
             ts: ev1.ts(),
             symbol: symbol.to_string(),
@@ -701,31 +496,32 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             stoploss: Some(buy_sl),
             targets: vec![buy_tp1, buy_tp2, buy_tp3],
             group: Some("alpha".into()),
+            trade_id: Some("alpha-buy-1".into()),
         },
-        // 2. Tighten stoploss on the last opened position on this symbol
+        // 2. Tighten stoploss on trade "alpha-buy-1"
         RawSignal::ModifyStoploss {
             ts: ev_mod.ts(),
-            position: PositionRef::LastOnSymbol {
-                symbol: symbol.to_string(),
+            position: PositionRef::ByTradeId {
+                trade_id: "alpha-buy-1".into(),
             },
             price: tightened_sl,
         },
-        // 3. Partial close 50% of the position
+        // 3. Partial close 50% of trade "alpha-buy-1"
         RawSignal::ClosePartial {
             ts: ev_partial.ts(),
-            position: PositionRef::LastOnSymbol {
-                symbol: symbol.to_string(),
+            position: PositionRef::ByTradeId {
+                trade_id: "alpha-buy-1".into(),
             },
             ratio: 0.5,
         },
-        // 4. Move stoploss to entry (breakeven)
+        // 4. Move stoploss to entry (breakeven) on "alpha-buy-1"
         RawSignal::MoveStoplossToEntry {
             ts: ev_be.ts(),
-            position: PositionRef::LastOnSymbol {
-                symbol: symbol.to_string(),
+            position: PositionRef::ByTradeId {
+                trade_id: "alpha-buy-1".into(),
             },
         },
-        // 5. Open SELL in group "beta"
+        // 5. Open SELL in group "beta" with trade_id "beta-sell-1"
         RawSignal::Entry {
             ts: ev2.ts(),
             symbol: symbol.to_string(),
@@ -736,27 +532,28 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             stoploss: Some(sell_sl),
             targets: vec![sell_tp1],
             group: Some("beta".into()),
+            trade_id: Some("beta-sell-1".into()),
         },
-        // 6. Scale into the SELL position (add more size)
+        // 6. Scale into "beta-sell-1"
         RawSignal::ScaleIn {
             ts: ev_scale.ts(),
-            position: PositionRef::LastInGroup {
-                group_id: "beta".into(),
+            position: PositionRef::ByTradeId {
+                trade_id: "beta-sell-1".into(),
             },
             price: None,
             size: 0.03,
         },
-        // 7. Add a trailing stop rule to the SELL
+        // 7. Add a trailing stop rule to "beta-sell-1"
         RawSignal::AddRule {
             ts: ev_rule.ts(),
-            position: PositionRef::LastInGroup {
-                group_id: "beta".into(),
+            position: PositionRef::ByTradeId {
+                trade_id: "beta-sell-1".into(),
             },
             rule: qs_backtest::profile::RuleConfigDef::TrailingStop {
                 distance: 30.0 * pip,
             },
         },
-        // 8. Open another BUY in group "alpha"
+        // 8. Open another BUY in group "alpha" with trade_id "alpha-buy-2"
         RawSignal::Entry {
             ts: ev3.ts(),
             symbol: symbol.to_string(),
@@ -767,6 +564,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             stoploss: Some(buy3_sl),
             targets: vec![buy3_tp1, buy3_tp2],
             group: Some("alpha".into()),
+            trade_id: Some("alpha-buy-2".into()),
         },
         // 9. Close all positions in group "beta"
         RawSignal::CloseAllInGroup {
@@ -879,64 +677,20 @@ fn main() {
 
     // 3. Run backtest based on mode
     let result = match args.mode.as_str() {
-        "direct" => {
-            // Direct mode: generate Signal with inline SL/TP/rules → run_signals
-            let signals = generate_dummy_signals(&events, &data_symbol);
-            let mut feed = VecFeed::new(events);
-            let runner = BacktestRunner::new(config);
-            println!(
-                "Running backtest (direct mode, {} signals)...",
-                signals.len()
-            );
-            println!();
-            runner.run_signals(&mut feed, signals)
-        }
-        "profile" => {
-            // Profile mode: RawSignalEntry → profile.apply_batch → run_signals
-            let profiles_path = args.profiles_path.as_ref().unwrap();
-            let profile_name = args.profile.as_ref().unwrap();
-
-            let registry = ProfileRegistry::load(profiles_path).unwrap_or_else(|e| {
-                eprintln!("Error loading profiles from '{profiles_path}': {e}");
-                process::exit(1);
-            });
-            let profile = registry.get(profile_name).unwrap_or_else(|| {
-                let available = registry.names();
-                eprintln!("Error: profile '{profile_name}' not found. Available: {available:?}");
-                process::exit(1);
-            });
-            let raw = generate_raw_signals(&events, &data_symbol);
-            let transformed = profile.apply_batch(&raw);
-            println!(
-                "Applied profile '{profile_name}' → {} signals",
-                transformed.len()
-            );
-            for (i, sig) in transformed.iter().enumerate() {
-                println!("  Signal {}: ts={} action={:?}", i, sig.ts, sig.action);
-            }
-            println!();
-
-            let mut feed = VecFeed::new(events);
-            let runner = BacktestRunner::new(config);
-            println!("Running backtest (profile mode)...");
-            println!();
-            runner.run_signals(&mut feed, transformed)
-        }
         "raw-signals" => {
-            // F14 mode: RawSignal stream (entries + management) → run_raw_signals
+            // RawSignal stream -> run_raw_signals
             let raw_signals = generate_f14_raw_signals(&events, &data_symbol);
             let mut feed = VecFeed::new(events);
             let runner = BacktestRunner::new(config);
             println!(
-                "Running backtest (F14 raw-signals mode, {} signals, no profile)...",
+                "Running backtest (raw-signals mode, {} signals)...",
                 raw_signals.len()
             );
             println!();
             runner.run_raw_signals(&mut feed, raw_signals, None)
         }
         "raw-signals-profile" => {
-            // F14 + profile mode: entries go through profile transform,
-            // management signals pass through untouched → run_raw_signals
+            // Entry signals -> profile transform, management pass through
             let profiles_path = args.profiles_path.as_ref().unwrap();
             let profile_name = args.profile.as_ref().unwrap();
 
@@ -949,12 +703,11 @@ fn main() {
                 eprintln!("Error: profile '{profile_name}' not found. Available: {available:?}");
                 process::exit(1);
             });
-
             let raw_signals = generate_f14_raw_signals(&events, &data_symbol);
             let mut feed = VecFeed::new(events);
             let runner = BacktestRunner::new(config);
             println!(
-                "Running backtest (F14 raw-signals + profile '{}', {} signals)...",
+                "Running backtest (raw-signals + profile '{}', {} signals)...",
                 profile_name,
                 raw_signals.len()
             );

@@ -5,6 +5,7 @@
 //! returns a response message. Errors are captured in the response rather
 //! than crashing the server.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::RwLock;
 use std::time::Instant;
@@ -13,10 +14,11 @@ use chrono::NaiveDateTime;
 use data_preprocess::ParquetStore;
 use data_preprocess::models::{BarQueryOpts, QueryOpts, Timeframe};
 use qs_backtest::BacktestResult;
-use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
-use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RawSignal, RawSignalEntry};
+use qs_backtest::data_feed::{
+    DataFeed, MarketEvent, VecFeed, bars_to_feed, merge_feeds, ticks_to_feed,
+};
+use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RawSignal};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
-use qs_core::types::{Action, OrderType, Side, Signal};
 use qs_symbols::SymbolRegistry;
 
 use crate::convert::{config_from_msg, profile_from_msg, raw_signal_from_msg, result_to_msg};
@@ -163,43 +165,37 @@ fn execute_backtest(state: &ServerState, req: &RunBacktestRequest) -> Result<Bac
         })?;
     }
 
-    // 2. Normalize symbol via registry.
-    let symbol = normalize_symbol(&state.symbol_registry, &req.symbol);
+    // 2. Resolve one or more symbols via registry.
+    let symbols = resolve_request_symbols(
+        &state.symbol_registry,
+        &req.symbol,
+        &req.symbols,
+        req.all_symbols,
+        &req.raw_signals,
+    )?;
     let exchange = req.exchange.to_lowercase();
 
     // 3. Parse date range filters.
     let from = parse_optional_datetime(&req.from)?;
     let to = parse_optional_datetime(&req.to)?;
 
-    // 4. Load market data from Parquet store.
-    let mut feed = load_market_data(
+    // 4. Load and merge market data for every requested symbol.
+    let mut feed = load_market_data_for_symbols(
         &state.data_dir,
         &exchange,
-        &symbol,
+        &symbols,
         &req.data_type,
         req.timeframe.as_deref(),
         from,
         to,
     )?;
 
-    // 5. Check for raw_signals (F14) — takes precedence over signals.
-    if !req.raw_signals.is_empty() {
-        let raw_signals = build_raw_signals(state, req, &symbol)?;
-        let profile = resolve_profile(state, req)?;
-        let config = config_from_msg(&req.config);
-        let runner = BacktestRunner::new(config);
-        let result = runner.run_raw_signals(&mut feed, raw_signals, profile.as_ref());
-        return Ok(result);
-    }
-
-    // 6. Legacy path: convert signals and optionally apply profile.
-    let signals = build_signals(state, req, &symbol)?;
-
-    // 7. Run the backtest.
+    // 5. Convert raw signals and run one portfolio backtest.
+    let raw_signals = build_raw_signals_for_symbols(state, &req.raw_signals, &symbols)?;
+    let profile = resolve_profile(state, req)?;
     let config = config_from_msg(&req.config);
     let runner = BacktestRunner::new(config);
-    let result = runner.run_signals(&mut feed, signals);
-
+    let result = runner.run_raw_signals(&mut feed, raw_signals, profile.as_ref());
     Ok(result)
 }
 
@@ -256,7 +252,40 @@ fn execute_backtest_multi(
             .collect();
     }
 
-    let symbol = normalize_symbol(&state.symbol_registry, &req.symbol);
+    if req.raw_signals.is_empty() {
+        return req
+            .profiles
+            .iter()
+            .map(|pr| ProfileResult {
+                profile: profile_ref_name(pr),
+                success: false,
+                error: Some("At least one raw_signal is required.".into()),
+                result: None,
+            })
+            .collect();
+    }
+
+    let symbols = match resolve_request_symbols(
+        &state.symbol_registry,
+        &req.symbol,
+        &req.symbols,
+        req.all_symbols,
+        &req.raw_signals,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return req
+                .profiles
+                .iter()
+                .map(|pr| ProfileResult {
+                    profile: profile_ref_name(pr),
+                    success: false,
+                    error: Some(e.to_string()),
+                    result: None,
+                })
+                .collect();
+        }
+    };
     let exchange = req.exchange.to_lowercase();
 
     let from = match parse_optional_datetime(&req.from) {
@@ -291,11 +320,11 @@ fn execute_backtest_multi(
         }
     };
 
-    // Load market data once — shared across all profile runs.
-    let events = match load_market_events(
+    // Load market data once - shared across all profile runs.
+    let events = match load_market_events_for_symbols(
         &state.data_dir,
         &exchange,
-        &symbol,
+        &symbols,
         &data_type,
         req.timeframe.as_deref(),
         from,
@@ -318,20 +347,10 @@ fn execute_backtest_multi(
 
     let config = config_from_msg(&req.config);
 
-    // Check for raw_signals (F14) — takes precedence over signals.
-    let use_raw = !req.raw_signals.is_empty();
-
-    // Convert signal messages to internal format once.
-    let legacy_signals: Option<Vec<RawSignalEntry>> = if use_raw {
-        None
-    } else {
-        match req
-            .signals
-            .iter()
-            .map(|s| convert_signal_msg(s, &symbol, &state.symbol_registry))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(v) => Some(v),
+    // Convert raw signal messages to internal format once.
+    let raw_signals_vec: Vec<RawSignal> =
+        match build_raw_signals_for_symbols(state, &req.raw_signals, &symbols) {
+            Ok(v) => v,
             Err(e) => {
                 return req
                     .profiles
@@ -344,79 +363,30 @@ fn execute_backtest_multi(
                     })
                     .collect();
             }
-        }
-    };
-
-    let raw_signals_vec: Option<Vec<RawSignal>> = if use_raw {
-        match req
-            .raw_signals
-            .iter()
-            .map(|s| raw_signal_from_msg(s, &symbol, &state.symbol_registry))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(v) => Some(v),
-            Err(e) => {
-                return req
-                    .profiles
-                    .iter()
-                    .map(|pr| ProfileResult {
-                        profile: profile_ref_name(pr),
-                        success: false,
-                        error: Some(e.to_string()),
-                        result: None,
-                    })
-                    .collect();
-            }
-        }
-    } else {
-        None
-    };
+        };
 
     // Run each profile independently.
     req.profiles
         .iter()
         .map(|pr| {
             let name = profile_ref_name(pr);
-            let run_result = if use_raw {
-                let raw_sigs = raw_signals_vec.as_ref().unwrap();
-                match pr {
-                    ProfileRef::Named(profile_name) => {
-                        let registry = state.profile_registry.read().unwrap();
-                        run_single_profile_raw(&registry, profile_name, raw_sigs, &events, &config)
-                    }
-                    ProfileRef::Inline(msg) => match profile_from_msg(msg) {
-                        Ok(profile) => {
-                            if let Err(e) = profile.validate() {
-                                Err(BacktestServerError::InvalidRequest(format!(
-                                    "Invalid inline profile: {e}"
-                                )))
-                            } else {
-                                run_profile_direct_raw(&profile, raw_sigs, &events, &config)
-                            }
-                        }
-                        Err(e) => Err(e),
-                    },
+            let run_result = match pr {
+                ProfileRef::Named(profile_name) => {
+                    let registry = state.profile_registry.read().unwrap();
+                    run_single_profile(&registry, profile_name, &raw_signals_vec, &events, &config)
                 }
-            } else {
-                let legacy_sigs = legacy_signals.as_ref().unwrap();
-                match pr {
-                    ProfileRef::Named(profile_name) => {
-                        let registry = state.profile_registry.read().unwrap();
-                        run_single_profile(&registry, profile_name, legacy_sigs, &events, &config)
-                    }
-                    ProfileRef::Inline(msg) => match profile_from_msg(msg) {
-                        Ok(profile) => {
-                            if let Err(e) = profile.validate() {
-                                Err(BacktestServerError::InvalidRequest(format!(
-                                    "Invalid inline profile: {e}"
-                                )))
-                            } else {
-                                run_profile_direct(&profile, legacy_sigs, &events, &config)
-                            }
+                ProfileRef::Inline(msg) => match profile_from_msg(msg) {
+                    Ok(profile) => {
+                        if let Err(e) = profile.validate() {
+                            Err(BacktestServerError::InvalidRequest(format!(
+                                "Invalid inline profile: {e}"
+                            )))
+                        } else {
+                            run_profile_direct(&profile, &raw_signals_vec, &events, &config)
                         }
-                        Err(e) => Err(e),
-                    },
-                }
+                    }
+                    Err(e) => Err(e),
+                },
             };
             match run_result {
                 Ok(result) => ProfileResult {
@@ -448,40 +418,6 @@ fn profile_ref_name(pr: &ProfileRef) -> String {
 fn run_single_profile(
     registry: &ProfileRegistry,
     profile_name: &str,
-    raw_signals: &[RawSignalEntry],
-    events: &[qs_backtest::data_feed::MarketEvent],
-    config: &BacktestConfig,
-) -> Result<BacktestResult> {
-    let profile = registry
-        .get(profile_name)
-        .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.into()))?;
-
-    let signals = profile.apply_batch(raw_signals);
-
-    let mut feed = VecFeed::new(events.to_vec());
-    let runner = BacktestRunner::new(config.clone());
-    let result = runner.run_signals(&mut feed, signals);
-    Ok(result)
-}
-
-/// Run a profile directly (already converted from inline definition).
-fn run_profile_direct(
-    profile: &ManagementProfile,
-    raw_signals: &[RawSignalEntry],
-    events: &[qs_backtest::data_feed::MarketEvent],
-    config: &BacktestConfig,
-) -> Result<BacktestResult> {
-    let signals = profile.apply_batch(raw_signals);
-    let mut feed = VecFeed::new(events.to_vec());
-    let runner = BacktestRunner::new(config.clone());
-    let result = runner.run_signals(&mut feed, signals);
-    Ok(result)
-}
-
-/// Run a single named profile with raw signals (F14).
-fn run_single_profile_raw(
-    registry: &ProfileRegistry,
-    profile_name: &str,
     raw_signals: &[RawSignal],
     events: &[qs_backtest::data_feed::MarketEvent],
     config: &BacktestConfig,
@@ -496,8 +432,8 @@ fn run_single_profile_raw(
     Ok(result)
 }
 
-/// Run a profile directly with raw signals (F14).
-fn run_profile_direct_raw(
+/// Run a profile directly (already converted from inline definition).
+fn run_profile_direct(
     profile: &ManagementProfile,
     raw_signals: &[RawSignal],
     events: &[qs_backtest::data_feed::MarketEvent],
@@ -511,108 +447,138 @@ fn run_profile_direct_raw(
 
 // ── Signal Conversion ───────────────────────────────────────────────────────
 
-/// Build the Vec<Signal> from request, optionally applying a management profile.
-///
-/// Priority: inline `profile_def` > named `profile` > raw passthrough.
-fn build_signals(
-    state: &ServerState,
-    req: &RunBacktestRequest,
+/// Resolve the market-data symbols requested for one portfolio backtest.
+fn resolve_request_symbols(
+    registry: &SymbolRegistry,
     symbol: &str,
-) -> Result<Vec<Signal>> {
-    // Convert wire messages to internal RawSignalEntry.
-    let raw_signals: Vec<RawSignalEntry> = req
-        .signals
-        .iter()
-        .map(|s| convert_signal_msg(s, symbol, &state.symbol_registry))
-        .collect::<Result<Vec<_>>>()?;
+    symbols: &[String],
+    all_symbols: bool,
+    raw_signals: &[RawSignalMsg],
+) -> Result<Vec<String>> {
+    let mut resolved = BTreeSet::new();
 
-    if let Some(ref profile_msg) = req.profile_def {
-        // Inline profile definition takes highest priority.
-        let profile = profile_from_msg(profile_msg)?;
-        profile.validate().map_err(|e| {
-            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {e}"))
-        })?;
-        Ok(profile.apply_batch(&raw_signals))
-    } else if let Some(ref profile_name) = req.profile {
-        // Named profile lookup via registry.
-        let registry = state.profile_registry.read().unwrap();
-        let profile = registry
-            .get(profile_name)
-            .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.clone()))?;
-        Ok(profile.apply_batch(&raw_signals))
+    if all_symbols {
+        for signal in raw_signals {
+            collect_raw_signal_symbols(registry, signal, &mut resolved);
+        }
+        if resolved.is_empty() {
+            return Err(BacktestServerError::InvalidRequest(
+                "all_symbols requested, but no symbols were found in raw entry signals".into(),
+            ));
+        }
+    } else if !symbols.is_empty() {
+        for raw in symbols {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                resolved.insert(normalize_symbol(registry, trimmed));
+            }
+        }
+        if resolved.is_empty() {
+            return Err(BacktestServerError::InvalidRequest(
+                "symbols was provided but did not contain any non-empty symbol".into(),
+            ));
+        }
     } else {
-        // No profile — convert raw signals directly to Action::Open.
-        let signals: Vec<Signal> = raw_signals
-            .into_iter()
-            .filter_map(|raw| {
-                let action = Action::Open {
-                    symbol: raw.symbol,
-                    side: raw.side,
-                    order_type: raw.order_type,
-                    price: raw.price,
-                    size: raw.size,
-                    stoploss: raw.stoploss,
-                    targets: raw
-                        .targets
-                        .iter()
-                        .enumerate()
-                        .map(|(_i, &price)| qs_core::types::TargetSpec {
-                            price,
-                            close_ratio: if raw.targets.len() == 1 {
-                                1.0
-                            } else {
-                                1.0 / raw.targets.len() as f64
-                            },
-                        })
-                        .collect(),
-                    rules: Vec::new(),
-                    group: raw.group,
-                };
-                Some(Signal { ts: raw.ts, action })
-            })
-            .collect();
-        Ok(signals)
+        let trimmed = symbol.trim();
+        if trimmed.is_empty() {
+            return Err(BacktestServerError::InvalidRequest(
+                "symbol is required unless symbols or all_symbols is provided".into(),
+            ));
+        }
+        resolved.insert(normalize_symbol(registry, trimmed));
+    }
+
+    Ok(resolved.into_iter().collect())
+}
+
+fn collect_raw_signal_symbols(
+    registry: &SymbolRegistry,
+    signal: &RawSignalMsg,
+    symbols: &mut BTreeSet<String>,
+) {
+    match signal {
+        RawSignalMsg::Entry { symbol, .. }
+        | RawSignalMsg::CloseAllOf { symbol, .. }
+        | RawSignalMsg::ModifyAllStoploss { symbol, .. } => {
+            let trimmed = symbol.trim();
+            if !trimmed.is_empty() {
+                symbols.insert(normalize_symbol(registry, trimmed));
+            }
+        }
+        RawSignalMsg::Close { position, .. }
+        | RawSignalMsg::ClosePartial { position, .. }
+        | RawSignalMsg::ModifyStoploss { position, .. }
+        | RawSignalMsg::MoveStoplossToEntry { position, .. }
+        | RawSignalMsg::AddTarget { position, .. }
+        | RawSignalMsg::RemoveTarget { position, .. }
+        | RawSignalMsg::AddRule { position, .. }
+        | RawSignalMsg::RemoveRule { position, .. }
+        | RawSignalMsg::ScaleIn { position, .. }
+        | RawSignalMsg::CancelPending { position, .. } => {
+            if let PositionRefMsg::AllOnSymbol { symbol } = position {
+                let trimmed = symbol.trim();
+                if !trimmed.is_empty() {
+                    symbols.insert(normalize_symbol(registry, trimmed));
+                }
+            }
+        }
+        RawSignalMsg::CloseAll { .. }
+        | RawSignalMsg::CancelAllPending { .. }
+        | RawSignalMsg::CloseAllInGroup { .. }
+        | RawSignalMsg::ModifyAllStoplossInGroup { .. } => {}
     }
 }
 
-/// Convert a wire-format signal message to the internal `RawSignalEntry`.
-fn convert_signal_msg(
-    msg: &RawSignalEntryMsg,
-    default_symbol: &str,
-    registry: &SymbolRegistry,
-) -> Result<RawSignalEntry> {
-    let ts = parse_datetime(&msg.ts)?;
-    let symbol = if msg.symbol.is_empty() {
-        default_symbol.to_string()
+/// Build `Vec<RawSignal>` from the `raw_signals` field.
+fn build_raw_signals_for_symbols(
+    state: &ServerState,
+    raw_signal_msgs: &[RawSignalMsg],
+    symbols: &[String],
+) -> Result<Vec<RawSignal>> {
+    let default_symbol = if symbols.len() == 1 {
+        symbols[0].as_str()
     } else {
-        normalize_symbol(registry, &msg.symbol)
+        ""
     };
-    let side = parse_side(&msg.side)?;
-    let order_type = parse_order_type(&msg.order_type)?;
+    let raw_signals = raw_signal_msgs
+        .iter()
+        .map(|s| raw_signal_from_msg(s, default_symbol, &state.symbol_registry))
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok(RawSignalEntry {
-        ts,
-        symbol,
-        side,
-        order_type,
-        price: msg.price,
-        size: msg.size,
-        stoploss: msg.stoploss,
-        targets: msg.targets.clone(),
-        group: msg.group.clone(),
-    })
+    if symbols.len() > 1 {
+        ensure_entry_symbols_are_explicit(raw_signal_msgs)?;
+        ensure_entry_symbols_are_loaded(&raw_signals, symbols)?;
+    }
+
+    Ok(raw_signals)
 }
 
-/// Build `Vec<RawSignal>` from the `raw_signals` field (F14).
-fn build_raw_signals(
-    state: &ServerState,
-    req: &RunBacktestRequest,
-    symbol: &str,
-) -> Result<Vec<RawSignal>> {
-    req.raw_signals
-        .iter()
-        .map(|s| raw_signal_from_msg(s, symbol, &state.symbol_registry))
-        .collect::<Result<Vec<_>>>()
+fn ensure_entry_symbols_are_explicit(raw_signal_msgs: &[RawSignalMsg]) -> Result<()> {
+    for signal in raw_signal_msgs {
+        if let RawSignalMsg::Entry { symbol, .. } = signal {
+            if symbol.trim().is_empty() {
+                return Err(BacktestServerError::InvalidRequest(
+                    "Entry signal symbol is required for multi-symbol backtests".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_entry_symbols_are_loaded(raw_signals: &[RawSignal], symbols: &[String]) -> Result<()> {
+    let loaded: BTreeSet<&str> = symbols.iter().map(String::as_str).collect();
+    for signal in raw_signals {
+        if let RawSignal::Entry { symbol, .. } = signal {
+            if !loaded.contains(symbol.as_str()) {
+                return Err(BacktestServerError::InvalidRequest(format!(
+                    "Entry signal symbol '{symbol}' is not included in requested market-data symbols: {}",
+                    symbols.join(",")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the management profile from a request (inline or named).
@@ -651,6 +617,47 @@ fn load_market_data(
 ) -> Result<VecFeed> {
     let events = load_market_events(data_dir, exchange, symbol, data_type, timeframe, from, to)?;
     Ok(VecFeed::new(events))
+}
+
+/// Load market data for multiple symbols and merge the events into one timeline.
+fn load_market_data_for_symbols(
+    data_dir: &str,
+    exchange: &str,
+    symbols: &[String],
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Result<VecFeed> {
+    if symbols.is_empty() {
+        return Err(BacktestServerError::InvalidRequest(
+            "At least one symbol is required".into(),
+        ));
+    }
+
+    let mut feeds = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        feeds.push(load_market_data(
+            data_dir, exchange, symbol, data_type, timeframe, from, to,
+        )?);
+    }
+
+    Ok(merge_feeds(feeds))
+}
+
+/// Load raw market events for one or more symbols.
+fn load_market_events_for_symbols(
+    data_dir: &str,
+    exchange: &str,
+    symbols: &[String],
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Result<Vec<MarketEvent>> {
+    Ok(feed_to_events(load_market_data_for_symbols(
+        data_dir, exchange, symbols, data_type, timeframe, from, to,
+    )?))
 }
 
 /// Load raw market events from Parquet (shared between single and multi runs).
@@ -825,9 +832,9 @@ fn validate_request(req: &RunBacktestRequest) -> Result<()> {
             "timeframe is required when data_type is 'bar'.".into(),
         ));
     }
-    if req.signals.is_empty() && req.raw_signals.is_empty() {
+    if req.raw_signals.is_empty() {
         return Err(BacktestServerError::InvalidRequest(
-            "At least one signal is required.".into(),
+            "At least one raw_signal is required.".into(),
         ));
     }
     Ok(())
@@ -838,29 +845,6 @@ fn validate_request(req: &RunBacktestRequest) -> Result<()> {
 /// Normalize a symbol name via the registry, falling back to passthrough.
 fn normalize_symbol(registry: &SymbolRegistry, raw: &str) -> String {
     registry.normalize_or_passthrough(raw)
-}
-
-/// Parse a side string ("Buy" or "Sell") into the core enum.
-fn parse_side(s: &str) -> Result<Side> {
-    match s {
-        "Buy" | "buy" | "BUY" | "Long" | "long" => Ok(Side::Buy),
-        "Sell" | "sell" | "SELL" | "Short" | "short" => Ok(Side::Sell),
-        other => Err(BacktestServerError::InvalidRequest(format!(
-            "Invalid side: '{other}'. Must be 'Buy' or 'Sell'."
-        ))),
-    }
-}
-
-/// Parse an order type string into the core enum.
-fn parse_order_type(s: &str) -> Result<OrderType> {
-    match s {
-        "Market" | "market" | "MARKET" => Ok(OrderType::Market),
-        "Limit" | "limit" | "LIMIT" => Ok(OrderType::Limit),
-        "Stop" | "stop" | "STOP" => Ok(OrderType::Stop),
-        other => Err(BacktestServerError::InvalidRequest(format!(
-            "Invalid order_type: '{other}'. Must be 'Market', 'Limit', or 'Stop'."
-        ))),
-    }
 }
 
 /// Parse an ISO datetime string into NaiveDateTime.
@@ -983,23 +967,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_side_variants() {
-        assert_eq!(parse_side("Buy").unwrap(), Side::Buy);
-        assert_eq!(parse_side("sell").unwrap(), Side::Sell);
-        assert_eq!(parse_side("Long").unwrap(), Side::Buy);
-        assert_eq!(parse_side("Short").unwrap(), Side::Sell);
-        assert!(parse_side("invalid").is_err());
-    }
-
-    #[test]
-    fn parse_order_type_variants() {
-        assert_eq!(parse_order_type("Market").unwrap(), OrderType::Market);
-        assert_eq!(parse_order_type("limit").unwrap(), OrderType::Limit);
-        assert_eq!(parse_order_type("STOP").unwrap(), OrderType::Stop);
-        assert!(parse_order_type("foobar").is_err());
-    }
-
-    #[test]
     fn parse_datetime_iso() {
         let dt = parse_datetime("2026-01-15T10:30:00").unwrap();
         assert_eq!(dt.to_string(), "2026-01-15 10:30:00");
@@ -1040,15 +1007,102 @@ mod tests {
     }
 
     #[test]
+    fn resolve_request_symbols_uses_explicit_symbols() {
+        let reg = SymbolRegistry::empty();
+        let signals = vec![RawSignalMsg::Entry {
+            ts: "2026-01-15T10:00:00".into(),
+            symbol: "xauusd".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            price: Some(2000.0),
+            size: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+            trade_id: None,
+        }];
+        let symbols = resolve_request_symbols(
+            &reg,
+            "",
+            &["XAU/USD".into(), " GBPJPY ".into()],
+            false,
+            &signals,
+        )
+        .unwrap();
+        assert_eq!(symbols, vec!["gbpjpy", "xauusd"]);
+    }
+
+    #[test]
+    fn resolve_request_symbols_derives_all_symbols_from_entries() {
+        let reg = SymbolRegistry::empty();
+        let signals = vec![
+            RawSignalMsg::Entry {
+                ts: "2026-01-15T10:00:00".into(),
+                symbol: "XAUUSD".into(),
+                side: "Buy".into(),
+                order_type: "Market".into(),
+                price: Some(2000.0),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            },
+            RawSignalMsg::Entry {
+                ts: "2026-01-15T10:01:00".into(),
+                symbol: "GBP/JPY".into(),
+                side: "Sell".into(),
+                order_type: "Market".into(),
+                price: Some(190.0),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            },
+        ];
+        let symbols = resolve_request_symbols(&reg, "", &[], true, &signals).unwrap();
+        assert_eq!(symbols, vec!["gbpjpy", "xauusd"]);
+    }
+
+    #[test]
+    fn build_raw_signals_for_multi_symbol_rejects_empty_entry_symbol() {
+        let state = ServerState {
+            symbol_registry: SymbolRegistry::empty(),
+            profile_registry: RwLock::new(ProfileRegistry::empty()),
+            data_dir: "/tmp/test".into(),
+            profiles_path: String::new(),
+            start_time: Instant::now(),
+        };
+        let signals = vec![RawSignalMsg::Entry {
+            ts: "2026-01-15T10:00:00".into(),
+            symbol: "".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            price: Some(2000.0),
+            size: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+            trade_id: None,
+        }];
+        let err =
+            build_raw_signals_for_symbols(&state, &signals, &["xauusd".into(), "gbpjpy".into()])
+                .unwrap_err();
+        assert!(err.to_string().contains("symbol is required"));
+    }
+
+    #[test]
     fn validate_request_rejects_empty_signals() {
         let req = RunBacktestRequest {
             symbol: "eurusd".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
             exchange: "ctrader".into(),
             data_type: "tick".into(),
             timeframe: None,
             from: None,
             to: None,
-            signals: vec![],
             raw_signals: vec![],
             profile: None,
             profile_def: None,
@@ -1065,12 +1119,14 @@ mod tests {
     fn validate_request_rejects_invalid_data_type() {
         let req = RunBacktestRequest {
             symbol: "eurusd".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
             exchange: "ctrader".into(),
             data_type: "invalid".into(),
             timeframe: None,
             from: None,
             to: None,
-            signals: vec![RawSignalEntryMsg {
+            raw_signals: vec![RawSignalMsg::Entry {
                 ts: "2026-01-15T10:00:00".into(),
                 symbol: "eurusd".into(),
                 side: "Buy".into(),
@@ -1080,8 +1136,8 @@ mod tests {
                 stoploss: None,
                 targets: vec![],
                 group: None,
+                trade_id: None,
             }],
-            raw_signals: vec![],
             profile: None,
             profile_def: None,
             config: BacktestConfigMsg {
@@ -1097,12 +1153,14 @@ mod tests {
     fn validate_request_rejects_bar_without_timeframe() {
         let req = RunBacktestRequest {
             symbol: "eurusd".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
             exchange: "ctrader".into(),
             data_type: "bar".into(),
             timeframe: None,
             from: None,
             to: None,
-            signals: vec![RawSignalEntryMsg {
+            raw_signals: vec![RawSignalMsg::Entry {
                 ts: "2026-01-15T10:00:00".into(),
                 symbol: "eurusd".into(),
                 side: "Buy".into(),
@@ -1112,8 +1170,8 @@ mod tests {
                 stoploss: None,
                 targets: vec![],
                 group: None,
+                trade_id: None,
             }],
-            raw_signals: vec![],
             profile: None,
             profile_def: None,
             config: BacktestConfigMsg {
@@ -1129,12 +1187,14 @@ mod tests {
     fn validate_request_accepts_valid_tick() {
         let req = RunBacktestRequest {
             symbol: "eurusd".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
             exchange: "ctrader".into(),
             data_type: "tick".into(),
             timeframe: None,
             from: None,
             to: None,
-            signals: vec![RawSignalEntryMsg {
+            raw_signals: vec![RawSignalMsg::Entry {
                 ts: "2026-01-15T10:00:00".into(),
                 symbol: "eurusd".into(),
                 side: "Buy".into(),
@@ -1144,8 +1204,8 @@ mod tests {
                 stoploss: None,
                 targets: vec![],
                 group: None,
+                trade_id: None,
             }],
-            raw_signals: vec![],
             profile: None,
             profile_def: None,
             config: BacktestConfigMsg {
@@ -1463,46 +1523,5 @@ mod tests {
         );
         assert!(!resp.success);
         assert!(resp.error.as_ref().unwrap().contains("not found"));
-    }
-
-    #[test]
-    fn convert_signal_msg_basic() {
-        let reg = SymbolRegistry::empty();
-        let msg = RawSignalEntryMsg {
-            ts: "2026-01-15T10:00:00".into(),
-            symbol: "EURUSD".into(),
-            side: "Buy".into(),
-            order_type: "Market".into(),
-            price: None,
-            size: 1.0,
-            stoploss: Some(1.0800),
-            targets: vec![1.0900, 1.0950],
-            group: Some("g1".into()),
-        };
-        let raw = convert_signal_msg(&msg, "eurusd", &reg).unwrap();
-        assert_eq!(raw.symbol, "eurusd");
-        assert_eq!(raw.side, Side::Buy);
-        assert_eq!(raw.order_type, OrderType::Market);
-        assert!(raw.price.is_none());
-        assert_eq!(raw.targets.len(), 2);
-        assert_eq!(raw.group, Some("g1".into()));
-    }
-
-    #[test]
-    fn convert_signal_msg_empty_symbol_uses_default() {
-        let reg = SymbolRegistry::empty();
-        let msg = RawSignalEntryMsg {
-            ts: "2026-01-15T10:00:00".into(),
-            symbol: "".into(),
-            side: "Sell".into(),
-            order_type: "Limit".into(),
-            price: Some(1.0900),
-            size: 0.5,
-            stoploss: None,
-            targets: vec![],
-            group: None,
-        };
-        let raw = convert_signal_msg(&msg, "eurusd", &reg).unwrap();
-        assert_eq!(raw.symbol, "eurusd");
     }
 }

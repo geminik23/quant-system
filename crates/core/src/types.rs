@@ -212,6 +212,14 @@ pub type PositionId = String;
 /// Unique identifier for a position group.
 pub type GroupId = String;
 
+/// Application-defined trade identifier.
+///
+/// Parsers mint a stable `TradeId` per logical trade (for example,
+/// `chat_id:msg_id`) and reference it from later management signals.
+/// The engine stores it on `PositionData` and resolves it through
+/// `PositionRef::ByTradeId`.
+pub type TradeId = String;
+
 // ─── Enums ──────────────────────────────────────────────────────────────────
 
 /// Trade direction.
@@ -433,6 +441,9 @@ pub enum Action {
         /// Optional group for per-signal-source tracking and group-level actions.
         #[serde(default)]
         group: Option<GroupId>,
+        /// Optional application-defined trade id used by `PositionRef::ByTradeId`.
+        #[serde(default)]
+        trade_id: Option<TradeId>,
     },
 
     /// Add size to an existing open position (scale-in).  Shares the
@@ -441,6 +452,9 @@ pub enum Action {
         position_id: PositionId,
         price: Option<f64>,
         size: f64,
+        /// Optional application-defined trade id to attach to the resulting fill.
+        #[serde(default)]
+        trade_id: Option<TradeId>,
     },
 
     /// Close an entire position at market.

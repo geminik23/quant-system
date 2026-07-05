@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::position::Position;
-use crate::types::{GroupId, PositionId, PositionStatus, Side};
+use crate::types::{GroupId, PositionId, PositionStatus, Side, TradeId};
 
 /// Optional grouping of positions for coordinated management.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -22,6 +22,8 @@ pub struct PositionManager {
     groups: HashMap<GroupId, PositionGroup>,
     /// Secondary index: symbol → position IDs (all statuses).
     symbol_index: HashMap<String, HashSet<PositionId>>,
+    /// Secondary index: trade_id → position ID (current/last position per trade id).
+    trade_index: HashMap<TradeId, PositionId>,
 }
 
 impl PositionManager {
@@ -35,10 +37,14 @@ impl PositionManager {
     pub fn add(&mut self, position: Position) {
         let id = position.data.id.clone();
         let symbol = position.data.symbol.clone();
+        let trade_id = position.data.trade_id.clone();
         self.symbol_index
             .entry(symbol)
             .or_default()
             .insert(id.clone());
+        if let Some(tid) = trade_id {
+            self.trade_index.insert(tid, id.clone());
+        }
         self.positions.insert(id, position);
     }
 
@@ -50,6 +56,11 @@ impl PositionManager {
                 set.remove(id);
                 if set.is_empty() {
                     self.symbol_index.remove(&p.data.symbol);
+                }
+            }
+            if let Some(tid) = p.data.trade_id.as_ref() {
+                if self.trade_index.get(tid).map(|x| x == id).unwrap_or(false) {
+                    self.trade_index.remove(tid);
                 }
             }
         }
@@ -241,6 +252,19 @@ impl PositionManager {
     /// All group IDs that currently exist.
     pub fn all_group_ids(&self) -> Vec<&GroupId> {
         self.groups.keys().collect()
+    }
+
+    // ── Trade ID helpers ─────────────────────────────────────────────────
+
+    /// Look up the position ID for a given application-defined trade id.
+    pub fn id_by_trade_id(&self, trade_id: &str) -> Option<PositionId> {
+        self.trade_index.get(trade_id).cloned()
+    }
+
+    /// Update the trade_id mapping for a position (used when trade_id
+    /// is attached after position creation, e.g. during scale-in).
+    pub fn set_trade_id(&mut self, position_id: &str, trade_id: TradeId) {
+        self.trade_index.insert(trade_id, position_id.to_owned());
     }
 
     // ── Bulk helpers (used by engine) ───────────────────────────────────

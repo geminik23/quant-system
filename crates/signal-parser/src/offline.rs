@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 
 use clap::Parser;
-use qs_backtest::RawSignalEntry;
+use qs_backtest::RawSignal;
 
 use crate::error::SignalParserError;
 use crate::handler::{SignalContext, SignalHandler};
@@ -87,9 +87,9 @@ impl OfflineRunner {
             let count = run_with_handler(&self.registry, &messages, handler.as_ref());
             tracing::info!(count, "processed signals via handler");
         } else {
-            let entries = crate::pipeline::parse_messages(&self.registry, &messages)?;
-            tracing::info!(count = entries.len(), "parsed signal entries");
-            write_jsonl(&args.output, &entries)?;
+            let signals = crate::pipeline::parse_messages(&self.registry, &messages)?;
+            tracing::info!(count = signals.len(), "parsed raw signals");
+            write_jsonl(&args.output, &signals)?;
         }
 
         Ok(())
@@ -160,9 +160,9 @@ fn run_with_handler(
         };
 
         match action {
-            ParsedAction::Entries(entries) => {
-                total += entries.len();
-                handler.on_signals(entries, &signal_ctx);
+            ParsedAction::Signals(signals) => {
+                total += signals.len();
+                handler.on_signals(signals, &signal_ctx);
             }
             ParsedAction::Skip => {
                 handler.on_skip(&msg.message, &signal_ctx);
@@ -222,15 +222,15 @@ fn read_jsonl(path: &str) -> Result<Vec<RawTgMessage>, SignalParserError> {
     Ok(messages)
 }
 
-/// Write parsed signals as JSONL to a file (or stdout if path is None).
-fn write_jsonl(path: &Option<String>, entries: &[RawSignalEntry]) -> Result<(), SignalParserError> {
+/// Write parsed raw signals as JSONL to a file (or stdout if path is None).
+fn write_jsonl(path: &Option<String>, signals: &[RawSignal]) -> Result<(), SignalParserError> {
     let mut writer: Box<dyn Write> = match path {
         Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
     };
 
-    for entry in entries {
-        serde_json::to_writer(&mut writer, entry)?;
+    for signal in signals {
+        serde_json::to_writer(&mut writer, signal)?;
         writeln!(writer)?;
     }
 
@@ -251,11 +251,11 @@ mod tests {
     }
 
     impl SignalHandler for CountingHandler {
-        fn on_signals(&self, entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {
+        fn on_signals(&self, signals: Vec<RawSignal>, _ctx: &SignalContext) {
             self.signal_count
-                .fetch_add(entries.len(), Ordering::Relaxed);
+                .fetch_add(signals.len(), Ordering::Relaxed);
         }
-        fn on_signal_edit(&self, _entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {}
+        fn on_signal_edit(&self, _signals: Vec<RawSignal>, _ctx: &SignalContext) {}
         fn on_signal_delete(&self, _chat_id: i64, _msg_ids: Vec<i64>) {}
         fn on_skip(&self, _msg: &str, _ctx: &SignalContext) {
             self.skip_count.fetch_add(1, Ordering::Relaxed);
@@ -398,14 +398,14 @@ mod tests {
         }
 
         impl SignalHandler for CtxCapture {
-            fn on_signals(&self, _entries: Vec<RawSignalEntry>, ctx: &SignalContext) {
+            fn on_signals(&self, _signals: Vec<RawSignal>, ctx: &SignalContext) {
                 self.contexts.lock().unwrap().push((
                     ctx.chat_id,
                     ctx.msg_id,
                     ctx.parser_name.clone(),
                 ));
             }
-            fn on_signal_edit(&self, _entries: Vec<RawSignalEntry>, _ctx: &SignalContext) {}
+            fn on_signal_edit(&self, _signals: Vec<RawSignal>, _ctx: &SignalContext) {}
             fn on_signal_delete(&self, _chat_id: i64, _msg_ids: Vec<i64>) {}
         }
 
@@ -458,7 +458,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");
 
-        let entries = vec![RawSignalEntry {
+        let signals = vec![RawSignal::Entry {
             ts: NaiveDate::from_ymd_opt(2025, 1, 1)
                 .unwrap()
                 .and_hms_opt(10, 0, 0)
@@ -471,14 +471,16 @@ mod tests {
             stoploss: Some(1.08),
             targets: vec![1.09],
             group: Some("test".to_string()),
+            trade_id: None,
         }];
 
-        write_jsonl(&Some(path.to_str().unwrap().to_string()), &entries).unwrap();
+        write_jsonl(&Some(path.to_str().unwrap().to_string()), &signals).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 1);
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["action"], "Entry");
         assert_eq!(parsed["symbol"], "eurusd");
         assert_eq!(parsed["side"], "Buy");
 

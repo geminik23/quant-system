@@ -1,6 +1,6 @@
 //! Telegram signal backtest client — loads parsed JSONL and submits to backtest server.
 //!
-//! Reads pre-parsed signal JSONL (RawSignalEntryMsg format) produced by the
+//! Reads pre-parsed raw signal JSONL (RawSignalMsg format) produced by the
 //! `parse_signals` binary, connects to the backtest server over SHM, and
 //! prints the backtest results.
 
@@ -28,9 +28,17 @@ struct Args {
     #[arg(long, default_value = "backtest")]
     shm_name: String,
 
-    /// Symbol to backtest (e.g. EURUSD, XAUUSD).
+    /// Single symbol to backtest (e.g. EURUSD, XAUUSD).
     #[arg(long)]
-    symbol: String,
+    symbol: Option<String>,
+
+    /// Comma-separated symbols to backtest as one portfolio (e.g. XAUUSD,GBPJPY).
+    #[arg(long)]
+    symbols: Option<String>,
+
+    /// Derive all backtest symbols from Entry signals in the parsed JSONL.
+    #[arg(long, default_value_t = false)]
+    all_symbols: bool,
 
     /// Exchange / data source name (e.g. icmarkets, oanda).
     #[arg(long)]
@@ -110,8 +118,8 @@ async fn connect(
 
 // ── Signal Loading ──────────────────────────────────────────────────────────
 
-/// Read parsed signal JSONL from a file or stdin.
-fn load_signals(path: &str) -> Result<Vec<RawSignalEntryMsg>, Box<dyn std::error::Error>> {
+/// Read parsed raw signal JSONL from a file or stdin.
+fn load_raw_signals(path: &str) -> Result<Vec<RawSignalMsg>, Box<dyn std::error::Error>> {
     let reader: Box<dyn BufRead> = if path == "-" {
         Box::new(io::BufReader::new(io::stdin()))
     } else {
@@ -126,11 +134,57 @@ fn load_signals(path: &str) -> Result<Vec<RawSignalEntryMsg>, Box<dyn std::error
         if trimmed.is_empty() {
             continue;
         }
-        let msg: RawSignalEntryMsg = serde_json::from_str(trimmed)
-            .map_err(|e| format!("line {}: failed to parse signal: {}", lineno + 1, e))?;
+        let msg: RawSignalMsg = serde_json::from_str(trimmed)
+            .map_err(|e| format!("line {}: failed to parse raw signal: {}", lineno + 1, e))?;
         signals.push(msg);
     }
     Ok(signals)
+}
+
+fn parse_symbols_arg(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn resolve_cli_symbol_request(
+    symbol: &Option<String>,
+    symbols: &Option<String>,
+    all_symbols: bool,
+) -> Result<(String, Vec<String>, String), Box<dyn std::error::Error>> {
+    let parsed_symbols = parse_symbols_arg(symbols.as_deref());
+    let mode_count = usize::from(symbol.as_ref().is_some_and(|s| !s.trim().is_empty()))
+        + usize::from(!parsed_symbols.is_empty())
+        + usize::from(all_symbols);
+
+    if mode_count != 1 {
+        return Err(
+            "provide exactly one of --symbol <SYMBOL>, --symbols <A,B>, or --all-symbols".into(),
+        );
+    }
+
+    if all_symbols {
+        return Ok((
+            String::new(),
+            Vec::new(),
+            "all symbols from entries".to_string(),
+        ));
+    }
+
+    if !parsed_symbols.is_empty() {
+        return Ok((
+            String::new(),
+            parsed_symbols.clone(),
+            parsed_symbols.join(","),
+        ));
+    }
+
+    let single = symbol.as_ref().unwrap().trim().to_string();
+    Ok((single.clone(), Vec::new(), single))
 }
 
 // ── Display Helpers ─────────────────────────────────────────────────────────
@@ -334,24 +388,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load parsed signals from JSONL.
     print_header("Loading Parsed Signals");
-    let signals = load_signals(&args.input)?;
-    println!("  Loaded {} signals from {}", signals.len(), args.input);
+    let raw_signals = load_raw_signals(&args.input)?;
+    println!(
+        "  Loaded {} raw signals from {}",
+        raw_signals.len(),
+        args.input
+    );
 
-    if signals.is_empty() {
+    if raw_signals.is_empty() {
         eprintln!("  No signals to backtest — exiting.");
         return Ok(());
     }
 
+    let (request_symbol, request_symbols, symbol_label) =
+        resolve_cli_symbol_request(&args.symbol, &args.symbols, args.all_symbols)?;
+
     // Show first few signals as preview.
-    let preview = signals.len().min(5);
-    for s in &signals[..preview] {
-        println!(
-            "    [{}] {} {} {} sl={:?} tp={:?} grp={:?}",
-            s.ts, s.symbol, s.side, s.order_type, s.stoploss, s.targets, s.group
-        );
+    let preview = raw_signals.len().min(5);
+    for s in &raw_signals[..preview] {
+        println!("    {:?}", s);
     }
-    if signals.len() > preview {
-        println!("    ... and {} more", signals.len() - preview);
+    if raw_signals.len() > preview {
+        println!("    ... and {} more", raw_signals.len() - preview);
     }
 
     // 2. Connect to backtest server via SHM.
@@ -370,26 +428,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Build and submit the backtest request.
     print_header("Running Backtest");
     println!(
-        "  Symbol: {}, Exchange: {}, DataType: {}, Timeframe: {:?}",
-        args.symbol, args.exchange, args.data_type, args.timeframe
+        "  Symbols: {}, Exchange: {}, DataType: {}, Timeframe: {:?}",
+        symbol_label, args.exchange, args.data_type, args.timeframe
     );
     println!("  Date range: {:?} → {:?}", args.from, args.to);
     println!(
-        "  Profile: {:?}, Balance: ${:.2}, Signals: {}",
+        "  Profile: {:?}, Balance: ${:.2}, Raw signals: {}",
         args.profile,
         args.balance,
-        signals.len()
+        raw_signals.len()
     );
 
     let request = RunBacktestRequest {
-        symbol: args.symbol.clone(),
+        symbol: request_symbol,
+        symbols: request_symbols,
+        all_symbols: args.all_symbols,
         exchange: args.exchange.clone(),
         data_type: args.data_type.clone(),
         timeframe: args.timeframe.clone(),
         from: args.from.clone(),
         to: args.to.clone(),
-        signals,
-        raw_signals: vec![],
+        raw_signals,
         profile: args.profile.clone(),
         profile_def: None,
         config: BacktestConfigMsg {

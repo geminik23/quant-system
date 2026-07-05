@@ -1,6 +1,6 @@
 //! Management profiles — decouple entry signals from trade management.
 //!
-//! A [`ManagementProfile`] transforms raw signals ([`RawSignalEntry`]) into
+//! A [`ManagementProfile`] transforms [`RawSignal::Entry`] into
 //! fully-specified [`Action::Open`] calls.  Profiles are defined in TOML and
 //! loaded via [`ProfileRegistry`], enabling same-signals-different-management
 //! comparison without recompilation.
@@ -12,7 +12,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use qs_core::types::{
-    Action, GroupId, OrderType, PositionId, RuleConfig, Side, Signal, TargetSpec,
+    Action, GroupId, OrderType, PositionId, RuleConfig, Side, TargetSpec, TradeId,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -51,53 +51,29 @@ pub enum ProfileError {
     NotFound(String),
 }
 
-// ─── RawSignalEntry ─────────────────────────────────────────────────────────
-
-/// A raw trade signal from an external source.
-///
-/// Contains the entry decision and suggested price levels.
-/// The management profile decides how to use these levels.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawSignalEntry {
-    /// Timestamp of the signal.
-    pub ts: NaiveDateTime,
-    /// Symbol to trade.
-    pub symbol: String,
-    /// Trade direction.
-    pub side: Side,
-    /// Order type (Market, Limit, Stop).
-    pub order_type: OrderType,
-    /// Entry price (None for market orders that use current quote).
-    pub price: Option<f64>,
-    /// Position size.
-    pub size: f64,
-    /// Suggested stoploss price.
-    pub stoploss: Option<f64>,
-    /// Suggested target prices (ordered by distance from entry).
-    pub targets: Vec<f64>,
-    /// Optional group/source tag.
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
 // ─── PositionRef ────────────────────────────────────────────────────────────
 
 /// How a management signal references its target position(s).
 ///
 /// Resolved at runtime by the backtest runner, which has access to
 /// engine state for lookup.
+///
+/// The minimal set is:
+/// - `ByTradeId`: the canonical parser path. Each entry carries an
+///   application-defined `trade_id`; management signals reference it.
+/// - `AllOnSymbol`: bulk close by symbol.
+/// - `AllInGroup`: bulk close by group.
+///
+/// `group` is a reporting tag (channel-level), while `trade_id` is the
+/// per-trade identity used for addressing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PositionRef {
-    /// Explicit position ID (for strategy mode or known IDs).
-    Id { id: PositionId },
-    /// The most recently opened position on this symbol.
-    LastOnSymbol { symbol: String },
-    /// The most recently opened position in this group.
-    LastInGroup { group_id: GroupId },
-    /// All open positions on this symbol.
+    /// Target the position with the given application-defined trade id.
+    ByTradeId { trade_id: TradeId },
+    /// All open positions on a symbol.
     AllOnSymbol { symbol: String },
-    /// All open positions in this group.
+    /// All open positions in a group.
     AllInGroup { group_id: GroupId },
 }
 
@@ -124,6 +100,10 @@ pub enum RawSignal {
         targets: Vec<f64>,
         #[serde(default)]
         group: Option<String>,
+        /// Application-defined trade identity. Required for `ByTradeId`
+        /// resolution. Older JSONL without this field is still accepted.
+        #[serde(default)]
+        trade_id: Option<TradeId>,
     },
 
     // ── Per-position management ─────────────────────────────────────
@@ -232,50 +212,6 @@ impl RawSignal {
     pub fn is_entry(&self) -> bool {
         matches!(self, Self::Entry { .. })
     }
-
-    /// Convert to a `RawSignalEntry` if this is an `Entry` variant.
-    pub fn as_entry(&self) -> Option<RawSignalEntry> {
-        match self {
-            Self::Entry {
-                ts,
-                symbol,
-                side,
-                order_type,
-                price,
-                size,
-                stoploss,
-                targets,
-                group,
-            } => Some(RawSignalEntry {
-                ts: *ts,
-                symbol: symbol.clone(),
-                side: *side,
-                order_type: *order_type,
-                price: *price,
-                size: *size,
-                stoploss: *stoploss,
-                targets: targets.clone(),
-                group: group.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-impl From<RawSignalEntry> for RawSignal {
-    fn from(e: RawSignalEntry) -> Self {
-        RawSignal::Entry {
-            ts: e.ts,
-            symbol: e.symbol,
-            side: e.side,
-            order_type: e.order_type,
-            price: e.price,
-            size: e.size,
-            stoploss: e.stoploss,
-            targets: e.targets,
-            group: e.group,
-        }
-    }
 }
 
 // ─── Position Resolution ────────────────────────────────────────────────────
@@ -284,7 +220,7 @@ impl From<RawSignalEntry> for RawSignal {
 pub trait PositionResolver {
     /// Resolve a position reference to zero or more concrete position IDs.
     fn resolve(&self, pr: &PositionRef) -> Vec<PositionId>;
-    /// Get entry info (average_entry, side) for an open position.
+    /// Get entry info (average_entry, side) for a position.
     fn position_entry_info(&self, id: &PositionId) -> Option<(f64, Side)>;
 }
 
@@ -400,6 +336,7 @@ pub fn resolve_signal(signal: &RawSignal, resolver: &impl PositionResolver) -> V
                 position_id: id,
                 price: *price,
                 size: *size,
+                trade_id: None,
             })
             .collect(),
 
@@ -567,15 +504,39 @@ impl ManagementProfile {
         ProfileRegistry::validate_profile(self)
     }
 
-    /// Transform a raw signal into a fully-specified `Action::Open`.
-    pub fn apply(&self, signal: &RawSignalEntry) -> Option<Action> {
+    /// Transform a `RawSignal::Entry` into a fully-specified `Action::Open`.
+    ///
+    /// Reads directly from the `RawSignal::Entry` variant and propagates the
+    /// `trade_id` so that later management signals using
+    /// `PositionRef::ByTradeId` can resolve the resulting position.
+    /// Returns `None` for any non-`Entry` signal.
+    pub fn apply_entry_signal(&self, signal: &RawSignal) -> Option<Action> {
+        let entry = match signal {
+            RawSignal::Entry {
+                ts: _,
+                symbol,
+                side,
+                order_type,
+                price,
+                size,
+                stoploss,
+                targets,
+                group,
+                trade_id,
+            } => (
+                symbol, side, order_type, price, size, stoploss, targets, group, trade_id,
+            ),
+            _ => return None,
+        };
+        let (symbol, side, order_type, price, size, stoploss, targets, group, trade_id) = entry;
+
         // 1. Build target specs from selected targets + close ratios.
-        let mut targets = Vec::new();
+        let mut built_targets = Vec::new();
         for (i, &target_idx) in self.use_targets.iter().enumerate() {
-            if let Some(&target_price) = signal.targets.get(target_idx - 1) {
+            if let Some(&target_price) = targets.get(target_idx - 1) {
                 let ratio = self.close_ratios.get(i).copied().unwrap_or(0.0);
                 if ratio > 0.0 {
-                    targets.push(TargetSpec {
+                    built_targets.push(TargetSpec {
                         price: target_price,
                         close_ratio: ratio,
                     });
@@ -585,15 +546,13 @@ impl ManagementProfile {
         }
 
         // 2. Determine stoploss.
-        let stoploss = match &self.stoploss_mode {
-            StoplossMode::FromSignal => signal.stoploss,
+        let built_stoploss = match &self.stoploss_mode {
+            StoplossMode::FromSignal => *stoploss,
             StoplossMode::None => Option::None,
-            StoplossMode::FixedDistance { distance } => {
-                signal.price.map(|entry| match signal.side {
-                    Side::Buy => entry - distance,
-                    Side::Sell => entry + distance,
-                })
-            }
+            StoplossMode::FixedDistance { distance } => price.map(|entry_price| match side {
+                Side::Buy => entry_price - distance,
+                Side::Sell => entry_price + distance,
+            }),
             StoplossMode::FixedPrice { price } => Some(*price),
         };
 
@@ -601,58 +560,25 @@ impl ManagementProfile {
         let rules: Vec<RuleConfig> = self
             .rules
             .iter()
-            .filter_map(|def| def.resolve(signal.price, signal.side))
+            .filter_map(|def| def.resolve(*price, *side))
             .collect();
 
         // 4. Determine group (profile override takes precedence).
-        let group: Option<GroupId> = self.group_override.clone().or(signal.group.clone());
+        let built_group: Option<GroupId> = self.group_override.clone().or(group.clone());
 
-        // 5. Construct the action.
+        // 5. Construct the action, preserving the original trade_id.
         Some(Action::Open {
-            symbol: signal.symbol.clone(),
-            side: signal.side,
-            order_type: signal.order_type,
-            price: signal.price,
-            size: signal.size,
-            stoploss,
-            targets,
+            symbol: symbol.clone(),
+            side: *side,
+            order_type: *order_type,
+            price: *price,
+            size: *size,
+            stoploss: built_stoploss,
+            targets: built_targets,
             rules,
-            group,
+            group: built_group,
+            trade_id: trade_id.clone(),
         })
-    }
-
-    /// Transform a batch of raw signals into `Signal`s for `BacktestRunner::run_signals()`.
-    pub fn apply_batch(&self, raw_signals: &[RawSignalEntry]) -> Vec<Signal> {
-        raw_signals
-            .iter()
-            .filter_map(|raw| self.apply(raw).map(|action| Signal { ts: raw.ts, action }))
-            .collect()
-    }
-
-    /// Transform a `RawSignal` — entry signals are profile-transformed,
-    /// management signals pass through unchanged.
-    pub fn apply_raw(&self, signal: &RawSignal) -> Option<RawSignal> {
-        match signal {
-            RawSignal::Entry { .. } => {
-                // Convert to RawSignalEntry, apply profile, then wrap back.
-                // If apply() returns None we filter it out.
-                let entry = signal.as_entry()?;
-                let _action = self.apply(&entry)?;
-                // Profile accepted it — return the original entry signal
-                // (the actual Action conversion happens later in the runner).
-                Some(signal.clone())
-            }
-            _ => Some(signal.clone()),
-        }
-    }
-
-    /// Transform a batch of `RawSignal`s — entry signals are profile-filtered,
-    /// management signals pass through unchanged.
-    pub fn apply_batch_raw(&self, raw_signals: &[RawSignal]) -> Vec<RawSignal> {
-        raw_signals
-            .iter()
-            .filter_map(|s| self.apply_raw(s))
-            .collect()
     }
 }
 
@@ -813,8 +739,8 @@ mod tests {
     }
 
     /// Convenience: build a standard Buy signal with 2 targets.
-    fn buy_signal() -> RawSignalEntry {
-        RawSignalEntry {
+    fn buy_signal() -> RawSignal {
+        RawSignal::Entry {
             ts: ts(10, 0, 0),
             symbol: "eurusd".into(),
             side: Side::Buy,
@@ -824,12 +750,13 @@ mod tests {
             stoploss: Some(1.0800),
             targets: vec![1.0900, 1.0950],
             group: None,
+            trade_id: None,
         }
     }
 
     /// Convenience: build a standard Sell signal with 2 targets.
-    fn sell_signal() -> RawSignalEntry {
-        RawSignalEntry {
+    fn sell_signal() -> RawSignal {
+        RawSignal::Entry {
             ts: ts(10, 0, 0),
             symbol: "eurusd".into(),
             side: Side::Sell,
@@ -839,6 +766,7 @@ mod tests {
             stoploss: Some(1.0900),
             targets: vec![1.0800, 1.0750],
             group: None,
+            trade_id: None,
         }
     }
 
@@ -867,6 +795,7 @@ mod tests {
                 targets,
                 rules,
                 group,
+                ..
             } => (
                 symbol.as_str(),
                 *side,
@@ -1036,7 +965,7 @@ close_ratios = [1.0]
         let profile = reg.get("conservative").unwrap();
 
         let signal = buy_signal();
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (sym, side, _, price, size, sl, targets, _, _) = unwrap_open(&action);
 
         assert_eq!(sym, "eurusd");
@@ -1060,7 +989,7 @@ close_ratios = [0.5, 0.5]
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("aggressive").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, targets, _, _) = unwrap_open(&action);
 
         assert_eq!(targets.len(), 2);
@@ -1082,7 +1011,7 @@ let_remainder_run = true
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("runner").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, targets, _, _) = unwrap_open(&action);
 
         assert_eq!(targets.len(), 1);
@@ -1102,7 +1031,7 @@ stoploss_mode = { type = "FromSignal" }
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         assert_eq!(sl, Some(1.0800));
     }
@@ -1119,7 +1048,7 @@ stoploss_mode = { type = "None" }
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         assert_eq!(sl, None);
     }
@@ -1139,7 +1068,7 @@ distance = 0.0020
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         // Buy at 1.0850, distance 0.0020 → SL at 1.0830
         assert!((sl.unwrap() - 1.0830).abs() < 1e-10);
@@ -1160,7 +1089,7 @@ distance = 0.0020
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&sell_signal()).unwrap();
+        let action = profile.apply_entry_signal(&sell_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         // Sell at 1.0850, distance 0.0020 → SL at 1.0870
         assert!((sl.unwrap() - 1.0870).abs() < 1e-10);
@@ -1181,7 +1110,7 @@ price = 1.0780
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         assert!((sl.unwrap() - 1.0780).abs() < f64::EPSILON);
     }
@@ -1205,7 +1134,7 @@ distance = 0.0020
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         assert_eq!(rules.len(), 2);
@@ -1232,9 +1161,11 @@ group_override = "scalp"
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.group = Some("momentum".into());
+        if let RawSignal::Entry { ref mut group, .. } = signal {
+            *group = Some("momentum".into());
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, _, _, _, _, _, group) = unwrap_open(&action);
         // Profile override takes precedence.
         assert_eq!(group.as_deref(), Some("scalp"));
@@ -1252,9 +1183,11 @@ close_ratios = []
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.group = Some("momentum".into());
+        if let RawSignal::Entry { ref mut group, .. } = signal {
+            *group = Some("momentum".into());
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, _, _, _, _, _, group) = unwrap_open(&action);
         assert_eq!(group.as_deref(), Some("momentum"));
     }
@@ -1270,7 +1203,7 @@ close_ratios = []
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, _, group) = unwrap_open(&action);
         assert!(group.is_none());
     }
@@ -1287,7 +1220,7 @@ close_ratios = [1.0]
         let profile = reg.get("test").unwrap();
 
         // Signal only has 2 targets, profile asks for 3rd → empty targets.
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, targets, _, _) = unwrap_open(&action);
         assert!(targets.is_empty());
     }
@@ -1303,7 +1236,7 @@ close_ratios = []
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, targets, _, _) = unwrap_open(&action);
         assert!(targets.is_empty());
     }
@@ -1320,9 +1253,11 @@ close_ratios = [1.0]
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.price = None;
+        if let RawSignal::Entry { ref mut price, .. } = signal {
+            *price = None;
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, price, _, _, _, _, _) = unwrap_open(&action);
         assert_eq!(price, None);
     }
@@ -1339,10 +1274,17 @@ close_ratios = [1.0]
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.order_type = OrderType::Limit;
-        signal.price = Some(1.0800);
+        if let RawSignal::Entry {
+            ref mut order_type,
+            ref mut price,
+            ..
+        } = signal
+        {
+            *order_type = OrderType::Limit;
+            *price = Some(1.0800);
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, ot, price, _, _, _, _, _) = unwrap_open(&action);
         assert_eq!(ot, OrderType::Limit);
         assert_eq!(price, Some(1.0800));
@@ -1364,9 +1306,11 @@ distance = 0.0020
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.price = None;
+        if let RawSignal::Entry { ref mut price, .. } = signal {
+            *price = None;
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         // No entry price → can't compute SL from distance.
         assert_eq!(sl, None);
@@ -1389,7 +1333,7 @@ trigger_price_offset = 0.0020
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         assert_eq!(rules.len(), 1);
@@ -1421,9 +1365,11 @@ trigger_price_offset = 2.0
         let profile = reg.get("test").unwrap();
 
         let mut signal = sell_signal();
-        signal.price = Some(2010.0);
+        if let RawSignal::Entry { ref mut price, .. } = signal {
+            *price = Some(2010.0);
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         match &rules[0] {
@@ -1454,102 +1400,14 @@ trigger_price_offset = 0.0020
         let profile = reg.get("test").unwrap();
 
         let mut signal = buy_signal();
-        signal.price = None;
+        if let RawSignal::Entry { ref mut price, .. } = signal {
+            *price = None;
+        }
 
-        let action = profile.apply(&signal).unwrap();
+        let action = profile.apply_entry_signal(&signal).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
         // Rule is skipped because no entry price to compute offset.
         assert!(rules.is_empty());
-    }
-
-    // ── apply_batch() tests ─────────────────────────────────────────────
-
-    #[test]
-    fn apply_batch_transforms_all() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
-
-        let signals: Vec<RawSignalEntry> = (0..5)
-            .map(|i| {
-                let mut s = buy_signal();
-                s.ts = ts(10, i, 0);
-                s
-            })
-            .collect();
-
-        let result = profile.apply_batch(&signals);
-        assert_eq!(result.len(), 5);
-
-        // Verify timestamps are preserved in order.
-        for (i, sig) in result.iter().enumerate() {
-            assert_eq!(sig.ts, ts(10, i as u32, 0));
-        }
-    }
-
-    #[test]
-    fn apply_batch_preserves_order() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
-
-        let signals = vec![
-            {
-                let mut s = buy_signal();
-                s.ts = ts(10, 0, 0);
-                s.symbol = "eurusd".into();
-                s
-            },
-            {
-                let mut s = buy_signal();
-                s.ts = ts(10, 1, 0);
-                s.symbol = "gbpusd".into();
-                s
-            },
-            {
-                let mut s = buy_signal();
-                s.ts = ts(10, 2, 0);
-                s.symbol = "usdjpy".into();
-                s
-            },
-        ];
-
-        let result = profile.apply_batch(&signals);
-        assert_eq!(result.len(), 3);
-
-        let symbols: Vec<&str> = result
-            .iter()
-            .map(|s| match &s.action {
-                Action::Open { symbol, .. } => symbol.as_str(),
-                _ => panic!("Expected Open"),
-            })
-            .collect();
-        assert_eq!(symbols, vec!["eurusd", "gbpusd", "usdjpy"]);
-    }
-
-    #[test]
-    fn apply_batch_empty_input() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
-
-        let result = profile.apply_batch(&[]);
-        assert!(result.is_empty());
     }
 
     // ── TimeExit rule in profile ────────────────────────────────────────
@@ -1569,7 +1427,7 @@ max_seconds = 3600
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         assert_eq!(rules.len(), 1);
@@ -1681,8 +1539,8 @@ close_ratios = [0.5, 0.5]
         let conservative = reg.get("conservative").unwrap();
         let aggressive = reg.get("aggressive").unwrap();
 
-        let action_c = conservative.apply(&signal).unwrap();
-        let action_a = aggressive.apply(&signal).unwrap();
+        let action_c = conservative.apply_entry_signal(&signal).unwrap();
+        let action_a = aggressive.apply_entry_signal(&signal).unwrap();
 
         let (_, _, _, _, _, _, targets_c, _, _) = unwrap_open(&action_c);
         let (_, _, _, _, _, _, targets_a, _, _) = unwrap_open(&action_a);
@@ -1703,15 +1561,10 @@ close_ratios = [0.5, 0.5]
     fn serde_roundtrip_raw_signal() {
         let signal = buy_signal();
         let json = serde_json::to_string(&signal).unwrap();
-        let back: RawSignalEntry = serde_json::from_str(&json).unwrap();
+        let back: RawSignal = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(back.symbol, signal.symbol);
-        assert_eq!(back.side, signal.side);
-        assert_eq!(back.price, signal.price);
-        assert_eq!(back.size, signal.size);
-        assert_eq!(back.stoploss, signal.stoploss);
-        assert_eq!(back.targets, signal.targets);
-        assert_eq!(back.group, signal.group);
+        assert!(back.is_entry());
+        assert_eq!(back.ts(), ts(10, 0, 0));
     }
 
     #[test]
@@ -1758,7 +1611,6 @@ stoploss_mode = { type = "FromSignal" }
         let profile = reg.get("test").unwrap();
 
         let raw_signals = vec![buy_signal()];
-        let signals = profile.apply_batch(&raw_signals);
 
         // Create a price feed that triggers the TP.
         let events = vec![
@@ -1795,7 +1647,7 @@ stoploss_mode = { type = "FromSignal" }
             ..Default::default()
         };
         let runner = BacktestRunner::new(config);
-        let result = runner.run_signals(&mut feed, signals);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, Some(profile));
 
         // The trade should have been opened and TP should trigger.
         assert_eq!(result.total_trades, 1);
@@ -1821,7 +1673,7 @@ close_ratios = [0.5, 0.5]
 "#;
         let reg = ProfileRegistry::from_toml(toml).unwrap();
 
-        let raw = vec![buy_signal()];
+        let raw_signals = vec![buy_signal()];
 
         // Feed that hits TP1 (1.0900) but not TP2 (1.0950).
         let events = vec![
@@ -1852,20 +1704,28 @@ close_ratios = [0.5, 0.5]
         ];
 
         // Profile A: close 100% at TP1. Trade should fully close.
-        let signals_a = reg.get("tp1_only").unwrap().apply_batch(&raw);
+        let profile_a = reg.get("tp1_only").unwrap();
         let mut feed_a = VecFeed::new(events.clone());
         let config = BacktestConfig {
             initial_balance: 10_000.0,
             close_on_finish: true,
             ..Default::default()
         };
-        let result_a = BacktestRunner::new(config.clone()).run_signals(&mut feed_a, signals_a);
+        let result_a = BacktestRunner::new(config.clone()).run_raw_signals(
+            &mut feed_a,
+            raw_signals.clone(),
+            Some(profile_a),
+        );
 
         // Profile B: close 50% at TP1, 50% at TP2.
         // TP2 never hit, so remaining closes at end (close_on_finish).
-        let signals_b = reg.get("tp1_tp2").unwrap().apply_batch(&raw);
+        let profile_b = reg.get("tp1_tp2").unwrap();
         let mut feed_b = VecFeed::new(events);
-        let result_b = BacktestRunner::new(config).run_signals(&mut feed_b, signals_b);
+        let result_b = BacktestRunner::new(config).run_raw_signals(
+            &mut feed_b,
+            raw_signals.clone(),
+            Some(profile_b),
+        );
 
         // Both produced trades but with different P&L due to different management.
         assert!(result_a.total_trades >= 1);
@@ -1940,7 +1800,7 @@ distance = 0.0030
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("trail_only").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, targets, rules, _) = unwrap_open(&action);
 
         assert!(targets.is_empty());
@@ -1975,7 +1835,7 @@ max_seconds = 7200
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("complex").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         assert_eq!(rules.len(), 3);
@@ -2031,7 +1891,7 @@ price = 1.0750
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, _, _, rules, _) = unwrap_open(&action);
 
         assert_eq!(rules.len(), 1);
@@ -2054,7 +1914,7 @@ close_ratios = [0.5, 0.5]
         let reg = ProfileRegistry::from_toml(toml).unwrap();
         let profile = reg.get("test").unwrap();
 
-        let action = profile.apply(&sell_signal()).unwrap();
+        let action = profile.apply_entry_signal(&sell_signal()).unwrap();
         let (_, side, _, _, _, sl, targets, _, _) = unwrap_open(&action);
 
         assert_eq!(side, Side::Sell);
@@ -2211,7 +2071,7 @@ close_ratios = [1.0]
         let profile = reg.get("test").unwrap();
 
         // Default should be FromSignal — signal's SL should pass through.
-        let action = profile.apply(&buy_signal()).unwrap();
+        let action = profile.apply_entry_signal(&buy_signal()).unwrap();
         let (_, _, _, _, _, sl, _, _, _) = unwrap_open(&action);
         assert_eq!(sl, Some(1.0800));
     }
@@ -2230,6 +2090,7 @@ close_ratios = [1.0]
             stoploss: Some(1.0800),
             targets: vec![1.0900],
             group: None,
+            trade_id: Some("t1".into()),
         };
         assert_eq!(sig.ts(), ts(10, 0, 0));
     }
@@ -2238,7 +2099,9 @@ close_ratios = [1.0]
     fn raw_signal_close_has_correct_ts() {
         let sig = RawSignal::Close {
             ts: ts(11, 30, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
         };
         assert_eq!(sig.ts(), ts(11, 30, 0));
     }
@@ -2255,6 +2118,7 @@ close_ratios = [1.0]
             stoploss: None,
             targets: vec![],
             group: None,
+            trade_id: None,
         };
         assert!(sig.is_entry());
     }
@@ -2263,65 +2127,11 @@ close_ratios = [1.0]
     fn raw_signal_is_entry_false_for_close() {
         let sig = RawSignal::Close {
             ts: ts(10, 0, 0),
-            position: PositionRef::LastOnSymbol {
-                symbol: "eurusd".into(),
+            position: PositionRef::ByTradeId {
+                trade_id: "eurusd".into(),
             },
         };
         assert!(!sig.is_entry());
-    }
-
-    #[test]
-    fn raw_signal_as_entry_converts() {
-        let sig = RawSignal::Entry {
-            ts: ts(10, 0, 0),
-            symbol: "eurusd".into(),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: Some(1.0850),
-            size: 2.0,
-            stoploss: Some(1.0800),
-            targets: vec![1.0900, 1.0950],
-            group: Some("grp1".into()),
-        };
-        let entry = sig.as_entry().unwrap();
-        assert_eq!(entry.ts, ts(10, 0, 0));
-        assert_eq!(entry.symbol, "eurusd");
-        assert_eq!(entry.side, Side::Buy);
-        assert_eq!(entry.order_type, OrderType::Limit);
-        assert_eq!(entry.price, Some(1.0850));
-        assert!((entry.size - 2.0).abs() < f64::EPSILON);
-        assert_eq!(entry.stoploss, Some(1.0800));
-        assert_eq!(entry.targets, vec![1.0900, 1.0950]);
-        assert_eq!(entry.group, Some("grp1".into()));
-    }
-
-    #[test]
-    fn raw_signal_as_entry_returns_none_for_non_entry() {
-        let sig = RawSignal::CloseAll { ts: ts(10, 0, 0) };
-        assert!(sig.as_entry().is_none());
-    }
-
-    #[test]
-    fn from_raw_signal_entry_converts() {
-        let entry = RawSignalEntry {
-            ts: ts(10, 0, 0),
-            symbol: "gbpusd".into(),
-            side: Side::Sell,
-            order_type: OrderType::Market,
-            price: Some(1.2500),
-            size: 1.5,
-            stoploss: Some(1.2550),
-            targets: vec![1.2450],
-            group: Some("g1".into()),
-        };
-        let sig: RawSignal = entry.into();
-        assert!(sig.is_entry());
-        assert_eq!(sig.ts(), ts(10, 0, 0));
-        let back = sig.as_entry().unwrap();
-        assert_eq!(back.symbol, "gbpusd");
-        assert_eq!(back.side, Side::Sell);
-        assert!((back.size - 1.5).abs() < f64::EPSILON);
-        assert_eq!(back.group, Some("g1".into()));
     }
 
     #[test]
@@ -2336,6 +2146,7 @@ close_ratios = [1.0]
             stoploss: Some(1.0800),
             targets: vec![1.0900],
             group: None,
+            trade_id: Some("t1".into()),
         };
         let json = serde_json::to_string(&sig).unwrap();
         let back: RawSignal = serde_json::from_str(&json).unwrap();
@@ -2347,8 +2158,8 @@ close_ratios = [1.0]
     fn serde_roundtrip_raw_signal_close() {
         let sig = RawSignal::Close {
             ts: ts(11, 0, 0),
-            position: PositionRef::Id {
-                id: "pos123".into(),
+            position: PositionRef::ByTradeId {
+                trade_id: "pos123".into(),
             },
         };
         let json = serde_json::to_string(&sig).unwrap();
@@ -2360,18 +2171,14 @@ close_ratios = [1.0]
     #[test]
     fn serde_roundtrip_position_ref_all_variants() {
         let variants: Vec<PositionRef> = vec![
-            PositionRef::Id { id: "abc".into() },
-            PositionRef::LastOnSymbol {
-                symbol: "eurusd".into(),
-            },
-            PositionRef::LastInGroup {
-                group_id: "g1".into(),
+            PositionRef::ByTradeId {
+                trade_id: "abc".into(),
             },
             PositionRef::AllOnSymbol {
-                symbol: "gbpusd".into(),
+                symbol: "eurusd".into(),
             },
             PositionRef::AllInGroup {
-                group_id: "g2".into(),
+                group_id: "g1".into(),
             },
         ];
         for pr in &variants {
@@ -2435,6 +2242,7 @@ close_ratios = [1.0]
             stoploss: None,
             targets: vec![],
             group: None,
+            trade_id: None,
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
         let actions = resolve_signal(&sig, &resolver);
@@ -2445,7 +2253,9 @@ close_ratios = [1.0]
     fn resolve_signal_close_single() {
         let sig = RawSignal::Close {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
         let actions = resolve_signal(&sig, &resolver);
@@ -2473,8 +2283,8 @@ close_ratios = [1.0]
     fn resolve_signal_close_empty_resolver() {
         let sig = RawSignal::Close {
             ts: ts(10, 0, 0),
-            position: PositionRef::LastOnSymbol {
-                symbol: "eurusd".into(),
+            position: PositionRef::ByTradeId {
+                trade_id: "eurusd".into(),
             },
         };
         let resolver = MockResolver::empty();
@@ -2486,7 +2296,9 @@ close_ratios = [1.0]
     fn resolve_signal_close_partial() {
         let sig = RawSignal::ClosePartial {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             ratio: 0.5,
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
@@ -2505,7 +2317,9 @@ close_ratios = [1.0]
     fn resolve_signal_modify_stoploss() {
         let sig = RawSignal::ModifyStoploss {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             price: 1.0820,
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
@@ -2524,7 +2338,9 @@ close_ratios = [1.0]
     fn resolve_signal_move_sl_to_entry() {
         let sig = RawSignal::MoveStoplossToEntry {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
         let actions = resolve_signal(&sig, &resolver);
@@ -2539,7 +2355,9 @@ close_ratios = [1.0]
     fn resolve_signal_add_target() {
         let sig = RawSignal::AddTarget {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             price: 1.0950,
             close_ratio: 0.5,
         };
@@ -2564,7 +2382,9 @@ close_ratios = [1.0]
     fn resolve_signal_remove_target() {
         let sig = RawSignal::RemoveTarget {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             price: 1.0950,
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
@@ -2583,7 +2403,9 @@ close_ratios = [1.0]
     fn resolve_signal_add_rule_with_entry_info() {
         let sig = RawSignal::AddRule {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             rule: RuleConfigDef::BreakevenWhenOffset {
                 trigger_price_offset: 0.0050,
             },
@@ -2609,7 +2431,9 @@ close_ratios = [1.0]
     fn resolve_signal_add_rule_no_entry_info_skips() {
         let sig = RawSignal::AddRule {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             rule: RuleConfigDef::BreakevenWhenOffset {
                 trigger_price_offset: 0.0050,
             },
@@ -2624,7 +2448,9 @@ close_ratios = [1.0]
     fn resolve_signal_add_rule_trailing_stop() {
         let sig = RawSignal::AddRule {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             rule: RuleConfigDef::TrailingStop { distance: 0.0030 },
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
@@ -2644,7 +2470,9 @@ close_ratios = [1.0]
     fn resolve_signal_remove_rule() {
         let sig = RawSignal::RemoveRule {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             rule_name: "TrailingStop".into(),
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
@@ -2666,7 +2494,9 @@ close_ratios = [1.0]
     fn resolve_signal_scale_in() {
         let sig = RawSignal::ScaleIn {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
             price: Some(1.0860),
             size: 0.5,
         };
@@ -2678,6 +2508,7 @@ close_ratios = [1.0]
                 position_id,
                 price,
                 size,
+                ..
             } => {
                 assert_eq!(position_id, "pos1");
                 assert_eq!(*price, Some(1.0860));
@@ -2691,7 +2522,9 @@ close_ratios = [1.0]
     fn resolve_signal_cancel_pending() {
         let sig = RawSignal::CancelPending {
             ts: ts(10, 0, 0),
-            position: PositionRef::Id { id: "pos1".into() },
+            position: PositionRef::ByTradeId {
+                trade_id: "pos1".into(),
+            },
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
         let actions = resolve_signal(&sig, &resolver);
@@ -2788,20 +2621,19 @@ close_ratios = [1.0]
         }
     }
 
-    // ── Phase 3: apply_raw / apply_batch_raw tests ──────────────────────
-
     #[test]
-    fn apply_raw_entry_transforms() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
+    fn apply_entry_signal_preserves_trade_id() {
+        let profile = ManagementProfile {
+            name: "test".into(),
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+        };
 
-        let sig = RawSignal::Entry {
+        let signal = RawSignal::Entry {
             ts: ts(10, 0, 0),
             symbol: "eurusd".into(),
             side: Side::Buy,
@@ -2811,76 +2643,17 @@ close_ratios = [1.0]
             stoploss: Some(1.0800),
             targets: vec![1.0900],
             group: None,
+            trade_id: Some("t1".into()),
         };
-        let result = profile.apply_raw(&sig);
-        assert!(result.is_some());
-        assert!(result.unwrap().is_entry());
-    }
 
-    #[test]
-    fn apply_raw_close_passes_through() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
-
-        let sig = RawSignal::Close {
-            ts: ts(10, 30, 0),
-            position: PositionRef::LastOnSymbol {
-                symbol: "eurusd".into(),
-            },
-        };
-        let result = profile.apply_raw(&sig);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert!(!result.is_entry());
-        assert_eq!(result.ts(), ts(10, 30, 0));
-    }
-
-    #[test]
-    fn apply_batch_raw_mixed() {
-        let toml = r#"
-[[profile]]
-name = "test"
-use_targets = [1]
-close_ratios = [1.0]
-"#;
-        let reg = ProfileRegistry::from_toml(toml).unwrap();
-        let profile = reg.get("test").unwrap();
-
-        let signals = vec![
-            RawSignal::Entry {
-                ts: ts(10, 0, 0),
-                symbol: "eurusd".into(),
-                side: Side::Buy,
-                order_type: OrderType::Market,
-                price: Some(1.0850),
-                size: 1.0,
-                stoploss: Some(1.0800),
-                targets: vec![1.0900],
-                group: None,
-            },
-            RawSignal::Close {
-                ts: ts(10, 30, 0),
-                position: PositionRef::LastOnSymbol {
-                    symbol: "eurusd".into(),
-                },
-            },
-            RawSignal::ModifyStoploss {
-                ts: ts(10, 15, 0),
-                position: PositionRef::Id { id: "pos1".into() },
-                price: 1.0820,
-            },
-        ];
-
-        let result = profile.apply_batch_raw(&signals);
-        assert_eq!(result.len(), 3);
-        assert!(result[0].is_entry());
-        assert!(!result[1].is_entry());
-        assert!(!result[2].is_entry());
+        let action = profile
+            .apply_entry_signal(&signal)
+            .expect("Expected Some(Action)");
+        match action {
+            Action::Open { trade_id, .. } => {
+                assert_eq!(trade_id, Some("t1".into()));
+            }
+            _ => panic!("Expected Action::Open"),
+        }
     }
 }
