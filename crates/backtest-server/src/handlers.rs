@@ -5,9 +5,9 @@
 //! returns a response message. Errors are captured in the response rather
 //! than crashing the server.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use chrono::NaiveDateTime;
@@ -27,11 +27,73 @@ use crate::rpc_types::*;
 
 /// Shared state accessible by all client handlers.
 pub struct ServerState {
+    /// Symbol registry for normalization and contract size metadata.
     pub symbol_registry: SymbolRegistry,
+    /// Management profile registry (TOML-loaded + dynamically added).
     pub profile_registry: RwLock<ProfileRegistry>,
+    /// Root directory for Parquet market data.
     pub data_dir: String,
+    /// Path to the profiles TOML file (for reload).
     pub profiles_path: String,
+    /// Server start time for uptime reporting.
     pub start_time: Instant,
+    /// Async backtest job storage (Issue 2).
+    pub jobs: Mutex<HashMap<String, BacktestJob>>,
+}
+
+/// Internal representation of an async backtest job.
+#[derive(Debug, Clone)]
+pub struct BacktestJob {
+    /// Current job status.
+    pub status: JobStatus,
+    /// When the job was submitted.
+    pub submitted_at: Instant,
+    /// When the job completed (if finished).
+    pub completed_at: Option<Instant>,
+    /// Optional progress info (e.g. number of events processed).
+    pub progress: Option<String>,
+    /// Serialized result message (when completed).
+    pub result: Option<BacktestResultMsg>,
+    /// Error message (when failed).
+    pub error: Option<String>,
+}
+
+/// Typed job status for the async backtest API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    LoadingData,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    /// Convert to string for wire transport.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Queued => "Queued",
+            JobStatus::LoadingData => "LoadingData",
+            JobStatus::Running => "Running",
+            JobStatus::Completed => "Completed",
+            JobStatus::Failed => "Failed",
+            JobStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Parse from string.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Queued" => Some(Self::Queued),
+            "LoadingData" => Some(Self::LoadingData),
+            "Running" => Some(Self::Running),
+            "Completed" => Some(Self::Completed),
+            "Failed" => Some(Self::Failed),
+            "Cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 // ── Ping ────────────────────────────────────────────────────────────────────
@@ -174,12 +236,22 @@ fn execute_backtest(state: &ServerState, req: &RunBacktestRequest) -> Result<Bac
         &req.raw_signals,
     )?;
     let exchange = req.exchange.to_lowercase();
+    tracing::info!(
+        "run_backtest: symbols={:?} exchange={} data_type={}",
+        symbols,
+        exchange,
+        req.data_type
+    );
 
     // 3. Parse date range filters.
     let from = parse_optional_datetime(&req.from)?;
     let to = parse_optional_datetime(&req.to)?;
 
     // 4. Load and merge market data for every requested symbol.
+    tracing::info!(
+        "run_backtest: loading market data for {} symbols...",
+        symbols.len()
+    );
     let mut feed = load_market_data_for_symbols(
         &state.data_dir,
         &exchange,
@@ -189,13 +261,26 @@ fn execute_backtest(state: &ServerState, req: &RunBacktestRequest) -> Result<Bac
         from,
         to,
     )?;
+    tracing::info!("run_backtest: market data loaded, {} events", feed.total());
 
-    // 5. Convert raw signals and run one portfolio backtest.
-    let raw_signals = build_raw_signals_for_symbols(state, &req.raw_signals, &symbols)?;
+    // 5. Convert raw signals, filter by date range, and run backtest.
+    let mut raw_signals = build_raw_signals_for_symbols(state, &req.raw_signals, &symbols)?;
+    tracing::info!("run_backtest: {} raw signals converted", raw_signals.len());
+    raw_signals = filter_signals_by_date(raw_signals, from, to);
+    tracing::info!(
+        "run_backtest: {} signals after date filtering",
+        raw_signals.len()
+    );
     let profile = resolve_profile(state, req)?;
-    let config = config_from_msg(&req.config);
+    let config = config_from_msg(&req.config, &state.symbol_registry, &symbols);
     let runner = BacktestRunner::new(config);
+    tracing::info!("run_backtest: starting backtest engine...");
     let result = runner.run_raw_signals(&mut feed, raw_signals, profile.as_ref());
+    tracing::info!(
+        "run_backtest: done, {} trades, {} positions",
+        result.total_trades,
+        result.total_positions
+    );
     Ok(result)
 }
 
@@ -345,9 +430,9 @@ fn execute_backtest_multi(
         }
     };
 
-    let config = config_from_msg(&req.config);
+    let config = config_from_msg(&req.config, &state.symbol_registry, &symbols);
 
-    // Convert raw signal messages to internal format once.
+    // Convert raw signal messages to internal format once, then filter by date.
     let raw_signals_vec: Vec<RawSignal> =
         match build_raw_signals_for_symbols(state, &req.raw_signals, &symbols) {
             Ok(v) => v,
@@ -364,6 +449,7 @@ fn execute_backtest_multi(
                     .collect();
             }
         };
+    let raw_signals_vec = filter_signals_by_date(raw_signals_vec, from, to);
 
     // Run each profile independently.
     req.profiles
@@ -637,9 +723,11 @@ fn load_market_data_for_symbols(
 
     let mut feeds = Vec::with_capacity(symbols.len());
     for symbol in symbols {
+        tracing::info!("run_backtest: loading {}...", symbol);
         feeds.push(load_market_data(
             data_dir, exchange, symbol, data_type, timeframe, from, to,
         )?);
+        tracing::info!("run_backtest: loaded {}", symbol);
     }
 
     Ok(merge_feeds(feeds))
@@ -879,6 +967,30 @@ fn parse_optional_datetime(s: &Option<String>) -> Result<Option<NaiveDateTime>> 
     }
 }
 
+/// Filter raw signals to only those within the requested date range.
+///
+/// Signals outside the range are dropped.  When both `from` and `to` are
+/// `None` the full list is returned unchanged.  This is the authoritative
+/// server-side filter; correctness must not depend on client behaviour.
+fn filter_signals_by_date(
+    signals: Vec<RawSignal>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Vec<RawSignal> {
+    if from.is_none() && to.is_none() {
+        return signals;
+    }
+    signals
+        .into_iter()
+        .filter(|s| {
+            let ts = s.ts();
+            let after_from = from.map_or(true, |f| ts >= f);
+            let before_to = to.map_or(true, |t| ts <= t);
+            after_from && before_to
+        })
+        .collect()
+}
+
 // ── Phase 2: Profile Management Handlers ────────────────────────────────────
 
 /// Handle `add_profile` — add or overwrite a management profile at runtime.
@@ -960,11 +1072,228 @@ pub fn handle_reload_profiles(state: &ServerState) -> ReloadProfilesResponse {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+// ── Async Job API Handlers (Issue 2) ─────────────────────────────────────────
 
-#[cfg(test)]
+/// Handle `submit_backtest` — queue a backtest for async execution.
+///
+/// Returns immediately with a job_id.  The caller polls
+/// `get_backtest_status` and fetches results via `get_backtest_result`.
+pub fn handle_submit_backtest(
+    state: &ServerState,
+    req: &SubmitBacktestRequest,
+) -> SubmitBacktestResponse {
+    // Validate request before creating job.
+    if let Err(e) = validate_request(&req.request) {
+        return SubmitBacktestResponse {
+            success: false,
+            job_id: None,
+            error: Some(e.to_string()),
+        };
+    }
+
+    let job_id = format!("job-{}", uuid_v4_simple());
+    let job = BacktestJob {
+        status: JobStatus::Queued,
+        submitted_at: Instant::now(),
+        completed_at: None,
+        progress: None,
+        result: None,
+        error: None,
+    };
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        jobs.insert(job_id.clone(), job);
+    }
+    SubmitBacktestResponse {
+        success: true,
+        job_id: Some(job_id),
+        error: None,
+    }
+}
+
+/// Handle `get_backtest_status` — poll the status of a submitted job.
+pub fn handle_get_backtest_status(
+    state: &ServerState,
+    req: &GetBacktestStatusRequest,
+) -> BacktestStatusResponse {
+    let jobs = state.jobs.lock().unwrap();
+    match jobs.get(&req.job_id) {
+        Some(job) => {
+            let elapsed_ms = job
+                .completed_at
+                .map(|c| c.duration_since(job.submitted_at).as_millis() as u64);
+            BacktestStatusResponse {
+                success: true,
+                job_id: req.job_id.clone(),
+                status: job.status.as_str().to_string(),
+                error: job.error.clone(),
+                elapsed_ms,
+            }
+        }
+        None => BacktestStatusResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            status: "NotFound".into(),
+            error: Some(format!("Job '{}' not found", req.job_id)),
+            elapsed_ms: None,
+        },
+    }
+}
+
+/// Handle `get_backtest_result` — fetch the result of a completed job.
+pub fn handle_get_backtest_result(
+    state: &ServerState,
+    req: &GetBacktestResultRequest,
+) -> GetBacktestResultResponse {
+    let jobs = state.jobs.lock().unwrap();
+    match jobs.get(&req.job_id) {
+        Some(job) if job.status == JobStatus::Completed => GetBacktestResultResponse {
+            success: true,
+            job_id: req.job_id.clone(),
+            result: job.result.clone(),
+            error: None,
+        },
+        Some(job) => GetBacktestResultResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            result: None,
+            error: Some(format!(
+                "Job is not completed (status: {})",
+                job.status.as_str()
+            )),
+        },
+        None => GetBacktestResultResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            result: None,
+            error: Some(format!("Job '{}' not found", req.job_id)),
+        },
+    }
+}
+
+/// Handle `cancel_backtest` — cancel a submitted job.
+pub fn handle_cancel_backtest(
+    state: &ServerState,
+    req: &CancelBacktestRequest,
+) -> CancelBacktestResponse {
+    let mut jobs = state.jobs.lock().unwrap();
+    match jobs.get_mut(&req.job_id) {
+        Some(job)
+            if job.status == JobStatus::Queued
+                || job.status == JobStatus::LoadingData
+                || job.status == JobStatus::Running =>
+        {
+            job.status = JobStatus::Cancelled;
+            job.completed_at = Some(Instant::now());
+            CancelBacktestResponse {
+                success: true,
+                job_id: req.job_id.clone(),
+                error: None,
+            }
+        }
+        Some(job) => CancelBacktestResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            error: Some(format!(
+                "Cannot cancel job in status: {}",
+                job.status.as_str()
+            )),
+        },
+        None => CancelBacktestResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            error: Some(format!("Job '{}' not found", req.job_id)),
+        },
+    }
+}
+
+/// Run a submitted backtest job synchronously and store the result.
+/// Called from spawn_blocking in the server binary.
+pub fn run_job_and_store(state: Arc<ServerState>, job_id: String, req: RunBacktestRequest) {
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if job.status == JobStatus::Cancelled {
+                return;
+            }
+            job.status = JobStatus::LoadingData;
+        } else {
+            return;
+        }
+    }
+
+    // Transition to Running before the backtest engine starts.
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if job.status == JobStatus::Cancelled {
+                return;
+            }
+            job.status = JobStatus::Running;
+        }
+    }
+
+    let result = execute_backtest(&state, &req);
+
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if job.status == JobStatus::Cancelled {
+                return;
+            }
+            match result {
+                Ok(backtest_result) => {
+                    job.status = JobStatus::Completed;
+                    job.result = Some(result_to_msg(&backtest_result));
+                    job.progress = Some(format!(
+                        "{} trades, {} positions",
+                        backtest_result.total_trades, backtest_result.total_positions
+                    ));
+                    job.completed_at = Some(Instant::now());
+                }
+                Err(e) => {
+                    job.status = JobStatus::Failed;
+                    job.error = Some(e.to_string());
+                    job.completed_at = Some(Instant::now());
+                }
+            }
+        }
+    }
+}
+
+/// Generate a simple unique ID without external dependencies.
+fn uuid_v4_simple() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = now.as_nanos();
+    format!("{:x}", nanos)
+}
+
+/// Remove expired jobs from the job map.
+/// Completed/Failed/Cancelled jobs older than `max_age_secs` are removed.
+pub fn cleanup_expired_jobs(state: &ServerState, max_age_secs: u64) {
+    let now = Instant::now();
+    let max_duration = std::time::Duration::from_secs(max_age_secs);
+    let mut jobs = state.jobs.lock().unwrap();
+    jobs.retain(|_, job| {
+        let completed = match job.completed_at {
+            Some(c) => c,
+            None => return true, // still running, keep
+        };
+        now.duration_since(completed) < max_duration
+    });
+}
+
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use chrono::NaiveDate;
+    #[allow(unused_imports)]
+    use qs_core::types::{OrderType, Side};
+    #[allow(unused_imports)]
+    use std::sync::Arc;
 
     #[test]
     fn parse_datetime_iso() {
@@ -1073,6 +1402,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let signals = vec![RawSignalMsg::Entry {
             ts: "2026-01-15T10:00:00".into(),
@@ -1110,6 +1440,7 @@ mod tests {
                 initial_balance: None,
                 close_on_finish: None,
                 fill_model: None,
+                sizing: None,
             },
         };
         assert!(validate_request(&req).is_err());
@@ -1144,6 +1475,7 @@ mod tests {
                 initial_balance: None,
                 close_on_finish: None,
                 fill_model: None,
+                sizing: None,
             },
         };
         assert!(validate_request(&req).is_err());
@@ -1178,6 +1510,7 @@ mod tests {
                 initial_balance: None,
                 close_on_finish: None,
                 fill_model: None,
+                sizing: None,
             },
         };
         assert!(validate_request(&req).is_err());
@@ -1212,6 +1545,7 @@ mod tests {
                 initial_balance: None,
                 close_on_finish: None,
                 fill_model: None,
+                sizing: None,
             },
         };
         assert!(validate_request(&req).is_ok());
@@ -1225,12 +1559,14 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let resp = handle_ping(&state);
         assert_eq!(resp.status, "OK");
         assert_eq!(resp.data_dir, "/tmp/test");
     }
 
+    #[allow(dead_code)]
     fn temp_data_dir(name: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1346,6 +1682,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let resp = handle_list_profiles(&state);
         assert!(resp.profiles.is_empty());
@@ -1359,6 +1696,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
@@ -1386,6 +1724,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
@@ -1414,6 +1753,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let req1 = AddProfileRequest {
             profile: ManagementProfileMsg {
@@ -1453,6 +1793,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
@@ -1480,6 +1821,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // Add a profile first.
         let add_req = AddProfileRequest {
@@ -1514,6 +1856,7 @@ mod tests {
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
             start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let resp = handle_remove_profile(
             &state,
@@ -1523,5 +1866,371 @@ mod tests {
         );
         assert!(!resp.success);
         assert!(resp.error.as_ref().unwrap().contains("not found"));
+    }
+
+    //
+    // Issue 1: filter_signals_by_date tests
+    //
+
+    #[test]
+    fn filter_signals_by_date_inclusive() {
+        use qs_backtest::profile::RawSignal;
+        let t = |d: u32| {
+            NaiveDate::from_ymd_opt(2026, 3, d)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        };
+        let signals: Vec<RawSignal> = vec![
+            RawSignal::Entry {
+                ts: t(8),
+                symbol: "X".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: None,
+                size: 0.01,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            },
+            RawSignal::Entry {
+                ts: t(9),
+                symbol: "X".into(),
+                side: Side::Sell,
+                order_type: OrderType::Market,
+                price: None,
+                size: 0.01,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            },
+            RawSignal::Entry {
+                ts: t(12),
+                symbol: "X".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: None,
+                size: 0.01,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            },
+        ];
+        let filtered = filter_signals_by_date(signals, Some(t(8)), Some(t(11)));
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_signals_by_date_no_filter() {
+        use qs_backtest::profile::RawSignal;
+        let signals: Vec<RawSignal> = vec![RawSignal::Entry {
+            ts: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            symbol: "X".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: None,
+            size: 0.01,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+            trade_id: None,
+        }];
+        let filtered = filter_signals_by_date(signals, None, None);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    //
+    // Issue 2: Async job tests
+    //
+
+    #[allow(dead_code)]
+    fn job_test_state() -> ServerState {
+        ServerState {
+            symbol_registry: SymbolRegistry::empty(),
+            profile_registry: RwLock::new(ProfileRegistry::empty()),
+            data_dir: "/tmp/test".into(),
+            profiles_path: String::new(),
+            start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn valid_submit_request() -> SubmitBacktestRequest {
+        SubmitBacktestRequest {
+            request: RunBacktestRequest {
+                symbol: "XAUUSD".into(),
+                symbols: vec![],
+                all_symbols: false,
+                exchange: "icmarkets".into(),
+                data_type: "tick".into(),
+                timeframe: None,
+                from: None,
+                to: None,
+                raw_signals: vec![RawSignalMsg::Entry {
+                    ts: "2026-01-01T00:00:00".into(),
+                    symbol: "xauusd".into(),
+                    side: "Buy".into(),
+                    order_type: "Market".into(),
+                    price: Some(5000.0),
+                    size: 0.01,
+                    stoploss: Some(4990.0),
+                    targets: vec![],
+                    group: None,
+                    trade_id: None,
+                }],
+                profile: None,
+                profile_def: None,
+                config: BacktestConfigMsg {
+                    initial_balance: Some(10_000.0),
+                    close_on_finish: Some(true),
+                    fill_model: Some("BidAsk".into()),
+                    sizing: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn submit_and_cancel_job() {
+        let state = job_test_state();
+        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        assert!(submit.success);
+        let job_id = submit.job_id.unwrap();
+
+        let cancel = handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: job_id.clone(),
+            },
+        );
+        assert!(cancel.success);
+
+        let status = handle_get_backtest_status(&state, &GetBacktestStatusRequest { job_id });
+        assert_eq!(status.status, "Cancelled");
+    }
+
+    #[test]
+    fn submit_invalid_request_rejected() {
+        let state = job_test_state();
+        let mut req = valid_submit_request();
+        req.request.raw_signals = vec![];
+        let submit = handle_submit_backtest(&state, &req);
+        assert!(!submit.success);
+        assert!(submit.job_id.is_none());
+    }
+
+    #[test]
+    fn get_status_not_found() {
+        let state = job_test_state();
+        let status = handle_get_backtest_status(
+            &state,
+            &GetBacktestStatusRequest {
+                job_id: "nonexistent".into(),
+            },
+        );
+        assert!(!status.success);
+        assert_eq!(status.status, "NotFound");
+    }
+
+    #[test]
+    fn cancel_nonexistent_job() {
+        let state = job_test_state();
+        let resp = handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: "nope".into(),
+            },
+        );
+        assert!(!resp.success);
+    }
+
+    //
+    // Issue 3: Contract size wiring test
+    //
+
+    #[test]
+    fn config_from_msg_populates_contract_sizes() {
+        let toml = r#"
+[[symbol]]
+canonical = "xauusd"
+aliases = ["gold"]
+pip_position = 1
+digits = 2
+category = "metal"
+lot_base_units = 100
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
+canonical = "gbpjpy"
+aliases = []
+pip_position = 2
+digits = 3
+category = "forex"
+lot_base_units = 100000
+lot_step_units = 1000
+lot_min_steps = 1
+lot_max_steps = 0
+"#;
+        let registry = SymbolRegistry::from_toml(toml).unwrap();
+        let symbols = vec!["xauusd".to_string(), "gbpjpy".to_string()];
+        let msg = BacktestConfigMsg {
+            initial_balance: Some(10_000.0),
+            close_on_finish: Some(true),
+            fill_model: Some("BidAsk".into()),
+            sizing: None,
+        };
+        let config = config_from_msg(&msg, &registry, &symbols);
+        assert_eq!(config.contract_sizes.get("xauusd"), Some(&100.0));
+        assert_eq!(config.contract_sizes.get("gbpjpy"), Some(&100_000.0));
+        assert!(!config.symbol_specs.is_empty());
+    }
+
+    #[test]
+    fn job_full_lifecycle_transitions() {
+        use std::sync::Arc;
+        let state = Arc::new(job_test_state());
+
+        // Submit a valid job.
+        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        assert!(submit.success);
+        let job_id = submit.job_id.unwrap();
+
+        // Status should be Queued.
+        let status = handle_get_backtest_status(
+            &state,
+            &GetBacktestStatusRequest {
+                job_id: job_id.clone(),
+            },
+        );
+        assert_eq!(status.status, "Queued");
+
+        // Run the job via run_job_and_store (will fail since no real data,
+        // but should transition through LoadingData -> Failed).
+        let req = valid_submit_request().request;
+        run_job_and_store(state.clone(), job_id.clone(), req);
+
+        // Status should be Failed (no market data at /tmp/test).
+        let status = handle_get_backtest_status(
+            &state,
+            &GetBacktestStatusRequest {
+                job_id: job_id.clone(),
+            },
+        );
+        assert!(
+            status.status == "Failed" || status.status == "Completed",
+            "Expected Failed or Completed, got {}",
+            status.status
+        );
+
+        // Fetch result should fail since job is not Completed.
+        let result_resp = handle_get_backtest_result(&state, &GetBacktestResultRequest { job_id });
+        if status.status == "Failed" {
+            assert!(!result_resp.success);
+        }
+    }
+
+    #[test]
+    fn concurrent_jobs_independent() {
+        let state = job_test_state();
+
+        // Submit two jobs.
+        let submit1 = handle_submit_backtest(&state, &valid_submit_request());
+        let submit2 = handle_submit_backtest(&state, &valid_submit_request());
+
+        assert!(submit1.success);
+        assert!(submit2.success);
+
+        let id1 = submit1.job_id.unwrap();
+        let id2 = submit2.job_id.unwrap();
+
+        // IDs must be different.
+        assert_ne!(id1, id2);
+
+        // Both should be Queued.
+        let s1 = handle_get_backtest_status(
+            &state,
+            &GetBacktestStatusRequest {
+                job_id: id1.clone(),
+            },
+        );
+        let s2 = handle_get_backtest_status(
+            &state,
+            &GetBacktestStatusRequest {
+                job_id: id2.clone(),
+            },
+        );
+        assert_eq!(s1.status, "Queued");
+        assert_eq!(s2.status, "Queued");
+
+        // Cancel one, the other should still be Queued.
+        handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: id1.clone(),
+            },
+        );
+
+        let s1_after =
+            handle_get_backtest_status(&state, &GetBacktestStatusRequest { job_id: id1 });
+        let s2_after =
+            handle_get_backtest_status(&state, &GetBacktestStatusRequest { job_id: id2 });
+        assert_eq!(s1_after.status, "Cancelled");
+        assert_eq!(s2_after.status, "Queued");
+    }
+
+    #[test]
+    fn job_cleanup_removes_expired() {
+        let state = job_test_state();
+
+        // Submit and cancel a job.
+        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        let job_id = submit.job_id.unwrap();
+        handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: job_id.clone(),
+            },
+        );
+
+        // Job should exist.
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(jobs.contains_key(&job_id));
+        }
+
+        // Cleanup with max_age=0 removes completed/cancelled jobs.
+        cleanup_expired_jobs(&state, 0);
+
+        // Job should be gone.
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(!jobs.contains_key(&job_id));
+        }
+    }
+
+    #[test]
+    fn job_status_enum_roundtrip() {
+        assert_eq!(JobStatus::Queued.as_str(), "Queued");
+        assert_eq!(JobStatus::LoadingData.as_str(), "LoadingData");
+        assert_eq!(JobStatus::Running.as_str(), "Running");
+        assert_eq!(JobStatus::Completed.as_str(), "Completed");
+        assert_eq!(JobStatus::Failed.as_str(), "Failed");
+        assert_eq!(JobStatus::Cancelled.as_str(), "Cancelled");
+
+        assert_eq!(JobStatus::from_str("Queued"), Some(JobStatus::Queued));
+        assert_eq!(
+            JobStatus::from_str("LoadingData"),
+            Some(JobStatus::LoadingData)
+        );
+        assert_eq!(JobStatus::from_str("invalid"), None);
     }
 }

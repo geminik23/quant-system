@@ -34,7 +34,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use backtest_server::rpc_types::*;
-use xrpc::{MessageChannelAdapter, RpcClient, SharedMemoryFrameTransport};
+use xrpc::{JsonCodec, MessageChannelAdapter, RpcClient, SharedMemoryFrameTransport};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ async fn connect(
     client_name: &str,
 ) -> Result<
     (
-        RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport>>,
+        RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>,
         ConnectResponse,
     ),
     Box<dyn std::error::Error>,
@@ -100,8 +100,8 @@ async fn connect(
 
     // Step 1: Connect to the well-known acceptor endpoint.
     let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
-    let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
-    let acceptor_client = RpcClient::new(acceptor_channel);
+    let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
+    let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
     let _handle = acceptor_client.start();
 
     let resp: ConnectResponse = acceptor_client
@@ -126,8 +126,8 @@ async fn connect(
 
     // Step 2: Connect to the dedicated per-client slot.
     let transport = SharedMemoryFrameTransport::connect_client(&resp.slot_name)?;
-    let channel = MessageChannelAdapter::new(transport);
-    let client = RpcClient::new(channel);
+    let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
+    let client = RpcClient::with_codec(channel, JsonCodec);
     let _handle = client.start();
 
     Ok((client, resp))
@@ -592,6 +592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_balance: Some(args.balance),
             close_on_finish: Some(true),
             fill_model: Some("BidAsk".into()),
+            sizing: None,
         },
     };
 

@@ -7,10 +7,13 @@
 use std::io::{self, BufRead};
 use std::sync::Arc;
 
+use chrono::NaiveDateTime;
 use clap::Parser;
 
 use backtest_server::rpc_types::*;
-use xrpc::{MessageChannelAdapter, RpcClient, SharedMemoryFrameTransport};
+use xrpc::{
+    JsonCodec, MessageChannelAdapter, RpcClient, SharedMemoryConfig, SharedMemoryFrameTransport,
+};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -71,6 +74,16 @@ struct Args {
     /// Write full result JSON to this file.
     #[arg(long)]
     output: Option<String>,
+
+    /// Use async job submission mode (Issue 2).
+    /// Submits job, polls status, then fetches result.
+    #[arg(long, default_value_t = false)]
+    r#async: bool,
+
+    /// Risk per trade in account currency (Issue 3).  When set, uses
+    /// RRValue sizing policy with the given risk amount.
+    #[arg(long)]
+    risk_per_trade: Option<f64>,
 }
 
 // ── Connection ──────────────────────────────────────────────────────────────
@@ -78,15 +91,22 @@ struct Args {
 /// Connect via the SHM acceptor pattern and return an RPC client on a dedicated slot.
 async fn connect(
     shm_name: &str,
-) -> Result<RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport>>, Box<dyn std::error::Error>>
-{
+) -> Result<
+    RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>,
+    Box<dyn std::error::Error>,
+> {
     let accept_name = format!("{}-accept", shm_name);
     eprintln!("[connect] acceptor shm://{}", accept_name);
 
     // Handshake on the well-known acceptor endpoint.
-    let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
-    let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
-    let acceptor_client = RpcClient::new(acceptor_channel);
+    let acceptor_transport = SharedMemoryFrameTransport::connect_client_with_config(
+        &accept_name,
+        SharedMemoryConfig::default()
+            .with_read_timeout(std::time::Duration::from_secs(30))
+            .with_write_timeout(std::time::Duration::from_secs(10)),
+    )?;
+    let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
+    let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
     let _handle = acceptor_client.start();
 
     let resp: ConnectResponse = acceptor_client
@@ -108,9 +128,15 @@ async fn connect(
     acceptor_client.close().await?;
 
     // Reconnect on the dedicated per-client slot.
-    let transport = SharedMemoryFrameTransport::connect_client(&resp.slot_name)?;
-    let channel = MessageChannelAdapter::new(transport);
-    let client = RpcClient::new(channel);
+    let transport = SharedMemoryFrameTransport::connect_client_with_config(
+        &resp.slot_name,
+        SharedMemoryConfig::default()
+            .with_buffer_size(16 * 1024 * 1024)
+            .with_read_timeout(std::time::Duration::from_secs(300))
+            .with_write_timeout(std::time::Duration::from_secs(30)),
+    )?;
+    let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
+    let client = RpcClient::with_codec(channel, JsonCodec);
     let _handle = client.start();
 
     Ok(client)
@@ -139,6 +165,51 @@ fn load_raw_signals(path: &str) -> Result<Vec<RawSignalMsg>, Box<dyn std::error:
         signals.push(msg);
     }
     Ok(signals)
+}
+
+/// Filter raw signal messages to only those within the requested date range.
+///
+/// This is a client-side optimisation that reduces request payload size.
+/// The server also applies authoritative filtering, so correctness does not
+/// depend on this function.
+fn filter_signals_by_date(
+    signals: Vec<RawSignalMsg>,
+    from: &Option<String>,
+    to: &Option<String>,
+) -> Vec<RawSignalMsg> {
+    if from.is_none() && to.is_none() {
+        return signals;
+    }
+    let parse_ts = |s: &str| -> Option<NaiveDateTime> {
+        let formats = [
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        ];
+        for fmt in &formats {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+                return Some(dt);
+            }
+        }
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+    };
+    let from_dt = from.as_deref().and_then(parse_ts);
+    let to_dt = to.as_deref().and_then(parse_ts);
+    signals
+        .into_iter()
+        .filter(|s| {
+            let Some(ts) = parse_ts(s.ts()) else {
+                return true; // keep signals with unparseable timestamps
+            };
+            let after_from = from_dt.map_or(true, |f| ts >= f);
+            let before_to = to_dt.map_or(true, |t| ts <= t);
+            after_from && before_to
+        })
+        .collect()
 }
 
 fn parse_symbols_arg(value: Option<&str>) -> Vec<String> {
@@ -388,7 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load parsed signals from JSONL.
     print_header("Loading Parsed Signals");
-    let raw_signals = load_raw_signals(&args.input)?;
+    let mut raw_signals = load_raw_signals(&args.input)?;
     println!(
         "  Loaded {} raw signals from {}",
         raw_signals.len(),
@@ -397,6 +468,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if raw_signals.is_empty() {
         eprintln!("  No signals to backtest — exiting.");
+        return Ok(());
+    }
+
+    // 1b. Client-side date filtering (reduces payload; server also filters).
+    raw_signals = filter_signals_by_date(raw_signals, &args.from, &args.to);
+    println!("  After date filtering: {} signals", raw_signals.len());
+    if raw_signals.is_empty() {
+        eprintln!("  No signals in date range — exiting.");
         return Ok(());
     }
 
@@ -439,6 +518,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raw_signals.len()
     );
 
+    let sizing = args.risk_per_trade.map(|v| SizingPolicyMsg::RRValue {
+        qty: "all=0.01".into(),
+        value: v,
+    });
+
     let request = RunBacktestRequest {
         symbol: request_symbol,
         symbols: request_symbols,
@@ -455,32 +539,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_balance: Some(args.balance),
             close_on_finish: Some(true),
             fill_model: Some("BidAsk".into()),
+            sizing,
         },
     };
 
-    let resp: RunBacktestResponse = client.call("run_backtest", &request).await?;
-    println!("  Elapsed: {}ms", resp.elapsed_ms);
+    if args.r#async {
+        // Async mode: submit job, poll status, fetch result.
+        let submit: SubmitBacktestResponse = client
+            .call(
+                "submit_backtest",
+                &SubmitBacktestRequest {
+                    request: request.clone(),
+                },
+            )
+            .await?;
+        if !submit.success || submit.job_id.is_none() {
+            eprintln!(
+                "  ✗ Failed to submit job: {}",
+                submit.error.as_deref().unwrap_or("unknown error")
+            );
+            client.close().await?;
+            return Ok(());
+        }
+        let job_id = submit.job_id.unwrap();
+        println!("  Job submitted: {}", job_id);
 
-    // 5. Display results.
-    if resp.success {
-        if let Some(ref result) = resp.result {
-            print_result_summary(result);
-            print_trade_log(&result.trade_log, 30);
-            print_positions(&result.positions, 15);
-
-            // Write full result JSON to file if requested.
-            if let Some(ref output_path) = args.output {
-                let json = serde_json::to_string_pretty(result)?;
-                std::fs::write(output_path, json)?;
-                println!();
-                println!("  Full result written to {}", output_path);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let status: BacktestStatusResponse = client
+                .call(
+                    "get_backtest_status",
+                    &GetBacktestStatusRequest {
+                        job_id: job_id.clone(),
+                    },
+                )
+                .await?;
+            println!("  Status: {}", status.status);
+            if status.status == "Completed"
+                || status.status == "Failed"
+                || status.status == "Cancelled"
+            {
+                break;
             }
         }
+
+        let result_resp: GetBacktestResultResponse = client
+            .call(
+                "get_backtest_result",
+                &GetBacktestResultRequest {
+                    job_id: job_id.clone(),
+                },
+            )
+            .await?;
+        if result_resp.success {
+            if let Some(ref result) = result_resp.result {
+                print_result_summary(result);
+                print_trade_log(&result.trade_log, 30);
+                print_positions(&result.positions, 15);
+                if let Some(ref output_path) = args.output {
+                    let json = serde_json::to_string_pretty(result)?;
+                    std::fs::write(output_path, json)?;
+                    println!();
+                    println!("  Full result written to {}", output_path);
+                }
+            }
+        } else {
+            eprintln!(
+                "  ✗ Job failed: {}",
+                result_resp.error.as_deref().unwrap_or("unknown error")
+            );
+        }
     } else {
-        eprintln!(
-            "  ✗ Backtest failed: {}",
-            resp.error.as_deref().unwrap_or("unknown error")
-        );
+        let resp: RunBacktestResponse = client
+            .call_with_timeout(
+                "run_backtest",
+                &request,
+                std::time::Duration::from_secs(300),
+            )
+            .await?;
+        println!("  Elapsed: {}ms", resp.elapsed_ms);
+
+        if resp.success {
+            if let Some(ref result) = resp.result {
+                print_result_summary(result);
+                print_trade_log(&result.trade_log, 30);
+                print_positions(&result.positions, 15);
+
+                if let Some(ref output_path) = args.output {
+                    let json = serde_json::to_string_pretty(result)?;
+                    std::fs::write(output_path, json)?;
+                    println!();
+                    println!("  Full result written to {}", output_path);
+                }
+            }
+        } else {
+            eprintln!(
+                "  ✗ Backtest failed: {}",
+                resp.error.as_deref().unwrap_or("unknown error")
+            );
+        }
     }
 
     // 6. Disconnect.

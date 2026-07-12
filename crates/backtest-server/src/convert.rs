@@ -16,8 +16,8 @@ use crate::error::BacktestServerError;
 use crate::rpc_types::{
     BacktestConfigMsg, BacktestResultMsg, CloseReasonStatsMsg, DurationStatsMsg, EquityPoint,
     ManagementProfileMsg, MonthlyReturnMsg, PositionRefMsg, PositionSummaryMsg, RawSignalMsg,
-    RiskMetricsMsg, RuleConfigDefMsg, StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg,
-    TradeResultMsg,
+    RiskMetricsMsg, RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg,
+    SubsetStatsMsg, TradeResultMsg,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -31,12 +31,47 @@ fn ndt_to_string(ts: NaiveDateTime) -> String {
 // ── BacktestConfigMsg -> BacktestConfig ──────────────────────────────────────
 
 /// Convert the wire config message into the internal `BacktestConfig`.
-pub fn config_from_msg(msg: &BacktestConfigMsg) -> BacktestConfig {
+///
+/// `registry` and `symbols` are used to populate per-symbol contract sizes
+/// and symbol specs from the symbol registry metadata.
+pub fn config_from_msg(
+    msg: &BacktestConfigMsg,
+    registry: &SymbolRegistry,
+    symbols: &[String],
+) -> BacktestConfig {
+    let mut contract_sizes = std::collections::HashMap::new();
+    let mut symbol_specs = std::collections::HashMap::new();
+    for symbol in symbols {
+        if let Some(spec) = registry.spec(symbol) {
+            contract_sizes.insert(symbol.clone(), spec.lot_base_units as f64);
+            symbol_specs.insert(symbol.clone(), spec.clone());
+        }
+    }
+    let sizing = msg.sizing.as_ref().map(sizing_from_msg);
     BacktestConfig {
         initial_balance: msg.initial_balance.unwrap_or(10_000.0),
         close_on_finish: msg.close_on_finish.unwrap_or(true),
         fill_model: parse_fill_model(msg.fill_model.as_deref()),
-        contract_sizes: std::collections::HashMap::new(),
+        contract_sizes,
+        sizing,
+        symbol_specs,
+    }
+}
+
+/// Convert a wire-safe `SizingPolicyMsg` into the internal `SizingPolicy`.
+pub fn sizing_from_msg(msg: &SizingPolicyMsg) -> qs_backtest::sizing::SizingPolicy {
+    use qs_backtest::sizing::SizingPolicy;
+    match msg {
+        SizingPolicyMsg::FixedLot { qty } => SizingPolicy::FixedLot { qty: qty.clone() },
+        SizingPolicyMsg::FixedValueLot { qty } => SizingPolicy::FixedValueLot { qty: qty.clone() },
+        SizingPolicyMsg::RRLot { qty, pips } => SizingPolicy::RRLot {
+            qty: qty.clone(),
+            pips: *pips,
+        },
+        SizingPolicyMsg::RRValue { qty, value } => SizingPolicy::RRValue {
+            qty: qty.clone(),
+            value: *value,
+        },
     }
 }
 
@@ -589,8 +624,11 @@ mod tests {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         };
-        let cfg = config_from_msg(&msg);
+        let registry = qs_symbols::SymbolRegistry::empty();
+        let symbols: Vec<String> = vec![];
+        let cfg = config_from_msg(&msg, &registry, &symbols);
         assert!((cfg.initial_balance - 10_000.0).abs() < f64::EPSILON);
         assert!(cfg.close_on_finish);
         assert_eq!(cfg.fill_model, FillModel::BidAsk);
@@ -602,8 +640,11 @@ mod tests {
             initial_balance: Some(50_000.0),
             close_on_finish: Some(false),
             fill_model: Some("MidPrice".into()),
+            sizing: None,
         };
-        let cfg = config_from_msg(&msg);
+        let registry = qs_symbols::SymbolRegistry::empty();
+        let symbols: Vec<String> = vec![];
+        let cfg = config_from_msg(&msg, &registry, &symbols);
         assert!((cfg.initial_balance - 50_000.0).abs() < f64::EPSILON);
         assert!(!cfg.close_on_finish);
         assert_eq!(cfg.fill_model, FillModel::MidPrice);

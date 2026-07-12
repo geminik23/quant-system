@@ -84,6 +84,10 @@ impl BacktestExecutor {
     /// `engine` is passed by reference so that the executor can look up
     /// position details (e.g. entry price, side) when recording opens.
     /// `quote` is the current market price used for close-price calculation.
+    ///
+    /// For close effects the executor resolves the position symbol and
+    /// prefers the engine's last known quote for that symbol.  This prevents
+    /// cross-symbol quote contamination in merged multi-symbol feeds.
     pub fn process_effects(
         &mut self,
         effects: &[Effect],
@@ -113,12 +117,14 @@ impl BacktestExecutor {
 
                 // ── Position fully closed ───────────────────────────
                 Effect::PositionClosed { id, reason } => {
-                    self.record_close(id, 1.0, *reason, quote);
+                    let close_quote = self.resolve_close_quote(id, engine, quote);
+                    self.record_close(id, 1.0, *reason, &close_quote);
                 }
 
                 // ── Partial close ───────────────────────────────────
                 Effect::PartialClose { id, ratio, reason } => {
-                    self.record_close(id, *ratio, *reason, quote);
+                    let close_quote = self.resolve_close_quote(id, engine, quote);
+                    self.record_close(id, *ratio, *reason, &close_quote);
                 }
 
                 // ── Scale-in: update the tracked entry ──────────────
@@ -138,6 +144,28 @@ impl BacktestExecutor {
                 _ => {}
             }
         }
+    }
+
+    /// Resolve the best available quote for closing a position.
+    ///
+    /// Uses the engine's last known quote for the position symbol when
+    /// available.  Falls back to the caller-supplied quote when the engine
+    /// has no quote for that symbol (e.g. the position was just opened and
+    /// no tick has arrived yet).
+    fn resolve_close_quote(
+        &self,
+        position_id: &str,
+        engine: &TradeEngine,
+        fallback: &PriceQuote,
+    ) -> PriceQuote {
+        if let Some(entry) = self.open_entries.get(position_id) {
+            if let Some(sym_quote) = engine.last_quote(&entry.symbol) {
+                if sym_quote.symbol == entry.symbol {
+                    return sym_quote.clone();
+                }
+            }
+        }
+        fallback.clone()
     }
 
     /// Realised P&L so far.
@@ -559,5 +587,145 @@ mod tests {
         assert!((entry.entry_price - 1.0850).abs() < 1e-10); // (1.08+1.09)/2
         assert!((entry.original_size - 2.0).abs() < f64::EPSILON);
         assert!((entry.remaining_size - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cross_symbol_close_uses_position_symbol_quote() {
+        // Regression test for Issue 1 Part 3:
+        // A close action for XAUUSD should use the engine's last XAUUSD
+        // quote, not the current merged-feed event quote (GBPJPY).
+        let mut engine = TradeEngine::new();
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
+
+        let xau_open = make_quote("XAUUSD", 4999.0, 5000.0, ts(10, 0, 0));
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "XAUUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(5000.0),
+                    size: 1.0,
+                    stoploss: None,
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                    trade_id: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &xau_open);
+        let pos_id = exec.open_entries.keys().next().unwrap().clone();
+
+        let gbpjpy_quote = make_quote("GBPJPY", 210.0, 210.5, ts(10, 1, 0));
+        engine.on_price(&gbpjpy_quote);
+
+        let xau_later = make_quote("XAUUSD", 5050.0, 5051.0, ts(10, 2, 0));
+        engine.on_price(&xau_later);
+
+        let close_effects = engine
+            .apply_action(
+                Action::ClosePosition {
+                    position_id: pos_id,
+                },
+                ts(10, 3, 0),
+            )
+            .unwrap();
+        let gbpjpy_current = make_quote("GBPJPY", 211.0, 211.5, ts(10, 3, 0));
+        exec.process_effects(&close_effects, &engine, &gbpjpy_current);
+
+        assert_eq!(exec.trade_log.len(), 1);
+        let trade = &exec.trade_log[0];
+        assert!(
+            (trade.exit_price - 5050.0).abs() < 1e-10,
+            "Exit price should be XAUUSD bid 5050.0, got {}",
+            trade.exit_price
+        );
+        assert_eq!(trade.symbol, "XAUUSD");
+    }
+
+    #[test]
+    fn contract_size_affects_pnl_xauusd() {
+        let mut engine = TradeEngine::new();
+        let mut cs = HashMap::new();
+        cs.insert("XAUUSD".to_string(), 100.0);
+        let mut exec = BacktestExecutor::new(10_000.0, cs);
+
+        let open_quote = make_quote("XAUUSD", 4999.0, 5000.0, ts(10, 0, 0));
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "XAUUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(5000.0),
+                    size: 1.0,
+                    stoploss: None,
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                    trade_id: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &open_quote);
+
+        let close_quote = make_quote("XAUUSD", 5049.0, 5050.0, ts(10, 5, 0));
+        engine.on_price(&close_quote);
+        let effects = engine
+            .apply_action(
+                Action::ClosePosition {
+                    position_id: exec.open_entries.keys().next().unwrap().clone(),
+                },
+                ts(10, 5, 0),
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &close_quote);
+
+        assert!((exec.trade_log[0].pnl - 4900.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contract_size_affects_pnl_gbpjpy() {
+        let mut engine = TradeEngine::new();
+        let mut cs = HashMap::new();
+        cs.insert("GBPJPY".to_string(), 100_000.0);
+        let mut exec = BacktestExecutor::new(10_000.0, cs);
+
+        let open_quote = make_quote("GBPJPY", 209.0, 210.0, ts(10, 0, 0));
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "GBPJPY".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(210.0),
+                    size: 0.01,
+                    stoploss: None,
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                    trade_id: None,
+                },
+                ts(10, 0, 0),
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &open_quote);
+
+        let close_quote = make_quote("GBPJPY", 214.0, 215.0, ts(10, 5, 0));
+        engine.on_price(&close_quote);
+        let effects = engine
+            .apply_action(
+                Action::ClosePosition {
+                    position_id: exec.open_entries.keys().next().unwrap().clone(),
+                },
+                ts(10, 5, 0),
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &close_quote);
+
+        assert!((exec.trade_log[0].pnl - 4000.0).abs() < 1e-6);
     }
 }

@@ -13,8 +13,10 @@ use tokio::task::JoinHandle;
 
 use backtest_server::config::load_config;
 use backtest_server::handlers::{
-    ServerState, handle_add_profile, handle_list_profiles, handle_list_symbols, handle_ping,
+    ServerState, handle_add_profile, handle_cancel_backtest, handle_get_backtest_result,
+    handle_get_backtest_status, handle_list_profiles, handle_list_symbols, handle_ping,
     handle_reload_profiles, handle_remove_profile, handle_run_backtest, handle_run_backtest_multi,
+    handle_submit_backtest, run_job_and_store,
 };
 use backtest_server::rpc_types::*;
 
@@ -22,7 +24,9 @@ use data_preprocess::ParquetStore;
 use qs_backtest::profile::ProfileRegistry;
 use qs_symbols::SymbolRegistry;
 
-use xrpc::{MessageChannelAdapter, RpcServer, SharedMemoryConfig, SharedMemoryFrameTransport};
+use xrpc::{
+    JsonCodec, MessageChannelAdapter, RpcServer, SharedMemoryConfig, SharedMemoryFrameTransport,
+};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -88,8 +92,8 @@ fn spawn_client_handler(
             }
         };
 
-        let channel = MessageChannelAdapter::new(transport);
-        let server = RpcServer::new();
+        let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
+        let server = RpcServer::with_codec(JsonCodec);
 
         // ── Register: ping ──
         {
@@ -132,7 +136,12 @@ fn spawn_client_handler(
             server.register_typed("run_backtest", move |req: RunBacktestRequest| {
                 let state = state.clone();
                 async move {
-                    let resp = handle_run_backtest(&state, &req);
+                    let resp =
+                        tokio::task::spawn_blocking(move || handle_run_backtest(&state, &req))
+                            .await
+                            .map_err(|e| {
+                                xrpc::RpcError::ServerError(format!("backtest task failed: {e}"))
+                            })?;
                     Ok(resp)
                 }
             });
@@ -183,6 +192,60 @@ fn spawn_client_handler(
                     let resp = handle_reload_profiles(&state);
                     Ok(resp)
                 }
+            });
+        }
+
+        // ── Register: submit_backtest (Issue 2) ──
+        {
+            let state = state.clone();
+            server.register_typed("submit_backtest", move |req: SubmitBacktestRequest| {
+                let state = state.clone();
+                async move {
+                    let job_id = handle_submit_backtest(&state, &req);
+                    // Spawn blocking task to run the backtest.
+                    if let Some(ref id) = job_id.job_id {
+                        let id = id.clone();
+                        let inner_req = req.request.clone();
+                        let st = state.clone();
+                        tokio::task::spawn_blocking(move || {
+                            run_job_and_store(st, id, inner_req);
+                        });
+                    }
+                    Ok(job_id)
+                }
+            });
+        }
+
+        // ── Register: get_backtest_status (Issue 2) ──
+        {
+            let state = state.clone();
+            server.register_typed(
+                "get_backtest_status",
+                move |req: GetBacktestStatusRequest| {
+                    let state = state.clone();
+                    async move { Ok(handle_get_backtest_status(&state, &req)) }
+                },
+            );
+        }
+
+        // ── Register: get_backtest_result (Issue 2) ──
+        {
+            let state = state.clone();
+            server.register_typed(
+                "get_backtest_result",
+                move |req: GetBacktestResultRequest| {
+                    let state = state.clone();
+                    async move { Ok(handle_get_backtest_result(&state, &req)) }
+                },
+            );
+        }
+
+        // ── Register: cancel_backtest (Issue 2) ──
+        {
+            let state = state.clone();
+            server.register_typed("cancel_backtest", move |req: CancelBacktestRequest| {
+                let state = state.clone();
+                async move { Ok(handle_cancel_backtest(&state, &req)) }
             });
         }
 
@@ -263,6 +326,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         data_dir: cfg.database.data_dir.clone(),
         profiles_path,
         start_time: std::time::Instant::now(),
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // 7. SHM configuration.
@@ -308,8 +372,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
-        let acceptor_server = RpcServer::new();
+        let acceptor_channel =
+            MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
+        let acceptor_server = RpcServer::with_codec(JsonCodec);
 
         let state_clone = state.clone();
         let shm_config_clone = shm_config.clone();

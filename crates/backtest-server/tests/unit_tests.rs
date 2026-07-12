@@ -30,6 +30,7 @@ fn empty_state() -> ServerState {
         data_dir: "/tmp/test-data".into(),
         profiles_path: String::new(),
         start_time: Instant::now(),
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -91,6 +92,7 @@ fn backtest_config_msg_serde_roundtrip() {
         initial_balance: Some(50_000.0),
         close_on_finish: Some(false),
         fill_model: Some("MidPrice".into()),
+        sizing: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: BacktestConfigMsg = serde_json::from_str(&json).unwrap();
@@ -117,6 +119,7 @@ fn run_backtest_request_serde_roundtrip() {
             initial_balance: Some(10000.0),
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -147,6 +150,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -233,8 +237,11 @@ fn config_msg_defaults() {
         initial_balance: None,
         close_on_finish: None,
         fill_model: None,
+        sizing: None,
     };
-    let cfg = config_from_msg(&msg);
+    let registry = qs_symbols::SymbolRegistry::empty();
+    let symbols: Vec<String> = vec![];
+    let cfg = config_from_msg(&msg, &registry, &symbols);
     assert!((cfg.initial_balance - 10_000.0).abs() < f64::EPSILON);
     assert!(cfg.close_on_finish);
     assert_eq!(cfg.fill_model, FillModel::BidAsk);
@@ -246,8 +253,11 @@ fn config_msg_overrides() {
         initial_balance: Some(50_000.0),
         close_on_finish: Some(false),
         fill_model: Some("MidPrice".into()),
+        sizing: None,
     };
-    let cfg = config_from_msg(&msg);
+    let registry = qs_symbols::SymbolRegistry::empty();
+    let symbols: Vec<String> = vec![];
+    let cfg = config_from_msg(&msg, &registry, &symbols);
     assert!((cfg.initial_balance - 50_000.0).abs() < f64::EPSILON);
     assert!(!cfg.close_on_finish);
     assert_eq!(cfg.fill_model, FillModel::MidPrice);
@@ -410,6 +420,7 @@ fn handler_run_backtest_invalid_data_type() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);
@@ -438,6 +449,7 @@ fn handler_run_backtest_bar_without_timeframe() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);
@@ -464,6 +476,7 @@ fn handler_run_backtest_empty_signals() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);
@@ -483,6 +496,7 @@ fn handler_run_backtest_no_data_returns_error() {
         data_dir: tmp.to_string_lossy().to_string(),
         profiles_path: String::new(),
         start_time: Instant::now(),
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
     let req = RunBacktestRequest {
         symbol: "eurusd".into(),
@@ -500,6 +514,7 @@ fn handler_run_backtest_no_data_returns_error() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);
@@ -528,6 +543,7 @@ fn handler_run_backtest_unknown_profile() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = backtest_server::handlers::handle_run_backtest_multi(&state, &req);
@@ -554,6 +570,7 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = backtest_server::handlers::handle_run_backtest_multi(&state, &req);
@@ -999,6 +1016,7 @@ fn run_backtest_request_with_profile_def_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1038,6 +1056,7 @@ fn inline_profile_validation_error() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);
@@ -1070,6 +1089,7 @@ fn backward_compat_no_profile_def() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     // This will fail at data loading (no data), but should NOT fail at profile validation
@@ -1457,6 +1477,7 @@ fn run_backtest_request_raw_signals_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1729,6 +1750,7 @@ fn run_backtest_multi_request_raw_signals_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1755,6 +1777,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
+            sizing: None,
         },
     };
     let resp = handle_run_backtest(&state, &req);

@@ -23,6 +23,7 @@ use crate::data_feed::DataFeed;
 use crate::executor::BacktestExecutor;
 use crate::profile::{ManagementProfile, PositionRef, PositionResolver, RawSignal, resolve_signal};
 use crate::report::BacktestResult;
+use crate::sizing::SizingPolicy;
 use crate::strategy::Strategy;
 
 /// Build an `Action::Open` directly from a `RawSignal::Entry`.
@@ -87,6 +88,12 @@ pub struct BacktestConfig {
     /// When a symbol is absent from this map the multiplier defaults to `1.0`,
     /// which preserves backward compatibility with all existing tests.
     pub contract_sizes: HashMap<String, f64>,
+    /// Optional position sizing policy.  When set, entry signal sizes are
+    /// recalculated after profile transformation using symbol metadata.
+    pub sizing: Option<SizingPolicy>,
+    /// Symbol specs for sizing calculations.  Populated by the server from
+    /// the symbol registry.  Empty when no sizing policy is configured.
+    pub symbol_specs: HashMap<String, qs_symbols::SymbolSpec>,
 }
 
 impl Default for BacktestConfig {
@@ -96,6 +103,8 @@ impl Default for BacktestConfig {
             close_on_finish: true,
             fill_model: FillModel::default(),
             contract_sizes: HashMap::new(),
+            sizing: None,
+            symbol_specs: HashMap::new(),
         }
     }
 }
@@ -195,6 +204,11 @@ impl BacktestRunner {
     }
 
     /// Apply a single action, forwarding effects to the executor.
+    ///
+    /// For close effects the executor resolves the position symbol and uses
+    /// the engine's last known quote for that symbol rather than blindly
+    /// trusting the caller-supplied `quote`.  This prevents cross-symbol
+    /// quote contamination in merged multi-symbol feeds.
     fn apply_single_action(
         &mut self,
         action: Action,
@@ -284,6 +298,9 @@ impl BacktestRunner {
 
     /// Process a single raw signal: entry signals go through profile transform,
     /// management signals are resolved against live engine state.
+    ///
+    /// When a sizing policy is configured, entry size is recalculated after
+    /// profile transformation using the final entry price and stoploss.
     fn process_raw_signal(
         &mut self,
         signal: &RawSignal,
@@ -293,17 +310,18 @@ impl BacktestRunner {
         let ts = signal.ts();
 
         if signal.is_entry() {
-            // Entry path: optionally apply profile, then convert to Action::Open.
             let action = if let Some(prof) = profile {
                 prof.apply_entry_signal(signal)
             } else {
                 build_entry_action(signal)
             };
-            if let Some(act) = action {
+            if let Some(mut act) = action {
+                if let Some(ref policy) = self.config.sizing {
+                    act = apply_sizing(act, policy, &self.config.symbol_specs, quote);
+                }
                 self.apply_single_action(act, ts, quote);
             }
         } else {
-            // Management path: resolve against engine state.
             let actions = resolve_signal(signal, &self.engine);
             for action in actions {
                 self.apply_single_action(action, ts, quote);
@@ -351,7 +369,58 @@ impl BacktestRunner {
     }
 }
 
-// ─── PositionResolver for TradeEngine ───────────────────────────────────────
+//
+// Apply a sizing policy to an Action::Open, replacing the size field.
+// If the action is not an Open or sizing fails, returns the original action.
+//
+fn apply_sizing(
+    mut action: Action,
+    policy: &SizingPolicy,
+    specs: &HashMap<String, qs_symbols::SymbolSpec>,
+    quote: &PriceQuote,
+) -> Action {
+    if let Action::Open {
+        symbol,
+        side,
+        price,
+        stoploss,
+        size,
+        ..
+    } = &mut action
+    {
+        let entry_price = price.or_else(|| {
+            Some(match side {
+                Side::Buy => quote.ask,
+                Side::Sell => quote.bid,
+            })
+        });
+        if let Some(spec) = specs.get(symbol) {
+            let r = crate::sizing::compute_size(
+                policy,
+                symbol,
+                *side,
+                entry_price,
+                *stoploss,
+                spec,
+                &std::collections::HashMap::new(),
+            );
+            if r.skipped {
+                if let Some(ref err) = r.error {
+                    eprintln!("Sizing skipped for {}: {}", symbol, err);
+                }
+                // On skip with error, set size to 0 to prevent opening.
+                if r.error.is_some() {
+                    *size = 0.0;
+                }
+            } else {
+                *size = r.size;
+            }
+        }
+    }
+    action
+}
+
+// ─── PositionResolver for TradeEngine ────────────────────────────────────
 
 impl PositionResolver for TradeEngine {
     fn resolve(&self, pr: &PositionRef) -> Vec<PositionId> {
@@ -1108,9 +1177,13 @@ mod tests {
     }
 
     #[test]
-    fn signal_replay_signal_before_data() {
-        // Signal timestamp is before first data event -- should still be
-        // injected when the first event arrives.
+    fn signal_replay_signal_before_data_filtered() {
+        // Signal timestamp is before first data event.
+        // The runner itself does not filter; the server is responsible
+        // for date filtering. This test verifies that when a pre-window
+        // signal IS passed to the runner, it is injected at the first
+        // event (backward-compatible library behavior).
+        // Server-side filtering is tested separately.
         let events = vec![
             tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
             tick("EURUSD", 1.0900, 1.0902, ts(10, 0, 1)),
@@ -1343,5 +1416,96 @@ mod tests {
         for trade in &result.trade_log {
             assert_eq!(trade.group.as_deref(), Some("alpha"));
         }
+    }
+
+    #[test]
+    fn merged_feed_manual_close_uses_correct_symbol_quote() {
+        // Regression test for Issue 1 Part 3:
+        // Open XAUUSD, then close it manually while the current merged-feed
+        // event is a GBPJPY tick. The exit price must be a XAUUSD price,
+        // not a GBPJPY price.
+        use crate::data_feed::MarketEvent;
+        let events = vec![
+            MarketEvent::Tick { symbol: "XAUUSD".into(), ts: ts(10, 0, 0), bid: 5000.0, ask: 5001.0 },
+            MarketEvent::Tick { symbol: "GBPJPY".into(), ts: ts(10, 0, 1), bid: 210.0, ask: 211.0 },
+            MarketEvent::Tick { symbol: "XAUUSD".into(), ts: ts(10, 0, 2), bid: 5050.0, ask: 5051.0 },
+            // GBPJPY event at ts(10,0,3) - manual close fires here.
+            MarketEvent::Tick { symbol: "GBPJPY".into(), ts: ts(10, 0, 3), bid: 212.0, ask: 213.0 },
+        ];
+        let mut feed = VecFeed::new(events);
+
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "XAUUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(5000.0),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: Some("xau-1".into()),
+            },
+            // Manual close at ts(10,0,3) while current event is GBPJPY.
+            RawSignal::Close {
+                ts: ts(10, 0, 3),
+                position: PositionRef::ByTradeId { trade_id: "xau-1".into() },
+            },
+        ];
+
+        let config = BacktestConfig {
+            initial_balance: 10_000.0,
+            close_on_finish: false,
+            ..Default::default()
+        };
+        let runner = BacktestRunner::new(config);
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        assert_eq!(result.total_trades, 1);
+        let trade = &result.trade_log[0];
+        assert_eq!(trade.symbol, "XAUUSD");
+        // Exit price must be a XAUUSD price (~5050), not GBPJPY (~212).
+        assert!(
+            trade.exit_price > 4000.0,
+            "Exit price should be XAUUSD (~5050), got {}",
+            trade.exit_price
+        );
+    }
+
+    #[test]
+    fn server_filter_signals_before_market_window() {
+        // Regression test for Issue 1 Part 4:
+        // Verify the runner does NOT filter pre-window signals (library level).
+        // The server filter is tested separately in handlers.
+        // Here we verify that signals with ts before first market event
+        // ARE still injected (library behavior). Server filtering removes them.
+        let events = vec![
+            tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
+            tick("EURUSD", 1.0900, 1.0902, ts(10, 0, 1)),
+        ];
+        let mut feed = VecFeed::new(events);
+
+        // Signal from January, market data from "today" (ts(10,0,0)).
+        let raw_signals = vec![
+            RawSignal::Entry {
+                ts: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.0850),
+                size: 1.0,
+                stoploss: None,
+                targets: vec![1.0900],
+                group: None,
+                trade_id: None,
+            },
+        ];
+
+        let runner = BacktestRunner::with_defaults();
+        let result = runner.run_raw_signals(&mut feed, raw_signals, None);
+
+        // Library still injects it; server filtering is the authoritative gate.
+        assert_eq!(result.total_trades, 1);
     }
 }

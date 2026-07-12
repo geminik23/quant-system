@@ -26,6 +26,7 @@ pub mod executor;
 pub mod profile;
 pub mod report;
 pub mod runner;
+pub mod sizing;
 pub mod strategy;
 
 // ── Convenience re-exports ──────────────────────────────────────────────────

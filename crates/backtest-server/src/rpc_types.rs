@@ -89,6 +89,96 @@ pub struct BacktestConfigMsg {
     pub close_on_finish: Option<bool>,
     /// Fill model: "BidAsk", "AskOnly", or "MidPrice". Default: "BidAsk"
     pub fill_model: Option<String>,
+    /// Optional sizing policy. When absent, parser-emitted sizes are used.
+    #[serde(default)]
+    pub sizing: Option<SizingPolicyMsg>,
+}
+
+/// Wire-safe sizing policy, compatible with the legacy autotrader model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SizingPolicyMsg {
+    /// Use the configured lot directly.
+    FixedLot {
+        /// Pipe-delimited symbol-to-lot map (e.g. "all=0.01|xauusd=0.03").
+        qty: String,
+    },
+    /// Normalize lot by symbol pip value.
+    FixedValueLot { qty: String },
+    /// Scale base lot by configured/actual pip ratio.
+    RRLot {
+        qty: String,
+        /// Reference stop distance in pips.
+        pips: f64,
+    },
+    /// Compute lot from fixed money risk.
+    RRValue {
+        qty: String,
+        /// Target risk amount in account currency.
+        value: f64,
+    },
+}
+
+// ── Async Job API (Issue 2) ─────────────────────────────────────────────────
+
+/// Submit a backtest job for asynchronous execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitBacktestRequest {
+    /// Same fields as `RunBacktestRequest`.
+    pub request: RunBacktestRequest,
+}
+
+/// Response from submitting a backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitBacktestResponse {
+    pub success: bool,
+    pub job_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Request the current status of a backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBacktestStatusRequest {
+    pub job_id: String,
+}
+
+/// Status of a backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestStatusResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Request the result of a completed backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBacktestResultRequest {
+    pub job_id: String,
+}
+
+/// Response containing the result of a completed backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBacktestResultResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub result: Option<BacktestResultMsg>,
+    pub error: Option<String>,
+}
+
+/// Request cancellation of a backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelBacktestRequest {
+    pub job_id: String,
+}
+
+/// Response from cancelling a backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelBacktestResponse {
+    pub success: bool,
+    pub job_id: String,
+    pub error: Option<String>,
 }
 
 // ── Run Backtest ────────────────────────────────────────────────────────────
@@ -469,6 +559,31 @@ pub enum RawSignalMsg {
         group_id: String,
         price: f64,
     },
+}
+
+impl RawSignalMsg {
+    /// Extract the timestamp string from any variant.
+    pub fn ts(&self) -> &str {
+        match self {
+            RawSignalMsg::Entry { ts, .. }
+            | RawSignalMsg::Close { ts, .. }
+            | RawSignalMsg::ClosePartial { ts, .. }
+            | RawSignalMsg::ModifyStoploss { ts, .. }
+            | RawSignalMsg::MoveStoplossToEntry { ts, .. }
+            | RawSignalMsg::AddTarget { ts, .. }
+            | RawSignalMsg::RemoveTarget { ts, .. }
+            | RawSignalMsg::AddRule { ts, .. }
+            | RawSignalMsg::RemoveRule { ts, .. }
+            | RawSignalMsg::ScaleIn { ts, .. }
+            | RawSignalMsg::CancelPending { ts, .. }
+            | RawSignalMsg::CloseAllOf { ts, .. }
+            | RawSignalMsg::CloseAll { ts }
+            | RawSignalMsg::CancelAllPending { ts }
+            | RawSignalMsg::ModifyAllStoploss { ts, .. }
+            | RawSignalMsg::CloseAllInGroup { ts, .. }
+            | RawSignalMsg::ModifyAllStoplossInGroup { ts, .. } => ts,
+        }
+    }
 }
 
 /// Wire-safe position reference.
