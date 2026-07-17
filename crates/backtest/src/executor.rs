@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 
 use qs_core::TradeEngine;
-use qs_core::types::{CloseReason, Effect, GroupId, PositionId, PriceQuote, Side};
+use qs_core::types::{
+    CloseReason, Effect, GroupId, PositionId, PriceQuote, Side, position_size_tolerance,
+};
 
 use crate::report::TradeResult;
 
@@ -33,14 +35,25 @@ use crate::report::TradeResult;
 struct OpenEntry {
     symbol: String,
     side: Side,
-    entry_price: f64,
-    /// Original position size at open (never mutated after scale-in updates).
+    /// Average-cost basis assigned only to inventory that is still open.
+    open_entry_value: f64,
+    /// Original position size at open (updated only by scale-ins).
     original_size: f64,
     /// Remaining size after partial closes.
     remaining_size: f64,
     open_ts: NaiveDateTime,
     /// Group this position belongs to (propagated to TradeResult on close).
     group: Option<GroupId>,
+}
+
+impl OpenEntry {
+    fn average_entry(&self) -> f64 {
+        if self.remaining_size <= position_size_tolerance(self.original_size) {
+            0.0
+        } else {
+            self.open_entry_value / self.remaining_size
+        }
+    }
 }
 
 // ─── BacktestExecutor ───────────────────────────────────────────────────────
@@ -105,7 +118,7 @@ impl BacktestExecutor {
                             OpenEntry {
                                 symbol: pos.data.symbol.clone(),
                                 side: pos.data.side,
-                                entry_price: pos.data.average_entry(),
+                                open_entry_value: pos.data.open_entry_value,
                                 original_size: filled,
                                 remaining_size: filled,
                                 open_ts: pos.data.open_ts.unwrap_or(quote.ts),
@@ -128,15 +141,11 @@ impl BacktestExecutor {
                 }
 
                 // ── Scale-in: update the tracked entry ──────────────
-                Effect::ScaledIn { id, .. } => {
-                    if let Some(pos) = engine.get_position(id) {
-                        if let Some(entry) = self.open_entries.get_mut(id) {
-                            entry.entry_price = pos.data.average_entry();
-                            let new_total = pos.data.total_filled_size();
-                            let added = new_total - entry.original_size;
-                            entry.original_size = new_total;
-                            entry.remaining_size += added;
-                        }
+                Effect::ScaledIn { id, fill } => {
+                    if let Some(entry) = self.open_entries.get_mut(id) {
+                        entry.open_entry_value += fill.price * fill.size;
+                        entry.original_size += fill.size;
+                        entry.remaining_size += fill.size;
                     }
                 }
 
@@ -158,12 +167,11 @@ impl BacktestExecutor {
         engine: &TradeEngine,
         fallback: &PriceQuote,
     ) -> PriceQuote {
-        if let Some(entry) = self.open_entries.get(position_id) {
-            if let Some(sym_quote) = engine.last_quote(&entry.symbol) {
-                if sym_quote.symbol == entry.symbol {
-                    return sym_quote.clone();
-                }
-            }
+        if let Some(entry) = self.open_entries.get(position_id)
+            && let Some(sym_quote) = engine.last_quote(&entry.symbol)
+            && sym_quote.symbol == entry.symbol
+        {
+            return sym_quote.clone();
         }
         fallback.clone()
     }
@@ -190,7 +198,7 @@ impl BacktestExecutor {
     ) {
         // For a full close (ratio == 1.0) we remove the entry; for partial
         // we keep it and reduce the tracked size.
-        let is_full = (close_ratio - 1.0).abs() < f64::EPSILON
+        let is_full = close_ratio >= 1.0 - position_size_tolerance(1.0)
             || reason == CloseReason::Stoploss
             || reason == CloseReason::TrailingStop
             || reason == CloseReason::TimeExit
@@ -207,13 +215,14 @@ impl BacktestExecutor {
         };
 
         let exit_price = quote.close_price(entry.side);
+        let entry_price = entry.average_entry();
         // close_ratio is always relative to the *original* position size,
         // so compute close_size from original_size.  For full closes, use
         // remaining_size to capture everything that's left.
         let close_size = if is_full {
             entry.remaining_size
         } else {
-            entry.original_size * close_ratio
+            (entry.original_size * close_ratio).min(entry.remaining_size)
         };
 
         let cs = self
@@ -223,8 +232,8 @@ impl BacktestExecutor {
             .unwrap_or(1.0);
 
         let pnl = match entry.side {
-            Side::Buy => (exit_price - entry.entry_price) * close_size * cs,
-            Side::Sell => (entry.entry_price - exit_price) * close_size * cs,
+            Side::Buy => (exit_price - entry_price) * close_size * cs,
+            Side::Sell => (entry_price - exit_price) * close_size * cs,
         };
 
         self.balance += pnl;
@@ -233,7 +242,7 @@ impl BacktestExecutor {
             position_id: position_id.to_owned(),
             symbol: entry.symbol.clone(),
             side: entry.side,
-            entry_price: entry.entry_price,
+            entry_price,
             exit_price,
             size: close_size,
             pnl,
@@ -244,12 +253,12 @@ impl BacktestExecutor {
         });
 
         // If partial, reduce the remaining size for future closes.
-        if !is_full {
-            if let Some(tracked) = self.open_entries.get_mut(position_id) {
-                tracked.remaining_size -= close_size;
-                if tracked.remaining_size <= f64::EPSILON {
-                    self.open_entries.remove(position_id);
-                }
+        if !is_full && let Some(tracked) = self.open_entries.get_mut(position_id) {
+            tracked.remaining_size = (tracked.remaining_size - close_size).max(0.0);
+            tracked.open_entry_value =
+                (tracked.open_entry_value - entry_price * close_size).max(0.0);
+            if tracked.remaining_size <= position_size_tolerance(tracked.original_size) {
+                self.open_entries.remove(position_id);
             }
         }
     }
@@ -584,9 +593,85 @@ mod tests {
 
         // Check that the tracked entry now has averaged price and combined size
         let entry = exec.open_entries.get(&id).unwrap();
-        assert!((entry.entry_price - 1.0850).abs() < 1e-10); // (1.08+1.09)/2
+        assert!((entry.average_entry() - 1.0850).abs() < 1e-10); // (1.08+1.09)/2
         assert!((entry.original_size - 2.0).abs() < f64::EPSILON);
         assert!((entry.remaining_size - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn partial_close_scale_in_and_final_close_conserve_cash_flow_pnl() {
+        let mut engine = TradeEngine::new();
+        let mut exec = BacktestExecutor::new(10_000.0, HashMap::new());
+        let open_quote = make_quote("EURUSD", 100.0, 100.0, ts(10, 0, 0));
+        let effects = engine
+            .apply_action(
+                Action::Open {
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    price: Some(100.0),
+                    size: 2.0,
+                    stoploss: None,
+                    targets: vec![],
+                    rules: vec![],
+                    group: None,
+                    trade_id: None,
+                },
+                open_quote.ts,
+            )
+            .unwrap();
+        let id = match &effects[0] {
+            Effect::PositionOpened { id } => id.clone(),
+            effect => panic!("unexpected effect: {effect:?}"),
+        };
+        exec.process_effects(&effects, &engine, &open_quote);
+
+        let first_close = make_quote("EURUSD", 110.0, 110.0, ts(10, 1, 0));
+        engine.on_price(&first_close);
+        let effects = engine
+            .apply_action(
+                Action::ClosePartial {
+                    position_id: id.clone(),
+                    ratio: 0.5,
+                },
+                first_close.ts,
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &first_close);
+
+        let scale_quote = make_quote("EURUSD", 120.0, 120.0, ts(10, 2, 0));
+        let effects = engine
+            .apply_action(
+                Action::ScaleIn {
+                    position_id: id.clone(),
+                    price: Some(120.0),
+                    size: 1.0,
+                    trade_id: None,
+                },
+                scale_quote.ts,
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &scale_quote);
+
+        let final_close = make_quote("EURUSD", 130.0, 130.0, ts(10, 3, 0));
+        engine.on_price(&final_close);
+        let effects = engine
+            .apply_action(
+                Action::ClosePosition {
+                    position_id: id.clone(),
+                },
+                final_close.ts,
+            )
+            .unwrap();
+        exec.process_effects(&effects, &engine, &final_close);
+
+        assert_eq!(exec.open_count(), 0);
+        assert_eq!(exec.trade_log.len(), 2);
+        assert_eq!(exec.trade_log[0].entry_price, 100.0);
+        assert_eq!(exec.trade_log[0].pnl, 10.0);
+        assert_eq!(exec.trade_log[1].entry_price, 110.0);
+        assert_eq!(exec.trade_log[1].pnl, 40.0);
+        assert_eq!(exec.realized_pnl(), 50.0);
     }
 
     #[test]

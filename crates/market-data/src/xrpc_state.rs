@@ -8,6 +8,12 @@ pub struct XrpcState {
     client_seq: RwLock<usize>,
 }
 
+impl Default for XrpcState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl XrpcState {
     pub fn new() -> Self {
         Self {

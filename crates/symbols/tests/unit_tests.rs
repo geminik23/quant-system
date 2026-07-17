@@ -1,4 +1,6 @@
-use qs_symbols::{SymbolError, SymbolRegistry, SymbolSpec};
+use qs_symbols::{
+    SymbolCurrencyMetadata, SymbolError, SymbolRegistry, SymbolSpec, normalize_currency_code,
+};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -10,6 +12,9 @@ aliases = ["eur/usd", "eur-usd", "eur_usd"]
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 lot_min_steps = 1
@@ -21,6 +26,9 @@ aliases = ["gold", "xau/usd", "xau-usd"]
 pip_position = 1
 digits = 2
 category = "metal"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100
 lot_step_units = 1
 lot_min_steps = 1
@@ -32,6 +40,7 @@ aliases = ["nas100", "nasdaq", "us tech 100"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 lot_min_steps = 1
@@ -43,6 +52,9 @@ aliases = ["usd/jpy"]
 pip_position = 2
 digits = 3
 category = "forex"
+base_currency = "USD"
+quote_currency = "JPY"
+pnl_currency = "JPY"
 lot_base_units = 100000
 lot_step_units = 1000
 lot_min_steps = 1
@@ -54,6 +66,9 @@ aliases = ["bitcoin", "btc/usd"]
 pip_position = 1
 digits = 2
 category = "crypto"
+base_currency = "BTC"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000000
 lot_step_units = 100000
 lot_min_steps = 1
@@ -361,6 +376,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 lot_min_steps = 1
@@ -486,6 +504,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 
@@ -495,6 +516,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 "#;
@@ -511,6 +535,7 @@ aliases = ["nasdaq"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 
@@ -520,6 +545,7 @@ aliases = ["nasdaq"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 "#;
@@ -547,6 +573,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 0
 "#;
@@ -569,6 +598,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = -1
 "#;
@@ -585,6 +617,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100
 lot_step_units = 200
 "#;
@@ -601,6 +636,9 @@ aliases = []
 pip_position = 6
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 "#;
@@ -643,6 +681,9 @@ aliases = ["eur/usd", "eur-usd"]
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 "#;
@@ -659,7 +700,7 @@ lot_step_units = 1000
 fn default_toml_loads_without_errors() {
     let content = include_str!("../symbols.toml");
     let reg = SymbolRegistry::from_toml(content).unwrap();
-    assert!(reg.len() > 0);
+    assert!(!reg.is_empty());
 }
 
 #[test]
@@ -767,6 +808,7 @@ aliases = []
 pip_position = 2
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 "#;
@@ -787,6 +829,7 @@ aliases = []
 pip_position = 0
 digits = 0
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 "#;
@@ -958,4 +1001,141 @@ fn suggest_does_not_duplicate_canonical_from_alias_and_direct() {
         xauusd_count <= 1,
         "xauusd appears {xauusd_count} times in suggestions"
     );
+}
+
+fn currency_symbol_toml(category: &str, metadata: &str) -> String {
+    format!(
+        r#"
+[[symbol]]
+canonical = "test"
+aliases = []
+pip_position = 2
+digits = 2
+category = "{category}"
+{metadata}
+lot_base_units = 1
+lot_step_units = 1
+"#
+    )
+}
+
+#[test]
+fn currency_codes_are_normalized_to_uppercase_ascii() {
+    let toml = currency_symbol_toml(
+        "forex",
+        r#"base_currency = " eur "
+quote_currency = "usd"
+pnl_currency = "Usd""#,
+    );
+    let reg = SymbolRegistry::from_toml(&toml).unwrap();
+    let metadata = reg.currency_metadata("test").unwrap();
+    assert_eq!(metadata.base_currency.as_deref(), Some("EUR"));
+    assert_eq!(metadata.quote_currency.as_deref(), Some("USD"));
+    assert_eq!(metadata.pnl_currency, "USD");
+    assert_eq!(normalize_currency_code(" jPy ").as_deref(), Some("JPY"));
+    assert_eq!(normalize_currency_code("US1"), None);
+    assert_eq!(normalize_currency_code("EURO"), None);
+}
+
+#[test]
+fn loaded_symbol_rejects_invalid_currency_code() {
+    let toml = currency_symbol_toml(
+        "forex",
+        r#"base_currency = "EU1"
+quote_currency = "USD"
+pnl_currency = "USD""#,
+    );
+    let error = SymbolRegistry::from_toml(&toml).unwrap_err();
+    assert!(matches!(
+        error,
+        SymbolError::InvalidCurrencyCode {
+            field: "base_currency",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn loaded_non_forex_symbol_requires_explicit_pnl_currency() {
+    let error = SymbolRegistry::from_toml(&currency_symbol_toml("index", "")).unwrap_err();
+    assert!(matches!(
+        error,
+        SymbolError::MissingCurrencyMetadata {
+            field: "pnl_currency",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn loaded_forex_symbol_requires_base_and_quote_currencies() {
+    let toml = currency_symbol_toml("forex", "pnl_currency = \"USD\"");
+    let error = SymbolRegistry::from_toml(&toml).unwrap_err();
+    assert!(matches!(
+        error,
+        SymbolError::MissingCurrencyMetadata {
+            field: "base_currency",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn loaded_forex_symbol_requires_distinct_base_and_quote() {
+    let toml = currency_symbol_toml(
+        "forex",
+        r#"base_currency = "USD"
+quote_currency = "USD"
+pnl_currency = "USD""#,
+    );
+    let error = SymbolRegistry::from_toml(&toml).unwrap_err();
+    assert!(matches!(error, SymbolError::DuplicateForexCurrency { .. }));
+}
+
+#[test]
+fn loaded_forex_symbol_requires_pnl_to_match_quote() {
+    let toml = currency_symbol_toml(
+        "forex",
+        r#"base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "EUR""#,
+    );
+    let error = SymbolRegistry::from_toml(&toml).unwrap_err();
+    assert!(matches!(
+        error,
+        SymbolError::ForexPnlCurrencyMismatch { .. }
+    ));
+}
+
+#[test]
+fn default_toml_has_complete_normalized_currency_metadata() {
+    let reg = SymbolRegistry::from_toml(include_str!("../symbols.toml")).unwrap();
+    for canonical in reg.canonical_names() {
+        let spec = reg.spec(canonical).unwrap();
+        let metadata = reg.currency_metadata(canonical).unwrap();
+        assert_eq!(
+            normalize_currency_code(&metadata.pnl_currency).as_deref(),
+            Some(metadata.pnl_currency.as_str())
+        );
+        if spec.category == "forex" {
+            let base = metadata.base_currency.as_deref().unwrap();
+            let quote = metadata.quote_currency.as_deref().unwrap();
+            assert_ne!(base, quote);
+            assert_eq!(metadata.pnl_currency, quote);
+        }
+    }
+}
+
+#[test]
+fn currency_metadata_serde_defaults_preserve_legacy_payloads() {
+    let legacy: SymbolCurrencyMetadata = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy, SymbolCurrencyMetadata::default());
+
+    let metadata = SymbolCurrencyMetadata {
+        base_currency: None,
+        quote_currency: None,
+        pnl_currency: "USD".into(),
+    };
+    let json = serde_json::to_string(&metadata).unwrap();
+    assert_eq!(json, r#"{"pnl_currency":"USD"}"#);
 }

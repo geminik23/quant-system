@@ -5,12 +5,26 @@
 //! streak analysis, duration stats, monthly returns, and breakdowns by symbol,
 //! group, side, and close reason.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use qs_core::types::{CloseReason, GroupId, PositionId, Side};
+
+use crate::artifacts::{
+    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts, NetPnlOutcome,
+    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+    PendingOrderSnapshot, RecordedFill,
+};
+use crate::evaluation::{
+    EvaluationOptions, EvaluationReport, EvaluationRequest, ExcursionInput,
+    ExecutionDiagnosticsInput, LifecycleCounts, OutcomeClassification, PositionDimensions,
+    PositionOutcome, PositionSide, evaluate,
+};
+use crate::ledger::{ActionDisposition, ActionDispositionStatus};
+use crate::mtm::MtmOutputSummary;
+use crate::portfolio::EquityPoint;
 
 // ─── Serde helper for f64 fields that may be INFINITY or NaN ────────────────
 
@@ -240,6 +254,48 @@ impl StreakStats {
             current_streak,
         }
     }
+
+    /// Compute FutureQuote streaks from completed campaigns in deterministic close order.
+    pub fn from_completed_positions(positions: &[CompletedPosition]) -> Self {
+        let mut ordered: Vec<&CompletedPosition> = positions.iter().collect();
+        ordered.sort_by(|left, right| {
+            left.close_ts
+                .cmp(&right.close_ts)
+                .then_with(|| left.position_id.cmp(&right.position_id))
+                .then_with(|| left.open_ts.cmp(&right.open_ts))
+        });
+
+        let mut current_streak: i32 = 0;
+        let mut max_wins: u32 = 0;
+        let mut max_losses: u32 = 0;
+        for position in ordered {
+            match position.outcome {
+                NetPnlOutcome::Win => {
+                    current_streak = if current_streak > 0 {
+                        current_streak + 1
+                    } else {
+                        1
+                    };
+                    max_wins = max_wins.max(current_streak as u32);
+                }
+                NetPnlOutcome::Loss => {
+                    current_streak = if current_streak < 0 {
+                        current_streak - 1
+                    } else {
+                        -1
+                    };
+                    max_losses = max_losses.max(current_streak.unsigned_abs());
+                }
+                NetPnlOutcome::Breakeven => current_streak = 0,
+            }
+        }
+
+        Self {
+            max_consecutive_wins: max_wins,
+            max_consecutive_losses: max_losses,
+            current_streak,
+        }
+    }
 }
 
 // ─── RiskMetrics ────────────────────────────────────────────────────────────
@@ -414,12 +470,12 @@ fn compute_max_dd_duration(
     }
 
     // Check unrecovered drawdown at end.
-    if let Some(&(last_ts, last_bal)) = equity_curve.last() {
-        if last_bal < peak {
-            let dur = (last_ts - peak_ts).num_seconds();
-            if dur > max_dd_dur_secs {
-                max_dd_dur_secs = dur;
-            }
+    if let Some(&(last_ts, last_bal)) = equity_curve.last()
+        && last_bal < peak
+    {
+        let dur = (last_ts - peak_ts).num_seconds();
+        if dur > max_dd_dur_secs {
+            max_dd_dur_secs = dur;
         }
     }
 
@@ -432,7 +488,7 @@ fn compute_max_dd_duration(
 
 // ─── DurationStats ──────────────────────────────────────────────────────────
 
-/// Trade holding time statistics (all values in seconds).
+/// Trade or completed-campaign holding time statistics (all values in seconds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurationStats {
     /// Average holding time across all trades (seconds).
@@ -494,6 +550,48 @@ impl DurationStats {
             avg_loser_duration_secs,
         })
     }
+
+    /// Compute FutureQuote holding times once per completed campaign.
+    pub fn from_completed_positions(positions: &[CompletedPosition]) -> Option<Self> {
+        if positions.is_empty() {
+            return None;
+        }
+
+        let duration =
+            |position: &CompletedPosition| (position.close_ts - position.open_ts).num_seconds();
+        let durations: Vec<i64> = positions.iter().map(duration).collect();
+        let winner_durations: Vec<i64> = positions
+            .iter()
+            .filter(|position| position.outcome == NetPnlOutcome::Win)
+            .map(duration)
+            .collect();
+        let loser_durations: Vec<i64> = positions
+            .iter()
+            .filter(|position| position.outcome == NetPnlOutcome::Loss)
+            .map(duration)
+            .collect();
+        let average = |values: &[i64]| {
+            if values.is_empty() {
+                0
+            } else {
+                values.iter().sum::<i64>() / values.len() as i64
+            }
+        };
+
+        Some(Self {
+            avg_duration_secs: average(&durations),
+            min_duration_secs: *durations
+                .iter()
+                .min()
+                .expect("completed positions are non-empty"),
+            max_duration_secs: *durations
+                .iter()
+                .max()
+                .expect("completed positions are non-empty"),
+            avg_winner_duration_secs: average(&winner_durations),
+            avg_loser_duration_secs: average(&loser_durations),
+        })
+    }
 }
 
 // ─── MonthlyReturn ──────────────────────────────────────────────────────────
@@ -505,9 +603,9 @@ pub struct MonthlyReturn {
     pub year: i32,
     /// Month (1–12).
     pub month: u32,
-    /// Sum of P&L for trades closed in this month.
+    /// Sum of P&L for rows closed in this month.
     pub pnl: f64,
-    /// Number of trades closed in this month.
+    /// Number of close events (Legacy) or completed campaigns (FutureQuote).
     pub trade_count: usize,
     /// Balance at end of month.
     pub ending_balance: f64,
@@ -523,11 +621,11 @@ fn compute_monthly_returns(trade_log: &[TradeResult], initial_balance: f64) -> V
     let mut groups: Vec<((i32, u32), Vec<&TradeResult>)> = Vec::new();
     for trade in trade_log {
         let key = (trade.close_ts.date().year(), trade.close_ts.date().month());
-        if let Some(last) = groups.last_mut() {
-            if last.0 == key {
-                last.1.push(trade);
-                continue;
-            }
+        if let Some(last) = groups.last_mut()
+            && last.0 == key
+        {
+            last.1.push(trade);
+            continue;
         }
         groups.push((key, vec![trade]));
     }
@@ -538,6 +636,45 @@ fn compute_monthly_returns(trade_log: &[TradeResult], initial_balance: f64) -> V
         .map(|((year, month), trades)| {
             let pnl: f64 = trades.iter().map(|t| t.pnl).sum();
             let trade_count = trades.len();
+            balance += pnl;
+            MonthlyReturn {
+                year,
+                month,
+                pnl,
+                trade_count,
+                ending_balance: balance,
+            }
+        })
+        .collect()
+}
+
+fn compute_monthly_returns_from_completed(
+    positions: &[CompletedPosition],
+    initial_balance: f64,
+) -> Vec<MonthlyReturn> {
+    let mut ordered: Vec<&CompletedPosition> = positions.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.close_ts
+            .cmp(&right.close_ts)
+            .then_with(|| left.position_id.cmp(&right.position_id))
+            .then_with(|| left.net_pnl.total_cmp(&right.net_pnl))
+    });
+
+    let mut groups: BTreeMap<(i32, u32), (f64, usize)> = BTreeMap::new();
+    for position in ordered {
+        let key = (
+            position.close_ts.date().year(),
+            position.close_ts.date().month(),
+        );
+        let (pnl, count) = groups.entry(key).or_default();
+        *pnl += position.net_pnl;
+        *count += 1;
+    }
+
+    let mut balance = initial_balance;
+    groups
+        .into_iter()
+        .map(|((year, month), (pnl, trade_count))| {
             balance += pnl;
             MonthlyReturn {
                 year,
@@ -562,7 +699,8 @@ pub struct PositionSummary {
     pub symbol: String,
     pub side: Side,
     pub group: Option<GroupId>,
-    /// Entry price (from the first close event — all share the same entry).
+    /// Campaign entry basis, size-weighted across the basis recorded at each close event.
+    /// This preserves a shared basis while reflecting average-cost changes after scale-ins.
     pub entry_price: f64,
     /// Size-weighted average exit price across all closes.
     pub avg_exit_price: f64,
@@ -594,6 +732,11 @@ impl PositionSummary {
         let net_pnl: f64 = trades.iter().map(|t| t.pnl).sum();
         let original_size: f64 = trades.iter().map(|t| t.size).sum();
 
+        let entry_price = if original_size > 0.0 {
+            trades.iter().map(|t| t.entry_price * t.size).sum::<f64>() / original_size
+        } else {
+            first.entry_price
+        };
         let avg_exit_price = if original_size > 0.0 {
             trades.iter().map(|t| t.exit_price * t.size).sum::<f64>() / original_size
         } else {
@@ -608,7 +751,7 @@ impl PositionSummary {
             symbol: first.symbol.clone(),
             side: first.side,
             group: first.group.clone(),
-            entry_price: first.entry_price,
+            entry_price,
             avg_exit_price,
             original_size,
             close_count: trades.len(),
@@ -678,8 +821,13 @@ fn compute_close_reason_stats(trade_log: &[TradeResult]) -> Vec<CloseReasonStats
         })
         .collect();
 
-    // Sort by count descending.
-    stats.sort_by(|a, b| b.count.cmp(&a.count));
+    // Sort by count descending, then reason name for deterministic ties.
+    stats.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.reason.to_string().cmp(&right.reason.to_string()))
+    });
     stats
 }
 
@@ -719,10 +867,10 @@ pub struct BacktestResult {
     pub summary: SubsetStats,
 
     /// Stats broken down by symbol.
-    pub per_symbol: HashMap<String, SubsetStats>,
+    pub per_symbol: BTreeMap<String, SubsetStats>,
 
     /// Stats broken down by group (empty if no positions were grouped).
-    pub per_group: HashMap<GroupId, SubsetStats>,
+    pub per_group: BTreeMap<GroupId, SubsetStats>,
 
     /// Stats for long (Buy) trades.
     pub long_stats: SubsetStats,
@@ -745,17 +893,46 @@ pub struct BacktestResult {
     pub monthly_returns: Vec<MonthlyReturn>,
 
     // ── Per-position aggregation ────────────────────────────────────
-    /// Per-position summaries (all close events for one position aggregated).
+    /// Per-position summaries. Legacy reports aggregate close-event rows; FutureQuote
+    /// reports include only campaigns present in `completed_positions`.
     pub positions: Vec<PositionSummary>,
 
-    /// Number of unique positions.
+    /// Number of unique legacy positions or completed FutureQuote campaigns.
     pub total_positions: usize,
-    /// Positions with net_pnl > 0.
+    /// Winning legacy positions or epsilon-classified FutureQuote campaigns.
     pub winning_positions: usize,
-    /// Positions with net_pnl < 0.
+    /// Losing legacy positions or epsilon-classified FutureQuote campaigns.
     pub losing_positions: usize,
     /// Position-level win rate: winning_positions / total_positions.
     pub position_win_rate: f64,
+
+    // ── FutureQuoteV1 additive artifacts ─────────────────────────────
+    #[serde(default)]
+    pub execution_metadata: Option<ExecutionMetadata>,
+    #[serde(default)]
+    pub recorded_fills: Vec<RecordedFill>,
+    #[serde(default)]
+    pub action_dispositions: Vec<ActionDisposition>,
+    #[serde(default)]
+    pub close_events: Vec<CloseEvent>,
+    #[serde(default)]
+    pub completed_positions: Vec<CompletedPosition>,
+    #[serde(default)]
+    pub open_position_snapshots: Vec<OpenPositionSnapshot>,
+    #[serde(default)]
+    pub pending_order_snapshots: Vec<PendingOrderSnapshot>,
+    #[serde(default)]
+    pub pending_order_lifecycle: Vec<PendingOrderLifecycleEvent>,
+    #[serde(default)]
+    pub mtm_equity_curve: Vec<EquityPoint>,
+    #[serde(default)]
+    pub mtm_output_summary: MtmOutputSummary,
+    #[serde(default)]
+    pub mtm_max_drawdown: Option<f64>,
+    #[serde(default)]
+    pub mtm_max_drawdown_pct: Option<f64>,
+    #[serde(default)]
+    pub provider_evaluation: Option<EvaluationReport>,
 }
 
 impl BacktestResult {
@@ -828,7 +1005,7 @@ impl BacktestResult {
                 .or_default()
                 .push(trade);
         }
-        let per_symbol: HashMap<String, SubsetStats> = by_symbol
+        let per_symbol: BTreeMap<String, SubsetStats> = by_symbol
             .iter()
             .map(|(sym, trades)| (sym.clone(), SubsetStats::from_trades(trades)))
             .collect();
@@ -840,7 +1017,7 @@ impl BacktestResult {
                 by_group.entry(g.clone()).or_default().push(trade);
             }
         }
-        let per_group: HashMap<GroupId, SubsetStats> = by_group
+        let per_group: BTreeMap<GroupId, SubsetStats> = by_group
             .iter()
             .map(|(g, trades)| (g.clone(), SubsetStats::from_trades(trades)))
             .collect();
@@ -885,8 +1062,13 @@ impl BacktestResult {
             .values()
             .map(|trades| PositionSummary::from_trades(trades))
             .collect();
-        // Sort by open time for deterministic output.
-        positions.sort_by_key(|p| p.open_ts);
+        // Stable lifecycle tie-breaks keep full-result serialization deterministic.
+        positions.sort_by(|left, right| {
+            left.open_ts
+                .cmp(&right.open_ts)
+                .then_with(|| left.final_close_ts.cmp(&right.final_close_ts))
+                .then_with(|| left.position_id.cmp(&right.position_id))
+        });
 
         let total_positions = positions.len();
         let winning_positions = positions.iter().filter(|p| p.is_winner()).count();
@@ -925,8 +1107,342 @@ impl BacktestResult {
             winning_positions,
             losing_positions,
             position_win_rate,
+            execution_metadata: None,
+            recorded_fills: Vec::new(),
+            action_dispositions: Vec::new(),
+            close_events: Vec::new(),
+            completed_positions: Vec::new(),
+            open_position_snapshots: Vec::new(),
+            pending_order_snapshots: Vec::new(),
+            pending_order_lifecycle: Vec::new(),
+            mtm_equity_curve: Vec::new(),
+            mtm_output_summary: MtmOutputSummary::default(),
+            mtm_max_drawdown: None,
+            mtm_max_drawdown_pct: None,
+            provider_evaluation: None,
         }
     }
+
+    /// Build legacy close-event rows plus completed-position FutureQuoteV1 statistics
+    /// and additive artifacts using the backward-compatible all-sections report.
+    pub fn from_future_artifacts(artifacts: FutureBacktestArtifacts) -> Self {
+        Self::from_future_artifacts_with_options(artifacts, EvaluationOptions::default())
+    }
+
+    /// Build a FutureQuoteV1 result and apply typed provider-evaluation selection.
+    pub fn from_future_artifacts_with_options(
+        artifacts: FutureBacktestArtifacts,
+        evaluation_options: EvaluationOptions,
+    ) -> Self {
+        let trade_log = future_trade_log(&artifacts);
+        let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
+        let mut result = Self::from_trade_log(artifacts.execution.initial_balance, trade_log);
+        result.replace_position_statistics(&artifacts.completed_positions);
+        result.execution_metadata = Some(artifacts.execution);
+        result.recorded_fills = artifacts.fills;
+        result.action_dispositions = artifacts.lifecycle.as_slice().to_vec();
+        result.close_events = artifacts.close_events;
+        result.completed_positions = artifacts.completed_positions;
+        result.open_position_snapshots = artifacts.open_positions;
+        result.pending_order_snapshots = artifacts.pending_orders;
+        result.pending_order_lifecycle = artifacts.pending_order_lifecycle;
+        result.mtm_equity_curve = artifacts.equity_curve;
+        result.mtm_output_summary = artifacts.mtm_output_summary;
+        result.mtm_max_drawdown = artifacts.max_drawdown;
+        result.mtm_max_drawdown_pct = artifacts.max_drawdown_pct;
+        result.provider_evaluation = Some(provider_evaluation);
+        result
+    }
+
+    fn replace_position_statistics(&mut self, completed_positions: &[CompletedPosition]) {
+        self.positions = completed_positions
+            .iter()
+            .map(position_summary_from_completed)
+            .collect();
+        self.positions.sort_by(|left, right| {
+            left.open_ts
+                .cmp(&right.open_ts)
+                .then_with(|| left.final_close_ts.cmp(&right.final_close_ts))
+                .then_with(|| left.position_id.cmp(&right.position_id))
+        });
+        self.streaks = StreakStats::from_completed_positions(completed_positions);
+        self.duration_stats = DurationStats::from_completed_positions(completed_positions);
+        self.monthly_returns =
+            compute_monthly_returns_from_completed(completed_positions, self.initial_balance);
+        self.total_positions = completed_positions.len();
+        self.winning_positions = completed_positions
+            .iter()
+            .filter(|position| position.outcome == NetPnlOutcome::Win)
+            .count();
+        self.losing_positions = completed_positions
+            .iter()
+            .filter(|position| position.outcome == NetPnlOutcome::Loss)
+            .count();
+        self.position_win_rate = if self.total_positions > 0 {
+            self.winning_positions as f64 / self.total_positions as f64
+        } else {
+            0.0
+        };
+    }
+}
+
+fn position_summary_from_completed(position: &CompletedPosition) -> PositionSummary {
+    let closed_size = position
+        .close_events
+        .iter()
+        .map(|event| event.size)
+        .sum::<f64>();
+    let avg_exit_price = if closed_size > 0.0 {
+        position
+            .close_events
+            .iter()
+            .map(|event| event.price * event.size)
+            .sum::<f64>()
+            / closed_size
+    } else {
+        0.0
+    };
+    let close_reasons = if position.close_events.is_empty() {
+        position.close_reasons.clone()
+    } else {
+        position
+            .close_events
+            .iter()
+            .map(|event| event.reason)
+            .collect()
+    };
+
+    PositionSummary {
+        position_id: position.position_id.clone(),
+        symbol: position.symbol.clone(),
+        side: position.side,
+        group: position.group.clone(),
+        entry_price: position.average_entry_price,
+        avg_exit_price,
+        original_size: position.entry_size,
+        close_count: position.close_events.len(),
+        net_pnl: position.net_pnl,
+        close_reasons,
+        open_ts: position.open_ts,
+        final_close_ts: position.close_ts,
+        duration_seconds: (position.close_ts - position.open_ts).num_seconds(),
+    }
+}
+
+fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
+    let mut rows = Vec::with_capacity(artifacts.close_events.len());
+    for event in &artifacts.close_events {
+        let completed = artifacts
+            .completed_positions
+            .iter()
+            .find(|position| position.position_id == event.position_id);
+        let open = artifacts
+            .open_positions
+            .iter()
+            .find(|position| position.position_id == event.position_id);
+        let entry_price = event
+            .entry_price
+            .or_else(|| completed.map(|position| position.average_entry_price))
+            .or_else(|| open.map(|position| position.average_entry_price))
+            .unwrap_or(event.price);
+        let open_ts = completed
+            .map(|position| position.open_ts)
+            .or_else(|| open.and_then(|position| position.open_ts))
+            .unwrap_or(event.ts);
+        let group = completed
+            .and_then(|position| position.group.clone())
+            .or_else(|| open.and_then(|position| position.group.clone()));
+        rows.push(TradeResult {
+            position_id: event.position_id.clone(),
+            symbol: event.symbol.clone(),
+            side: event.side,
+            entry_price,
+            exit_price: event.price,
+            size: event.size,
+            pnl: event.pnl,
+            open_ts,
+            close_ts: event.ts,
+            close_reason: event.reason,
+            group,
+        });
+    }
+    rows.sort_by(|left, right| {
+        left.close_ts
+            .cmp(&right.close_ts)
+            .then_with(|| left.position_id.cmp(&right.position_id))
+            .then_with(|| {
+                left.close_reason
+                    .to_string()
+                    .cmp(&right.close_reason.to_string())
+            })
+            .then_with(|| left.size.total_cmp(&right.size))
+            .then_with(|| left.pnl.total_cmp(&right.pnl))
+    });
+    rows
+}
+
+fn evaluate_future_positions(
+    artifacts: &FutureBacktestArtifacts,
+    options: EvaluationOptions,
+) -> EvaluationReport {
+    let positions = artifacts
+        .completed_positions
+        .iter()
+        .map(|position| {
+            let initial_risk = position.initial_risk();
+            let excursions = initial_risk.and_then(|risk| {
+                (risk > 0.0).then_some(ExcursionInput {
+                    favorable_r: position.mfe.map(|value| value / risk),
+                    adverse_r: position.mae.map(|value| value / risk),
+                })
+            });
+            let fills: Vec<_> = artifacts
+                .fills
+                .iter()
+                .filter(|fill| fill.position_id == position.position_id)
+                .collect();
+            let execution = (!fills.is_empty()).then(|| {
+                let latency_ms = fills
+                    .iter()
+                    .map(|fill| {
+                        (fill.execution_ts.unwrap_or(fill.quote_ts) - fill.effective_ts)
+                            .num_milliseconds() as f64
+                    })
+                    .sum::<f64>()
+                    / fills.len() as f64;
+                let slippage_bps = fills
+                    .iter()
+                    .filter(|fill| fill.fill.quote_price.is_finite() && fill.fill.quote_price > 0.0)
+                    .map(|fill| {
+                        let raw = (fill.fill.price - fill.fill.quote_price) / fill.fill.quote_price
+                            * 10_000.0;
+                        let adverse_sign = match (fill.fill.purpose.is_entry(), fill.fill.side) {
+                            (true, Side::Buy) | (false, Side::Sell) => 1.0,
+                            (true, Side::Sell) | (false, Side::Buy) => -1.0,
+                        };
+                        raw * adverse_sign
+                    })
+                    .sum::<f64>()
+                    / fills.len() as f64;
+                ExecutionDiagnosticsInput {
+                    slippage_bps: Some(slippage_bps),
+                    latency_ms: Some(latency_ms),
+                    fill_ratio: position_fill_ratio(position, artifacts),
+                }
+            });
+            PositionOutcome {
+                id: position.position_id.clone(),
+                trade_id: position.trade_id.clone(),
+                ordinal: position.close_ts.and_utc().timestamp_millis(),
+                dimensions: PositionDimensions {
+                    symbol: position.symbol.clone(),
+                    side: match position.side {
+                        Side::Buy => PositionSide::Long,
+                        Side::Sell => PositionSide::Short,
+                    },
+                    group: position.group.clone(),
+                    close_reasons: position
+                        .close_reasons
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    tags: std::collections::BTreeMap::new(),
+                },
+                outcome: position.net_pnl,
+                outcome_classification: Some(match position.outcome {
+                    NetPnlOutcome::Win => OutcomeClassification::Win,
+                    NetPnlOutcome::Loss => OutcomeClassification::Loss,
+                    NetPnlOutcome::Breakeven => OutcomeClassification::Breakeven,
+                }),
+                r_multiple: position.realized_r,
+                excursions,
+                execution,
+            }
+        })
+        .collect();
+    let entry_dispositions: Vec<_> = artifacts
+        .lifecycle
+        .iter()
+        .filter(|disposition| disposition.action_kind.as_deref() == Some("entry"))
+        .collect();
+    let accepted = entry_dispositions
+        .iter()
+        .filter(|disposition| disposition.status == ActionDispositionStatus::Applied)
+        .count() as u64;
+    let rejected = entry_dispositions.len() as u64 - accepted;
+    let lifecycle = LifecycleCounts {
+        candidates: entry_dispositions.len() as u64,
+        accepted,
+        opened: artifacts
+            .fills
+            .iter()
+            .filter(|fill| fill.fill.purpose.is_entry())
+            .map(|fill| fill.position_id.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64,
+        completed: artifacts.completed_positions.len() as u64,
+        rejected,
+        filled: artifacts
+            .pending_order_lifecycle
+            .iter()
+            .filter(|event| event.state == PendingOrderLifecycleState::Filled)
+            .count() as u64,
+        cancelled: artifacts
+            .pending_order_lifecycle
+            .iter()
+            .filter(|event| event.state == PendingOrderLifecycleState::Cancelled)
+            .count() as u64,
+        unfilled_at_end: artifacts
+            .pending_order_lifecycle
+            .iter()
+            .filter(|event| event.state == PendingOrderLifecycleState::UnfilledAtEnd)
+            .count() as u64,
+        open_at_end: artifacts.open_positions.len() as u64,
+    };
+    evaluate(&EvaluationRequest {
+        positions,
+        lifecycle: Some(lifecycle),
+        options,
+    })
+}
+
+fn position_fill_ratio(
+    position: &CompletedPosition,
+    artifacts: &FutureBacktestArtifacts,
+) -> Option<f64> {
+    let entry_fills: Vec<_> = artifacts
+        .fills
+        .iter()
+        .filter(|fill| fill.position_id == position.position_id && fill.fill.purpose.is_entry())
+        .collect();
+    if entry_fills.is_empty() {
+        return None;
+    }
+
+    let total_filled = entry_fills
+        .iter()
+        .map(|fill| fill.size)
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .sum::<f64>();
+    if total_filled <= 0.0 {
+        return None;
+    }
+
+    let pending_fill = artifacts.pending_order_lifecycle.iter().find(|event| {
+        event.position_id == position.position_id
+            && event.state == PendingOrderLifecycleState::Filled
+    });
+    let Some(pending_fill) = pending_fill else {
+        // Market entry and scale-in fills are fill-or-reject in FutureQuoteV1.
+        return Some(1.0);
+    };
+    let pending_filled = pending_fill.filled_size.filter(|size| size.is_finite())?;
+    if !pending_fill.requested_size.is_finite() || pending_fill.requested_size <= 0.0 {
+        return None;
+    }
+    let other_filled = (total_filled - pending_filled).max(0.0);
+    let requested = pending_fill.requested_size + other_filled;
+    (requested > 0.0).then_some(total_filled / requested)
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -1173,7 +1689,9 @@ impl std::fmt::Display for BacktestResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evaluation::{EvaluationSection, GroupFilter, PositionFilter};
     use chrono::NaiveDate;
+    use std::collections::BTreeSet;
 
     fn ts(year: i32, month: u32, day: u32, h: u32, m: u32, s: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(year, month, day)
@@ -1208,6 +1726,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeping fixture fields explicit is clearer than rewriting the many stable call sites"
+    )]
     fn make_trade_full(
         pos_id: &str,
         symbol: &str,
@@ -1911,6 +2433,8 @@ mod tests {
         // Sorted by count descending — Target (2), then SL (1) and Trailing (1).
         assert_eq!(result.per_close_reason[0].reason, CloseReason::Target);
         assert_eq!(result.per_close_reason[0].count, 2);
+        assert_eq!(result.per_close_reason[1].reason, CloseReason::Stoploss);
+        assert_eq!(result.per_close_reason[2].reason, CloseReason::TrailingStop);
         assert!((result.per_close_reason[0].percentage - 0.5).abs() < f64::EPSILON);
     }
 
@@ -2022,6 +2546,7 @@ mod tests {
         let ps = PositionSummary::from_trades(&refs);
 
         assert_eq!(ps.close_count, 2);
+        assert!((ps.entry_price - 1.0850).abs() < f64::EPSILON);
         assert!((ps.net_pnl - 15.0).abs() < f64::EPSILON);
         assert!((ps.original_size - 1.0).abs() < f64::EPSILON);
         assert!(ps.is_winner());
@@ -2030,6 +2555,84 @@ mod tests {
             vec![CloseReason::Target, CloseReason::Stoploss]
         );
         assert_eq!(ps.duration_seconds, 4 * 3600); // 10:00 to 14:00
+    }
+
+    #[test]
+    fn position_summary_weights_changing_close_time_entry_basis() {
+        let first_partial_close = TradeResult {
+            position_id: "scaled".into(),
+            symbol: "TEST".into(),
+            side: Side::Buy,
+            entry_price: 100.0,
+            exit_price: 110.0,
+            size: 1.0,
+            pnl: 10.0,
+            open_ts: ts_hms(10, 0, 0),
+            close_ts: ts_hms(11, 0, 0),
+            close_reason: CloseReason::Target,
+            group: None,
+        };
+        let close_after_scale_in = TradeResult {
+            position_id: "scaled".into(),
+            symbol: "TEST".into(),
+            side: Side::Buy,
+            entry_price: 120.0,
+            exit_price: 125.0,
+            size: 3.0,
+            pnl: 15.0,
+            open_ts: ts_hms(10, 0, 0),
+            close_ts: ts_hms(12, 0, 0),
+            close_reason: CloseReason::Manual,
+            group: None,
+        };
+        let trades = [&first_partial_close, &close_after_scale_in];
+
+        let summary = PositionSummary::from_trades(&trades);
+
+        assert!((summary.entry_price - 115.0).abs() < f64::EPSILON);
+        assert!((summary.avg_exit_price - 121.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn position_summary_weighted_prices_conserve_pnl() {
+        let first_partial_close = TradeResult {
+            position_id: "scaled".into(),
+            symbol: "TEST".into(),
+            side: Side::Buy,
+            entry_price: 100.0,
+            exit_price: 110.0,
+            size: 1.0,
+            pnl: 10.0,
+            open_ts: ts_hms(10, 0, 0),
+            close_ts: ts_hms(11, 0, 0),
+            close_reason: CloseReason::Target,
+            group: None,
+        };
+        let close_after_scale_in = TradeResult {
+            position_id: "scaled".into(),
+            symbol: "TEST".into(),
+            side: Side::Buy,
+            entry_price: 120.0,
+            exit_price: 125.0,
+            size: 3.0,
+            pnl: 15.0,
+            open_ts: ts_hms(10, 0, 0),
+            close_ts: ts_hms(12, 0, 0),
+            close_reason: CloseReason::Manual,
+            group: None,
+        };
+        let trades = [&first_partial_close, &close_after_scale_in];
+
+        let summary = PositionSummary::from_trades(&trades);
+        let pnl_from_close_rows = trades
+            .iter()
+            .map(|trade| (trade.exit_price - trade.entry_price) * trade.size)
+            .sum::<f64>();
+        let pnl_from_summary =
+            (summary.avg_exit_price - summary.entry_price) * summary.original_size;
+
+        assert!((summary.net_pnl - pnl_from_close_rows).abs() < f64::EPSILON);
+        assert!((pnl_from_summary - pnl_from_close_rows).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2075,6 +2678,361 @@ mod tests {
         assert_eq!(result.total_positions, 1);
         assert_eq!(result.winning_positions, 1);
         assert!((result.position_win_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    fn completed_position(
+        position_id: &str,
+        pnl: f64,
+        epsilon: f64,
+        open_ts: NaiveDateTime,
+        close_ts: NaiveDateTime,
+    ) -> CompletedPosition {
+        let reason = if pnl > 0.0 {
+            CloseReason::Target
+        } else {
+            CloseReason::Stoploss
+        };
+        let close = CloseEvent::new(
+            position_id,
+            0,
+            "ES",
+            Side::Buy,
+            close_ts,
+            1.0,
+            100.0 + pnl,
+            pnl,
+            reason,
+        );
+        CompletedPosition::from_close_events(
+            position_id,
+            "ES",
+            Side::Buy,
+            open_ts,
+            close_ts,
+            1.0,
+            100.0,
+            None,
+            None,
+            Vec::new(),
+            vec![close],
+            None,
+            None,
+            epsilon,
+        )
+    }
+
+    #[test]
+    fn automatic_provider_report_applies_or_within_and_and_between_filters() {
+        let mut matching_es =
+            completed_position("es-long", 1.0, 0.001, ts_hms(9, 0, 0), ts_hms(10, 0, 0));
+        matching_es.group = Some("trend".into());
+
+        let mut matching_nq =
+            completed_position("nq-long", 2.0, 0.001, ts_hms(10, 0, 0), ts_hms(11, 0, 0));
+        matching_nq.symbol = "NQ".into();
+        matching_nq.group = Some("trend".into());
+
+        let mut wrong_side =
+            completed_position("es-short", 3.0, 0.001, ts_hms(11, 0, 0), ts_hms(12, 0, 0));
+        wrong_side.side = Side::Sell;
+        wrong_side.group = Some("trend".into());
+
+        let mut wrong_group =
+            completed_position("es-other", 4.0, 0.001, ts_hms(12, 0, 0), ts_hms(13, 0, 0));
+        wrong_group.group = Some("countertrend".into());
+
+        let artifacts = FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                ..ExecutionMetadata::default()
+            },
+            completed_positions: vec![matching_es, matching_nq, wrong_side, wrong_group],
+            ..FutureBacktestArtifacts::default()
+        };
+        let result = BacktestResult::from_future_artifacts_with_options(
+            artifacts,
+            EvaluationOptions {
+                sections: BTreeSet::from([
+                    EvaluationSection::Coverage,
+                    EvaluationSection::PositionPerformance,
+                ]),
+                filter: PositionFilter {
+                    symbols: vec!["ES".into(), "NQ".into()],
+                    sides: vec![PositionSide::Long],
+                    groups: vec![GroupFilter::Named("trend".into())],
+                    close_reasons: vec!["Target".into(), "Manual".into()],
+                    ..PositionFilter::default()
+                },
+                ..EvaluationOptions::default()
+            },
+        );
+        let evaluation = result
+            .provider_evaluation
+            .expect("FutureQuote result includes provider evaluation");
+        let coverage = evaluation.coverage.expect("coverage requested");
+        let performance = evaluation
+            .position_performance
+            .expect("position performance requested");
+
+        assert_eq!(coverage.provided_positions, 4);
+        assert_eq!(coverage.selected_positions, 2);
+        assert_eq!(coverage.filtered_out_positions, 2);
+        assert_eq!(performance.position_count, 2);
+        assert_eq!(performance.total_outcome.value, Some(3.0));
+        assert!(evaluation.r_metrics.is_none());
+    }
+
+    #[test]
+    fn future_position_statistics_exclude_partially_closed_open_campaigns() {
+        let completed =
+            completed_position("completed", -10.0, 0.001, ts_hms(9, 0, 0), ts_hms(11, 0, 0));
+        let mut partial = CloseEvent::new(
+            "still-open",
+            0,
+            "ES",
+            Side::Buy,
+            ts_hms(12, 0, 0),
+            0.5,
+            110.0,
+            100.0,
+            CloseReason::Target,
+        );
+        partial.remaining_size = Some(0.5);
+        let open = OpenPositionSnapshot {
+            position_id: "still-open".into(),
+            symbol: "ES".into(),
+            side: Side::Buy,
+            open_ts: Some(ts_hms(10, 0, 0)),
+            average_entry_price: 100.0,
+            remaining_size: 0.5,
+            realized_pnl: 100.0,
+            ..OpenPositionSnapshot::default()
+        };
+        let artifacts = FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                pnl_epsilon: 0.001,
+                ..ExecutionMetadata::default()
+            },
+            close_events: vec![completed.close_events[0].clone(), partial],
+            completed_positions: vec![completed],
+            open_positions: vec![open],
+            ..FutureBacktestArtifacts::default()
+        };
+
+        let result = BacktestResult::from_future_artifacts(artifacts);
+
+        assert_eq!(result.total_trades, 2);
+        assert_eq!(result.trade_log.len(), 2);
+        assert_eq!(result.close_events.len(), 2);
+        assert!(
+            result
+                .trade_log
+                .iter()
+                .any(|row| row.position_id == "still-open")
+        );
+        assert_eq!(result.total_positions, 1);
+        assert_eq!(result.winning_positions, 0);
+        assert_eq!(result.losing_positions, 1);
+        assert_eq!(result.position_win_rate, 0.0);
+        assert_eq!(result.positions.len(), 1);
+        assert_eq!(result.positions[0].position_id, "completed");
+        assert_eq!(result.positions[0].net_pnl, -10.0);
+        assert_eq!(result.streaks.max_consecutive_wins, 0);
+        assert_eq!(result.streaks.max_consecutive_losses, 1);
+        assert_eq!(result.streaks.current_streak, -1);
+        let duration = result
+            .duration_stats
+            .expect("one completed campaign has duration stats");
+        assert_eq!(duration.avg_duration_secs, 2 * 3600);
+        assert_eq!(result.monthly_returns.len(), 1);
+        assert_eq!(result.monthly_returns[0].trade_count, 1);
+        assert_eq!(result.monthly_returns[0].pnl, -10.0);
+    }
+
+    #[test]
+    fn future_trade_reconstruction_uses_each_close_inventory_basis() {
+        let mut first = CloseEvent::new(
+            "campaign",
+            0,
+            "ES",
+            Side::Buy,
+            ts_hms(11, 0, 0),
+            1.0,
+            110.0,
+            10.0,
+            CloseReason::Manual,
+        );
+        first.entry_price = Some(100.0);
+        let mut final_close = CloseEvent::new(
+            "campaign",
+            1,
+            "ES",
+            Side::Buy,
+            ts_hms(12, 0, 0),
+            2.0,
+            130.0,
+            40.0,
+            CloseReason::Manual,
+        );
+        final_close.entry_price = Some(110.0);
+        let completed = CompletedPosition::from_close_events(
+            "campaign",
+            "ES",
+            Side::Buy,
+            ts_hms(10, 0, 0),
+            ts_hms(12, 0, 0),
+            3.0,
+            320.0 / 3.0,
+            None,
+            None,
+            vec![],
+            vec![first.clone(), final_close.clone()],
+            None,
+            None,
+            crate::artifacts::DEFAULT_PNL_EPSILON,
+        );
+        let result = BacktestResult::from_future_artifacts(FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                ..ExecutionMetadata::default()
+            },
+            close_events: vec![first, final_close],
+            completed_positions: vec![completed],
+            ..FutureBacktestArtifacts::default()
+        });
+
+        assert_eq!(result.trade_log[0].entry_price, 100.0);
+        assert_eq!(result.trade_log[1].entry_price, 110.0);
+        assert_eq!(result.total_pnl, 50.0);
+    }
+
+    #[test]
+    fn future_partial_tp_then_sl_is_one_breakeven_for_campaign_analytics() {
+        let open_ts = ts(2026, 1, 31, 22, 0, 0);
+        let partial_ts = ts(2026, 1, 31, 23, 0, 0);
+        let close_ts = ts(2026, 2, 1, 2, 0, 0);
+        let partial_tp = CloseEvent::new(
+            "campaign",
+            0,
+            "ES",
+            Side::Buy,
+            partial_ts,
+            0.5,
+            150.0,
+            50.0,
+            CloseReason::Target,
+        );
+        let final_sl = CloseEvent::new(
+            "campaign",
+            1,
+            "ES",
+            Side::Buy,
+            close_ts,
+            0.5,
+            50.0,
+            -50.0,
+            CloseReason::Stoploss,
+        );
+        let completed = CompletedPosition::from_close_events(
+            "campaign",
+            "ES",
+            Side::Buy,
+            open_ts,
+            close_ts,
+            1.0,
+            100.0,
+            None,
+            None,
+            Vec::new(),
+            vec![partial_tp.clone(), final_sl.clone()],
+            None,
+            None,
+            0.001,
+        );
+        assert_eq!(completed.outcome, NetPnlOutcome::Breakeven);
+        let result = BacktestResult::from_future_artifacts(FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                pnl_epsilon: 0.001,
+                ..ExecutionMetadata::default()
+            },
+            close_events: vec![partial_tp, final_sl],
+            completed_positions: vec![completed],
+            ..FutureBacktestArtifacts::default()
+        });
+
+        // Close-event fields remain legacy-compatible.
+        assert_eq!(result.total_trades, 2);
+        assert_eq!(result.winning_trades, 1);
+        assert_eq!(result.losing_trades, 1);
+
+        // Campaign analytics count only the completed net outcome.
+        assert_eq!(result.total_positions, 1);
+        assert_eq!(result.winning_positions, 0);
+        assert_eq!(result.losing_positions, 0);
+        assert_eq!(result.streaks.max_consecutive_wins, 0);
+        assert_eq!(result.streaks.max_consecutive_losses, 0);
+        assert_eq!(result.streaks.current_streak, 0);
+        let duration = result
+            .duration_stats
+            .expect("one completed campaign has duration stats");
+        assert_eq!(duration.avg_duration_secs, 4 * 3600);
+        assert_eq!(duration.min_duration_secs, 4 * 3600);
+        assert_eq!(duration.max_duration_secs, 4 * 3600);
+        assert_eq!(duration.avg_winner_duration_secs, 0);
+        assert_eq!(duration.avg_loser_duration_secs, 0);
+        assert_eq!(result.monthly_returns.len(), 1);
+        assert_eq!(result.monthly_returns[0].year, 2026);
+        assert_eq!(result.monthly_returns[0].month, 2);
+        assert_eq!(result.monthly_returns[0].trade_count, 1);
+        assert_eq!(result.monthly_returns[0].pnl, 0.0);
+        assert_eq!(result.monthly_returns[0].ending_balance, 10_000.0);
+    }
+
+    #[test]
+    fn future_position_and_provider_statistics_use_configured_breakeven_outcome() {
+        let completed =
+            completed_position("tiny", 0.0005, 0.001, ts_hms(9, 0, 0), ts_hms(11, 0, 0));
+        assert_eq!(completed.outcome, NetPnlOutcome::Breakeven);
+        let artifacts = FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                pnl_epsilon: 0.001,
+                ..ExecutionMetadata::default()
+            },
+            close_events: completed.close_events.clone(),
+            completed_positions: vec![completed],
+            ..FutureBacktestArtifacts::default()
+        };
+
+        let result = BacktestResult::from_future_artifacts(artifacts);
+        let performance = &result
+            .provider_evaluation
+            .as_ref()
+            .expect("future reports include provider evaluation")
+            .position_performance
+            .as_ref()
+            .expect("position performance requested");
+
+        assert_eq!(result.total_positions, 1);
+        assert_eq!(result.winning_positions, 0);
+        assert_eq!(result.losing_positions, 0);
+        assert_eq!(performance.wins, 0);
+        assert_eq!(performance.losses, 0);
+        assert_eq!(performance.breakeven, 1);
+        assert_eq!(performance.total_outcome.value, Some(0.0005));
+        assert_eq!(performance.gross_positive.value, Some(0.0));
+    }
+
+    #[test]
+    fn legacy_from_trade_log_keeps_exact_zero_position_classification() {
+        let result = BacktestResult::from_trade_log(10_000.0, vec![make_trade(0.0005, 11)]);
+
+        assert_eq!(result.total_positions, 1);
+        assert_eq!(result.winning_positions, 1);
+        assert_eq!(result.losing_positions, 0);
+        assert_eq!(result.position_win_rate, 1.0);
     }
 
     // ── Integration tests ───────────────────────────────────────────
@@ -2238,6 +3196,62 @@ mod tests {
         assert!(output.contains("Backtest Result"));
         assert!(output.contains("Risk Metrics"));
         assert!(output.contains("Side Breakdown"));
+    }
+
+    #[test]
+    fn serialized_breakdown_maps_use_stable_key_order() {
+        let trades = vec![
+            make_trade_full(
+                "z",
+                "ZZZ",
+                Side::Buy,
+                1.0,
+                ts_hms(9, 0, 0),
+                ts_hms(11, 0, 0),
+                CloseReason::Target,
+                Some("z-group".into()),
+            ),
+            make_trade_full(
+                "a",
+                "AAA",
+                Side::Buy,
+                1.0,
+                ts_hms(9, 0, 0),
+                ts_hms(12, 0, 0),
+                CloseReason::Target,
+                Some("a-group".into()),
+            ),
+        ];
+        let result = BacktestResult::from_trade_log(10_000.0, trades);
+
+        let symbols = serde_json::to_string(&result.per_symbol).expect("symbols serialize");
+        let groups = serde_json::to_string(&result.per_group).expect("groups serialize");
+        assert!(symbols.find("AAA").unwrap() < symbols.find("ZZZ").unwrap());
+        assert!(groups.find("a-group").unwrap() < groups.find("z-group").unwrap());
+    }
+
+    #[test]
+    fn mtm_output_summary_flows_from_artifacts_and_defaults_for_old_results() {
+        let summary = MtmOutputSummary {
+            policy: crate::mtm::MtmOutputPolicy::None,
+            observed_points: 12,
+            retained_points: 0,
+            omitted_points: 12,
+        };
+        let result = BacktestResult::from_future_artifacts(FutureBacktestArtifacts {
+            execution: ExecutionMetadata {
+                initial_balance: 10_000.0,
+                ..ExecutionMetadata::default()
+            },
+            mtm_output_summary: summary,
+            ..FutureBacktestArtifacts::default()
+        });
+        assert_eq!(result.mtm_output_summary, summary);
+
+        let mut json = serde_json::to_value(&result).unwrap();
+        json.as_object_mut().unwrap().remove("mtm_output_summary");
+        let restored: BacktestResult = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.mtm_output_summary, MtmOutputSummary::default());
     }
 
     #[test]

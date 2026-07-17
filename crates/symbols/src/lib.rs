@@ -33,6 +33,12 @@ struct SymbolEntry {
     pip_position: u16,
     digits: u16,
     category: String,
+    #[serde(default)]
+    base_currency: Option<String>,
+    #[serde(default)]
+    quote_currency: Option<String>,
+    #[serde(default)]
+    pnl_currency: Option<String>,
     lot_base_units: i64,
     lot_step_units: i64,
     #[serde(default = "default_lot_min_steps")]
@@ -66,6 +72,20 @@ pub struct SymbolSpec {
     pub lot_min_steps: i64,
     /// Maximum allowed lot steps (0 = no limit).
     pub lot_max_steps: i64,
+}
+
+/// Currency metadata associated with one loaded symbol.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolCurrencyMetadata {
+    /// Optional base currency or asset code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_currency: Option<String>,
+    /// Optional quote currency code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_currency: Option<String>,
+    /// Currency in which the symbol realizes profit and loss.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pnl_currency: String,
 }
 
 impl SymbolSpec {
@@ -114,6 +134,8 @@ impl SymbolSpec {
 pub struct SymbolRegistry {
     /// canonical_name → SymbolSpec
     symbols: HashMap<String, SymbolSpec>,
+    /// canonical_name to SymbolCurrencyMetadata
+    currency_metadata: HashMap<String, SymbolCurrencyMetadata>,
     /// alias (lowercase, stripped) → canonical_name
     alias_map: HashMap<String, String>,
 }
@@ -130,6 +152,7 @@ impl SymbolRegistry {
         let file: TomlFile = toml::from_str(content)?;
 
         let mut symbols = HashMap::with_capacity(file.symbol.len());
+        let mut currency_metadata = HashMap::with_capacity(file.symbol.len());
         let mut alias_map = HashMap::new();
 
         for entry in file.symbol {
@@ -156,6 +179,49 @@ impl SymbolRegistry {
                     step: entry.lot_step_units,
                     base: entry.lot_base_units,
                 });
+            }
+
+            let category = entry.category.to_ascii_lowercase();
+            let base_currency = normalize_optional_currency(
+                &canonical,
+                "base_currency",
+                entry.base_currency.as_deref(),
+            )?;
+            let quote_currency = normalize_optional_currency(
+                &canonical,
+                "quote_currency",
+                entry.quote_currency.as_deref(),
+            )?;
+            let pnl_currency =
+                required_currency(&canonical, "pnl_currency", entry.pnl_currency.as_deref())?;
+
+            if category == "forex" {
+                let base =
+                    base_currency
+                        .as_ref()
+                        .ok_or_else(|| SymbolError::MissingCurrencyMetadata {
+                            symbol: canonical.clone(),
+                            field: "base_currency",
+                        })?;
+                let quote = quote_currency.as_ref().ok_or_else(|| {
+                    SymbolError::MissingCurrencyMetadata {
+                        symbol: canonical.clone(),
+                        field: "quote_currency",
+                    }
+                })?;
+                if base == quote {
+                    return Err(SymbolError::DuplicateForexCurrency {
+                        symbol: canonical,
+                        currency: base.clone(),
+                    });
+                }
+                if &pnl_currency != quote {
+                    return Err(SymbolError::ForexPnlCurrencyMismatch {
+                        symbol: canonical,
+                        quote: quote.clone(),
+                        pnl: pnl_currency,
+                    });
+                }
             }
 
             // Register the canonical name itself as an alias
@@ -185,23 +251,36 @@ impl SymbolRegistry {
                 canonical: canonical.clone(),
                 pip_position: entry.pip_position,
                 digits: entry.digits,
-                category: entry.category,
+                category,
                 lot_base_units: entry.lot_base_units,
                 lot_step_units: entry.lot_step_units,
                 lot_min_steps: entry.lot_min_steps,
                 lot_max_steps: entry.lot_max_steps,
             };
 
+            currency_metadata.insert(
+                canonical.clone(),
+                SymbolCurrencyMetadata {
+                    base_currency,
+                    quote_currency,
+                    pnl_currency,
+                },
+            );
             symbols.insert(canonical, spec);
         }
 
-        Ok(Self { symbols, alias_map })
+        Ok(Self {
+            symbols,
+            currency_metadata,
+            alias_map,
+        })
     }
 
     /// Create an empty registry (for tests that don't need normalization).
     pub fn empty() -> Self {
         Self {
             symbols: HashMap::new(),
+            currency_metadata: HashMap::new(),
             alias_map: HashMap::new(),
         }
     }
@@ -240,6 +319,24 @@ impl SymbolRegistry {
     pub fn spec_by_any(&self, raw: &str) -> Option<&SymbolSpec> {
         let canonical = self.normalize(raw)?;
         self.symbols.get(canonical)
+    }
+
+    /// Get currency metadata by canonical symbol name.
+    pub fn currency_metadata(&self, canonical: &str) -> Option<&SymbolCurrencyMetadata> {
+        self.currency_metadata.get(canonical)
+    }
+
+    /// Get currency metadata by any symbol name.
+    pub fn currency_metadata_by_any(&self, raw: &str) -> Option<&SymbolCurrencyMetadata> {
+        let canonical = self.normalize(raw)?;
+        self.currency_metadata.get(canonical)
+    }
+
+    /// Get the P&L currency by canonical symbol name.
+    pub fn pnl_currency(&self, canonical: &str) -> Option<&str> {
+        self.currency_metadata
+            .get(canonical)
+            .map(|metadata| metadata.pnl_currency.as_str())
     }
 
     /// Get digits for a symbol by canonical name.
@@ -331,6 +428,44 @@ impl SymbolRegistry {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// Normalize a currency code to exactly three uppercase ASCII letters.
+pub fn normalize_currency_code(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_uppercase();
+    if normalized.len() == 3 && normalized.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn normalize_optional_currency(
+    symbol: &str,
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<Option<String>> {
+    value
+        .map(|raw| {
+            normalize_currency_code(raw).ok_or_else(|| SymbolError::InvalidCurrencyCode {
+                symbol: symbol.to_owned(),
+                field,
+                value: raw.to_owned(),
+            })
+        })
+        .transpose()
+}
+
+fn required_currency(symbol: &str, field: &'static str, value: Option<&str>) -> Result<String> {
+    let raw = value.ok_or_else(|| SymbolError::MissingCurrencyMetadata {
+        symbol: symbol.to_owned(),
+        field,
+    })?;
+    normalize_currency_code(raw).ok_or_else(|| SymbolError::InvalidCurrencyCode {
+        symbol: symbol.to_owned(),
+        field,
+        value: raw.to_owned(),
+    })
+}
+
 /// Strip `/`, `-`, `_`, and spaces from a string for normalization.
 fn strip_separators(s: &str) -> String {
     s.chars()
@@ -376,6 +511,9 @@ aliases = ["eur/usd", "eur-usd", "eur_usd"]
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 lot_min_steps = 1
@@ -387,6 +525,9 @@ aliases = ["gold", "xau/usd", "xau-usd"]
 pip_position = 1
 digits = 2
 category = "metal"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100
 lot_step_units = 1
 lot_min_steps = 1
@@ -398,6 +539,7 @@ aliases = ["nas100", "nasdaq", "us tech 100"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 lot_min_steps = 1
@@ -519,6 +661,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 
@@ -528,6 +673,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 "#;
@@ -544,6 +692,7 @@ aliases = ["nasdaq"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 
@@ -553,6 +702,7 @@ aliases = ["nasdaq"]
 pip_position = 1
 digits = 2
 category = "index"
+pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
 "#;
@@ -569,6 +719,9 @@ aliases = []
 pip_position = 4
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 0
 "#;
@@ -585,6 +738,9 @@ aliases = []
 pip_position = 6
 digits = 5
 category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100000
 lot_step_units = 1000
 "#;

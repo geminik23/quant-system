@@ -27,6 +27,10 @@ struct OfflineCli {
     /// Output file path (default: stdout). Ignored when a handler is set.
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Optional JSONL file receiving one structured parse outcome per message.
+    #[arg(long)]
+    outcomes_output: Option<String>,
 }
 
 //
@@ -72,10 +76,32 @@ impl OfflineRunner {
     /// Run the offline pipeline. Parses CLI args from the process arguments.
     pub fn run(self) -> Result<(), SignalParserError> {
         let cli = OfflineCli::parse();
-        self.run_with_args(OfflineArgs {
-            input: cli.input,
-            output: cli.output,
-        })
+        if let Some(outcomes_output) = cli.outcomes_output {
+            self.run_with_args_and_outcomes(
+                OfflineArgs {
+                    input: cli.input,
+                    output: cli.output,
+                },
+                outcomes_output,
+            )
+        } else {
+            self.run_with_args(OfflineArgs {
+                input: cli.input,
+                output: cli.output,
+            })
+        }
+    }
+
+    pub fn run_with_args_and_outcomes(
+        self,
+        args: OfflineArgs,
+        outcomes_output: String,
+    ) -> Result<(), SignalParserError> {
+        let messages = read_jsonl(&args.input)?;
+        let batch = crate::pipeline::parse_messages_v2(&self.registry, &messages);
+        write_jsonl_values(&args.output, &batch.signals)?;
+        write_jsonl_values(&Some(outcomes_output), &batch.outcomes)?;
+        Ok(())
     }
 
     /// Run the offline pipeline with pre-built arguments.
@@ -96,25 +122,6 @@ impl OfflineRunner {
     }
 }
 
-/// Try multiple ISO 8601 datetime formats (same as pipeline.rs).
-fn parse_iso_datetime(s: &str) -> Result<chrono::NaiveDateTime, SignalParserError> {
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.fZ",
-        "%Y-%m-%dT%H:%M:%S%.f",
-    ] {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(dt);
-        }
-    }
-    Err(SignalParserError::TimestampParse(
-        s.to_string(),
-        "unrecognized format".to_string(),
-    ))
-}
-
 /// Process messages one by one through the registry and call handler callbacks.
 /// Returns the total number of signal entries dispatched.
 fn run_with_handler(
@@ -124,8 +131,12 @@ fn run_with_handler(
 ) -> usize {
     let mut history: HashMap<i64, VecDeque<RawTgMessage>> = HashMap::new();
     let mut total = 0;
+    let mut ordered: Vec<(usize, &RawTgMessage)> = messages.iter().enumerate().collect();
+    ordered.sort_by_key(|(source_sequence, message)| {
+        (message.chat_id, message.msg_id, *source_sequence)
+    });
 
-    for msg in messages {
+    for (_, msg) in ordered {
         let parser = match registry.get(msg.chat_id) {
             Some(p) => p,
             None => {
@@ -134,7 +145,7 @@ fn run_with_handler(
             }
         };
 
-        let ts = match parse_iso_datetime(&msg.ts) {
+        let ts = match crate::pipeline::parse_iso_datetime(&msg.ts) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("skipping msg_id={}: {}", msg.msg_id, e);
@@ -159,19 +170,33 @@ fn run_with_handler(
             parser_name: parser.name().to_string(),
         };
 
-        match action {
-            ParsedAction::Signals(signals) => {
-                total += signals.len();
-                handler.on_signals(signals, &signal_ctx);
-            }
+        let retain_in_history = match action {
+            ParsedAction::Signals(signals) => match crate::pipeline::validate_signals(&signals) {
+                Ok(()) => {
+                    total += signals.len();
+                    handler.on_signals(signals, &signal_ctx);
+                    true
+                }
+                Err(failure) => {
+                    tracing::warn!(?failure, "signal parser emitted invalid signals");
+                    handler.on_skip(&msg.message, &signal_ctx);
+                    false
+                }
+            },
             ParsedAction::Skip => {
                 handler.on_skip(&msg.message, &signal_ctx);
+                true
             }
-        }
+            ParsedAction::Rejected(failure) => {
+                tracing::warn!(?failure, "signal parser rejected message");
+                handler.on_skip(&msg.message, &signal_ctx);
+                false
+            }
+        };
 
-        // Push current message into history.
+        // Push successful and intentionally skipped messages into history.
         let max_hist = parser.max_history();
-        if max_hist > 0 {
+        if retain_in_history && max_hist > 0 {
             chan_history.push_back(msg.clone());
             while chan_history.len() > max_hist {
                 chan_history.pop_front();
@@ -192,9 +217,9 @@ fn route_message(
 ) -> ParsedAction {
     if let Some(reply_to_id) = msg.reply_to {
         let parent = chan_history.iter().find(|m| m.msg_id == reply_to_id);
-        parser.parse_reply(&msg.message, ts, parent, ctx)
+        parser.parse_reply_message(msg, ts, parent, ctx)
     } else {
-        parser.parse_root(&msg.message, ts, ctx)
+        parser.parse_root_message(msg, ts, ctx)
     }
 }
 
@@ -224,13 +249,20 @@ fn read_jsonl(path: &str) -> Result<Vec<RawTgMessage>, SignalParserError> {
 
 /// Write parsed raw signals as JSONL to a file (or stdout if path is None).
 fn write_jsonl(path: &Option<String>, signals: &[RawSignal]) -> Result<(), SignalParserError> {
+    write_jsonl_values(path, signals)
+}
+
+fn write_jsonl_values<T: serde::Serialize>(
+    path: &Option<String>,
+    values: &[T],
+) -> Result<(), SignalParserError> {
     let mut writer: Box<dyn Write> = match path {
         Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
     };
 
-    for signal in signals {
-        serde_json::to_writer(&mut writer, signal)?;
+    for value in values {
+        serde_json::to_writer(&mut writer, value)?;
         writeln!(writer)?;
     }
 
@@ -268,7 +300,7 @@ mod tests {
     fn make_registry() -> ParserRegistry {
         let mut reg = ParserRegistry::new();
         let parser =
-            crate::template::TemplateParser::new("test-chan", vec![100], 0.01, Some("test".into()));
+            crate::template::TemplateParser::new("test-chan", vec![100], 1.0, Some("test".into()));
         reg.register(Box::new(parser));
         reg
     }
@@ -467,7 +499,7 @@ mod tests {
             side: Side::Buy,
             order_type: OrderType::Market,
             price: None,
-            size: 0.01,
+            risk_multiplier: 1.0,
             stoploss: Some(1.08),
             targets: vec![1.09],
             group: Some("test".to_string()),
@@ -483,6 +515,8 @@ mod tests {
         assert_eq!(parsed["action"], "Entry");
         assert_eq!(parsed["symbol"], "eurusd");
         assert_eq!(parsed["side"], "Buy");
+        assert_eq!(parsed["risk"], 1.0);
+        assert!(parsed.get("size").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

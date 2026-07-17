@@ -60,7 +60,7 @@ impl MarketHandler {
     pub async fn set_symbol2id(&self, data: HashMap<String, u32>) {
         let mut symbol_str2id_lock = self.symbol_str2id.write().await;
         symbol_str2id_lock.clear();
-        symbol_str2id_lock.extend(data.into_iter());
+        symbol_str2id_lock.extend(data);
     }
 
     pub async fn get_symbol_id(&self, symbol: &str) -> Option<u32> {

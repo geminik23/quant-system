@@ -1,6 +1,6 @@
 # data-preprocess
 
-Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar data from CSV files into Parquet (default) or DuckDB storage, with support for multiple exchanges, deduplication, querying, and management.
+Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar data from CSV files into Parquet (default) or DuckDB storage, with support for multiple exchanges, deduplication, querying, management, and bounded ascending Parquet cursors.
 
 ## Storage Backends
 
@@ -160,14 +160,14 @@ Tab-delimited, with header. Filename convention: `{SYMBOL}_*.csv`
 ### Parquet backend (default)
 
 ```rust
-use data_preprocess::{ParquetStore, models::{QueryOpts, BarQueryOpts}};
+use data_preprocess::{ParquetScanBounds, ParquetStore, models::{QueryOpts, BarQueryOpts}};
 
 let store = ParquetStore::open("market_data")?;
 
 // Import ticks
 let inserted = store.insert_ticks(&ticks)?;
 
-// Query ticks
+// Query ticks. The from/to bounds remain inclusive.
 let (ticks, total) = store.query_ticks(&QueryOpts {
     exchange: "ctrader".into(),
     symbol: "BTCUSD".into(),
@@ -177,6 +177,33 @@ let (ticks, total) = store.query_ticks(&QueryOpts {
     tail: false,
     descending: false,
 })?;
+
+// Find the newest executable quote strictly before a timestamp.
+let prior_tick = store.latest_valid_tick_before(
+    "ctrader",
+    "BTCUSD",
+    decision_ts,
+)?;
+
+// The cancellable variant checks between partitions, file reads, and rows.
+let prior_tick = store.latest_valid_tick_before_cancellable(
+    "ctrader",
+    "BTCUSD",
+    decision_ts,
+    || cancellation.is_cancelled(),
+)?;
+
+// Stream inclusive, ascending rows without materializing the full range.
+let bounds = ParquetScanBounds::new(from, to);
+let mut cursor = store.scan_ticks_cancellable(
+    "ctrader",
+    "BTCUSD",
+    bounds,
+    || cancellation.is_cancelled(),
+)?;
+while let Some(tick) = cursor.next_tick_cancellable(|| cancellation.is_cancelled())? {
+    consume(tick);
+}
 
 // Stats
 let stats = store.stats(None, None)?;
@@ -205,6 +232,27 @@ let (ticks, total) = db.query_ticks(&QueryOpts {
 })?;
 ```
 
+### Strict-before quote lookup
+
+`ParquetStore::latest_valid_tick_before` and `latest_valid_tick_before_cancellable` search date partitions newest-to-oldest and return at most one tick. The cutoff is strict: a tick whose timestamp equals the requested timestamp is never returned. Missing, non-finite, non-positive, and crossed bid/ask quotes are skipped. This is separate from `query_ticks`, whose `from` and `to` range bounds remain inclusive.
+
+### Bounded Parquet cursors
+
+`ParquetTickCursor` and `ParquetBarCursor` enumerate date partitions in ascending order and decode bounded row slices, using 65,536 rows per read by default. Bounds are inclusive. Cursor reads preserve physical row order for equal timestamps and reject timestamp regressions instead of sorting or buffering a complete series.
+
+Cancellable opens and reads check cancellation during partition discovery and before and after each bounded Polars read. One individual Polars read remains atomic because the backend has no interruption hook.
+
+### Deterministic backtest feed ordering
+
+`qs-backtest` keeps `MarketEvent` unchanged and attaches non-persisted `EventMetadata` in `FeedEvent`. Metadata contains `SeriesRoles`, `series_rank`, and `row_sequence`; deterministic feeds order events by `(timestamp, series_rank, row_sequence)`.
+
+- `SeriesRoles::PRIMARY_AND_CONVERSION` represents one shared tick once with both roles.
+- `EventBatchFeed` groups each ascending cursor into complete timestamp batches with stable source row sequence.
+- `KWayMergeFeed` retains one batch of lookahead per series and emits complete merged timestamp batches in deterministic order.
+- A primary bar and conversion tick can remain separate `FeedEvent`s in the same batch.
+- Source failures, cancellation, or timestamp regressions fail the stream rather than emitting a partial timestamp batch.
+- Materialized `VecFeed`, `ticks_to_feed_with_metadata`, `bars_to_feed_with_metadata`, and `merge_feeds` remain available for compatibility and tests.
+
 ### Consumer crates (models only, no backend)
 
 For crates that only need the type definitions (`Tick`, `Bar`, `Timeframe`, `QueryOpts`), disable default features to avoid pulling in Polars:
@@ -224,7 +272,7 @@ qs-data-preprocess = { path = "../data-preprocess", default-features = false }
 
 ## API Parity
 
-Both backends provide the same logical operations with identical return types:
+Core storage operations have matching logical behavior and return types. Parquet-only streaming extensions are listed explicitly:
 
 | Operation | `ParquetStore` | `Database` |
 |-----------|---------------|-----------|
@@ -232,6 +280,9 @@ Both backends provide the same logical operations with identical return types:
 | Insert ticks | `insert_ticks(&[Tick]) -> usize` | `insert_ticks(&[Tick]) -> usize` |
 | Insert bars | `insert_bars(&[Bar]) -> usize` | `insert_bars(&[Bar]) -> usize` |
 | Query ticks | `query_ticks(&QueryOpts) -> (Vec<Tick>, u64)` | `query_ticks(&QueryOpts) -> (Vec<Tick>, u64)` |
+| Latest valid tick strictly before timestamp | `latest_valid_tick_before(ex, sym, before) -> Option<Tick>` | Not available |
+| Ascending bounded tick cursor | `scan_ticks(ex, sym, bounds) -> ParquetTickCursor` | Not available |
+| Ascending bounded bar cursor | `scan_bars(ex, sym, tf, bounds) -> ParquetBarCursor` | Not available |
 | Query bars | `query_bars(&BarQueryOpts) -> (Vec<Bar>, u64)` | `query_bars(&BarQueryOpts) -> (Vec<Bar>, u64)` |
 | Delete ticks | `delete_ticks(ex, sym, from, to) -> usize` | `delete_ticks(ex, sym, from, to) -> usize` |
 | Delete bars | `delete_bars(ex, sym, tf, from, to) -> usize` | `delete_bars(ex, sym, tf, from, to) -> usize` |
@@ -245,7 +296,7 @@ Both backends provide the same logical operations with identical return types:
 | Crate | How |
 |-------|-----|
 | `qs-backtest` | `default-features = false` — imports `Tick`, `Bar`, `Timeframe`, `QueryOpts`, `BarQueryOpts` model types only (no Polars/DuckDB). Uses `ticks_to_feed()` / `bars_to_feed()` converters. |
-| `qs-backtest-server` | Full `parquet` feature — opens `ParquetStore` at runtime to query ticks/bars for backtest requests. Uses `stats()` for the `list_symbols` RPC. |
+| `qs-backtest-server` | Full `parquet` feature - opens bounded tick/bar cursors for streaming FutureQuote replay, retains materialized Legacy queries, and uses `stats()` for the `list_symbols` RPC. |
 
 ## License
 

@@ -1,23 +1,35 @@
 //! Conversions between internal backtest types and wire-safe RPC messages.
 
+use std::collections::BTreeSet;
+
 use chrono::NaiveDateTime;
+use qs_backtest::artifacts::{PendingOrderLifecycleEvent, PendingOrderLifecycleState};
+use qs_backtest::currency::RunCurrencyPlan;
+use qs_backtest::evaluation::{
+    BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationSection,
+    GroupFilter, PositionFilter, PositionSide, SourceCoverageCounts,
+};
 use qs_backtest::profile::{
-    ManagementProfile, PositionRef, RawSignal, RuleConfigDef, StoplossMode,
+    ManagementProfile, PositionRef, RawSignal, RuleConfigDef, StoplossMode, TargetSelection,
 };
 use qs_backtest::report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
     StreakStats, SubsetStats, TradeResult,
 };
-use qs_backtest::runner::BacktestConfig;
+use qs_backtest::runner::{BacktestConfig, FutureQuoteConfig};
+use qs_backtest::{MtmOutputPolicy, MtmOutputSummary};
 use qs_core::types::{FillModel, OrderType, Side};
-use qs_symbols::SymbolRegistry;
+use qs_symbols::{SymbolRegistry, normalize_currency_code};
 
 use crate::error::BacktestServerError;
 use crate::rpc_types::{
-    BacktestConfigMsg, BacktestResultMsg, CloseReasonStatsMsg, DurationStatsMsg, EquityPoint,
-    ManagementProfileMsg, MonthlyReturnMsg, PositionRefMsg, PositionSummaryMsg, RawSignalMsg,
-    RiskMetricsMsg, RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg,
-    SubsetStatsMsg, TradeResultMsg,
+    BacktestConfigMsg, BacktestResultMsg, BreakdownDimensionMsg, CloseReasonStatsMsg,
+    DurationStatsMsg, EquityPoint, EvaluationGroupFilterMsg, EvaluationPositionSideMsg,
+    EvaluationSectionMsg, FutureBacktestResultMsg, FutureQuoteConfigMsg, ManagementProfileMsg,
+    MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg, PendingOrderLifecycleEventMsg,
+    PendingOrderLifecycleStateMsg, PositionRefMsg, PositionSummaryMsg,
+    ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg, RuleConfigDefMsg, SizingPolicyMsg,
+    StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg, TargetSelectionMsg, TradeResultMsg,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -38,7 +50,14 @@ pub fn config_from_msg(
     msg: &BacktestConfigMsg,
     registry: &SymbolRegistry,
     symbols: &[String],
-) -> BacktestConfig {
+) -> crate::error::Result<BacktestConfig> {
+    let initial_balance = msg.initial_balance.unwrap_or(10_000.0);
+    if !initial_balance.is_finite() || initial_balance <= 0.0 {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "initial balance must be finite and positive, got {initial_balance}"
+        )));
+    }
+
     let mut contract_sizes = std::collections::HashMap::new();
     let mut symbol_specs = std::collections::HashMap::new();
     for symbol in symbols {
@@ -47,32 +66,361 @@ pub fn config_from_msg(
             symbol_specs.insert(symbol.clone(), spec.clone());
         }
     }
-    let sizing = msg.sizing.as_ref().map(sizing_from_msg);
-    BacktestConfig {
-        initial_balance: msg.initial_balance.unwrap_or(10_000.0),
+    let sizing = msg.sizing.as_ref().map(sizing_from_msg).transpose()?;
+    Ok(BacktestConfig {
+        initial_balance,
         close_on_finish: msg.close_on_finish.unwrap_or(true),
         fill_model: parse_fill_model(msg.fill_model.as_deref()),
         contract_sizes,
         sizing,
         symbol_specs,
+    })
+}
+
+pub fn account_currency_from_msg(msg: &FutureQuoteConfigMsg) -> crate::error::Result<String> {
+    normalize_currency_code(&msg.account_currency).ok_or_else(|| {
+        BacktestServerError::InvalidRequest(format!(
+            "account_currency must be 3 ASCII letters, got '{}'",
+            msg.account_currency
+        ))
+    })
+}
+
+fn mtm_output_policy_from_msg(msg: &MtmOutputPolicyMsg) -> crate::error::Result<MtmOutputPolicy> {
+    let policy = match *msg {
+        MtmOutputPolicyMsg::None => MtmOutputPolicy::None,
+        MtmOutputPolicyMsg::Bounded { max_points } => MtmOutputPolicy::Bounded { max_points },
+        MtmOutputPolicyMsg::Full => MtmOutputPolicy::Full,
+    };
+    policy.validate().map_err(|error| {
+        BacktestServerError::InvalidRequest(format!("invalid mtm_output: {error}"))
+    })?;
+    Ok(policy)
+}
+
+fn mtm_output_policy_to_msg(policy: MtmOutputPolicy) -> MtmOutputPolicyMsg {
+    match policy {
+        MtmOutputPolicy::None => MtmOutputPolicyMsg::None,
+        MtmOutputPolicy::Bounded { max_points } => MtmOutputPolicyMsg::Bounded { max_points },
+        MtmOutputPolicy::Full => MtmOutputPolicyMsg::Full,
     }
 }
 
-/// Convert a wire-safe `SizingPolicyMsg` into the internal `SizingPolicy`.
-pub fn sizing_from_msg(msg: &SizingPolicyMsg) -> qs_backtest::sizing::SizingPolicy {
-    use qs_backtest::sizing::SizingPolicy;
-    match msg {
-        SizingPolicyMsg::FixedLot { qty } => SizingPolicy::FixedLot { qty: qty.clone() },
-        SizingPolicyMsg::FixedValueLot { qty } => SizingPolicy::FixedValueLot { qty: qty.clone() },
-        SizingPolicyMsg::RRLot { qty, pips } => SizingPolicy::RRLot {
-            qty: qty.clone(),
-            pips: *pips,
-        },
-        SizingPolicyMsg::RRValue { qty, value } => SizingPolicy::RRValue {
-            qty: qty.clone(),
-            value: *value,
-        },
+fn mtm_output_summary_to_msg(summary: &MtmOutputSummary) -> MtmOutputSummaryMsg {
+    MtmOutputSummaryMsg {
+        policy: mtm_output_policy_to_msg(summary.policy),
+        observed_points: summary.observed_points,
+        retained_points: summary.retained_points,
+        omitted_points: summary.omitted_points,
     }
+}
+
+/// Validate FutureQuote scalar settings without requiring a replay or currency plan.
+pub fn validate_future_quote_scalars(msg: &FutureQuoteConfigMsg) -> crate::error::Result<()> {
+    account_currency_from_msg(msg)?;
+    if msg.signal_latency_ms < 0 {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "signal_latency_ms must be non-negative, got {}",
+            msg.signal_latency_ms
+        )));
+    }
+    if !msg.slippage_pips.is_finite() {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "slippage_pips must be finite, got {}",
+            msg.slippage_pips
+        )));
+    }
+    if msg.stale_quote_after_ms.is_some_and(|value| value < 0) {
+        return Err(BacktestServerError::InvalidRequest(
+            "stale_quote_after_ms must be non-negative".into(),
+        ));
+    }
+    if !msg.pnl_epsilon.is_finite() || msg.pnl_epsilon < 0.0 {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "pnl_epsilon must be finite and non-negative, got {}",
+            msg.pnl_epsilon
+        )));
+    }
+    if msg.conversion_stale_after_ms < 0 {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "conversion_stale_after_ms must be non-negative, got {}",
+            msg.conversion_stale_after_ms
+        )));
+    }
+    mtm_output_policy_from_msg(&msg.mtm_output)?;
+    Ok(())
+}
+
+/// Convert and validate FutureQuote settings with the server-derived currency plan.
+pub fn future_config_from_msg(
+    msg: &FutureQuoteConfigMsg,
+    currency_plan: RunCurrencyPlan,
+) -> crate::error::Result<FutureQuoteConfig> {
+    validate_future_quote_scalars(msg)?;
+    let account_currency = account_currency_from_msg(msg)?;
+    if account_currency != currency_plan.account_currency() {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "account_currency {account_currency} does not match currency plan {}",
+            currency_plan.account_currency()
+        )));
+    }
+    let mtm_output = mtm_output_policy_from_msg(&msg.mtm_output)?;
+
+    Ok(FutureQuoteConfig {
+        signal_latency_ms: msg.signal_latency_ms,
+        slippage_pips: msg.slippage_pips,
+        stale_quote_after_ms: msg.stale_quote_after_ms,
+        pnl_epsilon: msg.pnl_epsilon,
+        currency_plan: Some(currency_plan),
+        conversion_stale_after_ms: msg.conversion_stale_after_ms,
+        mtm_output,
+    })
+}
+
+/// Convert and validate the strict V2 provider-evaluation configuration.
+pub fn evaluation_options_from_msg(
+    msg: &ProviderEvaluationOptionsMsg,
+    registry: &SymbolRegistry,
+) -> crate::error::Result<EvaluationOptions> {
+    evaluation_options_from_msg_for_symbols(msg, registry, &[])
+}
+
+/// Convert evaluation options after request symbols have been resolved.
+///
+/// Registry-known filters are always accepted. A registry-unknown passthrough
+/// symbol is accepted only when it names one of the resolved request symbols.
+pub fn evaluation_options_from_msg_for_symbols(
+    msg: &ProviderEvaluationOptionsMsg,
+    registry: &SymbolRegistry,
+    request_symbols: &[String],
+) -> crate::error::Result<EvaluationOptions> {
+    let invalid = |message: String| BacktestServerError::InvalidRequest(message);
+    for (name, value) in [
+        ("provider_id", msg.context.provider_id.as_deref()),
+        ("source_id", msg.context.source_id.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(invalid(format!("evaluation {name} must not be empty")));
+        }
+    }
+    if msg.bootstrap.samples == 0 {
+        return Err(invalid(
+            "evaluation bootstrap.samples must be positive".into(),
+        ));
+    }
+    if !msg.bootstrap.confidence_level.is_finite()
+        || !(0.0..1.0).contains(&msg.bootstrap.confidence_level)
+        || msg.bootstrap.confidence_level == 0.0
+    {
+        return Err(invalid(
+            "evaluation bootstrap.confidence_level must be finite and between 0 and 1".into(),
+        ));
+    }
+    if msg.bootstrap.minimum_sample_size == 0 {
+        return Err(invalid(
+            "evaluation bootstrap.minimum_sample_size must be positive".into(),
+        ));
+    }
+    if msg.rolling_window == 0 {
+        return Err(invalid("evaluation rolling_window must be positive".into()));
+    }
+    if msg.minimum_breakdown_bucket_count == 0 {
+        return Err(invalid(
+            "evaluation minimum_breakdown_bucket_count must be positive".into(),
+        ));
+    }
+    if msg.maximum_position_rows.is_some() && !msg.include_positions {
+        return Err(invalid(
+            "evaluation maximum_position_rows requires include_positions=true".into(),
+        ));
+    }
+    if !msg.filter.tags.is_empty() {
+        return Err(invalid(
+            "unsupported evaluation selector: tag filters are not supported by integrated V2 backtests because completed positions have no tags".into(),
+        ));
+    }
+    if msg
+        .breakdowns
+        .iter()
+        .any(|dimension| matches!(dimension, BreakdownDimensionMsg::Tag(_)))
+    {
+        return Err(invalid(
+            "unsupported evaluation selector: tag breakdowns are not supported by integrated V2 backtests because completed positions have no tags".into(),
+        ));
+    }
+
+    let source_coverage = msg.source_coverage.map(|coverage| SourceCoverageCounts {
+        raw_messages: coverage.raw_messages,
+        parsed_messages: coverage.parsed_messages,
+        skipped_messages: coverage.skipped_messages,
+        failed_messages: coverage.failed_messages,
+        emitted_signals: coverage.emitted_signals,
+        emitted_entry_signals: coverage.emitted_entry_signals,
+    });
+    if let Some(error) = source_coverage.and_then(SourceCoverageCounts::validation_error) {
+        return Err(invalid(format!(
+            "invalid evaluation source_coverage: {error}"
+        )));
+    }
+
+    let symbols = msg
+        .filter
+        .symbols
+        .iter()
+        .map(|symbol| normalize_evaluation_symbol(registry, request_symbols, symbol))
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let sections: BTreeSet<_> = msg.sections.iter().copied().map(section_from_msg).collect();
+    if !msg.breakdowns.is_empty() && !sections.contains(&EvaluationSection::Breakdowns) {
+        return Err(invalid(
+            "evaluation breakdowns require the breakdowns report section".into(),
+        ));
+    }
+
+    Ok(EvaluationOptions {
+        context: EvaluationContext {
+            provider_id: msg.context.provider_id.clone(),
+            source_id: msg.context.source_id.clone(),
+        },
+        source_coverage,
+        sections,
+        filter: PositionFilter {
+            symbols,
+            sides: msg
+                .filter
+                .sides
+                .iter()
+                .copied()
+                .map(position_side_from_msg)
+                .collect(),
+            groups: msg
+                .filter
+                .groups
+                .iter()
+                .cloned()
+                .map(group_filter_from_msg)
+                .collect(),
+            close_reasons: msg.filter.close_reasons.clone(),
+            tags: msg.filter.tags.clone(),
+        },
+        breakdowns: msg
+            .breakdowns
+            .iter()
+            .cloned()
+            .map(breakdown_from_msg)
+            .collect(),
+        bootstrap: BootstrapConfig {
+            samples: msg.bootstrap.samples,
+            confidence_level: msg.bootstrap.confidence_level,
+            seed: msg.bootstrap.seed,
+            minimum_sample_size: msg.bootstrap.minimum_sample_size,
+        },
+        rolling_window: msg.rolling_window,
+        minimum_breakdown_bucket_count: msg.minimum_breakdown_bucket_count,
+        maximum_breakdown_rows: msg.maximum_breakdown_rows,
+        include_position_rows: msg.include_positions,
+        maximum_position_rows: msg.maximum_position_rows,
+    })
+}
+
+fn normalize_evaluation_symbol(
+    registry: &SymbolRegistry,
+    request_symbols: &[String],
+    raw: &str,
+) -> crate::error::Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(BacktestServerError::InvalidRequest(
+            "evaluation symbol filters must not be empty".into(),
+        ));
+    }
+    let normalized = registry.normalize_or_passthrough(raw);
+    if registry.is_known(raw)
+        || request_symbols
+            .iter()
+            .any(|request_symbol| request_symbol == &normalized)
+    {
+        return Ok(normalized);
+    }
+
+    let suggestions = registry.suggest(raw, 3, 3);
+    let suggestion = if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; did you mean {}?",
+            suggestions
+                .iter()
+                .map(|(symbol, _)| format!("`{symbol}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(BacktestServerError::InvalidRequest(format!(
+        "unknown evaluation symbol `{raw}`{suggestion}"
+    )))
+}
+
+fn section_from_msg(section: EvaluationSectionMsg) -> EvaluationSection {
+    match section {
+        EvaluationSectionMsg::Coverage => EvaluationSection::Coverage,
+        EvaluationSectionMsg::PositionPerformance => EvaluationSection::PositionPerformance,
+        EvaluationSectionMsg::RMetrics => EvaluationSection::RMetrics,
+        EvaluationSectionMsg::Excursions => EvaluationSection::Excursions,
+        EvaluationSectionMsg::Execution => EvaluationSection::Execution,
+        EvaluationSectionMsg::Robustness => EvaluationSection::Robustness,
+        EvaluationSectionMsg::Breakdowns => EvaluationSection::Breakdowns,
+    }
+}
+
+fn position_side_from_msg(side: EvaluationPositionSideMsg) -> PositionSide {
+    match side {
+        EvaluationPositionSideMsg::Long => PositionSide::Long,
+        EvaluationPositionSideMsg::Short => PositionSide::Short,
+    }
+}
+
+fn group_filter_from_msg(group: EvaluationGroupFilterMsg) -> GroupFilter {
+    match group {
+        EvaluationGroupFilterMsg::Named(name) => GroupFilter::Named(name),
+        EvaluationGroupFilterMsg::Ungrouped => GroupFilter::Ungrouped,
+    }
+}
+
+fn breakdown_from_msg(dimension: BreakdownDimensionMsg) -> BreakdownDimension {
+    match dimension {
+        BreakdownDimensionMsg::Symbol => BreakdownDimension::Symbol,
+        BreakdownDimensionMsg::Side => BreakdownDimension::Side,
+        BreakdownDimensionMsg::Group => BreakdownDimension::Group,
+        BreakdownDimensionMsg::CloseReason => BreakdownDimension::CloseReason,
+        BreakdownDimensionMsg::Tag(key) => BreakdownDimension::Tag(key),
+    }
+}
+
+pub fn sizing_from_msg(
+    msg: &SizingPolicyMsg,
+) -> crate::error::Result<qs_backtest::sizing::SizingPolicy> {
+    use qs_backtest::sizing::SizingPolicy;
+    let (name, value, policy) = match msg {
+        SizingPolicyMsg::FixedLot { lots } => {
+            ("fixed lots", *lots, SizingPolicy::FixedLot { lots: *lots })
+        }
+        SizingPolicyMsg::FixedRiskAmount { amount } => (
+            "fixed risk amount",
+            *amount,
+            SizingPolicy::FixedRiskAmount { amount: *amount },
+        ),
+        SizingPolicyMsg::BalanceRiskPercent { percent } => (
+            "balance risk percent",
+            *percent,
+            SizingPolicy::BalanceRiskPercent { percent: *percent },
+        ),
+    };
+    if !value.is_finite() || value <= 0.0 {
+        return Err(BacktestServerError::InvalidRequest(format!(
+            "{name} must be finite and positive, got {value}"
+        )));
+    }
+    Ok(policy)
 }
 
 /// Parse a fill model string, defaulting to BidAsk for unknown values.
@@ -86,7 +434,27 @@ pub fn parse_fill_model(s: Option<&str>) -> FillModel {
 
 // ── Profile Conversions (F13) ───────────────────────────────────────────────
 
+fn target_selection_from_msg(msg: &TargetSelectionMsg) -> TargetSelection {
+    match msg {
+        TargetSelectionMsg::All => TargetSelection::All,
+        TargetSelectionMsg::None => TargetSelection::None,
+        TargetSelectionMsg::Selected(indices) => TargetSelection::Selected(indices.clone()),
+    }
+}
+
+fn target_selection_to_msg(selection: &TargetSelection) -> TargetSelectionMsg {
+    match selection {
+        TargetSelection::All => TargetSelectionMsg::All,
+        TargetSelection::None => TargetSelectionMsg::None,
+        TargetSelection::Selected(indices) => TargetSelectionMsg::Selected(indices.clone()),
+    }
+}
+
 /// Convert a wire-format `ManagementProfileMsg` into the internal `ManagementProfile`.
+///
+/// An explicit `target_selection` is preserved and takes precedence during V2
+/// application. Omission remains `None`, allowing the internal profile to derive
+/// its current selection from compatibility `use_targets` only for older payloads.
 pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<ManagementProfile> {
     let stoploss_mode = match &msg.stoploss_mode {
         Some(StoplossModeMsg::FromSignal) | None => StoplossMode::FromSignal,
@@ -130,6 +498,7 @@ pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<Mana
 
     Ok(ManagementProfile {
         name: msg.name.clone(),
+        target_selection: msg.target_selection.as_ref().map(target_selection_from_msg),
         use_targets: msg.use_targets.clone(),
         close_ratios: msg.close_ratios.clone(),
         stoploss_mode,
@@ -183,6 +552,7 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
 
     ManagementProfileMsg {
         name: p.name.clone(),
+        target_selection: p.target_selection.as_ref().map(target_selection_to_msg),
         use_targets: p.use_targets.clone(),
         close_ratios: p.close_ratios.clone(),
         stoploss_mode,
@@ -247,10 +617,74 @@ pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
         winning_positions: r.winning_positions,
         losing_positions: r.losing_positions,
         position_win_rate: r.position_win_rate,
+        future: r
+            .execution_metadata
+            .as_ref()
+            .map(|metadata| FutureBacktestResultMsg {
+                schema_version: metadata.schema_version,
+                execution_metadata: serde_json::to_value(metadata)
+                    .unwrap_or(serde_json::Value::Null),
+                recorded_fills: serde_json::to_value(&r.recorded_fills)
+                    .unwrap_or(serde_json::Value::Null),
+                action_dispositions: serde_json::to_value(&r.action_dispositions)
+                    .unwrap_or(serde_json::Value::Null),
+                close_events: serde_json::to_value(&r.close_events)
+                    .unwrap_or(serde_json::Value::Null),
+                completed_positions: serde_json::to_value(&r.completed_positions)
+                    .unwrap_or(serde_json::Value::Null),
+                open_positions: serde_json::to_value(&r.open_position_snapshots)
+                    .unwrap_or(serde_json::Value::Null),
+                pending_orders: serde_json::to_value(&r.pending_order_snapshots)
+                    .unwrap_or(serde_json::Value::Null),
+                pending_order_lifecycle: r
+                    .pending_order_lifecycle
+                    .iter()
+                    .map(pending_order_lifecycle_to_msg)
+                    .collect(),
+                mtm_equity_curve: serde_json::to_value(&r.mtm_equity_curve)
+                    .unwrap_or(serde_json::Value::Null),
+                mtm_output_summary: mtm_output_summary_to_msg(&r.mtm_output_summary),
+                mtm_max_drawdown: r.mtm_max_drawdown,
+                mtm_max_drawdown_pct: r.mtm_max_drawdown_pct,
+                provider_evaluation: serde_json::to_value(&r.provider_evaluation)
+                    .unwrap_or(serde_json::Value::Null),
+            }),
     }
 }
 
 // ── Individual struct conversions ───────────────────────────────────────────
+
+fn pending_order_lifecycle_to_msg(
+    event: &PendingOrderLifecycleEvent,
+) -> PendingOrderLifecycleEventMsg {
+    let state = match event.state {
+        PendingOrderLifecycleState::Placed => PendingOrderLifecycleStateMsg::Placed,
+        PendingOrderLifecycleState::Filled => PendingOrderLifecycleStateMsg::Filled,
+        PendingOrderLifecycleState::Cancelled => PendingOrderLifecycleStateMsg::Cancelled,
+        PendingOrderLifecycleState::UnfilledAtEnd => PendingOrderLifecycleStateMsg::UnfilledAtEnd,
+    };
+    PendingOrderLifecycleEventMsg {
+        id: event.id.clone(),
+        sequence: event.sequence,
+        position_id: event.position_id.clone(),
+        placement_action_id: event.placement_action_id.clone(),
+        terminal_action_id: event.terminal_action_id.clone(),
+        state,
+        symbol: event.symbol.clone(),
+        side: format!("{:?}", event.side),
+        order_type: format!("{:?}", event.order_type),
+        requested_size: event.requested_size,
+        filled_size: event.filled_size,
+        requested_price: event.requested_price,
+        fill_price: event.fill_price,
+        signal_ts: event.signal_ts.map(ndt_to_string),
+        placed_ts: event.placed_ts.map(ndt_to_string),
+        effective_ts: event.effective_ts.map(ndt_to_string),
+        terminal_ts: event.terminal_ts.map(ndt_to_string),
+        wait_latency_ms: event.wait_latency_ms,
+        fill_ratio: event.fill_ratio,
+    }
+}
 
 fn subset_stats_to_msg(s: &SubsetStats) -> SubsetStatsMsg {
     SubsetStatsMsg {
@@ -396,7 +830,7 @@ pub fn raw_signal_from_msg(
             side,
             order_type,
             price,
-            size,
+            risk,
             stoploss,
             targets,
             group,
@@ -410,13 +844,40 @@ pub fn raw_signal_from_msg(
             };
             let parsed_side = parse_side_internal(side)?;
             let parsed_order_type = parse_order_type_internal(order_type)?;
+            if !risk.is_finite() || *risk <= 0.0 {
+                return Err(BacktestServerError::InvalidRequest(format!(
+                    "entry risk must be finite and positive, got {risk}"
+                )));
+            }
+            if matches!(parsed_order_type, OrderType::Limit | OrderType::Stop)
+                && !price.is_some_and(|value| value.is_finite() && value > 0.0)
+            {
+                return Err(BacktestServerError::InvalidRequest(format!(
+                    "{parsed_order_type} entry requires a finite positive price"
+                )));
+            }
+            if let Some(entry) = price
+                && let Some(stop) = stoploss
+            {
+                let protective = stop.is_finite()
+                    && *stop > 0.0
+                    && match parsed_side {
+                        Side::Buy => *stop < *entry,
+                        Side::Sell => *stop > *entry,
+                    };
+                if !protective {
+                    return Err(BacktestServerError::InvalidRequest(
+                        "entry stoploss is not protective".into(),
+                    ));
+                }
+            }
             Ok(RawSignal::Entry {
                 ts: parsed_ts,
                 symbol: parsed_symbol,
                 side: parsed_side,
                 order_type: parsed_order_type,
                 price: *price,
-                size: *size,
+                risk_multiplier: *risk,
                 stoploss: *stoploss,
                 targets: targets.clone(),
                 group: group.clone(),
@@ -468,6 +929,17 @@ pub fn raw_signal_from_msg(
             ts: parse_datetime_internal(ts)?,
             position: position_ref_from_msg(position, registry),
             price: *price,
+        }),
+        RawSignalMsg::ModifyTarget {
+            ts,
+            position,
+            old_price,
+            new_price,
+        } => Ok(RawSignal::ModifyTarget {
+            ts: parse_datetime_internal(ts)?,
+            position: position_ref_from_msg(position, registry),
+            old_price: *old_price,
+            new_price: *new_price,
         }),
         RawSignalMsg::AddRule { ts, position, rule } => {
             let rule_def = rule_config_def_from_msg(rule);
@@ -608,8 +1080,8 @@ fn parse_order_type_internal(s: &str) -> crate::error::Result<OrderType> {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-    use qs_backtest::profile::ManagementProfile;
-    use qs_core::types::{CloseReason, Side};
+    use qs_backtest::profile::{ManagementProfile, TargetSelection};
+    use qs_core::types::{CloseReason, OrderType, Side};
 
     fn ts(h: u32, m: u32, s: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 1, 1)
@@ -628,7 +1100,7 @@ mod tests {
         };
         let registry = qs_symbols::SymbolRegistry::empty();
         let symbols: Vec<String> = vec![];
-        let cfg = config_from_msg(&msg, &registry, &symbols);
+        let cfg = config_from_msg(&msg, &registry, &symbols).unwrap();
         assert!((cfg.initial_balance - 10_000.0).abs() < f64::EPSILON);
         assert!(cfg.close_on_finish);
         assert_eq!(cfg.fill_model, FillModel::BidAsk);
@@ -644,10 +1116,79 @@ mod tests {
         };
         let registry = qs_symbols::SymbolRegistry::empty();
         let symbols: Vec<String> = vec![];
-        let cfg = config_from_msg(&msg, &registry, &symbols);
+        let cfg = config_from_msg(&msg, &registry, &symbols).unwrap();
         assert!((cfg.initial_balance - 50_000.0).abs() < f64::EPSILON);
         assert!(!cfg.close_on_finish);
         assert_eq!(cfg.fill_model, FillModel::MidPrice);
+    }
+
+    #[test]
+    fn config_rejects_invalid_sizing_value() {
+        let msg = BacktestConfigMsg {
+            initial_balance: None,
+            close_on_finish: None,
+            fill_model: None,
+            sizing: Some(SizingPolicyMsg::BalanceRiskPercent { percent: 0.0 }),
+        };
+        let error = config_from_msg(&msg, &SymbolRegistry::empty(), &[]).unwrap_err();
+        assert!(error.to_string().contains("balance risk percent"));
+    }
+
+    #[test]
+    fn future_config_validates_and_embeds_currency_plan() {
+        use qs_backtest::currency::ConversionRoute;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let primary_symbols = BTreeSet::from(["eurusd".to_owned()]);
+        let pnl = BTreeMap::from([("eurusd".to_owned(), "USD".to_owned())]);
+        let routes = BTreeMap::from([(
+            "USD".to_owned(),
+            ConversionRoute::Identity {
+                currency: "USD".to_owned(),
+            },
+        )]);
+        let plan = RunCurrencyPlan::new(
+            "USD",
+            primary_symbols,
+            BTreeSet::new(),
+            pnl,
+            routes,
+            Vec::new(),
+        )
+        .unwrap();
+        let msg = FutureQuoteConfigMsg {
+            account_currency: " usd ".into(),
+            conversion_stale_after_ms: 42_000,
+            ..FutureQuoteConfigMsg::default()
+        };
+        let config = future_config_from_msg(&msg, plan).unwrap();
+        assert_eq!(config.conversion_stale_after_ms, 42_000);
+        assert_eq!(
+            config.mtm_output,
+            MtmOutputPolicy::Bounded { max_points: 4_096 }
+        );
+        assert_eq!(config.currency_plan.unwrap().account_currency(), "USD");
+    }
+
+    #[test]
+    fn mtm_output_policy_maps_and_validates_internal_bounds() {
+        for (message, expected) in [
+            (MtmOutputPolicyMsg::None, MtmOutputPolicy::None),
+            (
+                MtmOutputPolicyMsg::Bounded { max_points: 512 },
+                MtmOutputPolicy::Bounded { max_points: 512 },
+            ),
+            (MtmOutputPolicyMsg::Full, MtmOutputPolicy::Full),
+        ] {
+            assert_eq!(mtm_output_policy_from_msg(&message).unwrap(), expected);
+        }
+
+        for max_points in [7, 16_385] {
+            let error = mtm_output_policy_from_msg(&MtmOutputPolicyMsg::Bounded { max_points })
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid mtm_output"));
+            assert!(error.to_string().contains(&max_points.to_string()));
+        }
     }
 
     #[test]
@@ -723,12 +1264,66 @@ mod tests {
         assert!(msg.positions.is_empty());
     }
 
+    #[test]
+    fn future_result_converts_pending_order_lifecycle_to_typed_message() {
+        let mut result = BacktestResult::from_trade_log(10_000.0, Vec::new());
+        result.execution_metadata = Some(qs_backtest::ExecutionMetadata::default());
+        result.mtm_output_summary = MtmOutputSummary {
+            policy: MtmOutputPolicy::Full,
+            observed_points: 12,
+            retained_points: 12,
+            omitted_points: 0,
+        };
+        result.pending_order_lifecycle = vec![PendingOrderLifecycleEvent {
+            id: "position-1:pending_filled:00000001".into(),
+            sequence: 1,
+            position_id: "position-1".into(),
+            placement_action_id: Some("signal:00000000".into()),
+            state: PendingOrderLifecycleState::Filled,
+            symbol: "EURUSD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            requested_size: 2.0,
+            filled_size: Some(2.0),
+            requested_price: Some(1.1),
+            fill_price: Some(1.09),
+            signal_ts: Some(ts(10, 0, 0)),
+            placed_ts: Some(ts(10, 0, 1)),
+            effective_ts: Some(ts(10, 0, 0)),
+            terminal_ts: Some(ts(10, 0, 3)),
+            wait_latency_ms: Some(2_000),
+            fill_ratio: Some(1.0),
+            ..PendingOrderLifecycleEvent::default()
+        }];
+
+        let future = result_to_msg(&result).future.expect("FutureQuote payload");
+        assert_eq!(
+            future.mtm_output_summary,
+            MtmOutputSummaryMsg {
+                policy: MtmOutputPolicyMsg::Full,
+                observed_points: 12,
+                retained_points: 12,
+                omitted_points: 0,
+            }
+        );
+        assert_eq!(future.pending_order_lifecycle.len(), 1);
+        let event = &future.pending_order_lifecycle[0];
+        assert_eq!(event.state, PendingOrderLifecycleStateMsg::Filled);
+        assert_eq!(event.order_type, "Limit");
+        assert_eq!(event.requested_size, 2.0);
+        assert_eq!(event.filled_size, Some(2.0));
+        assert_eq!(event.wait_latency_ms, Some(2_000));
+        assert_eq!(event.fill_ratio, Some(1.0));
+        assert_eq!(event.terminal_ts.as_deref(), Some("2026-01-01T10:00:03"));
+    }
+
     // ── Profile conversion tests (F13) ──────────────────────────────────
 
     #[test]
     fn profile_from_msg_basic() {
         let msg = ManagementProfileMsg {
             name: "test".into(),
+            target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
             stoploss_mode: Some(StoplossModeMsg::FromSignal),
@@ -750,6 +1345,7 @@ mod tests {
     fn profile_from_msg_defaults() {
         let msg = ManagementProfileMsg {
             name: "minimal".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -769,6 +1365,7 @@ mod tests {
         // FromSignal
         let msg = ManagementProfileMsg {
             name: "a".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: Some(StoplossModeMsg::FromSignal),
@@ -828,6 +1425,7 @@ mod tests {
         ];
         let msg = ManagementProfileMsg {
             name: "allrules".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -853,9 +1451,61 @@ mod tests {
     }
 
     #[test]
+    fn profile_target_selection_serde_and_conversion_roundtrip() {
+        let selections = [
+            TargetSelectionMsg::All,
+            TargetSelectionMsg::None,
+            TargetSelectionMsg::Selected(vec![2, 1]),
+        ];
+
+        for selection in selections {
+            let msg = ManagementProfileMsg {
+                name: "selection".into(),
+                target_selection: Some(selection.clone()),
+                use_targets: vec![1],
+                close_ratios: vec![],
+                stoploss_mode: None,
+                rules: vec![],
+                group_override: None,
+                let_remainder_run: false,
+            };
+            let json = serde_json::to_value(&msg).unwrap();
+            assert!(json.get("target_selection").is_some());
+
+            let decoded: ManagementProfileMsg = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.target_selection, Some(selection.clone()));
+
+            let profile = profile_from_msg(&decoded).unwrap();
+            let roundtrip = profile_to_msg(&profile);
+            assert_eq!(roundtrip.target_selection, Some(selection));
+            assert!(roundtrip.close_ratios.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_profile_msg_omission_uses_legacy_selection_default() {
+        let json = serde_json::json!({
+            "name": "legacy",
+            "use_targets": [2],
+            "close_ratios": [1.0]
+        });
+        let msg: ManagementProfileMsg = serde_json::from_value(json).unwrap();
+        assert_eq!(msg.target_selection, None);
+
+        let profile = profile_from_msg(&msg).unwrap();
+        assert_eq!(profile.target_selection, None);
+        assert_eq!(
+            profile.effective_target_selection(),
+            TargetSelection::Selected(vec![2])
+        );
+        assert_eq!(profile_to_msg(&profile).target_selection, None);
+    }
+
+    #[test]
     fn profile_to_msg_roundtrip() {
         let original = ManagementProfile {
             name: "rt".into(),
+            target_selection: Some(TargetSelection::Selected(vec![2, 1])),
             use_targets: vec![1, 2],
             close_ratios: vec![0.6, 0.4],
             stoploss_mode: StoplossMode::FixedDistance { distance: 25.0 },
@@ -870,6 +1520,7 @@ mod tests {
         let back = profile_from_msg(&msg).unwrap();
 
         assert_eq!(back.name, original.name);
+        assert_eq!(back.target_selection, original.target_selection);
         assert_eq!(back.use_targets, original.use_targets);
         assert_eq!(back.close_ratios, original.close_ratios);
         assert!(matches!(
@@ -923,7 +1574,7 @@ mod tests {
             side: "Buy".into(),
             order_type: "Market".into(),
             price: None,
-            size: 0.02,
+            risk: 0.02,
             stoploss: Some(1.0800),
             targets: vec![1.0900],
             group: Some("grp".into()),
@@ -936,7 +1587,7 @@ mod tests {
                 symbol,
                 side,
                 order_type,
-                size,
+                risk_multiplier,
                 stoploss,
                 targets,
                 group,
@@ -946,7 +1597,7 @@ mod tests {
                 assert_eq!(symbol, "eurusd");
                 assert_eq!(*side, Side::Buy);
                 assert_eq!(*order_type, OrderType::Market);
-                assert_eq!(*size, 0.02);
+                assert_eq!(*risk_multiplier, 0.02);
                 assert_eq!(*stoploss, Some(1.0800));
                 assert_eq!(*targets, vec![1.0900]);
                 assert_eq!(*group, Some("grp".into()));
@@ -978,6 +1629,33 @@ mod tests {
             }
             _ => panic!("Expected ClosePartial"),
         }
+    }
+
+    #[test]
+    fn raw_signal_from_msg_modify_target() {
+        let reg = qs_symbols::SymbolRegistry::empty();
+        let msg = RawSignalMsg::ModifyTarget {
+            ts: "2026-01-15T10:25:00".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "targeted".into(),
+            },
+            old_price: 1.0900,
+            new_price: 1.0950,
+        };
+
+        let result = raw_signal_from_msg(&msg, "eurusd", &reg).unwrap();
+
+        assert!(matches!(
+            result,
+            RawSignal::ModifyTarget {
+                position: PositionRef::ByTradeId { trade_id },
+                old_price,
+                new_price,
+                ..
+            } if trade_id == "targeted"
+                && (old_price - 1.0900).abs() < f64::EPSILON
+                && (new_price - 1.0950).abs() < f64::EPSILON
+        ));
     }
 
     #[test]
@@ -1056,7 +1734,7 @@ mod tests {
             order_type: "Market".into(),
             price: None,
             trade_id: None,
-            size: 0.01,
+            risk: 0.01,
             stoploss: None,
             targets: vec![],
             group: None,
@@ -1082,7 +1760,7 @@ mod tests {
             side: "Sell".into(),
             order_type: "Limit".into(),
             price: Some(1.0900),
-            size: 0.01,
+            risk: 0.01,
             stoploss: None,
             targets: vec![],
             trade_id: None,

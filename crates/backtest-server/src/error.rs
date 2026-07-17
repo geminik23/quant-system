@@ -30,8 +30,20 @@ pub enum BacktestServerError {
         data_type: String,
     },
 
+    #[error("Backtest cancelled")]
+    Cancelled,
+
+    #[error("Market-data stream error: {0}")]
+    MarketStream(String),
+
     #[error("Backtest engine error: {0}")]
     Engine(#[from] qs_core::CoreError),
+
+    #[error("Currency conversion error: {0}")]
+    Currency(#[from] qs_backtest::ConversionError),
+
+    #[error("Currency plan error: {0}")]
+    CurrencyPlan(#[from] qs_backtest::RunCurrencyPlanError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

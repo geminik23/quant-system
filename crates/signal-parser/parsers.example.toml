@@ -5,10 +5,10 @@
 name = "wave-trader"
 type = "template"
 channel_ids = [2331249584]
-default_size = 0.01
+default_risk_multiplier = 1.0
 
 [[parser]]
 name = "gold-signals"
 type = "template"
 channel_ids = [1890843109, 1735292110]
-default_size = 0.05
+default_risk_multiplier = 1.0

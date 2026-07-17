@@ -5,8 +5,10 @@
 //!   {root}/bars/exchange={ex}/symbol={sym}/timeframe={tf}/{date}.parquet
 
 use std::collections::HashMap;
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::NaiveDateTime;
 use polars::prelude::*;
@@ -17,6 +19,7 @@ use crate::convert::{
 };
 use crate::error::{DataError, Result};
 use crate::models::{Bar, BarQueryOpts, QueryOpts, StatRow, Tick};
+use crate::scanner::{ParquetScanBounds, ParquetTickScan};
 
 /// Parquet-based storage backend for tick and bar data.
 pub struct ParquetStore {
@@ -97,7 +100,7 @@ impl ParquetStore {
         let mut total_inserted = 0usize;
 
         for ((exchange, symbol, timeframe, date), group_bars) in &groups {
-            let dir = self.bar_dir(&exchange, &symbol, &timeframe);
+            let dir = self.bar_dir(exchange, symbol, timeframe);
             fs::create_dir_all(&dir)?;
             let file_path = dir.join(format!("{date}.parquet"));
 
@@ -125,70 +128,145 @@ impl ParquetStore {
     /// Query ticks for a given exchange+symbol, optionally filtered by date range.
     /// Returns (ticks, total_count_matching_filters).
     pub fn query_ticks(&self, opts: &QueryOpts) -> Result<(Vec<Tick>, u64)> {
+        self.query_ticks_cancellable(opts, || false)
+    }
+
+    /// Cancellable tick query.
+    ///
+    /// Cancellation is checked while traversing directory entries, before and
+    /// after every Parquet file, and between DataFrame processing stages. The
+    /// low-level Polars collect/read for one file remains atomic because Polars
+    /// does not expose an interruption hook for that operation.
+    pub fn query_ticks_cancellable<F>(
+        &self,
+        opts: &QueryOpts,
+        mut is_cancelled: F,
+    ) -> Result<(Vec<Tick>, u64)>
+    where
+        F: FnMut() -> bool,
+    {
+        ensure_not_cancelled(&mut is_cancelled)?;
         let dir = self.tick_dir(&opts.exchange, &opts.symbol);
         if !dir.exists() {
             return Ok((Vec::new(), 0));
         }
 
-        let files = list_date_files(&dir, opts.from, opts.to)?;
+        let files = list_date_files_cancellable(&dir, opts.from, opts.to, &mut is_cancelled)?;
         if files.is_empty() {
             return Ok((Vec::new(), 0));
         }
 
-        let mut all_dfs: Vec<DataFrame> = Vec::new();
+        let mut all_dfs: Vec<DataFrame> = Vec::with_capacity(files.len());
         for file in &files {
+            ensure_not_cancelled(&mut is_cancelled)?;
             let df = read_parquet_file(file)?;
+            ensure_not_cancelled(&mut is_cancelled)?;
             all_dfs.push(df);
         }
         let mut combined = concat_dataframes(all_dfs)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
-        // Apply timestamp filters
         combined = apply_ts_filter(combined, opts.from, opts.to)?;
-
-        // Sort by ts ascending
+        ensure_not_cancelled(&mut is_cancelled)?;
         combined = combined.sort(["ts"], SortMultipleOptions::default())?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
         let total = combined.height() as u64;
-
-        // Apply limit/tail/descending
         combined = apply_pagination(combined, opts.limit, opts.tail, opts.descending)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
         let ticks = dataframe_to_ticks(&combined)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
         Ok((ticks, total))
+    }
+
+    /// Return the latest tick with a valid quote strictly before `before`.
+    pub fn latest_valid_tick_before(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        before: NaiveDateTime,
+    ) -> Result<Option<Tick>> {
+        self.latest_valid_tick_before_cancellable(exchange, symbol, before, || false)
+    }
+
+    /// Cancellable strict-before lookup for the latest tick with a valid quote.
+    ///
+    /// Date partitions and their rows are searched newest-to-oldest.
+    /// Ticks at `before` are excluded, and ticks with missing, non-finite, non-positive, or crossed bid/ask prices are skipped.
+    pub fn latest_valid_tick_before_cancellable<F>(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        before: NaiveDateTime,
+        mut is_cancelled: F,
+    ) -> Result<Option<Tick>>
+    where
+        F: FnMut() -> bool,
+    {
+        ensure_not_cancelled(&mut is_cancelled)?;
+        let scan = ParquetTickScan::describe_cancellable(
+            &self.root,
+            exchange,
+            symbol,
+            ParquetScanBounds::new(None, Some(before)),
+            &mut is_cancelled,
+        )?;
+        let latest = scan
+            .latest_valid_tick_before_cancellable(before, &mut is_cancelled)?
+            .map(|row| row.row);
+        ensure_not_cancelled(&mut is_cancelled)?;
+        Ok(latest)
     }
 
     /// Query bars for a given exchange+symbol+timeframe, optionally filtered by date range.
     /// Returns (bars, total_count_matching_filters).
     pub fn query_bars(&self, opts: &BarQueryOpts) -> Result<(Vec<Bar>, u64)> {
+        self.query_bars_cancellable(opts, || false)
+    }
+
+    /// Cancellable bar query with the same cooperative boundaries as
+    /// [`Self::query_ticks_cancellable`].
+    pub fn query_bars_cancellable<F>(
+        &self,
+        opts: &BarQueryOpts,
+        mut is_cancelled: F,
+    ) -> Result<(Vec<Bar>, u64)>
+    where
+        F: FnMut() -> bool,
+    {
+        ensure_not_cancelled(&mut is_cancelled)?;
         let dir = self.bar_dir(&opts.exchange, &opts.symbol, &opts.timeframe);
         if !dir.exists() {
             return Ok((Vec::new(), 0));
         }
 
-        let files = list_date_files(&dir, opts.from, opts.to)?;
+        let files = list_date_files_cancellable(&dir, opts.from, opts.to, &mut is_cancelled)?;
         if files.is_empty() {
             return Ok((Vec::new(), 0));
         }
 
-        let mut all_dfs: Vec<DataFrame> = Vec::new();
+        let mut all_dfs: Vec<DataFrame> = Vec::with_capacity(files.len());
         for file in &files {
+            ensure_not_cancelled(&mut is_cancelled)?;
             let df = read_parquet_file(file)?;
+            ensure_not_cancelled(&mut is_cancelled)?;
             all_dfs.push(df);
         }
         let mut combined = concat_dataframes(all_dfs)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
-        // Apply timestamp filters
         combined = apply_ts_filter(combined, opts.from, opts.to)?;
-
-        // Sort by ts ascending
+        ensure_not_cancelled(&mut is_cancelled)?;
         combined = combined.sort(["ts"], SortMultipleOptions::default())?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
         let total = combined.height() as u64;
-
-        // Apply limit/tail/descending
         combined = apply_pagination(combined, opts.limit, opts.tail, opts.descending)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
 
         let bars = dataframe_to_bars(&combined)?;
+        ensure_not_cancelled(&mut is_cancelled)?;
         Ok((bars, total))
     }
 
@@ -294,16 +372,20 @@ impl ParquetStore {
     pub fn total_size(&self) -> Option<u64> {
         let mut total = 0u64;
         for entry in walkdir(&self.root) {
-            if entry.extension().map_or(false, |e| e == "parquet") {
-                if let Ok(meta) = fs::metadata(&entry) {
-                    total += meta.len();
-                }
+            if entry.extension().is_some_and(|e| e == "parquet")
+                && let Ok(meta) = fs::metadata(&entry)
+            {
+                total += meta.len();
             }
         }
         if total == 0 { None } else { Some(total) }
     }
 
     // ── Private helpers ─────────────────────────────────────────
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
+    }
 
     /// Build tick directory path for a given exchange+symbol.
     fn tick_dir(&self, exchange: &str, symbol: &str) -> PathBuf {
@@ -331,10 +413,10 @@ impl ParquetStore {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "parquet") {
-                    if let Ok(df) = read_parquet_file(&path) {
-                        count += df.height();
-                    }
+                if path.extension().is_some_and(|e| e == "parquet")
+                    && let Ok(df) = read_parquet_file(&path)
+                {
+                    count += df.height();
                 }
             }
         }
@@ -348,10 +430,10 @@ impl ParquetStore {
         }
         let mut count = 0;
         for path in walkdir(dir) {
-            if path.extension().map_or(false, |e| e == "parquet") {
-                if let Ok(df) = read_parquet_file(&path) {
-                    count += df.height();
-                }
+            if path.extension().is_some_and(|e| e == "parquet")
+                && let Ok(df) = read_parquet_file(&path)
+            {
+                count += df.height();
             }
         }
         count
@@ -380,15 +462,15 @@ impl ParquetStore {
         }
 
         for (exchange, symbol, dir) in self.iter_exchange_symbol_dirs(&ticks_dir)? {
-            if let Some(ef) = exchange_filter {
-                if exchange != ef {
-                    continue;
-                }
+            if let Some(ef) = exchange_filter
+                && exchange != ef
+            {
+                continue;
             }
-            if let Some(sf) = symbol_filter {
-                if symbol != sf {
-                    continue;
-                }
+            if let Some(sf) = symbol_filter
+                && symbol != sf
+            {
+                continue;
             }
 
             let (count, ts_min, ts_max) = self.aggregate_parquet_stats(&dir)?;
@@ -420,15 +502,15 @@ impl ParquetStore {
         }
 
         for (exchange, symbol, timeframe, dir) in self.iter_exchange_symbol_tf_dirs(&bars_dir)? {
-            if let Some(ef) = exchange_filter {
-                if exchange != ef {
-                    continue;
-                }
+            if let Some(ef) = exchange_filter
+                && exchange != ef
+            {
+                continue;
             }
-            if let Some(sf) = symbol_filter {
-                if symbol != sf {
-                    continue;
-                }
+            if let Some(sf) = symbol_filter
+                && symbol != sf
+            {
+                continue;
             }
 
             let (count, ts_min, ts_max) = self.aggregate_parquet_stats(&dir)?;
@@ -547,7 +629,7 @@ impl ParquetStore {
 
         for entry in fs::read_dir(dir)?.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "parquet") {
+            if path.extension().is_some_and(|e| e == "parquet") {
                 let df = read_parquet_file(&path)?;
                 total_count += df.height() as u64;
 
@@ -584,24 +666,43 @@ fn parse_partition_value(dir_name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn ensure_not_cancelled(is_cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
+    if is_cancelled() {
+        Err(DataError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// List parquet files in a directory, optionally filtered by date range in filename.
 fn list_date_files(
     dir: &Path,
     from: Option<NaiveDateTime>,
     to: Option<NaiveDateTime>,
 ) -> Result<Vec<PathBuf>> {
+    list_date_files_cancellable(dir, from, to, &mut || false)
+}
+
+fn list_date_files_cancellable(
+    dir: &Path,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<Vec<PathBuf>> {
+    ensure_not_cancelled(is_cancelled)?;
     let mut files = Vec::new();
     let from_date = from.map(|d| d.format("%Y-%m-%d").to_string());
     let to_date = to.map(|d| d.format("%Y-%m-%d").to_string());
 
-    for entry in fs::read_dir(dir)?.flatten() {
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "parquet") {
+    for entry in fs::read_dir(dir)? {
+        ensure_not_cancelled(is_cancelled)?;
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "parquet") {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
             // Filename-level date pruning
-            let dominated_by_from = from_date.as_ref().map_or(false, |fd| stem < fd.as_str());
-            let past_to = to_date.as_ref().map_or(false, |td| stem > td.as_str());
+            let dominated_by_from = from_date.as_ref().is_some_and(|fd| stem < fd.as_str());
+            let past_to = to_date.as_ref().is_some_and(|td| stem > td.as_str());
 
             if !dominated_by_from && !past_to {
                 files.push(path);
@@ -609,6 +710,7 @@ fn list_date_files(
         }
     }
 
+    ensure_not_cancelled(is_cancelled)?;
     files.sort();
     Ok(files)
 }
@@ -620,13 +722,103 @@ fn read_parquet_file(path: &Path) -> Result<DataFrame> {
     Ok(df)
 }
 
-/// Write a DataFrame to a Parquet file with zstd compression.
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Write a DataFrame to a temporary file and atomically replace the partition.
 fn write_parquet_file(path: &Path, df: &mut DataFrame) -> Result<()> {
-    let file = std::fs::File::create(path)?;
-    ParquetWriter::new(file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(df)?;
+    let (temp_path, mut file) = create_partition_temp_file(path)?;
+    let write_result = (|| -> Result<()> {
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .finish(df)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+
+    if let Err(error) = write_result {
+        fs::remove_file(&temp_path).ok();
+        return Err(error);
+    }
+    if let Err(error) = atomic_replace(&temp_path, path) {
+        fs::remove_file(&temp_path).ok();
+        return Err(error.into());
+    }
     Ok(())
+}
+
+fn create_partition_temp_file(path: &Path) -> Result<(PathBuf, File)> {
+    let parent = path.parent().ok_or_else(|| {
+        DataError::Other(format!("partition path has no parent: {}", path.display()))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        DataError::Other(format!(
+            "partition path has no file name: {}",
+            path.display()
+        ))
+    })?;
+
+    loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), id));
+        let temp_path = parent.join(temp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Concat two tick DataFrames, dedup on (exchange, symbol, ts), sort by ts.
@@ -756,7 +948,7 @@ fn delete_from_partition(
         // Remove all parquet files but keep the directory
         for entry in fs::read_dir(dir)?.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "parquet") {
+            if path.extension().is_some_and(|e| e == "parquet") {
                 fs::remove_file(&path)?;
             }
         }
@@ -827,10 +1019,10 @@ fn count_all_rows_in_dir(dir: &Path) -> usize {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "parquet") {
-                if let Ok(df) = read_parquet_file(&path) {
-                    count += df.height();
-                }
+            if path.extension().is_some_and(|e| e == "parquet")
+                && let Ok(df) = read_parquet_file(&path)
+            {
+                count += df.height();
             }
         }
     }

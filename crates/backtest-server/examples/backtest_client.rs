@@ -252,7 +252,7 @@ fn print_trade_log(trades: &[TradeResultMsg], max: usize) {
     let show = trades.len().min(max);
     println!(
         "  {:<12} {:<6} {:<6} {:>12} {:>12} {:>8} {:>12} {:<15}",
-        "POS_ID", "SYMBOL", "SIDE", "ENTRY", "EXIT", "SIZE", "PNL", "CLOSE_REASON"
+        "POS_ID", "SYMBOL", "SIDE", "ENTRY", "EXIT", "EXEC_LOT", "PNL", "CLOSE_REASON"
     );
     println!("  {}", "-".repeat(100));
     for t in &trades[..show] {
@@ -284,7 +284,7 @@ fn print_positions(positions: &[PositionSummaryMsg], max: usize) {
     let show = positions.len().min(max);
     println!(
         "  {:<12} {:<6} {:<6} {:>12} {:>12} {:>8} {:>12} {:<20}",
-        "POS_ID", "SYMBOL", "SIDE", "ENTRY", "AVG_EXIT", "SIZE", "NET_PNL", "CLOSE_REASONS"
+        "POS_ID", "SYMBOL", "SIDE", "ENTRY", "AVG_EXIT", "ORIG_LOT", "NET_PNL", "CLOSE_REASONS"
     );
     println!("  {}", "-".repeat(105));
     for p in &positions[..show] {
@@ -327,7 +327,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             side: "Buy".into(),
             order_type: "Market".into(),
             price: None,
-            size: 1.0,
+            risk: 1.0,
             stoploss: Some(1.0800),
             targets: vec![1.1050, 1.1100],
             group: Some("f14-demo".into()),
@@ -363,7 +363,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             side: "Sell".into(),
             order_type: "Market".into(),
             price: None,
-            size: 0.75,
+            risk: 1.0,
             stoploss: Some(1.1150),
             targets: vec![1.0900],
             group: Some("f14-hedge".into()),
@@ -393,7 +393,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             side: "Buy".into(),
             order_type: "Market".into(),
             price: None,
-            size: 1.5,
+            risk: 1.0,
             stoploss: Some(1.0700),
             targets: vec![1.1000, 1.1050],
             group: Some("f14-demo".into()),
@@ -515,8 +515,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_section("F14 Signal Stream");
     for (i, sig) in f14_signals.iter().enumerate() {
         let desc = match sig {
-            RawSignalMsg::Entry { side, size, .. } => {
-                format!("Entry {} size={}", side, size)
+            RawSignalMsg::Entry { side, risk, .. } => {
+                format!("Entry {} risk={}", side, risk)
             }
             RawSignalMsg::ModifyStoploss { ts: _, price, .. } => {
                 format!("ModifyStoploss price={}", price)
@@ -550,6 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | RawSignalMsg::MoveStoplossToEntry { ts, .. }
             | RawSignalMsg::AddTarget { ts, .. }
             | RawSignalMsg::RemoveTarget { ts, .. }
+            | RawSignalMsg::ModifyTarget { ts, .. }
             | RawSignalMsg::AddRule { ts, .. }
             | RawSignalMsg::RemoveRule { ts, .. }
             | RawSignalMsg::ScaleIn { ts, .. }
@@ -568,7 +569,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // profile needed).
     let inline_profile = ManagementProfileMsg {
         name: "inline-demo".into(),
-        use_targets: vec![0, 1],
+        target_selection: Some(TargetSelectionMsg::Selected(vec![1, 2])),
+        use_targets: vec![1, 2],
         close_ratios: vec![0.5, 0.5],
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
         rules: vec![RuleConfigDefMsg::BreakevenAfterTargets { after_n: 1 }],
@@ -592,11 +594,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_balance: Some(args.balance),
             close_on_finish: Some(true),
             fill_model: Some("BidAsk".into()),
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
 
-    let f14_resp: RunBacktestResponse = client.call("run_backtest", &f14_request).await?;
+    let f14_resp: RunBacktestResponse = client
+        .call(
+            "run_backtest_v2",
+            &RunBacktestV2Request {
+                schema_version: 2,
+                request: f14_request,
+                future: FutureQuoteConfigMsg {
+                    account_currency: "USD".into(),
+                    ..FutureQuoteConfigMsg::default()
+                },
+                evaluation: ProviderEvaluationOptionsMsg::default(),
+                result_delivery: ResultDeliveryMsg::Auto,
+            },
+        )
+        .await?;
     println!("  Elapsed: {}ms", f14_resp.elapsed_ms);
 
     if f14_resp.success {

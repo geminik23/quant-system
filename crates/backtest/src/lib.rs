@@ -21,8 +21,15 @@
 //! | [`DataFeed`] | Trait for sequential market event sources |
 //! | [`Strategy`] | Trait for strategy-driven backtests |
 
+pub mod artifacts;
+pub mod currency;
 pub mod data_feed;
+pub mod evaluation;
 pub mod executor;
+pub mod future_executor;
+pub mod ledger;
+pub mod mtm;
+pub mod portfolio;
 pub mod profile;
 pub mod report;
 pub mod runner;
@@ -31,15 +38,37 @@ pub mod strategy;
 
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
+pub use artifacts::{
+    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts, NetPnlOutcome,
+    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+    PendingOrderSnapshot, RecordedFill, RiskBasisStatus, RiskTranche,
+};
+pub use currency::{
+    ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
+    ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,
+    RunCurrencyPlan, RunCurrencyPlanError, resolve_conversion_route, resolve_fx_pair,
+};
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
+pub use evaluation::{
+    BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationReport,
+    EvaluationSection, GroupFilter, PositionFilter, PositionSide,
+};
 pub use executor::BacktestExecutor;
+pub use future_executor::FutureExecutor;
+pub use mtm::{
+    DEFAULT_MTM_MAX_POINTS, MAX_MTM_MAX_POINTS, MIN_MTM_MAX_POINTS, MtmCurveCollector,
+    MtmOutputPolicy, MtmOutputPolicyError, MtmOutputSummary,
+};
 pub use profile::{
-    ManagementProfile, PositionRef, PositionResolver, ProfileError, ProfileRegistry, RawSignal,
-    RuleConfigDef, StoplossMode, resolve_signal,
+    ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError, ProfileError,
+    ProfileRegistry, RawSignal, ResolvedEntry, RuleConfigDef, StoplossMode, TargetResolution,
+    TargetSelection, allocate_target_units, resolve_signal, resolve_unprofiled_entry_v2,
 };
 pub use report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
     StreakStats, SubsetStats, TradeResult,
 };
-pub use runner::BacktestRunner;
+pub use runner::{
+    BacktestRunner, FutureQuoteConfig, ReplayCancelled, ReplayProgress, StreamingReplayError,
+};
 pub use strategy::Strategy;

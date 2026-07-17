@@ -204,6 +204,150 @@ impl std::fmt::Display for FillModel {
     }
 }
 
+// ─── Execution configuration ────────────────────────────────────────────────
+
+/// Selects the price convention used by the standalone execution pricer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ExecutionConvention {
+    /// Preserve the engine's historical behavior: market orders use the quote,
+    /// while triggered limit, stop, stop-loss, and take-profit orders use their
+    /// requested price.
+    #[default]
+    Legacy,
+    /// Quote-aware deterministic pricing with gap handling and price caps.
+    FutureQuoteV1,
+}
+
+/// The reason an execution price is being calculated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FillPurpose {
+    MarketEntry,
+    MarketExit,
+    LimitEntry,
+    StopEntry,
+    StopLoss,
+    TakeProfit,
+}
+
+impl FillPurpose {
+    /// Whether this fill increases exposure rather than reducing it.
+    pub const fn is_entry(self) -> bool {
+        matches!(
+            self,
+            FillPurpose::MarketEntry | FillPurpose::LimitEntry | FillPurpose::StopEntry
+        )
+    }
+
+    /// Whether this purpose requires a requested order/trigger price.
+    pub const fn requires_requested_price(self) -> bool {
+        !matches!(self, FillPurpose::MarketEntry | FillPurpose::MarketExit)
+    }
+}
+
+/// Deterministic slippage applied by the execution pricer.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum SlippageModel {
+    #[default]
+    None,
+    /// Fixed signed pips. Positive values are adverse to the position and
+    /// negative values are favorable. `pip_size` is supplied to the pricer.
+    FixedPips { pips: f64 },
+}
+
+impl SlippageModel {
+    pub fn adverse(pips: f64) -> Self {
+        Self::FixedPips { pips: pips.abs() }
+    }
+
+    pub fn favorable(pips: f64) -> Self {
+        Self::FixedPips { pips: -pips.abs() }
+    }
+
+    pub const fn pips(self) -> f64 {
+        match self {
+            Self::None => 0.0,
+            Self::FixedPips { pips } => pips,
+        }
+    }
+}
+
+/// Complete configuration for deterministic execution pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionModel {
+    pub convention: ExecutionConvention,
+    pub fill_model: FillModel,
+    pub slippage: SlippageModel,
+}
+
+impl ExecutionModel {
+    pub const fn new(
+        convention: ExecutionConvention,
+        fill_model: FillModel,
+        slippage: SlippageModel,
+    ) -> Self {
+        Self {
+            convention,
+            fill_model,
+            slippage,
+        }
+    }
+
+    pub const fn future_quote_v1(fill_model: FillModel) -> Self {
+        Self::new(
+            ExecutionConvention::FutureQuoteV1,
+            fill_model,
+            SlippageModel::None,
+        )
+    }
+}
+
+impl Default for ExecutionModel {
+    fn default() -> Self {
+        Self::new(
+            ExecutionConvention::Legacy,
+            FillModel::default(),
+            SlippageModel::default(),
+        )
+    }
+}
+
+/// Result of a deterministic execution-price calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionFill {
+    pub purpose: FillPurpose,
+    pub side: Side,
+    /// Final executable price after convention rules and slippage.
+    pub price: f64,
+    /// Quote-side price selected by the configured [`FillModel`].
+    pub quote_price: f64,
+    /// Limit, stop, stop-loss, or take-profit price when applicable.
+    pub requested_price: Option<f64>,
+    /// Configured signed slippage in pips (`+` adverse, `-` favorable).
+    pub slippage_pips: f64,
+}
+
+/// Source of the currently effective protective stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StopOrigin {
+    Initial,
+    Modified,
+    Breakeven,
+    Trailing,
+}
+
+/// A resolved protective stop and the rule/state that supplied it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveStop {
+    pub price: f64,
+    pub origin: StopOrigin,
+}
+
+impl EffectiveStop {
+    pub const fn new(price: f64, origin: StopOrigin) -> Self {
+        Self { price, origin }
+    }
+}
+
 // ─── Identity types ─────────────────────────────────────────────────────────
 
 /// Unique identifier for a position.
@@ -219,6 +363,14 @@ pub type GroupId = String;
 /// The engine stores it on `PositionData` and resolves it through
 /// `PositionRef::ByTradeId`.
 pub type TradeId = String;
+
+/// Relative tolerance used when deciding whether a close consumed all exposure.
+///
+/// Core position accounting and external executors must use the same tolerance
+/// so a full-close effect cannot leave a residual open account.
+pub fn position_size_tolerance(reference_size: f64) -> f64 {
+    reference_size.abs().max(1.0) * 1.0e-12
+}
 
 // ─── Enums ──────────────────────────────────────────────────────────────────
 
@@ -302,6 +454,8 @@ pub enum CloseReason {
     TimeExit,
     BreakevenStop,
     Manual,
+    /// Position was forcibly liquidated when the historical feed ended.
+    EndOfData,
     GroupRule,
     Cancelled,
 }
@@ -317,6 +471,7 @@ impl std::fmt::Display for CloseReason {
             CloseReason::Manual => write!(f, "Manual"),
             CloseReason::GroupRule => write!(f, "GroupRule"),
             CloseReason::Cancelled => write!(f, "Cancelled"),
+            CloseReason::EndOfData => write!(f, "EndOfData"),
         }
     }
 }
@@ -405,7 +560,7 @@ impl PriceQuote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub price: f64,
-    /// Fraction of the **original** position size to close at this level (0.0–1.0).
+    /// Fraction of all entered size to close at this level (0.0–1.0).
     pub close_ratio: f64,
 }
 
@@ -463,7 +618,7 @@ pub enum Action {
     /// Close a fraction of a position at market.
     ClosePartial {
         position_id: PositionId,
-        /// Fraction of *original* size to close (0.0–1.0).
+        /// Fraction of all entered size to close (0.0–1.0).
         ratio: f64,
     },
 
@@ -486,6 +641,14 @@ pub enum Action {
 
     /// Remove a take-profit level at a specific price.
     RemoveTarget { position_id: PositionId, price: f64 },
+
+    /// Atomically change the price of an existing, untriggered take-profit
+    /// while preserving its close ratio and runtime state.
+    ModifyTarget {
+        position_id: PositionId,
+        old_price: f64,
+        new_price: f64,
+    },
 
     /// Attach a new management rule to a position.
     AddRule {
@@ -786,18 +949,152 @@ pub enum Effect {
         reason: CloseReason,
     },
 
-    /// The fixed stoploss of a position was moved.
+    /// The fixed stoploss of a position was moved or added.
     StoplossModified {
         id: PositionId,
         old_price: f64,
         new_price: f64,
     },
 
+    /// The fixed stoploss of a position was removed.
+    StoplossRemoved { id: PositionId, old_price: f64 },
+
     /// A new fill was added to an existing position (scale-in).
     ScaledIn { id: PositionId, fill: Fill },
 
     /// A management rule was triggered (informational).
     RuleTriggered { id: PositionId, rule_name: String },
+}
+
+/// A concrete FutureQuote fill. `execution` is the single authoritative
+/// pricing result and `ts` is the execution/transaction timestamp.
+///
+/// `source_quote_ts` is carried separately because deterministic end-of-data
+/// liquidation executes at the global feed-end time while pricing from the
+/// last (possibly stale) quote for each symbol. Older payloads default the
+/// source timestamp to `ts`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FutureFill {
+    pub execution: ExecutionFill,
+    pub size: f64,
+    pub ts: NaiveDateTime,
+    #[serde(default)]
+    pub source_quote_ts: Option<NaiveDateTime>,
+}
+
+impl FutureFill {
+    pub fn source_quote_ts(&self) -> NaiveDateTime {
+        self.source_quote_ts.unwrap_or(self.ts)
+    }
+
+    pub fn as_fill(&self) -> Fill {
+        Fill {
+            price: self.execution.price,
+            size: self.size,
+            ts: self.ts,
+        }
+    }
+}
+
+/// FutureQuote effect with an explicit distinction between informational
+/// effects and effects produced by an authoritative execution fill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FutureEffect {
+    Plain {
+        effect: Effect,
+        /// Configured stop transition value for non-fill effects.
+        requested_price: Option<f64>,
+        /// Protective-stop provenance when applicable.
+        stop_origin: Option<StopOrigin>,
+    },
+    Filled {
+        effect: Effect,
+        fill: FutureFill,
+        /// Protective-stop provenance for stop-driven closes.
+        stop_origin: Option<StopOrigin>,
+    },
+}
+
+impl FutureEffect {
+    pub fn plain(effect: Effect) -> Self {
+        Self::Plain {
+            effect,
+            requested_price: None,
+            stop_origin: None,
+        }
+    }
+
+    pub fn plain_with_metadata(
+        effect: Effect,
+        requested_price: Option<f64>,
+        stop_origin: Option<StopOrigin>,
+    ) -> Self {
+        Self::Plain {
+            effect,
+            requested_price,
+            stop_origin,
+        }
+    }
+
+    pub fn filled(effect: Effect, fill: FutureFill, stop_origin: Option<StopOrigin>) -> Self {
+        Self::Filled {
+            effect,
+            fill,
+            stop_origin,
+        }
+    }
+
+    pub fn effect(&self) -> &Effect {
+        match self {
+            Self::Plain { effect, .. } | Self::Filled { effect, .. } => effect,
+        }
+    }
+
+    pub fn into_effect(self) -> Effect {
+        match self {
+            Self::Plain { effect, .. } | Self::Filled { effect, .. } => effect,
+        }
+    }
+
+    pub fn fill(&self) -> Option<&FutureFill> {
+        match self {
+            Self::Plain { .. } => None,
+            Self::Filled { fill, .. } => Some(fill),
+        }
+    }
+
+    pub fn stop_origin(&self) -> Option<StopOrigin> {
+        match self {
+            Self::Plain { stop_origin, .. } | Self::Filled { stop_origin, .. } => *stop_origin,
+        }
+    }
+}
+
+/// Internal unpriced rule intent. This never crosses the engine/executor
+/// boundary; the engine must turn it into a [`FutureEffect`] first.
+#[derive(Debug, Clone)]
+pub(crate) struct FutureIntent {
+    pub effect: Effect,
+    pub requested_price: Option<f64>,
+    pub stop_origin: Option<StopOrigin>,
+}
+
+impl FutureIntent {
+    pub fn plain(effect: Effect) -> Self {
+        Self {
+            effect,
+            requested_price: None,
+            stop_origin: None,
+        }
+    }
+}
+
+/// A pending entry priced by the runner before the engine commits its fill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedPendingFill {
+    pub position_id: PositionId,
+    pub execution: ExecutionFill,
+    pub size: f64,
 }
 
 // ─── Position records (audit trail) ─────────────────────────────────────────
@@ -828,6 +1125,11 @@ pub enum PositionRecord {
     },
     TargetRemoved {
         price: f64,
+    },
+    TargetModified {
+        from: f64,
+        to: f64,
+        close_ratio: f64,
     },
     RuleAdded {
         rule_name: String,

@@ -1,16 +1,25 @@
 //! Unit tests for the backtest server crate.
 
+use backtest_server::artifact_store::{ArtifactStore, ArtifactStoreError};
 use backtest_server::config::ServerConfig;
 use backtest_server::convert::{
-    config_from_msg, parse_fill_model, position_ref_from_msg, profile_from_msg, profile_to_msg,
-    raw_signal_from_msg, result_to_msg,
+    config_from_msg, evaluation_options_from_msg, parse_fill_model, position_ref_from_msg,
+    profile_from_msg, profile_to_msg, raw_signal_from_msg, result_to_msg,
 };
 use backtest_server::handlers::{
-    ServerState, handle_add_profile, handle_list_profiles, handle_ping, handle_remove_profile,
-    handle_run_backtest,
+    BacktestJob, JobCancellationToken, JobStatus, ServerState, cleanup_expired_jobs,
+    handle_add_profile, handle_cancel_backtest, handle_delete_result_artifact,
+    handle_get_backtest_result, handle_get_backtest_status, handle_get_result_artifact_chunk,
+    handle_list_profiles, handle_list_symbols, handle_ping, handle_remove_profile,
+    handle_run_backtest_multi_v2, handle_run_backtest_v2, handle_submit_backtest_v2,
+    run_job_and_store_v2,
 };
 use backtest_server::rpc_types::*;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{NaiveDate, NaiveDateTime};
+use data_preprocess::{Bar, ParquetStore, Tick, Timeframe};
+use qs_backtest::evaluation::{BreakdownDimension, EvaluationSection, GroupFilter, PositionSide};
 use qs_backtest::profile::{
     ManagementProfile, PositionRef, ProfileRegistry, RawSignal, RuleConfigDef, StoplossMode,
 };
@@ -18,10 +27,101 @@ use qs_backtest::report::BacktestResult;
 use qs_core::types::{FillModel, Side};
 use qs_symbols::SymbolRegistry;
 
-use std::sync::RwLock;
-use std::time::Instant;
+fn test_v2_request(request: RunBacktestRequest) -> RunBacktestV2Request {
+    RunBacktestV2Request {
+        schema_version: 2,
+        request,
+        future: FutureQuoteConfigMsg {
+            account_currency: "USD".into(),
+            ..FutureQuoteConfigMsg::default()
+        },
+        evaluation: ProviderEvaluationOptionsMsg::default(),
+        result_delivery: ResultDeliveryMsg::Auto,
+    }
+}
+
+fn run_v2_for_test(state: &ServerState, request: &RunBacktestRequest) -> RunBacktestResponse {
+    handle_run_backtest_v2(state, &test_v2_request(request.clone()))
+}
+
+fn submit_v2_for_test(state: &ServerState, request: &RunBacktestRequest) -> SubmitBacktestResponse {
+    handle_submit_backtest_v2(
+        state,
+        &SubmitBacktestV2Request {
+            request: test_v2_request(request.clone()),
+        },
+    )
+}
+
+fn run_job_v2_for_test(state: Arc<ServerState>, job_id: String, request: RunBacktestRequest) {
+    run_job_and_store_v2(state, job_id, test_v2_request(request));
+}
+
+fn run_multi_v2_for_test(
+    state: &ServerState,
+    request: &RunBacktestMultiRequest,
+) -> RunBacktestMultiResponse {
+    handle_run_backtest_multi_v2(
+        state,
+        &RunBacktestMultiV2Request {
+            schema_version: 2,
+            request: request.clone(),
+            future: FutureQuoteConfigMsg {
+                account_currency: "USD".into(),
+                ..FutureQuoteConfigMsg::default()
+            },
+            evaluation: ProviderEvaluationOptionsMsg::default(),
+            result_delivery: ResultDeliveryMsg::Auto,
+        },
+    )
+}
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn evaluation_symbol_registry() -> SymbolRegistry {
+    SymbolRegistry::from_toml(
+        r#"
+[[symbol]]
+canonical = "eurusd"
+aliases = ["eur/usd", "eur-usd"]
+pip_position = 4
+digits = 5
+category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100000
+lot_step_units = 1000
+
+[[symbol]]
+canonical = "us100"
+aliases = ["nasdaq", "nas-100"]
+pip_position = 1
+digits = 2
+category = "index"
+pnl_currency = "USD"
+lot_base_units = 1
+lot_step_units = 1
+"#,
+    )
+    .unwrap()
+}
+
+fn test_artifact_store(directory: PathBuf) -> ArtifactStore {
+    ArtifactStore::new(
+        directory,
+        12 * 1024 * 1024,
+        1024 * 1024,
+        Duration::from_secs(3_600),
+        1024 * 1024 * 1024,
+    )
+    .unwrap()
+}
 
 fn empty_state() -> ServerState {
     ServerState {
@@ -31,6 +131,11 @@ fn empty_state() -> ServerState {
         profiles_path: String::new(),
         start_time: Instant::now(),
         jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        max_retained_jobs: 1_000,
+        artifact_store: test_artifact_store(std::env::temp_dir().join(format!(
+            "qs_backtest_server_unit_artifacts_{}",
+            std::process::id()
+        ))),
     }
 }
 
@@ -41,12 +146,463 @@ fn sample_raw_signal() -> RawSignalMsg {
         side: "Buy".into(),
         order_type: "Market".into(),
         price: None,
-        size: 1.0,
+        risk: 1.0,
         stoploss: Some(1.0800),
         targets: vec![1.0900, 1.0950],
         group: None,
         trade_id: None,
     }
+}
+
+fn sample_run_request() -> RunBacktestRequest {
+    RunBacktestRequest {
+        symbol: "eurusd".into(),
+        symbols: Vec::new(),
+        all_symbols: false,
+        exchange: "ctrader".into(),
+        data_type: "tick".into(),
+        timeframe: None,
+        from: None,
+        to: None,
+        raw_signals: vec![sample_raw_signal()],
+        profile: None,
+        profile_def: None,
+        config: BacktestConfigMsg {
+            initial_balance: Some(10_000.0),
+            close_on_finish: None,
+            fill_model: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+        },
+    }
+}
+
+struct V2PathFixture {
+    state: Arc<ServerState>,
+    data_dir: PathBuf,
+}
+
+impl Drop for V2PathFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+fn fixture_ts(second: u32) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 1, 15)
+        .unwrap()
+        .and_hms_opt(10, 0, second)
+        .unwrap()
+}
+
+fn v2_path_fixture() -> V2PathFixture {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qs_backtest_server_v2_path_parity_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    let store = ParquetStore::open(&data_dir).unwrap();
+    let ticks = [
+        (0, 1.1000, 1.1002),
+        (1, 1.1005, 1.1007),
+        (2, 1.1017, 1.1019),
+        (3, 1.1010, 1.1012),
+    ]
+    .into_iter()
+    .map(|(second, bid, ask)| Tick {
+        exchange: "fixture".into(),
+        symbol: "EURUSD".into(),
+        ts: fixture_ts(second),
+        bid: Some(bid),
+        ask: Some(ask),
+        last: None,
+        volume: Some(1.0),
+        flags: None,
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
+
+    V2PathFixture {
+        state: Arc::new(ServerState {
+            symbol_registry: evaluation_symbol_registry(),
+            profile_registry: RwLock::new(ProfileRegistry::empty()),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            profiles_path: String::new(),
+            start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_retained_jobs: 1_000,
+            artifact_store: test_artifact_store(data_dir.join("artifacts")),
+        }),
+        data_dir,
+    }
+}
+
+fn v2_inline_profile() -> ManagementProfileMsg {
+    ManagementProfileMsg {
+        name: "future-parity".into(),
+        target_selection: Some(TargetSelectionMsg::Selected(vec![1])),
+        use_targets: vec![1],
+        close_ratios: vec![1.0],
+        stoploss_mode: Some(StoplossModeMsg::FromSignal),
+        rules: Vec::new(),
+        group_override: Some("parity-group".into()),
+        let_remainder_run: false,
+    }
+}
+
+fn v2_path_request() -> RunBacktestV2Request {
+    RunBacktestV2Request {
+        schema_version: 2,
+        request: RunBacktestRequest {
+            symbol: "EUR/USD".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
+            exchange: "fixture".into(),
+            data_type: "tick".into(),
+            timeframe: None,
+            from: None,
+            to: None,
+            raw_signals: vec![
+                RawSignalMsg::Entry {
+                    ts: "2026-01-15T10:00:00".into(),
+                    symbol: "EURUSD".into(),
+                    side: "Buy".into(),
+                    order_type: "Market".into(),
+                    price: Some(1.1002),
+                    risk: 1.0,
+                    stoploss: Some(1.0990),
+                    targets: vec![1.1015],
+                    group: Some("signal-group".into()),
+                    trade_id: Some("future-parity-trade".into()),
+                },
+                RawSignalMsg::Entry {
+                    ts: "2026-01-15T10:00:00".into(),
+                    symbol: "EUR/USD".into(),
+                    side: "Sell".into(),
+                    order_type: "Market".into(),
+                    price: Some(1.1000),
+                    risk: 1.0,
+                    stoploss: Some(1.1020),
+                    targets: vec![1.0990],
+                    group: Some("signal-group".into()),
+                    trade_id: Some("future-parity-filtered".into()),
+                },
+            ],
+            profile: None,
+            profile_def: Some(v2_inline_profile()),
+            config: BacktestConfigMsg {
+                initial_balance: Some(25_000.0),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            },
+        },
+        future: FutureQuoteConfigMsg {
+            signal_latency_ms: 500,
+            slippage_pips: 0.25,
+            stale_quote_after_ms: Some(1_500),
+            pnl_epsilon: 1.0e-6,
+            account_currency: "USD".into(),
+            conversion_stale_after_ms: 300_000,
+            mtm_output: MtmOutputPolicyMsg::default(),
+        },
+        evaluation: ProviderEvaluationOptionsMsg {
+            context: EvaluationContextMsg {
+                provider_id: Some("fixture-provider".into()),
+                source_id: Some("fixture-source".into()),
+            },
+            source_coverage: Some(SourceCoverageCountsMsg {
+                raw_messages: 3,
+                parsed_messages: 1,
+                skipped_messages: 1,
+                failed_messages: 1,
+                emitted_signals: 3,
+                emitted_entry_signals: 2,
+            }),
+            sections: EvaluationSectionMsg::ALL.to_vec(),
+            filter: PositionFilterMsg {
+                symbols: vec!["EUR-USD".into()],
+                sides: vec![EvaluationPositionSideMsg::Long],
+                groups: vec![EvaluationGroupFilterMsg::Named("parity-group".into())],
+                close_reasons: Vec::new(),
+                tags: BTreeMap::new(),
+            },
+            breakdowns: vec![BreakdownDimensionMsg::Symbol, BreakdownDimensionMsg::Group],
+            bootstrap: BootstrapConfigMsg {
+                samples: 32,
+                confidence_level: 0.9,
+                seed: 42,
+                minimum_sample_size: 1,
+            },
+            rolling_window: 2,
+            minimum_breakdown_bucket_count: 1,
+            maximum_breakdown_rows: Some(10),
+            include_positions: true,
+            maximum_position_rows: Some(10),
+        },
+        result_delivery: ResultDeliveryMsg::Auto,
+    }
+}
+
+fn multi_v2_request(single: &RunBacktestV2Request) -> RunBacktestMultiV2Request {
+    let request = &single.request;
+    RunBacktestMultiV2Request {
+        schema_version: single.schema_version,
+        request: RunBacktestMultiRequest {
+            symbol: request.symbol.clone(),
+            symbols: request.symbols.clone(),
+            all_symbols: request.all_symbols,
+            exchange: request.exchange.clone(),
+            data_type: request.data_type.clone(),
+            timeframe: request.timeframe.clone(),
+            from: request.from.clone(),
+            to: request.to.clone(),
+            raw_signals: request.raw_signals.clone(),
+            profiles: vec![ProfileRef::Inline(
+                request.profile_def.clone().expect("inline fixture profile"),
+            )],
+            config: request.config.clone(),
+        },
+        future: single.future.clone(),
+        evaluation: single.evaluation.clone(),
+        result_delivery: single.result_delivery,
+    }
+}
+
+fn active_symbol_registry() -> SymbolRegistry {
+    SymbolRegistry::from_toml(
+        r#"
+[[symbol]]
+canonical = "xauusd"
+aliases = ["xau/usd", "xau-usd"]
+pip_position = 1
+digits = 2
+category = "commodity"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100
+lot_step_units = 1
+
+[[symbol]]
+canonical = "gbpjpy"
+aliases = ["gbp/jpy", "gbp-jpy"]
+pip_position = 2
+digits = 3
+category = "forex"
+base_currency = "GBP"
+quote_currency = "JPY"
+pnl_currency = "JPY"
+lot_base_units = 100000
+lot_step_units = 1000
+"#,
+    )
+    .unwrap()
+}
+
+fn active_symbol_fixture() -> V2PathFixture {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qs_backtest_server_active_symbol_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    let store = ParquetStore::open(&data_dir).unwrap();
+    let ticks = [
+        (0, 2000.0, 2000.2),
+        (1, 2000.2, 2000.4),
+        (2, 2001.2, 2001.4),
+        (3, 2001.0, 2001.2),
+    ]
+    .into_iter()
+    .map(|(second, bid, ask)| Tick {
+        exchange: "fixture".into(),
+        symbol: "XAUUSD".into(),
+        ts: fixture_ts(second),
+        bid: Some(bid),
+        ask: Some(ask),
+        last: None,
+        volume: Some(1.0),
+        flags: None,
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
+
+    V2PathFixture {
+        state: Arc::new(ServerState {
+            symbol_registry: active_symbol_registry(),
+            profile_registry: RwLock::new(ProfileRegistry::empty()),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            profiles_path: String::new(),
+            start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_retained_jobs: 1_000,
+            artifact_store: test_artifact_store(data_dir.join("artifacts")),
+        }),
+        data_dir,
+    }
+}
+
+fn active_symbol_request() -> RunBacktestV2Request {
+    RunBacktestV2Request {
+        schema_version: 2,
+        request: RunBacktestRequest {
+            symbol: "XAUUSD".into(),
+            symbols: vec!["XAU/USD".into(), "GBPJPY".into()],
+            all_symbols: false,
+            exchange: "fixture".into(),
+            data_type: "tick".into(),
+            timeframe: None,
+            from: Some("2026-01-15T10:00:00".into()),
+            to: Some("2026-01-15T10:00:03".into()),
+            raw_signals: vec![
+                RawSignalMsg::Entry {
+                    ts: "2026-01-15T09:59:59".into(),
+                    symbol: "GBP/JPY".into(),
+                    side: "Sell".into(),
+                    order_type: "Market".into(),
+                    price: Some(190.0),
+                    risk: 1.0,
+                    stoploss: Some(191.0),
+                    targets: vec![189.0],
+                    group: None,
+                    trade_id: Some("filtered-gbpjpy".into()),
+                },
+                RawSignalMsg::Entry {
+                    ts: "2026-01-15T10:00:00".into(),
+                    symbol: "XAUUSD".into(),
+                    side: "Buy".into(),
+                    order_type: "Market".into(),
+                    price: Some(2000.2),
+                    risk: 1.0,
+                    stoploss: Some(1999.0),
+                    targets: vec![2001.0],
+                    group: None,
+                    trade_id: Some("active-xauusd".into()),
+                },
+            ],
+            profile: None,
+            profile_def: Some(v2_inline_profile()),
+            config: BacktestConfigMsg {
+                initial_balance: Some(10_000.0),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+            },
+        },
+        future: FutureQuoteConfigMsg {
+            signal_latency_ms: 500,
+            account_currency: "USD".into(),
+            conversion_stale_after_ms: 300_000,
+            ..FutureQuoteConfigMsg::default()
+        },
+        evaluation: ProviderEvaluationOptionsMsg::default(),
+        result_delivery: ResultDeliveryMsg::Auto,
+    }
+}
+
+fn read_artifact_bytes(state: &ServerState, reference: &ResultArtifactRefMsg) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let response = handle_get_result_artifact_chunk(
+            state,
+            &GetResultArtifactChunkRequest {
+                artifact_id: reference.artifact_id.clone(),
+                offset,
+            },
+        );
+        assert!(response.success, "chunk: {:?}", response.error);
+        assert_eq!(response.offset, offset);
+        let chunk = BASE64_STANDARD.decode(response.data_base64).unwrap();
+        bytes.extend_from_slice(&chunk);
+        offset += chunk.len() as u64;
+        if response.eof {
+            break;
+        }
+    }
+    assert_eq!(bytes.len() as u64, reference.byte_len);
+    assert_eq!(
+        backtest_server::artifact_store::sha256_hex(&bytes),
+        reference.sha256
+    );
+    bytes
+}
+
+fn assert_future_quote_results_equal(
+    expected: &BacktestResultMsg,
+    actual: &BacktestResultMsg,
+    path: &str,
+) {
+    let expected_future = expected.future.as_ref().expect("sync FutureQuote result");
+    let actual_future = actual
+        .future
+        .as_ref()
+        .unwrap_or_else(|| panic!("{path} FutureQuote result"));
+
+    assert_eq!(
+        expected_future.schema_version, actual_future.schema_version,
+        "{path} schema_version"
+    );
+    assert_eq!(
+        expected_future.execution_metadata, actual_future.execution_metadata,
+        "{path} execution_metadata"
+    );
+    assert_eq!(
+        expected_future.recorded_fills, actual_future.recorded_fills,
+        "{path} recorded_fills"
+    );
+    assert_eq!(
+        expected_future.action_dispositions, actual_future.action_dispositions,
+        "{path} action_dispositions"
+    );
+    assert_eq!(
+        expected_future.close_events, actual_future.close_events,
+        "{path} close_events"
+    );
+    assert_eq!(
+        expected_future.completed_positions, actual_future.completed_positions,
+        "{path} completed_positions"
+    );
+    assert_eq!(
+        expected_future.open_positions, actual_future.open_positions,
+        "{path} open_positions"
+    );
+    assert_eq!(
+        expected_future.pending_orders, actual_future.pending_orders,
+        "{path} pending_orders"
+    );
+    assert_eq!(
+        expected_future.pending_order_lifecycle, actual_future.pending_order_lifecycle,
+        "{path} pending_order_lifecycle"
+    );
+    assert_eq!(
+        expected_future.mtm_equity_curve, actual_future.mtm_equity_curve,
+        "{path} mtm_equity_curve"
+    );
+    assert_eq!(
+        expected_future.mtm_max_drawdown, actual_future.mtm_max_drawdown,
+        "{path} mtm_max_drawdown"
+    );
+    assert_eq!(
+        expected_future.mtm_max_drawdown_pct, actual_future.mtm_max_drawdown_pct,
+        "{path} mtm_max_drawdown_pct"
+    );
+    assert_eq!(
+        expected_future.provider_evaluation, actual_future.provider_evaluation,
+        "{path} provider_evaluation"
+    );
+    assert_eq!(
+        serde_json::to_value(expected).unwrap(),
+        serde_json::to_value(actual).unwrap(),
+        "{path} complete BacktestResultMsg"
+    );
 }
 
 // ── RPC Types Serde ─────────────────────────────────────────────────────────
@@ -119,7 +675,7 @@ fn run_backtest_request_serde_roundtrip() {
             initial_balance: Some(10000.0),
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -128,6 +684,1247 @@ fn run_backtest_request_serde_roundtrip() {
     assert_eq!(decoded.exchange, "ctrader");
     assert_eq!(decoded.raw_signals.len(), 1);
     assert_eq!(decoded.profile, Some("aggressive".into()));
+}
+
+#[test]
+fn v2_evaluation_serde_defaults_and_conversion_are_backward_compatible() {
+    let request = RunBacktestV2Request {
+        schema_version: 2,
+        request: sample_run_request(),
+        future: FutureQuoteConfigMsg {
+            account_currency: "USD".into(),
+            conversion_stale_after_ms: 300_000,
+            ..FutureQuoteConfigMsg::default()
+        },
+        evaluation: ProviderEvaluationOptionsMsg::default(),
+        result_delivery: ResultDeliveryMsg::Auto,
+    };
+    let mut legacy_json = serde_json::to_value(&request).unwrap();
+    legacy_json
+        .as_object_mut()
+        .expect("request object")
+        .remove("evaluation");
+    legacy_json
+        .as_object_mut()
+        .expect("request object")
+        .remove("result_delivery");
+    let decoded: RunBacktestV2Request = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(decoded.result_delivery, ResultDeliveryMsg::Inline);
+    assert_eq!(decoded.evaluation.sections, EvaluationSectionMsg::ALL);
+    assert_eq!(decoded.evaluation.rolling_window, 20);
+    assert_eq!(decoded.evaluation.minimum_breakdown_bucket_count, 1);
+    assert_eq!(decoded.evaluation.maximum_breakdown_rows, None);
+    assert_eq!(decoded.evaluation.source_coverage, None);
+    assert!(!decoded.evaluation.include_positions);
+    assert_eq!(decoded.evaluation.maximum_position_rows, None);
+
+    let mut legacy_multi = serde_json::to_value(multi_v2_request(&v2_path_request())).unwrap();
+    legacy_multi
+        .as_object_mut()
+        .expect("multi request object")
+        .remove("result_delivery");
+    let decoded_multi: RunBacktestMultiV2Request = serde_json::from_value(legacy_multi).unwrap();
+    assert_eq!(decoded_multi.result_delivery, ResultDeliveryMsg::Inline);
+
+    let custom = ProviderEvaluationOptionsMsg {
+        context: EvaluationContextMsg {
+            provider_id: Some("provider-1".into()),
+            source_id: Some("telegram:42".into()),
+        },
+        source_coverage: Some(SourceCoverageCountsMsg {
+            raw_messages: 4,
+            parsed_messages: 2,
+            skipped_messages: 1,
+            failed_messages: 1,
+            emitted_signals: 3,
+            emitted_entry_signals: 2,
+        }),
+        sections: vec![
+            EvaluationSectionMsg::Coverage,
+            EvaluationSectionMsg::PositionPerformance,
+            EvaluationSectionMsg::Breakdowns,
+        ],
+        filter: PositionFilterMsg {
+            symbols: vec!["EUR/USD".into(), "NASDAQ".into()],
+            sides: vec![EvaluationPositionSideMsg::Long],
+            groups: vec![EvaluationGroupFilterMsg::Named("trend".into())],
+            close_reasons: vec!["target".into(), "manual".into()],
+            tags: BTreeMap::new(),
+        },
+        breakdowns: vec![BreakdownDimensionMsg::Symbol, BreakdownDimensionMsg::Group],
+        bootstrap: BootstrapConfigMsg {
+            samples: 500,
+            confidence_level: 0.9,
+            seed: 7,
+            minimum_sample_size: 3,
+        },
+        rolling_window: 8,
+        minimum_breakdown_bucket_count: 2,
+        maximum_breakdown_rows: Some(25),
+        include_positions: true,
+        maximum_position_rows: Some(10),
+    };
+    let wire = serde_json::to_string(&custom).unwrap();
+    let roundtrip: ProviderEvaluationOptionsMsg = serde_json::from_str(&wire).unwrap();
+    assert_eq!(roundtrip, custom);
+
+    let internal = evaluation_options_from_msg(&roundtrip, &evaluation_symbol_registry()).unwrap();
+    assert_eq!(internal.context.provider_id.as_deref(), Some("provider-1"));
+    assert_eq!(internal.context.source_id.as_deref(), Some("telegram:42"));
+    assert!(internal.sections.contains(&EvaluationSection::Coverage));
+    assert!(
+        internal
+            .sections
+            .contains(&EvaluationSection::PositionPerformance)
+    );
+    assert!(internal.sections.contains(&EvaluationSection::Breakdowns));
+    assert_eq!(internal.filter.symbols, ["eurusd", "us100"]);
+    assert_eq!(internal.filter.sides, [PositionSide::Long]);
+    assert_eq!(internal.filter.groups, [GroupFilter::Named("trend".into())]);
+    assert_eq!(
+        internal.breakdowns,
+        [BreakdownDimension::Symbol, BreakdownDimension::Group]
+    );
+    assert_eq!(internal.bootstrap.samples, 500);
+    assert_eq!(internal.rolling_window, 8);
+    assert_eq!(internal.minimum_breakdown_bucket_count, 2);
+    assert_eq!(internal.maximum_breakdown_rows, Some(25));
+    assert!(internal.include_position_rows);
+    assert_eq!(internal.maximum_position_rows, Some(10));
+    assert_eq!(internal.source_coverage.unwrap().raw_messages, 4);
+}
+
+#[test]
+fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
+    let request = v2_path_request();
+    let mut unknown_selector = serde_json::to_value(&request).unwrap();
+    unknown_selector["evaluation"]["sections"] = serde_json::json!(["mystery"]);
+    let selector_error = serde_json::from_value::<RunBacktestV2Request>(unknown_selector)
+        .expect_err("unknown section must fail typed deserialization");
+    assert!(selector_error.to_string().contains("unknown variant"));
+
+    let mut unknown_config = serde_json::to_value(&request).unwrap();
+    unknown_config["evaluation"]["mystery_limit"] = serde_json::json!(3);
+    let config_error = serde_json::from_value::<RunBacktestV2Request>(unknown_config)
+        .expect_err("unknown evaluation config must fail typed deserialization");
+    assert!(config_error.to_string().contains("unknown field"));
+
+    let mut request_typo = serde_json::to_value(&request).unwrap();
+    request_typo["request"]["data_typo"] = serde_json::json!("tick");
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(request_typo)
+            .expect_err("nested V2 request typos must be rejected")
+            .to_string()
+            .contains("data_typo")
+    );
+
+    let mut config_typo = serde_json::to_value(&request).unwrap();
+    config_typo["request"]["config"]["initial_balnce"] = serde_json::json!(10_000.0);
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(config_typo)
+            .expect_err("nested V2 config typos must be rejected")
+            .to_string()
+            .contains("initial_balnce")
+    );
+
+    let mut signal_typo = serde_json::to_value(&request).unwrap();
+    signal_typo["request"]["raw_signals"][0]["stop_loss"] = serde_json::json!(1.09);
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(signal_typo)
+            .expect_err("nested V2 raw signal typos must be rejected")
+            .to_string()
+            .contains("stop_loss")
+    );
+
+    let mut missing_entry_risk = serde_json::to_value(&request).unwrap();
+    assert_eq!(missing_entry_risk["schema_version"], 2);
+    missing_entry_risk["request"]["raw_signals"][0]
+        .as_object_mut()
+        .expect("entry object")
+        .remove("risk");
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(missing_entry_risk)
+            .expect_err("V2 entries must require risk")
+            .to_string()
+            .contains("missing field `risk`")
+    );
+
+    let mut obsolete_entry_size = serde_json::to_value(&request).unwrap();
+    assert_eq!(obsolete_entry_size["schema_version"], 2);
+    obsolete_entry_size["request"]["raw_signals"][0]["size"] = serde_json::json!(1.0);
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(obsolete_entry_size)
+            .expect_err("V2 entries must reject obsolete size")
+            .to_string()
+            .contains("unknown field `size`")
+    );
+
+    let mut profile_typo = serde_json::to_value(&request).unwrap();
+    profile_typo["request"]["profile_def"]["close_ratio"] = serde_json::json!([1.0]);
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(profile_typo)
+            .expect_err("nested V2 profile typos must be rejected")
+            .to_string()
+            .contains("close_ratio")
+    );
+
+    let mut future_typo = serde_json::to_value(&request).unwrap();
+    future_typo["future"]["signal_lattency_ms"] = serde_json::json!(250);
+    let typo_error = serde_json::from_value::<RunBacktestV2Request>(future_typo)
+        .expect_err("FutureQuote field typos must not silently default");
+    assert!(typo_error.to_string().contains("signal_lattency_ms"));
+
+    let mut delivery_typo = serde_json::to_value(&request).unwrap();
+    delivery_typo["result_delivry"] = serde_json::json!("artifact");
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(delivery_typo)
+            .expect_err("delivery field typos must be rejected")
+            .to_string()
+            .contains("result_delivry")
+    );
+
+    let mut invalid_delivery = serde_json::to_value(&request).unwrap();
+    invalid_delivery["result_delivery"] = serde_json::json!("stream");
+    assert!(
+        serde_json::from_value::<RunBacktestV2Request>(invalid_delivery)
+            .expect_err("unknown delivery modes must be rejected")
+            .to_string()
+            .contains("unknown variant")
+    );
+
+    let mut outer_typo = serde_json::to_value(&request).unwrap();
+    outer_typo["schema_verison"] = serde_json::json!(2);
+    let outer_error = serde_json::from_value::<RunBacktestV2Request>(outer_typo)
+        .expect_err("V2 outer envelope typos must be rejected");
+    assert!(outer_error.to_string().contains("schema_verison"));
+
+    let mut submit_outer = serde_json::to_value(SubmitBacktestV2Request {
+        request: request.clone(),
+    })
+    .unwrap();
+    submit_outer["requset"] = submit_outer["request"].clone();
+    assert!(
+        serde_json::from_value::<SubmitBacktestV2Request>(submit_outer)
+            .expect_err("async V2 outer typos must be rejected")
+            .to_string()
+            .contains("requset")
+    );
+
+    let mut submit_nested = serde_json::to_value(SubmitBacktestV2Request {
+        request: request.clone(),
+    })
+    .unwrap();
+    submit_nested["request"]["request"]["raw_signals"][0]["tradeid"] = serde_json::json!("typo");
+    assert!(
+        serde_json::from_value::<SubmitBacktestV2Request>(submit_nested)
+            .expect_err("async V2 nested typos must be rejected")
+            .to_string()
+            .contains("tradeid")
+    );
+
+    let mut multi_outer = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    multi_outer["schema_verison"] = serde_json::json!(2);
+    assert!(
+        serde_json::from_value::<RunBacktestMultiV2Request>(multi_outer)
+            .expect_err("multi V2 outer typos must be rejected")
+            .to_string()
+            .contains("schema_verison")
+    );
+
+    let mut multi_nested = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    multi_nested["request"]["config"]["close_on_finsih"] = serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<RunBacktestMultiV2Request>(multi_nested)
+            .expect_err("multi V2 nested config typos must be rejected")
+            .to_string()
+            .contains("close_on_finsih")
+    );
+
+    let mut multi_profile = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    multi_profile["request"]["profiles"][0]["group_overide"] = serde_json::json!("typo");
+    serde_json::from_value::<RunBacktestMultiV2Request>(multi_profile)
+        .expect_err("multi V2 inline profile typos must be rejected");
+
+    let mut v1 = serde_json::to_value(sample_run_request()).unwrap();
+    v1["legacy_extension"] = serde_json::json!(true);
+    v1["config"]["legacy_config_extension"] = serde_json::json!(true);
+    let decoded = serde_json::from_value::<RunBacktestRequest>(v1)
+        .expect("V1 request and config must retain unknown-field compatibility");
+
+    let mut v1_profile = serde_json::to_value(v2_inline_profile()).unwrap();
+    v1_profile["legacy_profile_extension"] = serde_json::json!(true);
+    serde_json::from_value::<ManagementProfileMsg>(v1_profile)
+        .expect("V1 inline profiles must retain unknown-field compatibility");
+    assert_eq!(decoded.raw_signals.len(), 1);
+}
+
+#[test]
+fn v2_evaluation_conversion_rejects_inconsistent_config() {
+    let config = ProviderEvaluationOptionsMsg {
+        sections: vec![EvaluationSectionMsg::Coverage],
+        breakdowns: vec![BreakdownDimensionMsg::Symbol],
+        ..ProviderEvaluationOptionsMsg::default()
+    };
+    let error = evaluation_options_from_msg(&config, &evaluation_symbol_registry())
+        .expect_err("breakdowns without the section must be rejected");
+    assert!(error.to_string().contains("breakdowns report section"));
+}
+
+#[test]
+fn v2_evaluation_conversion_rejects_integrated_tag_selectors() {
+    let registry = evaluation_symbol_registry();
+    let tag_filter = ProviderEvaluationOptionsMsg {
+        filter: PositionFilterMsg {
+            tags: BTreeMap::from([("session".into(), vec!["us".into()])]),
+            ..PositionFilterMsg::default()
+        },
+        ..ProviderEvaluationOptionsMsg::default()
+    };
+    let filter_error = evaluation_options_from_msg(&tag_filter, &registry)
+        .expect_err("integrated tag filters must be rejected");
+    assert!(filter_error.to_string().contains("tag filters"));
+
+    let tag_breakdown = ProviderEvaluationOptionsMsg {
+        breakdowns: vec![BreakdownDimensionMsg::Tag("session".into())],
+        ..ProviderEvaluationOptionsMsg::default()
+    };
+    let breakdown_error = evaluation_options_from_msg(&tag_breakdown, &registry)
+        .expect_err("integrated tag breakdowns must be rejected");
+    assert!(breakdown_error.to_string().contains("tag breakdowns"));
+}
+
+#[test]
+fn v2_evaluation_conversion_rejects_unknown_filter_symbols() {
+    let config = ProviderEvaluationOptionsMsg {
+        filter: PositionFilterMsg {
+            symbols: vec!["not-a-market".into()],
+            ..PositionFilterMsg::default()
+        },
+        ..ProviderEvaluationOptionsMsg::default()
+    };
+    let error = evaluation_options_from_msg(&config, &evaluation_symbol_registry())
+        .expect_err("unknown evaluation symbols must not silently select zero rows");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown evaluation symbol `not-a-market`")
+    );
+}
+
+#[test]
+fn v2_artifact_response_is_compact_and_reconstructs_the_complete_result() {
+    let fixture = v2_path_fixture();
+    let mut artifact_request = v2_path_request();
+    artifact_request.result_delivery = ResultDeliveryMsg::Artifact;
+    let response = handle_run_backtest_v2(&fixture.state, &artifact_request);
+    assert!(response.success, "artifact: {:?}", response.error);
+    let summary = response.result.as_ref().expect("compact result summary");
+    assert!(summary.equity_curve.is_empty());
+    assert!(summary.trade_log.len() <= 30);
+    assert!(summary.positions.len() <= 15);
+    assert!(!response.inline_complete);
+    let reference = response.artifact.clone().expect("artifact reference");
+    assert!(serde_json::to_vec(&response).unwrap().len() < reference.byte_len as usize);
+    assert_eq!(reference.schema_version, RESULT_ARTIFACT_SCHEMA_VERSION);
+
+    let bytes = read_artifact_bytes(&fixture.state, &reference);
+    let artifact_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let actual: BacktestResultMsg = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_value(&actual).unwrap(), artifact_json);
+    assert_eq!(actual.total_trades, 2);
+    assert!(actual.future.is_some());
+    let deleted = handle_delete_result_artifact(
+        &fixture.state,
+        &DeleteResultArtifactRequest {
+            artifact_id: reference.artifact_id,
+        },
+    );
+    assert!(deleted.success, "delete: {:?}", deleted.error);
+}
+
+#[test]
+fn v2_inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
+    let fixture = v2_path_fixture();
+    let state = ServerState {
+        symbol_registry: evaluation_symbol_registry(),
+        profile_registry: RwLock::new(ProfileRegistry::empty()),
+        data_dir: fixture.data_dir.to_string_lossy().into_owned(),
+        profiles_path: String::new(),
+        start_time: Instant::now(),
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        max_retained_jobs: 1_000,
+        artifact_store: ArtifactStore::new(
+            fixture.data_dir.join("small-limit-artifacts"),
+            1,
+            128,
+            Duration::from_secs(3_600),
+            1024 * 1024,
+        )
+        .unwrap(),
+    };
+    let mut request = v2_path_request();
+    request.result_delivery = ResultDeliveryMsg::Inline;
+
+    let response = handle_run_backtest_v2(&state, &request);
+    assert!(!response.success);
+    assert!(response.result.is_none());
+    assert!(response.artifact.is_none());
+    assert!(!response.inline_complete);
+    assert!(
+        response
+            .error
+            .unwrap()
+            .contains("exceeding the configured inline limit")
+    );
+
+    request.result_delivery = ResultDeliveryMsg::Auto;
+    let auto = handle_run_backtest_v2(&state, &request);
+    assert!(auto.success, "auto: {:?}", auto.error);
+    assert!(auto.result.is_none());
+    assert!(auto.artifact.is_some());
+    assert!(!auto.inline_complete);
+    assert!(serde_json::to_vec(&auto).unwrap().len() < 1024);
+}
+
+#[test]
+fn v2_multi_artifact_response_reconstructs_all_profile_results() {
+    let fixture = v2_path_fixture();
+    let request = v2_path_request();
+    let mut multi = multi_v2_request(&request);
+    multi.result_delivery = ResultDeliveryMsg::Artifact;
+
+    let response = handle_run_backtest_multi_v2(&fixture.state, &multi);
+    assert!(response.success, "multi artifact: {:?}", response.error);
+    assert_eq!(response.results.len(), 1);
+    assert!(response.results[0].result.is_some());
+    assert!(!response.inline_complete);
+    let reference = response.artifact.clone().expect("multi artifact reference");
+    assert!(serde_json::to_vec(&response).unwrap().len() < reference.byte_len as usize);
+    let bytes = read_artifact_bytes(&fixture.state, &reference);
+    let results: Vec<ProfileResult> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].success, "profile: {:?}", results[0].error);
+    assert!(results[0].result.is_some());
+}
+
+#[test]
+fn v2_async_artifact_job_retains_only_a_compact_result_summary() {
+    let fixture = v2_path_fixture();
+    let mut request = v2_path_request();
+    request.result_delivery = ResultDeliveryMsg::Artifact;
+    let submission = handle_submit_backtest_v2(
+        &fixture.state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(submission.success, "submit: {:?}", submission.error);
+    let job_id = submission.job_id.unwrap();
+    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request);
+
+    {
+        let jobs = fixture.state.jobs.lock().unwrap();
+        let job = &jobs[&job_id];
+        assert!(job.result.is_some());
+        assert!(job.artifact.is_some());
+        assert!(!job.inline_complete);
+        assert!(!job.artifact_consumed);
+    }
+    let response = handle_get_backtest_result(
+        &fixture.state,
+        &GetBacktestResultRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert!(response.success, "result: {:?}", response.error);
+    assert!(response.result.is_some());
+    let artifact = response.artifact.expect("async artifact reference");
+    assert!(!response.inline_complete);
+    assert!(!response.artifact_consumed);
+
+    let deleted = handle_delete_result_artifact(
+        &fixture.state,
+        &DeleteResultArtifactRequest {
+            artifact_id: artifact.artifact_id,
+        },
+    );
+    assert!(deleted.success, "delete: {:?}", deleted.error);
+    let consumed = handle_get_backtest_result(&fixture.state, &GetBacktestResultRequest { job_id });
+    assert!(!consumed.success);
+    assert!(consumed.artifact.is_none());
+    assert!(consumed.artifact_consumed);
+    assert_eq!(
+        consumed.error.as_deref(),
+        Some("Job result artifact has already been consumed")
+    );
+}
+
+#[test]
+fn v2_sync_async_and_multi_profile_future_quote_results_are_equivalent() {
+    let fixture = v2_path_fixture();
+    let request = v2_path_request();
+
+    let sync_response = handle_run_backtest_v2(&fixture.state, &request);
+    assert!(sync_response.success, "sync: {:?}", sync_response.error);
+    let sync_result = sync_response.result.expect("sync result");
+    let sync_future = sync_result
+        .future
+        .as_ref()
+        .expect("sync FutureQuote result");
+
+    assert_eq!(
+        sync_future
+            .recorded_fills
+            .as_array()
+            .expect("recorded_fills array")
+            .len(),
+        4
+    );
+    assert_eq!(
+        sync_future
+            .completed_positions
+            .as_array()
+            .expect("completed_positions array")
+            .len(),
+        2
+    );
+    assert!(
+        !sync_future.provider_evaluation.is_null(),
+        "evaluation options must produce a report"
+    );
+    let evaluation = &sync_future.provider_evaluation;
+    assert_eq!(evaluation["coverage"]["source"]["raw_messages"], 3);
+    assert_eq!(evaluation["coverage"]["source"]["emitted_signals"], 3);
+    assert_eq!(evaluation["coverage"]["source"]["emitted_entry_signals"], 2);
+    assert_eq!(evaluation["coverage"]["lifecycle"]["candidates"], 2);
+    assert_eq!(evaluation["coverage"]["lifecycle"]["accepted"], 2);
+    assert_eq!(evaluation["coverage"]["lifecycle"]["rejected"], 0);
+    assert_eq!(
+        evaluation["position_rows"]["available_rows"],
+        evaluation["coverage"]["selected_positions"]
+    );
+    let rows = evaluation["position_rows"]["rows"]
+        .as_array()
+        .expect("filtered position rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dimensions"]["symbol"], "eurusd");
+    assert!(rows[0]["outcome"].is_number());
+    assert!(rows[0]["r_multiple"].is_number());
+    assert_eq!(rows[0]["outcome_classification"], "win");
+
+    let submission = handle_submit_backtest_v2(
+        &fixture.state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(submission.success, "async submit: {:?}", submission.error);
+    let job_id = submission.job_id.expect("submitted job id");
+    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request.clone());
+    let status = handle_get_backtest_status(
+        &fixture.state,
+        &GetBacktestStatusRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert_eq!(status.status, "Completed", "async: {:?}", status.error);
+    assert_eq!(status.progress.stage, "completed");
+    assert_eq!(status.progress.processed_symbols, 1);
+    assert_eq!(status.progress.total_symbols, 1);
+    assert_eq!(status.progress.processed_events, 3);
+    assert_eq!(status.progress.total_events, 3);
+    assert_eq!(status.progress.processed_signals, 2);
+    assert_eq!(status.progress.total_signals, 2);
+    let async_response =
+        handle_get_backtest_result(&fixture.state, &GetBacktestResultRequest { job_id });
+    assert!(async_response.success, "async: {:?}", async_response.error);
+    let async_result = async_response.result.expect("async result");
+
+    let multi_response = handle_run_backtest_multi_v2(&fixture.state, &multi_v2_request(&request));
+    assert!(multi_response.success, "multi: {:?}", multi_response.error);
+    assert_eq!(multi_response.results.len(), 1);
+    let profile_result = &multi_response.results[0];
+    assert_eq!(profile_result.profile, "future-parity");
+    assert!(profile_result.success, "multi: {:?}", profile_result.error);
+    let multi_result = profile_result
+        .result
+        .as_ref()
+        .expect("multi-profile result");
+
+    let metadata = &sync_future.execution_metadata;
+    assert_eq!(metadata["tags"]["data.exchange"], "fixture");
+    assert_eq!(metadata["tags"]["data.type"], "tick");
+    assert_eq!(metadata["tags"]["data.timeframe"], "none");
+    assert_eq!(metadata["tags"]["execution.signal_latency_ms"], "500");
+    assert_eq!(metadata["tags"]["data.requested_symbols"], "eurusd");
+    assert_eq!(metadata["tags"]["data.active_symbols"], "eurusd");
+    assert_eq!(metadata["tags"]["data.idle_symbols"], "");
+    assert_eq!(metadata["tags"]["data.idle_run"], "false");
+    assert_eq!(
+        metadata["tags"]["data.loading_from"],
+        "2026-01-15T10:00:00.500"
+    );
+    assert_eq!(metadata["tags"]["profile.identity"], "future-parity");
+    assert!(
+        metadata["tags"]["profile.options"]
+            .as_str()
+            .is_some_and(|options| options.contains("future-parity"))
+    );
+    assert_eq!(metadata["tags"]["sizing.identity"], "fixed_lot");
+    assert_eq!(metadata["tags"]["symbol.eurusd.pip_position"], "4");
+    assert_eq!(metadata["tags"]["symbol.eurusd.lot_base_units"], "100000");
+
+    assert_future_quote_results_equal(&sync_result, &async_result, "async");
+    assert_future_quote_results_equal(&sync_result, multi_result, "multi-profile");
+}
+
+#[test]
+fn v2_multi_profile_reopens_future_stream_for_each_profile() {
+    let fixture = v2_path_fixture();
+    let request = v2_path_request();
+    let mut multi = multi_v2_request(&request);
+    let mut second_profile = v2_inline_profile();
+    second_profile.name = "future-reopen-second".into();
+    multi
+        .request
+        .profiles
+        .push(ProfileRef::Inline(second_profile));
+
+    let response = handle_run_backtest_multi_v2(&fixture.state, &multi);
+    assert!(response.success, "multi reopen: {:?}", response.error);
+    assert_eq!(response.results.len(), 2);
+    for result in &response.results {
+        assert!(result.success, "{}: {:?}", result.profile, result.error);
+        let future = result
+            .result
+            .as_ref()
+            .and_then(|result| result.future.as_ref())
+            .expect("FutureQuote result");
+        assert_eq!(future.recorded_fills.as_array().unwrap().len(), 4);
+        assert_eq!(future.completed_positions.as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn v2_prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
+    let fixture = active_symbol_fixture();
+    let request = active_symbol_request();
+
+    let sync_response = handle_run_backtest_v2(&fixture.state, &request);
+    assert!(sync_response.success, "sync: {:?}", sync_response.error);
+    let sync_result = sync_response.result.expect("sync result");
+    let metadata = &sync_result
+        .future
+        .as_ref()
+        .expect("sync FutureQuote result")
+        .execution_metadata;
+    assert_eq!(metadata["tags"]["data.requested_symbols"], "gbpjpy,xauusd");
+    assert_eq!(metadata["tags"]["data.symbols"], "xauusd");
+    assert_eq!(metadata["tags"]["data.active_symbols"], "xauusd");
+    assert_eq!(metadata["tags"]["data.idle_symbols"], "gbpjpy");
+    assert_eq!(metadata["tags"]["data.idle_run"], "false");
+    assert_eq!(
+        metadata["tags"]["data.loading_from"],
+        "2026-01-15T10:00:00.500"
+    );
+    assert_eq!(
+        metadata["currency_plan"]["primary_symbols"],
+        serde_json::json!(["xauusd"])
+    );
+
+    let submission = handle_submit_backtest_v2(
+        &fixture.state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(submission.success, "async submit: {:?}", submission.error);
+    let job_id = submission.job_id.expect("submitted job id");
+    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request.clone());
+    let status = handle_get_backtest_status(
+        &fixture.state,
+        &GetBacktestStatusRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert_eq!(status.status, "Completed", "async: {:?}", status.error);
+    assert_eq!(status.progress.processed_symbols, 1);
+    assert_eq!(status.progress.total_symbols, 1);
+    assert_eq!(status.progress.processed_events, 2);
+    assert_eq!(status.progress.total_events, 2);
+    assert_eq!(status.progress.processed_signals, 1);
+    assert_eq!(status.progress.total_signals, 1);
+    let async_response =
+        handle_get_backtest_result(&fixture.state, &GetBacktestResultRequest { job_id });
+    assert!(async_response.success, "async: {:?}", async_response.error);
+    let async_result = async_response.result.expect("async result");
+
+    let multi_response = handle_run_backtest_multi_v2(&fixture.state, &multi_v2_request(&request));
+    assert!(multi_response.success, "multi: {:?}", multi_response.error);
+    let multi_result = multi_response.results[0]
+        .result
+        .as_ref()
+        .expect("multi-profile result");
+
+    assert_future_quote_results_equal(&sync_result, &async_result, "async active-symbol plan");
+    assert_future_quote_results_equal(&sync_result, multi_result, "multi active-symbol plan");
+}
+
+#[test]
+fn v2_filtered_entry_and_management_only_run_is_idle_without_market_data() {
+    let state = empty_state();
+    let request = RunBacktestV2Request {
+        schema_version: 2,
+        request: RunBacktestRequest {
+            symbol: "XAUUSD".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
+            exchange: "missing".into(),
+            data_type: "tick".into(),
+            timeframe: None,
+            from: Some("2026-01-15T10:00:00".into()),
+            to: Some("2026-01-15T10:01:00".into()),
+            raw_signals: vec![
+                RawSignalMsg::Entry {
+                    ts: "2026-01-15T09:59:59".into(),
+                    symbol: "GBPJPY".into(),
+                    side: "Sell".into(),
+                    order_type: "Market".into(),
+                    price: Some(190.0),
+                    risk: 1.0,
+                    stoploss: Some(191.0),
+                    targets: vec![189.0],
+                    group: None,
+                    trade_id: Some("filtered-out-of-scope".into()),
+                },
+                RawSignalMsg::CloseAll {
+                    ts: "2026-01-15T10:00:00".into(),
+                },
+            ],
+            profile: None,
+            profile_def: None,
+            config: BacktestConfigMsg {
+                initial_balance: Some(10_000.0),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: None,
+            },
+        },
+        future: FutureQuoteConfigMsg {
+            signal_latency_ms: 250,
+            account_currency: "USD".into(),
+            conversion_stale_after_ms: 300_000,
+            ..FutureQuoteConfigMsg::default()
+        },
+        evaluation: ProviderEvaluationOptionsMsg::default(),
+        result_delivery: ResultDeliveryMsg::Auto,
+    };
+
+    let response = handle_run_backtest_v2(&state, &request);
+    assert!(response.success, "idle run: {:?}", response.error);
+    let result = response.result.expect("idle result");
+    assert_eq!(result.total_trades, 0);
+    let future = result.future.expect("idle FutureQuote result");
+    let tags = &future.execution_metadata["tags"];
+    assert_eq!(tags["data.requested_symbols"], "xauusd");
+    assert_eq!(tags["data.active_symbols"], "");
+    assert_eq!(tags["data.idle_symbols"], "xauusd");
+    assert_eq!(tags["data.idle_run"], "true");
+    assert_eq!(tags["data.loading_from"], "2026-01-15T10:00:00.250");
+    assert_eq!(
+        future.execution_metadata["currency_plan"]["primary_symbols"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        future
+            .action_dispositions
+            .as_array()
+            .expect("idle action dispositions")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn v2_effective_start_after_requested_end_returns_zero_trade_result() {
+    let fixture = active_symbol_fixture();
+    let mut request = active_symbol_request();
+    request.request.to = Some("2026-01-15T10:00:00".into());
+
+    let response = handle_run_backtest_v2(&fixture.state, &request);
+    assert!(response.success, "early-load window: {:?}", response.error);
+    let result = response.result.expect("early-load result");
+    assert_eq!(result.total_trades, 0);
+    let future = result.future.expect("early-load FutureQuote result");
+    assert_eq!(
+        future.execution_metadata["tags"]["data.loading_from"],
+        "2026-01-15T10:00:00.500"
+    );
+    assert_eq!(
+        future
+            .action_dispositions
+            .as_array()
+            .expect("no-quote action dispositions")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_claims() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qs_backtest_server_bar_metadata_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    let store = ParquetStore::open(&data_dir).unwrap();
+    let bars = [
+        (0, 1.1000, 1.1010, 1.0990, 1.1002),
+        (1, 1.1002, 1.1020, 1.1000, 1.1010),
+        (2, 1.1010, 1.1030, 1.1005, 1.1020),
+    ]
+    .into_iter()
+    .map(|(second, open, high, low, close)| Bar {
+        exchange: "fixture".into(),
+        symbol: "EURUSD".into(),
+        timeframe: Timeframe::M1,
+        ts: fixture_ts(second),
+        open,
+        high,
+        low,
+        close,
+        tick_vol: 10,
+        volume: 10,
+        spread: 3,
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(store.insert_bars(&bars).unwrap(), bars.len());
+    let state = ServerState {
+        symbol_registry: evaluation_symbol_registry(),
+        profile_registry: RwLock::new(ProfileRegistry::empty()),
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        profiles_path: String::new(),
+        start_time: Instant::now(),
+        jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        max_retained_jobs: 1_000,
+        artifact_store: test_artifact_store(data_dir.join("artifacts")),
+    };
+    let request = RunBacktestV2Request {
+        schema_version: 2,
+        request: RunBacktestRequest {
+            symbol: "EUR/USD".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
+            exchange: "FIXTURE".into(),
+            data_type: "bar".into(),
+            timeframe: Some("1m".into()),
+            from: Some("2026-01-15T10:00:00".into()),
+            to: Some("2026-01-15T10:00:02".into()),
+            raw_signals: vec![RawSignalMsg::Entry {
+                ts: "2026-01-15T10:00:00".into(),
+                symbol: "EURUSD".into(),
+                side: "Buy".into(),
+                order_type: "Market".into(),
+                price: Some(1.1002),
+                risk: 1.0,
+                stoploss: Some(1.0990),
+                targets: vec![1.1015],
+                group: None,
+                trade_id: Some("bar-metadata".into()),
+            }],
+            profile: None,
+            profile_def: Some(v2_inline_profile()),
+            config: BacktestConfigMsg {
+                initial_balance: Some(10_000.0),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+            },
+        },
+        future: FutureQuoteConfigMsg {
+            signal_latency_ms: 750,
+            account_currency: "USD".into(),
+            conversion_stale_after_ms: 300_000,
+            ..FutureQuoteConfigMsg::default()
+        },
+        evaluation: ProviderEvaluationOptionsMsg::default(),
+        result_delivery: ResultDeliveryMsg::Auto,
+    };
+
+    let response = handle_run_backtest_v2(&state, &request);
+    assert!(response.success, "bar run: {:?}", response.error);
+    let metadata = &response.result.unwrap().future.unwrap().execution_metadata;
+    let tags = &metadata["tags"];
+    assert_eq!(tags["data.exchange"], "fixture");
+    assert_eq!(tags["data.type"], "bar");
+    assert_eq!(tags["data.timeframe"], "1m");
+    assert_eq!(tags["data.requested_from"], "2026-01-15T10:00:00");
+    assert_eq!(tags["data.requested_to"], "2026-01-15T10:00:02");
+    assert_eq!(tags["data.bar_quote_convention"], "close_only_zero_spread");
+    assert_eq!(tags["data.intrabar_simulation"], "false");
+    assert_eq!(tags["execution.signal_latency_ms"], "750");
+    assert_eq!(tags["profile.identity"], "future-parity");
+    assert_eq!(tags["sizing.identity"], "fixed_lot");
+    assert!(
+        tags["sizing.options"]
+            .as_str()
+            .is_some_and(|options| options.contains("FixedLot"))
+    );
+    assert_eq!(tags["symbol.eurusd.category"], "forex");
+    assert_eq!(tags["symbol.eurusd.digits"], "5");
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn v2_cancelled_job_remains_cancelled_and_never_stores_a_result() {
+    let fixture = v2_path_fixture();
+    let request = v2_path_request();
+    let submission = handle_submit_backtest_v2(
+        &fixture.state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    let job_id = submission.job_id.unwrap();
+    let cancelled = handle_cancel_backtest(
+        &fixture.state,
+        &CancelBacktestRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert!(cancelled.success);
+
+    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request);
+    let status = handle_get_backtest_status(
+        &fixture.state,
+        &GetBacktestStatusRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert_eq!(status.status, "Cancelled");
+    assert_eq!(status.progress.stage, "cancelled");
+    let result = handle_get_backtest_result(&fixture.state, &GetBacktestResultRequest { job_id });
+    assert!(!result.success);
+    assert!(result.result.is_none());
+}
+
+#[test]
+fn cancelled_active_worker_remains_capacity_accounted_until_it_releases_ownership() {
+    let state = Arc::new(ServerState {
+        max_retained_jobs: 1,
+        ..empty_state()
+    });
+    let request = sample_run_request();
+    let first = submit_v2_for_test(&state, &request);
+    let first_id = first.job_id.unwrap();
+
+    assert!(
+        handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: first_id.clone(),
+            },
+        )
+        .success
+    );
+    let blocked = submit_v2_for_test(&state, &request);
+    assert!(!blocked.success);
+    assert!(blocked.error.unwrap().contains("job limit"));
+
+    run_job_v2_for_test(state.clone(), first_id.clone(), request.clone());
+    assert!(!state.jobs.lock().unwrap()[&first_id].worker_active);
+    assert!(submit_v2_for_test(&state, &request).success);
+}
+
+#[test]
+fn async_job_store_is_bounded_and_cleanup_removes_terminal_jobs() {
+    let state = ServerState {
+        max_retained_jobs: 2,
+        ..empty_state()
+    };
+    let request = sample_run_request();
+    let first = submit_v2_for_test(&state, &request);
+    let second = submit_v2_for_test(&state, &request);
+    assert!(first.success && second.success);
+    let full = submit_v2_for_test(&state, &request);
+    assert!(!full.success);
+    assert!(full.error.unwrap().contains("job limit"));
+
+    let first_id = first.job_id.unwrap();
+    handle_cancel_backtest(
+        &state,
+        &CancelBacktestRequest {
+            job_id: first_id.clone(),
+        },
+    );
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .get_mut(&first_id)
+        .unwrap()
+        .worker_active = false;
+    let replacement = submit_v2_for_test(&state, &request);
+    assert!(
+        replacement.success,
+        "worker-released terminal jobs should be evictable"
+    );
+    let jobs = state.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert!(!jobs.contains_key(&first_id));
+    drop(jobs);
+
+    let second_id = second.job_id.unwrap();
+    let replacement_id = replacement.job_id.unwrap();
+    for job_id in [second_id, replacement_id] {
+        handle_cancel_backtest(
+            &state,
+            &CancelBacktestRequest {
+                job_id: job_id.clone(),
+            },
+        );
+        state
+            .jobs
+            .lock()
+            .unwrap()
+            .get_mut(&job_id)
+            .unwrap()
+            .worker_active = false;
+    }
+    assert_eq!(cleanup_expired_jobs(&state, Duration::ZERO), 2);
+    assert!(state.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
+    let state = ServerState {
+        max_retained_jobs: 1,
+        ..empty_state()
+    };
+    let insert_completed_artifact_job = |job_id: &str| {
+        let artifact = state.artifact_store.persist_json(b"job artifact").unwrap();
+        state.jobs.lock().unwrap().insert(
+            job_id.into(),
+            BacktestJob {
+                status: JobStatus::Completed,
+                submitted_at: Instant::now(),
+                completed_at: Some(Instant::now()),
+                progress: BacktestProgress::default(),
+                result: None,
+                artifact: Some(artifact.clone()),
+                inline_complete: false,
+                artifact_consumed: false,
+                error: None,
+                cancellation: JobCancellationToken::default(),
+                worker_active: false,
+            },
+        );
+        artifact
+    };
+
+    let expired = insert_completed_artifact_job("expired-artifact-job");
+    assert_eq!(cleanup_expired_jobs(&state, Duration::ZERO), 1);
+    assert!(matches!(
+        state.artifact_store.read_chunk(&expired.artifact_id, 0),
+        Err(ArtifactStoreError::NotFound(_))
+    ));
+
+    let evicted = insert_completed_artifact_job("evicted-artifact-job");
+    let replacement = submit_v2_for_test(&state, &sample_run_request());
+    assert!(replacement.success, "replacement: {:?}", replacement.error);
+    assert!(matches!(
+        state.artifact_store.read_chunk(&evicted.artifact_id, 0),
+        Err(ArtifactStoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn v2_future_scalar_validation_matches_sync_async_and_multi_before_planning() {
+    let state = empty_state();
+    let mut request = v2_path_request();
+    request.future.slippage_pips = f64::NAN;
+
+    let sync = handle_run_backtest_v2(&state, &request);
+    assert!(!sync.success);
+    let expected = sync.error.expect("sync scalar error");
+    assert!(expected.contains("slippage_pips must be finite"));
+
+    let asynchronous = handle_submit_backtest_v2(
+        &state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(!asynchronous.success);
+    assert!(asynchronous.job_id.is_none());
+    assert_eq!(asynchronous.error.as_deref(), Some(expected.as_str()));
+    assert!(state.jobs.lock().unwrap().is_empty());
+
+    let multi = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    assert!(!multi.success);
+    assert_eq!(multi.error.as_deref(), Some(expected.as_str()));
+    assert_eq!(multi.results.len(), 1);
+    assert_eq!(multi.results[0].error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn v2_invalid_schema_is_rejected_consistently_across_paths() {
+    let state = empty_state();
+    let mut request = v2_path_request();
+    request.schema_version = 1;
+    let expected = "unsupported schema_version: 1";
+
+    let sync_response = handle_run_backtest_v2(&state, &request);
+    assert!(!sync_response.success);
+    assert_eq!(sync_response.error.as_deref(), Some(expected));
+
+    let async_response = handle_submit_backtest_v2(
+        &state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(!async_response.success);
+    assert!(async_response.job_id.is_none());
+    assert_eq!(async_response.error.as_deref(), Some(expected));
+
+    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    assert!(!multi_response.success);
+    assert_eq!(multi_response.error.as_deref(), Some(expected));
+    assert_eq!(multi_response.results.len(), 1);
+    assert!(!multi_response.results[0].success);
+    assert_eq!(multi_response.results[0].error.as_deref(), Some(expected));
+}
+
+#[test]
+fn v2_multi_rejects_empty_profiles_with_top_level_error() {
+    let state = empty_state();
+    let request = v2_path_request();
+    let mut multi = multi_v2_request(&request);
+    multi.request.profiles.clear();
+
+    let response = handle_run_backtest_multi_v2(&state, &multi);
+    assert!(!response.success);
+    assert_eq!(
+        response.error.as_deref(),
+        Some("At least one profile is required.")
+    );
+    assert!(response.results.is_empty());
+
+    let decoded: RunBacktestMultiResponse = serde_json::from_value(serde_json::json!({
+        "results": [],
+        "elapsed_ms": 1
+    }))
+    .expect("older multi responses remain decodable");
+    assert!(decoded.success);
+    assert!(decoded.error.is_none());
+}
+
+#[test]
+fn v2_invalid_evaluation_is_rejected_consistently_across_paths() {
+    let state = empty_state();
+    let mut request = v2_path_request();
+    request.evaluation.sections = vec![EvaluationSectionMsg::Coverage];
+    request.evaluation.breakdowns = vec![BreakdownDimensionMsg::Symbol];
+
+    let sync_response = handle_run_backtest_v2(&state, &request);
+    assert!(!sync_response.success);
+    let expected = sync_response.error.expect("sync evaluation error");
+    assert!(expected.contains("breakdowns report section"));
+
+    let async_response = handle_submit_backtest_v2(
+        &state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(!async_response.success);
+    assert!(async_response.job_id.is_none());
+    assert_eq!(async_response.error.as_deref(), Some(expected.as_str()));
+
+    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    assert_eq!(multi_response.results.len(), 1);
+    assert!(!multi_response.results[0].success);
+    assert_eq!(
+        multi_response.results[0].error.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn v2_unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
+    let state = empty_state();
+    let mut request = v2_path_request();
+    request.evaluation.filter.symbols = vec!["not-a-market".into()];
+
+    let sync_response = handle_run_backtest_v2(&state, &request);
+    assert!(!sync_response.success);
+    assert!(
+        sync_response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown evaluation symbol `not-a-market`"))
+    );
+
+    let async_response = handle_submit_backtest_v2(
+        &state,
+        &SubmitBacktestV2Request {
+            request: request.clone(),
+        },
+    );
+    assert!(!async_response.success);
+    assert!(async_response.job_id.is_none());
+    assert!(
+        async_response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown evaluation symbol `not-a-market`"))
+    );
+
+    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    assert_eq!(multi_response.results.len(), 1);
+    assert!(!multi_response.results[0].success);
+    assert!(
+        multi_response.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown evaluation symbol `not-a-market`"))
+    );
+}
+
+#[test]
+fn v2_unknown_evaluation_selector_deserialization_is_consistent_across_paths() {
+    let request = v2_path_request();
+
+    let mut sync_json = serde_json::to_value(&request).unwrap();
+    sync_json["evaluation"]["sections"] = serde_json::json!(["mystery"]);
+    let sync_error = serde_json::from_value::<RunBacktestV2Request>(sync_json)
+        .expect_err("sync selector must fail")
+        .to_string();
+
+    let mut async_json = serde_json::to_value(SubmitBacktestV2Request {
+        request: request.clone(),
+    })
+    .unwrap();
+    async_json["request"]["evaluation"]["sections"] = serde_json::json!(["mystery"]);
+    let async_error = serde_json::from_value::<SubmitBacktestV2Request>(async_json)
+        .expect_err("async selector must fail")
+        .to_string();
+
+    let mut multi_json = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    multi_json["evaluation"]["sections"] = serde_json::json!(["mystery"]);
+    let multi_error = serde_json::from_value::<RunBacktestMultiV2Request>(multi_json)
+        .expect_err("multi-profile selector must fail")
+        .to_string();
+
+    assert!(sync_error.contains("unknown variant"));
+    assert_eq!(async_error, sync_error);
+    assert_eq!(multi_error, sync_error);
 }
 
 #[test]
@@ -150,7 +1947,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -208,11 +2005,42 @@ fn run_backtest_response_serde_roundtrip() {
         error: None,
         result: None,
         elapsed_ms: 42,
+        artifact: None,
+        inline_complete: true,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let decoded: RunBacktestResponse = serde_json::from_str(&json).unwrap();
     assert!(decoded.success);
     assert_eq!(decoded.elapsed_ms, 42);
+
+    let legacy: RunBacktestResponse = serde_json::from_value(serde_json::json!({
+        "success": true,
+        "error": null,
+        "result": null,
+        "elapsed_ms": 9
+    }))
+    .unwrap();
+    assert!(legacy.inline_complete);
+    assert!(legacy.artifact.is_none());
+
+    let legacy_async: GetBacktestResultResponse = serde_json::from_value(serde_json::json!({
+        "success": true,
+        "job_id": "job-old",
+        "result": null,
+        "error": null
+    }))
+    .unwrap();
+    assert!(legacy_async.inline_complete);
+    assert!(legacy_async.artifact.is_none());
+
+    let legacy_multi: RunBacktestMultiResponse = serde_json::from_value(serde_json::json!({
+        "results": [],
+        "elapsed_ms": 3
+    }))
+    .unwrap();
+    assert!(legacy_multi.success);
+    assert!(legacy_multi.inline_complete);
+    assert!(legacy_multi.artifact.is_none());
 }
 
 #[test]
@@ -241,7 +2069,7 @@ fn config_msg_defaults() {
     };
     let registry = qs_symbols::SymbolRegistry::empty();
     let symbols: Vec<String> = vec![];
-    let cfg = config_from_msg(&msg, &registry, &symbols);
+    let cfg = config_from_msg(&msg, &registry, &symbols).unwrap();
     assert!((cfg.initial_balance - 10_000.0).abs() < f64::EPSILON);
     assert!(cfg.close_on_finish);
     assert_eq!(cfg.fill_model, FillModel::BidAsk);
@@ -257,7 +2085,7 @@ fn config_msg_overrides() {
     };
     let registry = qs_symbols::SymbolRegistry::empty();
     let symbols: Vec<String> = vec![];
-    let cfg = config_from_msg(&msg, &registry, &symbols);
+    let cfg = config_from_msg(&msg, &registry, &symbols).unwrap();
     assert!((cfg.initial_balance - 50_000.0).abs() < f64::EPSILON);
     assert!(!cfg.close_on_finish);
     assert_eq!(cfg.fill_model, FillModel::MidPrice);
@@ -323,6 +2151,11 @@ registry_path = "symbols.toml"
 [profiles]
 profiles_path = "profiles.toml"
 
+[jobs]
+retention_secs = 120
+cleanup_interval_secs = 5
+max_retained_jobs = 25
+
 [logging]
 level = "debug"
 "#;
@@ -332,6 +2165,14 @@ level = "debug"
     assert_eq!(cfg.database.data_dir, "/data/market");
     assert_eq!(cfg.symbols.registry_path, "symbols.toml");
     assert_eq!(cfg.profiles.profiles_path, "profiles.toml");
+    assert_eq!(cfg.jobs.retention_secs, 120);
+    assert_eq!(cfg.jobs.cleanup_interval_secs, 5);
+    assert_eq!(cfg.jobs.max_retained_jobs, 25);
+    assert_eq!(cfg.artifacts.directory, "temp/backtest-artifacts");
+    assert_eq!(cfg.artifacts.inline_limit_bytes, 12 * 1024 * 1024);
+    assert_eq!(cfg.artifacts.chunk_size, 1024 * 1024);
+    assert_eq!(cfg.artifacts.retention_secs, 3_600);
+    assert_eq!(cfg.artifacts.max_total_bytes, 1024 * 1024 * 1024);
     assert_eq!(cfg.logging.level, "debug");
 }
 
@@ -352,6 +2193,14 @@ profiles_path = "prof.toml"
 "#;
     let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(cfg.server.shm_buffer_size, 16 * 1024 * 1024); // default 16MB
+    assert_eq!(cfg.jobs.retention_secs, 3_600);
+    assert_eq!(cfg.jobs.cleanup_interval_secs, 60);
+    assert_eq!(cfg.jobs.max_retained_jobs, 1_000);
+    assert_eq!(cfg.artifacts.directory, "temp/backtest-artifacts");
+    assert_eq!(cfg.artifacts.inline_limit_bytes, 12 * 1024 * 1024);
+    assert_eq!(cfg.artifacts.chunk_size, 1024 * 1024);
+    assert_eq!(cfg.artifacts.retention_secs, 3_600);
+    assert_eq!(cfg.artifacts.max_total_bytes, 1024 * 1024 * 1024);
     assert_eq!(cfg.logging.level, "info"); // default
 }
 
@@ -379,6 +2228,7 @@ fn handler_list_profiles_with_loaded_profiles() {
     let add_req = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "aggressive".into(),
+            target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
             stoploss_mode: None,
@@ -402,6 +2252,52 @@ fn handler_list_profiles_with_loaded_profiles() {
 }
 
 #[test]
+fn handler_list_symbols_parses_actual_bar_timeframe_format() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qs_backtest_server_bar_listing_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    let store = ParquetStore::open(&data_dir).unwrap();
+    let bars = vec![Bar {
+        exchange: "fixture".into(),
+        symbol: "EURUSD".into(),
+        timeframe: Timeframe::M1,
+        ts: fixture_ts(0),
+        open: 1.1000,
+        high: 1.1010,
+        low: 1.0990,
+        close: 1.1005,
+        tick_vol: 10,
+        volume: 10,
+        spread: 2,
+    }];
+    assert_eq!(store.insert_bars(&bars).unwrap(), 1);
+    let state = ServerState {
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        ..empty_state()
+    };
+
+    let response = handle_list_symbols(
+        &state,
+        &ListSymbolsRequest {
+            exchange: Some("fixture".into()),
+            data_type: Some("bar".into()),
+        },
+    )
+    .unwrap();
+    let availability = response.symbols.first().expect("listed bar");
+    assert_eq!(availability.data_type, "bar");
+    assert_eq!(availability.timeframe.as_deref(), Some("1m"));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
 fn handler_run_backtest_invalid_data_type() {
     let state = empty_state();
     let req = RunBacktestRequest {
@@ -420,10 +2316,10 @@ fn handler_run_backtest_invalid_data_type() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.is_some());
     assert!(resp.error.unwrap().contains("Invalid data_type"));
@@ -449,10 +2345,10 @@ fn handler_run_backtest_bar_without_timeframe() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("timeframe"));
 }
@@ -479,7 +2375,7 @@ fn handler_run_backtest_empty_signals() {
             sizing: None,
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("signal"));
 }
@@ -497,6 +2393,8 @@ fn handler_run_backtest_no_data_returns_error() {
         profiles_path: String::new(),
         start_time: Instant::now(),
         jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        max_retained_jobs: 1_000,
+        artifact_store: test_artifact_store(tmp.join("artifacts")),
     };
     let req = RunBacktestRequest {
         symbol: "eurusd".into(),
@@ -514,10 +2412,10 @@ fn handler_run_backtest_no_data_returns_error() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("No market data found"));
 
@@ -543,10 +2441,10 @@ fn handler_run_backtest_unknown_profile() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = backtest_server::handlers::handle_run_backtest_multi(&state, &req);
+    let resp = run_multi_v2_for_test(&state, &req);
     assert_eq!(resp.results.len(), 1);
     assert!(!resp.results[0].success);
     assert!(resp.results[0].error.is_some());
@@ -570,10 +2468,10 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = backtest_server::handlers::handle_run_backtest_multi(&state, &req);
+    let resp = run_multi_v2_for_test(&state, &req);
     assert_eq!(resp.results.len(), 2);
     assert!(resp.results.iter().all(|r| !r.success));
 }
@@ -757,6 +2655,7 @@ fn list_symbols_request_none_fields() {
 fn profile_from_msg_basic() {
     let msg = ManagementProfileMsg {
         name: "test".into(),
+        target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.5, 0.5],
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
@@ -778,6 +2677,7 @@ fn profile_from_msg_basic() {
 fn profile_from_msg_defaults() {
     let msg = ManagementProfileMsg {
         name: "minimal".into(),
+        target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
         stoploss_mode: None,
@@ -796,6 +2696,7 @@ fn profile_from_msg_defaults() {
 fn profile_from_msg_all_stoploss_modes() {
     let msg = ManagementProfileMsg {
         name: "a".into(),
+        target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
@@ -852,6 +2753,7 @@ fn profile_from_msg_all_rule_types() {
     ];
     let msg = ManagementProfileMsg {
         name: "allrules".into(),
+        target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
         stoploss_mode: None,
@@ -880,6 +2782,7 @@ fn profile_from_msg_all_rule_types() {
 fn profile_to_msg_roundtrip() {
     let original = ManagementProfile {
         name: "rt".into(),
+        target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.6, 0.4],
         stoploss_mode: StoplossMode::FixedDistance { distance: 25.0 },
@@ -909,6 +2812,7 @@ fn profile_to_msg_roundtrip() {
 fn management_profile_msg_serde_roundtrip() {
     let msg = ManagementProfileMsg {
         name: "serde_test".into(),
+        target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.6, 0.4],
         stoploss_mode: Some(StoplossModeMsg::FixedDistance { distance: 20.0 }),
@@ -975,6 +2879,7 @@ fn profile_ref_named_serde() {
 fn profile_ref_inline_serde() {
     let msg = ManagementProfileMsg {
         name: "inline_test".into(),
+        target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
         stoploss_mode: None,
@@ -1005,6 +2910,7 @@ fn run_backtest_request_with_profile_def_serde() {
         profile: None,
         profile_def: Some(ManagementProfileMsg {
             name: "inline".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -1016,7 +2922,7 @@ fn run_backtest_request_with_profile_def_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1045,6 +2951,7 @@ fn inline_profile_validation_error() {
         profile: None,
         profile_def: Some(ManagementProfileMsg {
             name: "bad_inline".into(),
+            target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![1.0], // mismatch
             stoploss_mode: None,
@@ -1056,10 +2963,10 @@ fn inline_profile_validation_error() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(
         resp.error
@@ -1089,11 +2996,11 @@ fn backward_compat_no_profile_def() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
     // This will fail at data loading (no data), but should NOT fail at profile validation
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     // The error should be about data, not profiles
     if let Some(ref err) = resp.error {
         assert!(
@@ -1129,6 +3036,7 @@ fn handler_add_profile_success() {
     let req = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "new_prof".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -1150,6 +3058,7 @@ fn handler_add_profile_duplicate_rejected() {
     let req = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "dup".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -1172,6 +3081,7 @@ fn handler_add_profile_overwrite_success() {
     let req1 = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "ow".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -1185,6 +3095,7 @@ fn handler_add_profile_overwrite_success() {
     let req2 = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "ow".into(),
+            target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
             stoploss_mode: None,
@@ -1205,6 +3116,7 @@ fn handler_add_profile_invalid_rejected() {
     let req = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "bad".into(),
+            target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![1.0], // mismatch
             stoploss_mode: None,
@@ -1226,6 +3138,7 @@ fn handler_remove_profile_success() {
     let add_req = AddProfileRequest {
         profile: ManagementProfileMsg {
             name: "rm_me".into(),
+            target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
             stoploss_mode: None,
@@ -1270,7 +3183,7 @@ fn raw_signal_msg_serde_entry() {
         side: "Buy".into(),
         order_type: "Market".into(),
         price: None,
-        size: 0.02,
+        risk: 1.0,
         stoploss: Some(1.0800),
         targets: vec![1.0900],
         group: Some("grp".into()),
@@ -1317,7 +3230,7 @@ fn raw_signal_msg_serde_all_variants() {
             side: "Buy".into(),
             order_type: "Market".into(),
             price: None,
-            size: 0.01,
+            risk: 1.0,
             stoploss: None,
             targets: vec![],
             group: None,
@@ -1363,6 +3276,14 @@ fn raw_signal_msg_serde_all_variants() {
                 trade_id: "abc".into(),
             },
             price: 1.0900,
+        },
+        RawSignalMsg::ModifyTarget {
+            ts: "2026-01-15T10:26:00".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "abc".into(),
+            },
+            old_price: 1.1000,
+            new_price: 1.1010,
         },
         RawSignalMsg::AddRule {
             ts: "2026-01-15T10:30:00".into(),
@@ -1417,7 +3338,7 @@ fn raw_signal_msg_serde_all_variants() {
             price: 1.0800,
         },
     ];
-    for (_i, msg) in messages.iter().enumerate() {
+    for msg in &messages {
         let json = serde_json::to_string(msg).unwrap();
         let _decoded: RawSignalMsg = serde_json::from_str(&json).unwrap();
     }
@@ -1460,7 +3381,7 @@ fn run_backtest_request_raw_signals_serde() {
                 side: "Buy".into(),
                 order_type: "Market".into(),
                 price: None,
-                size: 0.02,
+                risk: 1.0,
                 stoploss: Some(1.0800),
                 targets: vec![1.0900],
                 group: Some("grp".into()),
@@ -1477,7 +3398,7 @@ fn run_backtest_request_raw_signals_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.02 }),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1494,7 +3415,7 @@ fn raw_signal_from_msg_entry_converts() {
         side: "Buy".into(),
         order_type: "Market".into(),
         price: None,
-        size: 0.02,
+        risk: 1.0,
         stoploss: Some(1.0800),
         targets: vec![1.0900],
         group: Some("grp".into()),
@@ -1507,14 +3428,14 @@ fn raw_signal_from_msg_entry_converts() {
         RawSignal::Entry {
             symbol,
             side,
-            size,
+            risk_multiplier,
             stoploss,
             group,
             ..
         } => {
             assert_eq!(symbol, "eurusd");
             assert_eq!(*side, Side::Buy);
-            assert_eq!(*size, 0.02);
+            assert_eq!(*risk_multiplier, 1.0);
             assert_eq!(*stoploss, Some(1.0800));
             assert_eq!(*group, Some("grp".into()));
         }
@@ -1573,7 +3494,7 @@ fn raw_signal_from_msg_empty_symbol_uses_default() {
         side: "Sell".into(),
         order_type: "Limit".into(),
         price: Some(1.0900),
-        size: 0.01,
+        risk: 1.0,
         stoploss: None,
         targets: vec![],
         group: None,
@@ -1701,7 +3622,7 @@ fn raw_signal_from_msg_invalid_side_errors() {
         side: "INVALID".into(),
         order_type: "Market".into(),
         price: None,
-        size: 0.01,
+        risk: 1.0,
         stoploss: None,
         targets: vec![],
         group: None,
@@ -1739,7 +3660,7 @@ fn run_backtest_multi_request_raw_signals_serde() {
             side: "Buy".into(),
             order_type: "Market".into(),
             price: None,
-            size: 0.02,
+            risk: 1.0,
             stoploss: None,
             targets: vec![],
             group: None,
@@ -1750,7 +3671,7 @@ fn run_backtest_multi_request_raw_signals_serde() {
             initial_balance: None,
             close_on_finish: None,
             fill_model: None,
-            sizing: None,
+            sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.02 }),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1780,7 +3701,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
             sizing: None,
         },
     };
-    let resp = handle_run_backtest(&state, &req);
+    let resp = run_v2_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.as_ref().unwrap().contains("signal"));
 }
@@ -1795,7 +3716,7 @@ fn raw_signal_msg_full_workflow_json() {
             "symbol": "eurusd",
             "side": "Buy",
             "order_type": "Market",
-            "size": 0.02,
+            "risk": 1.0,
             "stoploss": 1.0800,
             "targets": [1.0880, 1.0920],
             "group": "momentum_v1"

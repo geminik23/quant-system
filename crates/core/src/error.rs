@@ -12,6 +12,12 @@ pub enum CoreError {
     #[error("invalid action: {0}")]
     InvalidAction(String),
 
+    #[error("take-profit target {price} not found for position {position_id}")]
+    TargetNotFound { position_id: String, price: f64 },
+
+    #[error("take-profit target {price} has already triggered for position {position_id}")]
+    TargetAlreadyTriggered { position_id: String, price: f64 },
+
     #[error("no price available for symbol: {0}")]
     NoPriceAvailable(String),
 

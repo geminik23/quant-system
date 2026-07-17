@@ -25,6 +25,7 @@
 pub mod alert_register;
 pub mod engine;
 pub mod error;
+pub mod execution;
 pub mod position;
 pub mod position_manager;
 pub mod rules;
@@ -33,11 +34,14 @@ pub mod types;
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
 pub use alert_register::PriceAlertRegister;
-pub use engine::TradeEngine;
+pub use engine::{FutureApplyError, FutureApplyResult, TradeEngine};
 pub use error::{CoreError, Result};
+pub use execution::{ExecutionError, ExecutionPricer, ExecutionResult};
 pub use position::Position;
 pub use rules::Rule;
 pub use types::{
-    Action, CloseReason, Effect, Fill, FillModel, FixedPrice, GroupId, Lots, OrderType, PositionId,
-    PositionRecord, PositionStatus, PriceQuote, RuleConfig, Side, Signal, TargetSpec, TradeId,
+    Action, CloseReason, Effect, EffectiveStop, ExecutionConvention, ExecutionFill, ExecutionModel,
+    Fill, FillModel, FillPurpose, FixedPrice, FutureEffect, FutureFill, GroupId, Lots, OrderType,
+    PositionId, PositionRecord, PositionStatus, PreparedPendingFill, PriceQuote, RuleConfig, Side,
+    Signal, SlippageModel, StopOrigin, TargetSpec, TradeId,
 };

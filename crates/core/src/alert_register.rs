@@ -82,6 +82,13 @@ pub struct PriceAlertRegister {
     tick_eval_positions: HashMap<String, HashSet<PositionId>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PriceAlertRegisterQuoteCheckpoint {
+    symbol: String,
+    alerts: DirectionalAlerts,
+    tick_eval_positions: Option<HashSet<PositionId>>,
+}
+
 /// Convert an f64 price to integer micros for BTreeMap keys.
 fn price_to_micros(price: f64) -> i64 {
     (price * 1_000_000.0).round() as i64
@@ -96,6 +103,56 @@ impl PriceAlertRegister {
     /// Create an empty alert register.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn checkpoint_for_quote(&self, symbol: &str) -> PriceAlertRegisterQuoteCheckpoint {
+        PriceAlertRegisterQuoteCheckpoint {
+            symbol: symbol.to_owned(),
+            alerts: DirectionalAlerts {
+                fire_on_drop: Self::entries_for_symbol(&self.alerts.fire_on_drop, symbol),
+                fire_on_rise: Self::entries_for_symbol(&self.alerts.fire_on_rise, symbol),
+            },
+            tick_eval_positions: self.tick_eval_positions.get(symbol).cloned(),
+        }
+    }
+
+    pub(crate) fn restore_quote(&mut self, checkpoint: PriceAlertRegisterQuoteCheckpoint) {
+        let PriceAlertRegisterQuoteCheckpoint {
+            symbol,
+            alerts,
+            tick_eval_positions,
+        } = checkpoint;
+
+        self.alerts
+            .fire_on_drop
+            .retain(|key, _| key.symbol.as_str() != symbol);
+        self.alerts
+            .fire_on_rise
+            .retain(|key, _| key.symbol.as_str() != symbol);
+        self.position_alerts.retain(|_, keys| {
+            keys.retain(|key| key.symbol.as_str() != symbol);
+            !keys.is_empty()
+        });
+
+        Self::restore_entries(
+            &mut self.alerts.fire_on_drop,
+            &mut self.position_alerts,
+            alerts.fire_on_drop,
+        );
+        Self::restore_entries(
+            &mut self.alerts.fire_on_rise,
+            &mut self.position_alerts,
+            alerts.fire_on_rise,
+        );
+
+        match tick_eval_positions {
+            Some(position_ids) => {
+                self.tick_eval_positions.insert(symbol, position_ids);
+            }
+            None => {
+                self.tick_eval_positions.remove(&symbol);
+            }
+        }
     }
 
     // ── Registration ────────────────────────────────────────────────────
@@ -189,10 +246,12 @@ impl PriceAlertRegister {
             TriggerDirection::FireOnRise => &mut self.alerts.fire_on_rise,
         };
 
-        Self::remove_entry_from_map(map, &key, position_id);
+        Self::remove_alert_from_map(map, &key, position_id, side, kind);
 
-        // Clean up reverse index.
-        if let Some(keys) = self.position_alerts.get_mut(position_id) {
+        // Clean up the reverse index only when no co-located alert remains.
+        if !self.has_entry_for_position_at_key(&key, position_id)
+            && let Some(keys) = self.position_alerts.get_mut(position_id)
+        {
             keys.remove(&key);
             if keys.is_empty() {
                 self.position_alerts.remove(position_id);
@@ -347,7 +406,7 @@ impl PriceAlertRegister {
                             entries.iter().any(|e| e.position_id == removed.position_id);
                         if !still_present {
                             // Also check fire_on_rise for this key.
-                            let in_rise = self.alerts.fire_on_rise.get(&key).map_or(false, |v| {
+                            let in_rise = self.alerts.fire_on_rise.get(&key).is_some_and(|v| {
                                 v.iter().any(|e| e.position_id == removed.position_id)
                             });
                             if !in_rise {
@@ -374,7 +433,7 @@ impl PriceAlertRegister {
                         let still_present =
                             entries.iter().any(|e| e.position_id == removed.position_id);
                         if !still_present {
-                            let in_drop = self.alerts.fire_on_drop.get(&key).map_or(false, |v| {
+                            let in_drop = self.alerts.fire_on_drop.get(&key).is_some_and(|v| {
                                 v.iter().any(|e| e.position_id == removed.position_id)
                             });
                             if !in_drop {
@@ -407,14 +466,14 @@ impl PriceAlertRegister {
     pub fn has_alerts(&self, position_id: &str) -> bool {
         self.position_alerts
             .get(position_id)
-            .map_or(false, |k| !k.is_empty())
+            .is_some_and(|k| !k.is_empty())
     }
 
     /// Check if a position is registered for tick evaluation.
     pub fn is_tick_eval(&self, symbol: &str, position_id: &str) -> bool {
         self.tick_eval_positions
             .get(symbol)
-            .map_or(false, |s| s.contains(position_id))
+            .is_some_and(|s| s.contains(position_id))
     }
 
     /// Total number of alert entries across both directional maps.
@@ -430,6 +489,40 @@ impl PriceAlertRegister {
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
+
+    fn entries_for_symbol(
+        entries: &BTreeMap<AlertKey, Vec<AlertEntry>>,
+        symbol: &str,
+    ) -> BTreeMap<AlertKey, Vec<AlertEntry>> {
+        let start = AlertKey {
+            symbol: symbol.to_owned(),
+            price_micros: i64::MIN,
+        };
+        let end = AlertKey {
+            symbol: symbol.to_owned(),
+            price_micros: i64::MAX,
+        };
+        entries
+            .range(start..=end)
+            .map(|(key, entries)| (key.clone(), entries.clone()))
+            .collect()
+    }
+
+    fn restore_entries(
+        destination: &mut BTreeMap<AlertKey, Vec<AlertEntry>>,
+        position_alerts: &mut HashMap<PositionId, HashSet<AlertKey>>,
+        entries: BTreeMap<AlertKey, Vec<AlertEntry>>,
+    ) {
+        for (key, alerts) in entries {
+            for alert in &alerts {
+                position_alerts
+                    .entry(alert.position_id.clone())
+                    .or_default()
+                    .insert(key.clone());
+            }
+            destination.insert(key, alerts);
+        }
+    }
 
     /// Determine which BTreeMap to use based on position side and alert kind.
     fn trigger_direction(side: Side, kind: &AlertKind) -> TriggerDirection {
@@ -483,6 +576,36 @@ impl PriceAlertRegister {
             }
         }
     }
+
+    /// Remove only the requested alert entry from a BTreeMap at a specific key.
+    fn remove_alert_from_map(
+        map: &mut BTreeMap<AlertKey, Vec<AlertEntry>>,
+        key: &AlertKey,
+        position_id: &str,
+        side: Side,
+        kind: &AlertKind,
+    ) {
+        if let Some(entries) = map.get_mut(key) {
+            entries.retain(|entry| {
+                !(entry.position_id == position_id && entry.side == side && &entry.kind == kind)
+            });
+            if entries.is_empty() {
+                map.remove(key);
+            }
+        }
+    }
+
+    fn has_entry_for_position_at_key(&self, key: &AlertKey, position_id: &str) -> bool {
+        self.alerts
+            .fire_on_drop
+            .get(key)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.position_id == position_id))
+            || self
+                .alerts
+                .fire_on_rise
+                .get(key)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.position_id == position_id))
+    }
 }
 
 /// Which directional BTreeMap to store/check the alert in.
@@ -513,6 +636,22 @@ mod tests {
             bid,
             ask,
         }
+    }
+
+    fn assert_reverse_index_parity(reg: &PriceAlertRegister) {
+        let mut expected = HashMap::<PositionId, HashSet<AlertKey>>::new();
+        for map in [&reg.alerts.fire_on_drop, &reg.alerts.fire_on_rise] {
+            for (key, entries) in map {
+                for entry in entries {
+                    expected
+                        .entry(entry.position_id.clone())
+                        .or_default()
+                        .insert(key.clone());
+                }
+            }
+        }
+
+        assert_eq!(&reg.position_alerts, &expected);
     }
 
     #[test]
@@ -724,6 +863,86 @@ mod tests {
         let t = reg.check(&q, FillModel::BidAsk);
         assert_eq!(t.len(), 1);
         assert!(matches!(t[0].kind, AlertKind::TakeProfit { .. }));
+    }
+
+    #[test]
+    fn deregister_alert_preserves_colocated_same_direction_kind() {
+        let mut reg = PriceAlertRegister::new();
+        reg.register(
+            "EURUSD",
+            1.0900,
+            "p1".into(),
+            Side::Buy,
+            AlertKind::TakeProfit { close_ratio: 0.5 },
+        );
+        reg.register(
+            "EURUSD",
+            1.0900,
+            "p1".into(),
+            Side::Buy,
+            AlertKind::BreakevenTrigger,
+        );
+        assert_reverse_index_parity(&reg);
+
+        reg.deregister_alert(
+            "EURUSD",
+            1.0900,
+            "p1",
+            Side::Buy,
+            &AlertKind::TakeProfit { close_ratio: 0.5 },
+        );
+
+        assert_eq!(reg.alert_count(), 1);
+        assert!(reg.has_alerts("p1"));
+        assert_reverse_index_parity(&reg);
+
+        let triggered = reg.check(&quote("EURUSD", 1.0900, 1.0902), FillModel::BidAsk);
+        assert!(matches!(
+            triggered.as_slice(),
+            [TriggeredAlert {
+                position_id,
+                kind: AlertKind::BreakevenTrigger,
+                ..
+            }] if position_id == "p1"
+        ));
+        assert!(!reg.has_alerts("p1"));
+        assert_reverse_index_parity(&reg);
+    }
+
+    #[test]
+    fn deregister_alert_preserves_colocated_other_direction_and_index() {
+        let mut reg = PriceAlertRegister::new();
+        reg.register(
+            "EURUSD",
+            1.0900,
+            "p1".into(),
+            Side::Buy,
+            AlertKind::TakeProfit { close_ratio: 0.5 },
+        );
+        reg.register(
+            "EURUSD",
+            1.0900,
+            "p1".into(),
+            Side::Buy,
+            AlertKind::Stoploss,
+        );
+
+        reg.deregister_alert(
+            "EURUSD",
+            1.0900,
+            "p1",
+            Side::Buy,
+            &AlertKind::TakeProfit { close_ratio: 0.5 },
+        );
+
+        assert_eq!(reg.alert_count(), 1);
+        assert!(reg.has_alerts("p1"));
+        assert_reverse_index_parity(&reg);
+
+        reg.deregister_position("p1");
+        assert_eq!(reg.alert_count(), 0);
+        assert!(!reg.has_alerts("p1"));
+        assert_reverse_index_parity(&reg);
     }
 
     #[test]

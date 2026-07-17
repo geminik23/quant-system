@@ -37,4 +37,30 @@ pub enum SymbolError {
         pip: u16,
         digits: u16,
     },
+
+    #[error("Missing required currency metadata '{field}' for '{symbol}'")]
+    MissingCurrencyMetadata { symbol: String, field: &'static str },
+
+    #[error(
+        "Invalid currency code for '{symbol}' field '{field}': '{value}' must be 3 ASCII letters"
+    )]
+    InvalidCurrencyCode {
+        symbol: String,
+        field: &'static str,
+        value: String,
+    },
+
+    #[error(
+        "Invalid forex currencies for '{symbol}': base and quote must be distinct, got '{currency}'"
+    )]
+    DuplicateForexCurrency { symbol: String, currency: String },
+
+    #[error(
+        "Invalid forex P&L currency for '{symbol}': expected quote currency '{quote}', got '{pnl}'"
+    )]
+    ForexPnlCurrencyMismatch {
+        symbol: String,
+        quote: String,
+        pnl: String,
+    },
 }

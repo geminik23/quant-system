@@ -93,12 +93,8 @@ impl CTraderMarket {
     }
 
     pub async fn initialize(&mut self, disonnect: bool) -> Result<()> {
-        if disonnect {
-            if let Err(err) = self.client.disconnect().await {
-                tracing::error!(
-                    "[CtraderMakret] Failed to disconnect on intiailize method - {err:?}",
-                );
-            }
+        if disonnect && let Err(err) = self.client.disconnect().await {
+            tracing::error!("[CtraderMakret] Failed to disconnect on intiailize method - {err:?}",);
         }
 
         self.client.connect().await?;

@@ -4,16 +4,23 @@
 # transforms raw signals into fully-specified Action::Open calls.
 #
 # Fields:
-#   name            — unique profile identifier
-#   use_targets     — which signal targets to use (1-indexed)
-#   close_ratios    — fraction to close at each target (must match use_targets length, sum <= 1.0)
-#   stoploss_mode   — how to handle the stoploss: FromSignal, None, FixedDistance, FixedPrice
-#   rules           — additional management rules to attach
-#   group_override  — if set, overrides the signal's group tag
-#   let_remainder_run — when true and ratios sum < 1.0, remainder rides with SL/rules only
+#   name              — unique profile identifier
+#   target_selection  — current selector: All, None, or Selected(1-based indices)
+#   use_targets       — compatibility mirror for older schema-2 profile consumers
+#   close_ratios      — target weights. An empty list means equal 1/N weights; explicit weights must match
+#                       the effective selection and sum to <= 1.0.
+#   stoploss_mode     — FromSignal, None, FixedDistance, or FixedPrice
+#   rules             — additional management rules to attach
+#   group_override    — if set, overrides the signal's group tag
+#   let_remainder_run — required in strict V2 when explicit weights sum below 1.0;
+#                       the unallocated remainder rides with SL/rules only
+#
+# Shipped profiles state current target intent explicitly. `use_targets` is retained as
+# a compatibility mirror while older schema-2 profile payloads remain readable.
 
 [[profile]]
 name = "conservative"
+target_selection = { Selected = [1] }
 use_targets = [1]
 close_ratios = [1.0]
 stoploss_mode = { type = "FromSignal" }
@@ -21,6 +28,7 @@ let_remainder_run = false
 
 [[profile]]
 name = "aggressive"
+target_selection = { Selected = [1, 2] }
 use_targets = [1, 2]
 close_ratios = [0.5, 0.5]
 stoploss_mode = { type = "FromSignal" }
@@ -36,6 +44,7 @@ distance = 0.0020
 
 [[profile]]
 name = "runner"
+target_selection = { Selected = [1] }
 use_targets = [1]
 close_ratios = [0.3]
 stoploss_mode = { type = "FromSignal" }
@@ -51,6 +60,7 @@ distance = 0.0030
 
 [[profile]]
 name = "scalp_tight"
+target_selection = { Selected = [1] }
 use_targets = [1]
 close_ratios = [1.0]
 let_remainder_run = false
@@ -61,6 +71,7 @@ distance = 0.0010
 
 [[profile]]
 name = "time_limited"
+target_selection = { Selected = [1, 2] }
 use_targets = [1, 2]
 close_ratios = [0.5, 0.5]
 stoploss_mode = { type = "FromSignal" }

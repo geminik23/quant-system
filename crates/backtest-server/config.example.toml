@@ -9,7 +9,9 @@
 shm_name = "backtest"
 
 # Per-client SHM buffer size in bytes (default: 16 MB).
-# Increase if backtest results with large trade logs exceed the buffer.
+# Increase if FutureQuoteV1 results or artifacts exceed the buffer.
+# run_backtest_v2, submit_backtest_v2, and run_backtest_multi_v2 use the same
+# server/SHM settings; unversioned execution methods are not registered.
 shm_buffer_size = 16777216
 
 [database]
@@ -23,7 +25,29 @@ registry_path = "crates/symbols/symbols.toml"
 
 [profiles]
 # Path to the management profiles TOML (qs-backtest / F09).
+# Profiles should include explicit target_selection. Existing schema-2 payloads with
+# only use_targets remain readable. Dynamic RPC additions are not persisted.
 profiles_path = "crates/backtest/profiles.toml"
+
+[jobs]
+# Retain completed, failed, and cancelled jobs for one hour.
+retention_secs = 3600
+# Periodically remove expired terminal jobs.
+cleanup_interval_secs = 60
+# Hard bound across queued, running, and retained terminal jobs/results.
+max_retained_jobs = 1000
+
+[artifacts]
+# Filesystem directory for complete result JSON artifacts.
+directory = "temp/backtest-artifacts"
+# Results up to 12 MiB can be returned inline while preserving the 16 MiB transport.
+inline_limit_bytes = 12582912
+# Raw bytes returned per base64-encoded chunk RPC.
+chunk_size = 1048576
+# Retain artifacts for one hour unless they are deleted after download.
+retention_secs = 3600
+# Bound total retained artifact storage to 1 GiB.
+max_total_bytes = 1073741824
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error"

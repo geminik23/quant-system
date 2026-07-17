@@ -70,7 +70,7 @@ mod tests {
     use crate::template::TemplateParser;
 
     fn make_parser(name: &str, ids: Vec<i64>) -> Box<dyn ChannelParser> {
-        Box::new(TemplateParser::new(name.to_string(), ids, 0.01, None))
+        Box::new(TemplateParser::new(name.to_string(), ids, 1.0, None))
     }
 
     #[test]

@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::rules::{PositionView, Rule};
 use crate::types::{
-    CloseReason, Effect, Fill, FillModel, GroupId, OrderType, PositionId, PositionRecord,
-    PositionStatus, PriceQuote, Side, TradeId,
+    CloseReason, Effect, Fill, FillModel, FillPurpose, FutureIntent, GroupId, OrderType,
+    PositionId, PositionRecord, PositionStatus, PriceQuote, Side, StopOrigin, TradeId,
+    position_size_tolerance,
 };
 
 /// Core position data — the pure state without rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "PositionDataSerde")]
 pub struct PositionData {
     /// Unique identifier.
     pub id: PositionId,
@@ -41,8 +43,27 @@ pub struct PositionData {
     /// Actual execution fills (one for market, potentially many for scale-in).
     pub entries: Vec<Fill>,
 
-    /// Fraction of the original position still open (1.0 = full, 0.0 = closed).
+    /// Fraction of all entered size still open (1.0 = full, 0.0 = closed).
+    ///
+    /// Retained for wire compatibility and rule views. Absolute sizes are the
+    /// source of truth and every core mutation keeps this value synchronized.
     pub remaining_ratio: f64,
+
+    /// Absolute size closed across all partial and full exits.
+    ///
+    /// Entry size is the sum of `entries`; open size is derived as entered size
+    /// minus this value. Older serialized positions infer this from
+    /// `remaining_ratio` during deserialization.
+    pub closed_size: f64,
+
+    /// Cost basis assigned to the inventory that is still open.
+    ///
+    /// Positions use average-cost accounting: every close releases
+    /// `average_entry * close_size` from this value, while a scale-in adds only
+    /// the new fill's value. Historical `entries` remain unchanged for audit.
+    /// Older serialized positions infer this from their historical weighted
+    /// average and remaining size.
+    pub open_entry_value: f64,
 
     /// Number of take-profit levels that have been hit.  Used by
     /// `BreakevenAfterTargets` rule.
@@ -67,6 +88,10 @@ pub struct PositionData {
     #[serde(default)]
     pub trade_id: Option<TradeId>,
 
+    /// Provenance of the current fixed protective stop.
+    #[serde(default)]
+    pub stop_origin: Option<crate::types::StopOrigin>,
+
     /// Immutable audit trail.
     pub records: Vec<(PositionRecord, NaiveDateTime)>,
 }
@@ -78,20 +103,118 @@ pub struct Position {
     pub rules: Vec<Rule>,
 }
 
+#[derive(Deserialize)]
+struct PositionDataSerde {
+    id: PositionId,
+    symbol: String,
+    side: Side,
+    order_type: OrderType,
+    status: PositionStatus,
+    pending_price: Option<f64>,
+    size: f64,
+    entries: Vec<Fill>,
+    remaining_ratio: f64,
+    #[serde(default)]
+    closed_size: Option<f64>,
+    #[serde(default)]
+    open_entry_value: Option<f64>,
+    target_hits: u32,
+    open_ts: Option<NaiveDateTime>,
+    close_ts: Option<NaiveDateTime>,
+    #[serde(default)]
+    group: Option<GroupId>,
+    #[serde(default)]
+    trade_id: Option<TradeId>,
+    #[serde(default)]
+    stop_origin: Option<StopOrigin>,
+    records: Vec<(PositionRecord, NaiveDateTime)>,
+}
+
+impl From<PositionDataSerde> for PositionData {
+    fn from(value: PositionDataSerde) -> Self {
+        let entered_size: f64 = value.entries.iter().map(|fill| fill.size).sum();
+        let inferred_closed_size = entered_size * (1.0 - value.remaining_ratio.clamp(0.0, 1.0));
+        let closed_size = value
+            .closed_size
+            .unwrap_or(inferred_closed_size)
+            .max(0.0)
+            .min(entered_size.max(0.0));
+        let remaining_size = (entered_size - closed_size).max(0.0);
+        let remaining_ratio = if entered_size > 0.0 {
+            remaining_size / entered_size
+        } else {
+            value.remaining_ratio
+        };
+        let historical_entry_value: f64 = value
+            .entries
+            .iter()
+            .map(|fill| fill.price * fill.size)
+            .sum();
+        let inferred_open_entry_value = if entered_size > 0.0 {
+            historical_entry_value * (remaining_size / entered_size)
+        } else {
+            0.0
+        };
+        let open_entry_value = if remaining_size <= position_size_tolerance(entered_size) {
+            0.0
+        } else {
+            value
+                .open_entry_value
+                .filter(|basis| basis.is_finite() && *basis >= 0.0)
+                .unwrap_or(inferred_open_entry_value)
+        };
+
+        Self {
+            id: value.id,
+            symbol: value.symbol,
+            side: value.side,
+            order_type: value.order_type,
+            status: value.status,
+            pending_price: value.pending_price,
+            size: value.size,
+            entries: value.entries,
+            remaining_ratio,
+            closed_size,
+            open_entry_value,
+            target_hits: value.target_hits,
+            open_ts: value.open_ts,
+            close_ts: value.close_ts,
+            group: value.group,
+            trade_id: value.trade_id,
+            stop_origin: value.stop_origin,
+            records: value.records,
+        }
+    }
+}
+
 // ─── PositionData helpers ───────────────────────────────────────────────────
 
 impl PositionData {
-    /// Volume-weighted average entry price across all fills.
+    /// Average-cost entry price of the inventory that is still open.
+    ///
+    /// Historical fills are intentionally not re-averaged here: after a
+    /// partial close, only the remaining inventory basis participates in a
+    /// later scale-in and subsequent close.
     pub fn average_entry(&self) -> f64 {
-        if self.entries.is_empty() {
-            return 0.0;
+        let remaining_size = self.remaining_size();
+        if remaining_size == 0.0 {
+            0.0
+        } else {
+            self.open_entry_value / remaining_size
         }
-        let total_value: f64 = self.entries.iter().map(|f| f.price * f.size).sum();
-        let total_size: f64 = self.entries.iter().map(|f| f.size).sum();
+    }
+
+    /// Volume-weighted average across all historical entry fills.
+    pub fn historical_average_entry(&self) -> f64 {
+        let total_size = self.total_filled_size();
         if total_size == 0.0 {
             0.0
         } else {
-            total_value / total_size
+            self.entries
+                .iter()
+                .map(|fill| fill.price * fill.size)
+                .sum::<f64>()
+                / total_size
         }
     }
 
@@ -100,9 +223,53 @@ impl PositionData {
         self.entries.iter().map(|f| f.size).sum()
     }
 
-    /// Size still active in the market.
+    /// Size still active in the market, derived from absolute quantities.
     pub fn remaining_size(&self) -> f64 {
-        self.total_filled_size() * self.remaining_ratio
+        let entered_size = self.total_filled_size();
+        let remaining = (entered_size - self.closed_size).max(0.0);
+        if remaining <= position_size_tolerance(entered_size) {
+            0.0
+        } else {
+            remaining
+        }
+    }
+
+    /// Fraction of all entered size that is still open.
+    pub fn open_ratio(&self) -> f64 {
+        let entered_size = self.total_filled_size();
+        if entered_size <= 0.0 {
+            return 0.0;
+        }
+        self.remaining_size() / entered_size
+    }
+
+    /// Cap an original-entered-size close ratio to the exposure still open.
+    pub fn capped_close_ratio(&self, ratio: f64) -> f64 {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0.0;
+        }
+        ratio.min(self.open_ratio())
+    }
+
+    /// Absolute size represented by a close ratio, capped to open exposure.
+    pub fn close_size_for_ratio(&self, ratio: f64) -> f64 {
+        let actual_ratio = self.capped_close_ratio(ratio);
+        (self.total_filled_size() * actual_ratio).min(self.remaining_size())
+    }
+
+    fn sync_remaining_ratio(&mut self) {
+        let entered_size = self.total_filled_size().max(0.0);
+        self.closed_size = self.closed_size.max(0.0).min(entered_size);
+        self.remaining_ratio = if entered_size > 0.0 {
+            self.remaining_size() / entered_size
+        } else if self.status == PositionStatus::Pending {
+            1.0
+        } else {
+            0.0
+        };
+        if self.remaining_size() == 0.0 {
+            self.open_entry_value = 0.0;
+        }
     }
 
     /// Unrealised P&L at the given price.
@@ -117,17 +284,65 @@ impl PositionData {
 
     /// Whether the position is live (Open) and has remaining size.
     pub fn is_active(&self) -> bool {
-        self.status == PositionStatus::Open && self.remaining_ratio > 0.0
+        self.status == PositionStatus::Open && self.remaining_size() > 0.0
     }
 
-    /// Add a fill (scale-in).
+    /// Add a fill (scale-in), preserving previously closed absolute size and
+    /// adding the fill only to active inventory cost basis.
     pub fn add_fill(&mut self, fill: Fill) {
+        self.open_entry_value += fill.price * fill.size;
         self.entries.push(fill);
+        self.sync_remaining_ratio();
     }
 
-    /// Record a partial close, reducing `remaining_ratio`.
+    /// Replace the most recent entry fill price and timestamp.
     ///
-    /// If the remaining ratio reaches zero the status is flipped to `Closed`.
+    /// Future-quote backtests use this after a pending order triggers so the
+    /// engine's average entry matches the authoritative gap-aware execution
+    /// fill produced by the execution pricer. Returns `false` when no fill
+    /// exists or the replacement is invalid.
+    pub fn replace_latest_fill_execution(&mut self, price: f64, ts: NaiveDateTime) -> bool {
+        if !price.is_finite() || price <= 0.0 {
+            return false;
+        }
+        let Some(fill) = self.entries.last_mut() else {
+            return false;
+        };
+        self.open_entry_value += (price - fill.price) * fill.size;
+        fill.price = price;
+        fill.ts = ts;
+        true
+    }
+
+    /// Replace the latest entry fill and its audit record.
+    ///
+    /// Future-quote executors use this after the engine transitions a pending
+    /// order to `Open`, keeping core position state synchronized with the
+    /// externally calculated gap/improvement execution price.
+    pub fn synchronize_latest_fill(&mut self, fill: Fill) -> bool {
+        let Some(latest) = self.entries.last_mut() else {
+            return false;
+        };
+        self.open_entry_value += fill.price * fill.size - latest.price * latest.size;
+        *latest = fill.clone();
+        self.open_ts = Some(fill.ts);
+        self.sync_remaining_ratio();
+        if let Some((PositionRecord::Filled { fill: recorded }, _)) = self
+            .records
+            .iter_mut()
+            .rev()
+            .find(|(record, _)| matches!(record, PositionRecord::Filled { .. }))
+        {
+            *recorded = fill;
+        }
+        true
+    }
+
+    /// Record a partial close using an original-entered-size ratio.
+    ///
+    /// The close is capped to the absolute size still open. If no exposure
+    /// remains, the status is flipped to `Closed` and both absolute and ratio
+    /// accounting reach exact zero.
     pub fn apply_partial_close(
         &mut self,
         ratio: f64,
@@ -135,19 +350,34 @@ impl PositionData {
         reason: CloseReason,
         ts: NaiveDateTime,
     ) {
-        self.remaining_ratio = (self.remaining_ratio - ratio).max(0.0);
+        let actual_ratio = self.capped_close_ratio(ratio);
+        let entered_size = self.total_filled_size();
+        let open_size = self.remaining_size();
+        let close_size = self.close_size_for_ratio(actual_ratio);
+        let released_entry_value = self.average_entry() * close_size;
+        if open_size - close_size <= position_size_tolerance(entered_size) {
+            self.closed_size = entered_size;
+            self.open_entry_value = 0.0;
+        } else {
+            self.closed_size = (self.closed_size + close_size).min(entered_size);
+            self.open_entry_value = (self.open_entry_value - released_entry_value).max(0.0);
+        }
+        self.sync_remaining_ratio();
         if reason == CloseReason::Target {
             self.target_hits += 1;
         }
         self.records.push((
             PositionRecord::PartialClose {
-                ratio,
+                ratio: actual_ratio,
                 price,
                 reason,
             },
             ts,
         ));
-        if self.remaining_ratio <= f64::EPSILON {
+        if self.remaining_size() == 0.0 {
+            self.closed_size = entered_size;
+            self.open_entry_value = 0.0;
+            self.remaining_ratio = 0.0;
             self.status = PositionStatus::Closed;
             self.close_ts = Some(ts);
             self.records.push((PositionRecord::Closed { reason }, ts));
@@ -156,6 +386,8 @@ impl PositionData {
 
     /// Mark the position as fully closed.
     pub fn apply_full_close(&mut self, reason: CloseReason, ts: NaiveDateTime) {
+        self.closed_size = self.total_filled_size();
+        self.open_entry_value = 0.0;
         self.remaining_ratio = 0.0;
         self.status = PositionStatus::Closed;
         self.close_ts = Some(ts);
@@ -173,7 +405,7 @@ impl PositionData {
             side: self.side,
             status: self.status,
             average_entry: self.average_entry(),
-            remaining_ratio: self.remaining_ratio,
+            remaining_ratio: self.open_ratio(),
             target_hits: self.target_hits,
             open_ts: self.open_ts,
         }
@@ -193,6 +425,7 @@ impl Position {
     ) -> Self {
         let open_ts = fill.ts;
         let size = fill.size;
+        let open_entry_value = fill.price * fill.size;
         Self {
             data: PositionData {
                 id,
@@ -204,11 +437,14 @@ impl Position {
                 size,
                 entries: vec![fill],
                 remaining_ratio: 1.0,
+                closed_size: 0.0,
+                open_entry_value,
                 target_hits: 0,
                 open_ts: Some(open_ts),
                 close_ts: None,
                 group: None,
                 trade_id: None,
+                stop_origin: None,
                 records: vec![(
                     PositionRecord::Created {
                         symbol,
@@ -223,6 +459,8 @@ impl Position {
     }
 
     /// Create a pending position (Limit or Stop order).
+    // Preserve the established public constructor shape for API compatibility.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_pending(
         id: PositionId,
         symbol: String,
@@ -248,11 +486,14 @@ impl Position {
                 size,
                 entries: Vec::new(),
                 remaining_ratio: 1.0,
+                closed_size: 0.0,
+                open_entry_value: 0.0,
                 target_hits: 0,
                 open_ts: None,
                 close_ts: None,
                 group: None,
                 trade_id: None,
+                stop_origin: None,
                 records: vec![(
                     PositionRecord::Created {
                         symbol,
@@ -271,51 +512,66 @@ impl Position {
         self.data.trade_id = trade_id;
     }
 
-    /// Check if a pending order should fill at the given quote.
-    ///
-    /// Returns `true` (and transitions the position to Open) if the fill
-    /// condition is met.
-    pub fn try_fill(&mut self, quote: &PriceQuote, model: FillModel) -> bool {
+    /// Return the execution purpose when this pending order is triggered by
+    /// `quote`. This check is pure and is shared by Legacy and FutureQuote paths.
+    pub fn pending_fill_purpose(
+        &self,
+        quote: &PriceQuote,
+        model: FillModel,
+    ) -> Option<FillPurpose> {
+        if self.data.status != PositionStatus::Pending {
+            return None;
+        }
+        let pending_price = self.data.pending_price?;
+        let check = quote.fill_price(self.data.side, model);
+        let triggered = match (self.data.order_type, self.data.side) {
+            (OrderType::Limit, Side::Buy) => check <= pending_price,
+            (OrderType::Limit, Side::Sell) => check >= pending_price,
+            (OrderType::Stop, Side::Buy) => check >= pending_price,
+            (OrderType::Stop, Side::Sell) => check <= pending_price,
+            (OrderType::Market, _) => false,
+        };
+        if !triggered {
+            return None;
+        }
+        match self.data.order_type {
+            OrderType::Limit => Some(FillPurpose::LimitEntry),
+            OrderType::Stop => Some(FillPurpose::StopEntry),
+            OrderType::Market => None,
+        }
+    }
+
+    /// Commit a previously priced pending fill.
+    pub(crate) fn apply_pending_fill(&mut self, fill: Fill) -> bool {
         if self.data.status != PositionStatus::Pending {
             return false;
         }
+        let ts = fill.ts;
+        self.data.status = PositionStatus::Open;
+        self.data.add_fill(fill.clone());
+        self.data.open_ts = Some(ts);
+        self.data
+            .records
+            .push((PositionRecord::Filled { fill }, ts));
+        true
+    }
 
-        let pending_price = match self.data.pending_price {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let check = quote.fill_price(self.data.side, model);
-
-        let should_fill = match (self.data.order_type, self.data.side) {
-            // Limit Buy: fill when price drops to or below limit
-            (OrderType::Limit, Side::Buy) => check <= pending_price,
-            // Limit Sell: fill when price rises to or above limit
-            (OrderType::Limit, Side::Sell) => check >= pending_price,
-            // Stop Buy: fill when price rises to or above stop
-            (OrderType::Stop, Side::Buy) => check >= pending_price,
-            // Stop Sell: fill when price drops to or below stop
-            (OrderType::Stop, Side::Sell) => check <= pending_price,
-            // Market orders should never be pending
-            (OrderType::Market, _) => false,
-        };
-
-        if should_fill {
-            let fill = Fill {
-                price: pending_price,
-                size: self.data.size,
-                ts: quote.ts,
-            };
-            self.data.entries.push(fill.clone());
-            self.data.status = PositionStatus::Open;
-            self.data.open_ts = Some(quote.ts);
-            self.data
-                .records
-                .push((PositionRecord::Filled { fill }, quote.ts));
-            true
-        } else {
-            false
+    /// Check if a pending order should fill at the given quote.
+    ///
+    /// Returns `true` (and transitions the position to Open) if the fill
+    /// condition is met. Legacy semantics retain the requested-price fill.
+    pub fn try_fill(&mut self, quote: &PriceQuote, model: FillModel) -> bool {
+        if self.pending_fill_purpose(quote, model).is_none() {
+            return false;
         }
+        let Some(pending_price) = self.data.pending_price else {
+            return false;
+        };
+        self.apply_pending_fill(Fill {
+            price: pending_price,
+            size: self.data.size,
+            ts: quote.ts,
+        })
     }
 
     /// Evaluate all management rules against the current quote.
@@ -339,7 +595,234 @@ impl Position {
         effects
     }
 
+    /// Deterministic FutureQuote rule arbitration.
+    ///
+    /// One authoritative protective stop is evaluated first, crossed targets
+    /// are processed in economic order, terminal time exits follow, and
+    /// breakeven transitions are emitted only for surviving exposure.
+    pub(crate) fn evaluate_rules_future(
+        &mut self,
+        quote: &PriceQuote,
+        model: FillModel,
+    ) -> Vec<FutureIntent> {
+        if self.data.status != PositionStatus::Open {
+            return Vec::new();
+        }
+        let side = self.data.side;
+        let check = quote.eval_price(side, model);
+        let average_entry = self.data.average_entry();
+        let current_stop = self
+            .current_effective_stop()
+            .map(|stop| (stop.price, stop.origin));
+        let mut effective_stop = None;
+
+        for rule in &mut self.rules {
+            match rule {
+                Rule::FixedStoploss { price } => {
+                    let origin = self.data.stop_origin.unwrap_or(StopOrigin::Initial);
+                    effective_stop = more_protective_stop(side, effective_stop, (*price, origin));
+                }
+                Rule::TrailingStop {
+                    distance,
+                    peak_price,
+                    initialized,
+                } => {
+                    if !*initialized {
+                        *peak_price = average_entry;
+                        *initialized = true;
+                    }
+                    match side {
+                        Side::Buy => *peak_price = peak_price.max(check),
+                        Side::Sell => {
+                            *peak_price = if *peak_price == 0.0 {
+                                check
+                            } else {
+                                peak_price.min(check)
+                            }
+                        }
+                    }
+                    let candidate = match side {
+                        Side::Buy => *peak_price - *distance,
+                        Side::Sell => *peak_price + *distance,
+                    };
+                    effective_stop = more_protective_stop(
+                        side,
+                        effective_stop,
+                        (candidate, StopOrigin::Trailing),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((price, origin)) = effective_stop {
+            let hit = match side {
+                Side::Buy => check <= price,
+                Side::Sell => check >= price,
+            };
+            if hit {
+                let mut effects = Vec::new();
+                if let Some(effect) =
+                    stop_transition_effect(&self.data.id, current_stop, effective_stop)
+                {
+                    effects.push(effect);
+                }
+                let reason = match origin {
+                    StopOrigin::Breakeven => CloseReason::BreakevenStop,
+                    StopOrigin::Trailing => CloseReason::TrailingStop,
+                    _ => CloseReason::Stoploss,
+                };
+                effects.push(FutureIntent {
+                    effect: Effect::PositionClosed {
+                        id: self.data.id.clone(),
+                        reason,
+                    },
+                    requested_price: Some(price),
+                    stop_origin: Some(origin),
+                });
+                return effects;
+            }
+        }
+
+        let mut target_indices: Vec<(usize, f64, f64)> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rule)| match rule {
+                Rule::TakeProfit {
+                    price,
+                    close_ratio,
+                    triggered: false,
+                } if match side {
+                    Side::Buy => check >= *price,
+                    Side::Sell => check <= *price,
+                } =>
+                {
+                    Some((index, *price, *close_ratio))
+                }
+                _ => None,
+            })
+            .collect();
+        target_indices.sort_by(|left, right| match side {
+            Side::Buy => left.1.total_cmp(&right.1),
+            Side::Sell => right.1.total_cmp(&left.1),
+        });
+
+        let mut effects = Vec::new();
+        let mut remaining = self.data.open_ratio();
+        let mut target_hits = self.data.target_hits;
+        for (index, price, ratio) in target_indices {
+            if remaining <= position_size_tolerance(1.0) {
+                break;
+            }
+            if let Rule::TakeProfit { triggered, .. } = &mut self.rules[index] {
+                *triggered = true;
+            }
+            let actual = ratio.min(remaining).max(0.0);
+            if actual <= position_size_tolerance(1.0) {
+                continue;
+            }
+            target_hits += 1;
+            remaining = (remaining - actual).max(0.0);
+            let effect = if remaining <= position_size_tolerance(1.0) {
+                Effect::PositionClosed {
+                    id: self.data.id.clone(),
+                    reason: CloseReason::Target,
+                }
+            } else {
+                Effect::PartialClose {
+                    id: self.data.id.clone(),
+                    ratio: actual,
+                    reason: CloseReason::Target,
+                }
+            };
+            effects.push(FutureIntent {
+                effect,
+                requested_price: Some(price),
+                stop_origin: None,
+            });
+            if remaining <= position_size_tolerance(1.0) {
+                if let Some(effect) =
+                    stop_transition_effect(&self.data.id, current_stop, effective_stop)
+                {
+                    effects.insert(effects.len() - 1, effect);
+                }
+                return effects;
+            }
+        }
+
+        for rule in &self.rules {
+            if let Rule::TimeExit { max_seconds } = rule
+                && self
+                    .data
+                    .open_ts
+                    .is_some_and(|open| (quote.ts - open).num_seconds() >= *max_seconds as i64)
+            {
+                if let Some(effect) =
+                    stop_transition_effect(&self.data.id, current_stop, effective_stop)
+                {
+                    effects.push(effect);
+                }
+                effects.push(FutureIntent::plain(Effect::PositionClosed {
+                    id: self.data.id.clone(),
+                    reason: CloseReason::TimeExit,
+                }));
+                return effects;
+            }
+        }
+
+        let mut breakeven_triggered = false;
+        for rule in &mut self.rules {
+            let trigger = match rule {
+                Rule::BreakevenWhen {
+                    trigger_price,
+                    triggered,
+                } if !*triggered => {
+                    let hit = match side {
+                        Side::Buy => check >= *trigger_price,
+                        Side::Sell => check <= *trigger_price,
+                    };
+                    if hit {
+                        *triggered = true;
+                    }
+                    hit
+                }
+                Rule::BreakevenAfterTargets { after_n, triggered } if !*triggered => {
+                    let hit = target_hits >= *after_n;
+                    if hit {
+                        *triggered = true;
+                    }
+                    hit
+                }
+                _ => false,
+            };
+            if trigger {
+                breakeven_triggered = true;
+                break;
+            }
+        }
+        if breakeven_triggered {
+            effective_stop =
+                more_protective_stop(side, effective_stop, (average_entry, StopOrigin::Breakeven));
+        }
+        if let Some(effect) = stop_transition_effect(&self.data.id, current_stop, effective_stop) {
+            effects.push(effect);
+        }
+        effects
+    }
+
     /// Find the current fixed-stoploss price, if any.
+    pub fn current_effective_stop(&self) -> Option<crate::types::EffectiveStop> {
+        self.current_stoploss()
+            .map(|price| crate::types::EffectiveStop {
+                price,
+                origin: self
+                    .data
+                    .stop_origin
+                    .unwrap_or(crate::types::StopOrigin::Initial),
+            })
+    }
+
     pub fn current_stoploss(&self) -> Option<f64> {
         for rule in &self.rules {
             if let Rule::FixedStoploss { price } = rule {
@@ -351,6 +834,15 @@ impl Position {
 
     /// Update the fixed-stoploss price.  Returns the old price (if any).
     pub fn set_stoploss(&mut self, new_price: f64) -> Option<f64> {
+        self.set_stoploss_with_origin(new_price, crate::types::StopOrigin::Modified)
+    }
+
+    pub fn set_stoploss_with_origin(
+        &mut self,
+        new_price: f64,
+        origin: crate::types::StopOrigin,
+    ) -> Option<f64> {
+        self.data.stop_origin = Some(origin);
         for rule in &mut self.rules {
             if let Rule::FixedStoploss { price } = rule {
                 let old = *price;
@@ -393,6 +885,41 @@ impl Position {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+fn stop_transition_effect(
+    position_id: &str,
+    current: Option<(f64, StopOrigin)>,
+    next: Option<(f64, StopOrigin)>,
+) -> Option<FutureIntent> {
+    let (new_price, origin) = next?;
+    if current == next {
+        return None;
+    }
+    Some(FutureIntent {
+        effect: Effect::StoplossModified {
+            id: position_id.to_owned(),
+            old_price: current.map_or(0.0, |stop| stop.0),
+            new_price,
+        },
+        requested_price: Some(new_price),
+        stop_origin: Some(origin),
+    })
+}
+
+fn more_protective_stop(
+    side: Side,
+    current: Option<(f64, StopOrigin)>,
+    candidate: (f64, StopOrigin),
+) -> Option<(f64, StopOrigin)> {
+    match current {
+        None => Some(candidate),
+        Some(existing) => match side {
+            Side::Buy if candidate.0 > existing.0 => Some(candidate),
+            Side::Sell if candidate.0 < existing.0 => Some(candidate),
+            _ => Some(existing),
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -483,6 +1010,176 @@ mod tests {
     }
 
     #[test]
+    fn partial_close_then_scale_in_conserves_absolute_size() {
+        let mut pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(1.0850, 2.0),
+            vec![],
+        );
+
+        pos.data
+            .apply_partial_close(0.5, 1.0900, CloseReason::Manual, ts(10, 30, 0));
+        pos.data.add_fill(Fill {
+            price: 1.0950,
+            size: 1.0,
+            ts: ts(10, 35, 0),
+        });
+
+        assert!((pos.data.total_filled_size() - 3.0).abs() < f64::EPSILON);
+        assert!((pos.data.closed_size - 1.0).abs() < f64::EPSILON);
+        assert!((pos.data.remaining_size() - 2.0).abs() < f64::EPSILON);
+        assert!((pos.data.remaining_ratio - (2.0 / 3.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn partial_close_then_scale_in_preserves_average_cost_cash_flow() {
+        let mut pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(100.0, 2.0),
+            vec![],
+        );
+
+        let first_basis = pos.data.average_entry();
+        pos.data
+            .apply_partial_close(0.5, 110.0, CloseReason::Manual, ts(10, 30, 0));
+        let first_pnl = (110.0 - first_basis) * 1.0;
+        assert_eq!(pos.data.open_entry_value, 100.0);
+        assert_eq!(pos.data.average_entry(), 100.0);
+
+        pos.data.add_fill(Fill {
+            price: 120.0,
+            size: 1.0,
+            ts: ts(10, 35, 0),
+        });
+        assert_eq!(pos.data.average_entry(), 110.0);
+        assert_eq!(pos.data.open_entry_value, 220.0);
+
+        let final_basis = pos.data.average_entry();
+        let final_pnl = (130.0 - final_basis) * pos.data.remaining_size();
+        pos.data
+            .apply_full_close(CloseReason::Manual, ts(10, 40, 0));
+
+        assert_eq!(first_pnl + final_pnl, 50.0);
+        assert_eq!(pos.data.entries.len(), 2);
+        assert_eq!(pos.data.historical_average_entry(), 320.0 / 3.0);
+        assert_eq!(pos.data.open_entry_value, 0.0);
+    }
+
+    #[test]
+    fn scale_in_then_partial_close_uses_all_entered_size() {
+        let mut pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(1.0850, 2.0),
+            vec![],
+        );
+        pos.data.add_fill(Fill {
+            price: 1.0950,
+            size: 1.0,
+            ts: ts(10, 5, 0),
+        });
+        pos.data
+            .apply_partial_close(0.5, 1.1000, CloseReason::Manual, ts(10, 30, 0));
+
+        assert!((pos.data.closed_size - 1.5).abs() < f64::EPSILON);
+        assert!((pos.data.remaining_size() - 1.5).abs() < f64::EPSILON);
+        assert!((pos.data.remaining_ratio - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn repeated_partial_closes_cap_and_reach_exact_zero() {
+        let mut pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(1.0850, 1.0),
+            vec![],
+        );
+
+        for minute in [10, 20, 30] {
+            pos.data
+                .apply_partial_close(0.4, 1.0900, CloseReason::Manual, ts(10, minute, 0));
+        }
+
+        assert_eq!(pos.data.closed_size, 1.0);
+        assert_eq!(pos.data.remaining_size(), 0.0);
+        assert_eq!(pos.data.remaining_ratio, 0.0);
+        assert_eq!(pos.data.status, PositionStatus::Closed);
+        let last_ratio = pos
+            .data
+            .records
+            .iter()
+            .rev()
+            .find_map(|(record, _)| match record {
+                PositionRecord::PartialClose { ratio, .. } => Some(*ratio),
+                _ => None,
+            })
+            .unwrap();
+        assert!((last_ratio - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn serde_migrates_legacy_ratio_to_absolute_closed_size() {
+        let mut pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(1.0850, 2.0),
+            vec![],
+        );
+        pos.data
+            .apply_partial_close(0.25, 1.0900, CloseReason::Manual, ts(10, 30, 0));
+
+        let mut legacy = serde_json::to_value(&pos.data).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("closed_size")
+            .unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("open_entry_value")
+            .unwrap();
+        let migrated: PositionData = serde_json::from_value(legacy).unwrap();
+        assert!((migrated.closed_size - 0.5).abs() < f64::EPSILON);
+        assert!((migrated.remaining_size() - 1.5).abs() < f64::EPSILON);
+        assert!((migrated.remaining_ratio - 0.75).abs() < f64::EPSILON);
+        assert!((migrated.open_entry_value - 1.6275).abs() < f64::EPSILON);
+        assert!((migrated.average_entry() - 1.0850).abs() < f64::EPSILON);
+
+        let mut current = serde_json::to_value(&migrated).unwrap();
+        current["remaining_ratio"] = serde_json::json!(0.99);
+        let round_trip: PositionData = serde_json::from_value(current).unwrap();
+        assert!((round_trip.closed_size - 0.5).abs() < f64::EPSILON);
+        assert!((round_trip.remaining_ratio - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn serde_defaults_legacy_unclosed_position_to_zero_closed_size() {
+        let pos = Position::new_market(
+            "p1".into(),
+            "EURUSD".into(),
+            Side::Buy,
+            make_fill(1.0850, 2.0),
+            vec![],
+        );
+        let mut legacy = serde_json::to_value(&pos.data).unwrap();
+        legacy.as_object_mut().unwrap().remove("closed_size");
+        legacy.as_object_mut().unwrap().remove("open_entry_value");
+
+        let migrated: PositionData = serde_json::from_value(legacy).unwrap();
+        assert_eq!(migrated.closed_size, 0.0);
+        assert_eq!(migrated.remaining_size(), 2.0);
+        assert_eq!(migrated.remaining_ratio, 1.0);
+    }
+
+    #[test]
     fn full_close_via_partial() {
         let mut pos = Position::new_market(
             "p1".into(),
@@ -495,6 +1192,9 @@ mod tests {
             .apply_partial_close(1.0, 1.0900, CloseReason::Target, ts(10, 30, 0));
         assert_eq!(pos.data.status, PositionStatus::Closed);
         assert!(pos.data.close_ts.is_some());
+        assert_eq!(pos.data.closed_size, 1.0);
+        assert_eq!(pos.data.remaining_size(), 0.0);
+        assert_eq!(pos.data.remaining_ratio, 0.0);
     }
 
     #[test]
@@ -509,7 +1209,9 @@ mod tests {
         pos.data
             .apply_full_close(CloseReason::Stoploss, ts(10, 30, 0));
         assert_eq!(pos.data.status, PositionStatus::Closed);
-        assert!((pos.data.remaining_ratio).abs() < f64::EPSILON);
+        assert_eq!(pos.data.closed_size, 1.0);
+        assert_eq!(pos.data.remaining_size(), 0.0);
+        assert_eq!(pos.data.remaining_ratio, 0.0);
     }
 
     #[test]

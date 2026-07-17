@@ -55,26 +55,25 @@ impl PriceAlert {
     ///
     /// * Returns the new AlertSet
     pub fn modify_price(&mut self, alert_id: String, price: f64) -> Option<AlertSet> {
-        if let Some(symbol) = self.id2symbol.get(&alert_id) {
-            if let Some(cont) = self.alert_price.get_mut(symbol) {
-                if let Some(alert) = cont.remove(&alert_id) {
-                    let new_alert = match alert {
-                        AlertSet::Low(_) => AlertSet::Low(price),
-                        AlertSet::High(_) => AlertSet::High(price),
-                    };
-                    cont.insert(alert_id, new_alert.clone());
-                    return Some(new_alert);
-                }
-            }
+        if let Some(symbol) = self.id2symbol.get(&alert_id)
+            && let Some(cont) = self.alert_price.get_mut(symbol)
+            && let Some(alert) = cont.remove(&alert_id)
+        {
+            let new_alert = match alert {
+                AlertSet::Low(_) => AlertSet::Low(price),
+                AlertSet::High(_) => AlertSet::High(price),
+            };
+            cont.insert(alert_id, new_alert.clone());
+            return Some(new_alert);
         }
         None
     }
 
     pub fn remove(&mut self, alert_id: String) -> Option<AlertSet> {
-        if let Some(symbol) = self.id2symbol.remove(&alert_id) {
-            if let Some(cont) = self.alert_price.get_mut(&symbol) {
-                return cont.remove(&alert_id);
-            }
+        if let Some(symbol) = self.id2symbol.remove(&alert_id)
+            && let Some(cont) = self.alert_price.get_mut(&symbol)
+        {
+            return cont.remove(&alert_id);
         }
         None
     }

@@ -6,23 +6,42 @@
 //! than crashing the server.
 
 use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::NaiveDateTime;
+#[cfg(test)]
+use data_preprocess::DataError;
 use data_preprocess::ParquetStore;
+#[cfg(test)]
 use data_preprocess::models::{BarQueryOpts, QueryOpts, Timeframe};
 use qs_backtest::BacktestResult;
-use qs_backtest::data_feed::{
-    DataFeed, MarketEvent, VecFeed, bars_to_feed, merge_feeds, ticks_to_feed,
-};
+#[cfg(test)]
+use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
+use qs_backtest::data_feed::{EventBatchFeedError, KWayMergeError};
+use qs_backtest::evaluation::EvaluationOptions;
 use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RawSignal};
-use qs_backtest::runner::{BacktestConfig, BacktestRunner};
+use qs_backtest::runner::{
+    BacktestConfig, BacktestRunner, FutureQuoteConfig, ReplayProgress, StreamingReplayError,
+};
 use qs_symbols::SymbolRegistry;
 
-use crate::convert::{config_from_msg, profile_from_msg, raw_signal_from_msg, result_to_msg};
+use crate::artifact_store::ArtifactStore;
+use crate::convert::{
+    account_currency_from_msg, config_from_msg, evaluation_options_from_msg_for_symbols,
+    future_config_from_msg, profile_from_msg, raw_signal_from_msg, result_to_msg,
+    validate_future_quote_scalars,
+};
 use crate::error::{BacktestServerError, Result};
+use crate::fx_loader::describe_future_stream;
+use crate::market_loader::{
+    CancellationCheck, MarketStreamDescription, MarketStreamError, describe_primary_market_stream,
+};
+use crate::replay_plan::{ReplayPlan, RequestedSymbolScope};
 use crate::rpc_types::*;
 
 /// Shared state accessible by all client handlers.
@@ -39,6 +58,10 @@ pub struct ServerState {
     pub start_time: Instant,
     /// Async backtest job storage (Issue 2).
     pub jobs: Mutex<HashMap<String, BacktestJob>>,
+    /// Hard bound for queued, running, and retained terminal jobs.
+    pub max_retained_jobs: usize,
+    /// Filesystem storage for complete large result JSON payloads.
+    pub artifact_store: ArtifactStore,
 }
 
 /// Internal representation of an async backtest job.
@@ -50,12 +73,36 @@ pub struct BacktestJob {
     pub submitted_at: Instant,
     /// When the job completed (if finished).
     pub completed_at: Option<Instant>,
-    /// Optional progress info (e.g. number of events processed).
-    pub progress: Option<String>,
-    /// Serialized result message (when completed).
+    /// Structured loading and replay progress.
+    pub progress: BacktestProgress,
+    /// Complete inline result or compact console summary.
     pub result: Option<BacktestResultMsg>,
+    /// Complete result artifact when the full inline object was released.
+    pub artifact: Option<ResultArtifactRefMsg>,
+    /// True when the complete result is present in `result`.
+    pub inline_complete: bool,
+    /// True after the job artifact has been deleted following delivery.
+    pub artifact_consumed: bool,
     /// Error message (when failed).
     pub error: Option<String>,
+    /// Cooperative cancellation shared with the blocking worker.
+    pub cancellation: JobCancellationToken,
+    /// True while a blocking worker slot is reserved or still accessing this job.
+    pub worker_active: bool,
+}
+
+/// Lightweight per-job cancellation token without an additional runtime dependency.
+#[derive(Debug, Clone, Default)]
+pub struct JobCancellationToken(Arc<AtomicBool>);
+
+impl JobCancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Typed job status for the async backtest API.
@@ -67,6 +114,159 @@ pub enum JobStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+enum PreparedResult<T> {
+    Inline(T),
+    Artifact {
+        reference: ResultArtifactRefMsg,
+        summary: Option<T>,
+    },
+}
+
+fn prepare_result<T, F>(
+    state: &ServerState,
+    result: T,
+    delivery: Option<ResultDeliveryMsg>,
+    summarize: F,
+) -> std::result::Result<PreparedResult<T>, String>
+where
+    T: serde::Serialize,
+    F: FnOnce(&T) -> T,
+{
+    let bytes = serde_json::to_vec(&result)
+        .map_err(|error| format!("failed to serialize result JSON: {error}"))?;
+    let Some(delivery) = delivery else {
+        return Ok(PreparedResult::Inline(result));
+    };
+    let inline_limit = state.artifact_store.inline_limit_bytes();
+    match delivery {
+        ResultDeliveryMsg::Inline if bytes.len() > inline_limit => Err(format!(
+            "result JSON is {} bytes, exceeding the configured inline limit of {} bytes; use result_delivery 'auto' or 'artifact'",
+            bytes.len(),
+            inline_limit
+        )),
+        ResultDeliveryMsg::Inline => Ok(PreparedResult::Inline(result)),
+        ResultDeliveryMsg::Auto if bytes.len() <= inline_limit => {
+            Ok(PreparedResult::Inline(result))
+        }
+        ResultDeliveryMsg::Auto | ResultDeliveryMsg::Artifact => {
+            let reference = state
+                .artifact_store
+                .persist_json(&bytes)
+                .map_err(|error| format!("failed to persist result artifact: {error}"))?;
+            let summary = summarize(&result);
+            let summary = serde_json::to_vec(&summary)
+                .ok()
+                .filter(|bytes| bytes.len() <= inline_limit)
+                .map(|_| summary);
+            Ok(PreparedResult::Artifact { reference, summary })
+        }
+    }
+}
+
+fn compact_result_for_console(result: &BacktestResultMsg) -> BacktestResultMsg {
+    let mut summary = result.clone();
+    summary.equity_curve.clear();
+    summary.trade_log.truncate(30);
+    summary.positions.truncate(15);
+    if let Some(future) = summary.future.as_mut() {
+        future.recorded_fills = serde_json::Value::Null;
+        future.action_dispositions = serde_json::Value::Null;
+        future.close_events = serde_json::Value::Null;
+        future.completed_positions = serde_json::Value::Null;
+        future.open_positions = serde_json::Value::Null;
+        future.pending_orders = serde_json::Value::Null;
+        future.pending_order_lifecycle.clear();
+        future.mtm_equity_curve = serde_json::Value::Null;
+    }
+    summary
+}
+
+fn compact_profile_results(results: &[ProfileResult]) -> Vec<ProfileResult> {
+    results
+        .iter()
+        .cloned()
+        .map(|mut profile| {
+            profile.result = profile.result.as_ref().map(compact_result_for_console);
+            profile
+        })
+        .collect()
+}
+
+fn single_response_from_result(
+    state: &ServerState,
+    result: BacktestResultMsg,
+    start: Instant,
+    delivery: Option<ResultDeliveryMsg>,
+) -> RunBacktestResponse {
+    match prepare_result(state, result, delivery, compact_result_for_console) {
+        Ok(PreparedResult::Inline(result)) => RunBacktestResponse {
+            success: true,
+            error: None,
+            result: Some(result),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        },
+        Ok(PreparedResult::Artifact { reference, summary }) => RunBacktestResponse {
+            success: true,
+            error: None,
+            result: summary,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: Some(reference),
+            inline_complete: false,
+        },
+        Err(error) => RunBacktestResponse {
+            success: false,
+            error: Some(error),
+            result: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: false,
+        },
+    }
+}
+
+fn multi_response_from_results(
+    state: &ServerState,
+    results: Vec<ProfileResult>,
+    start: Instant,
+    delivery: Option<ResultDeliveryMsg>,
+) -> RunBacktestMultiResponse {
+    let result_error = results
+        .iter()
+        .find(|result| !result.success)
+        .and_then(|result| result.error.clone());
+    let result_success = result_error.is_none();
+    match prepare_result(state, results, delivery, |results| {
+        compact_profile_results(results)
+    }) {
+        Ok(PreparedResult::Inline(results)) => RunBacktestMultiResponse {
+            success: result_success,
+            error: result_error,
+            results,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        },
+        Ok(PreparedResult::Artifact { reference, summary }) => RunBacktestMultiResponse {
+            success: result_success,
+            error: result_error,
+            results: summary.unwrap_or_default(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: Some(reference),
+            inline_complete: false,
+        },
+        Err(error) => RunBacktestMultiResponse {
+            success: false,
+            error: Some(error),
+            results: Vec::new(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: false,
+        },
+    }
 }
 
 impl JobStatus {
@@ -82,16 +282,133 @@ impl JobStatus {
         }
     }
 
-    /// Parse from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+fn progress_stage_rank(stage: &str) -> u8 {
+    match stage {
+        "queued" => 0,
+        "loading_data" => 1,
+        "replay" => 2,
+        "completed" | "failed" | "cancelled" => 3,
+        _ => 0,
+    }
+}
+
+fn merge_progress(current: &mut BacktestProgress, next: BacktestProgress) {
+    if progress_stage_rank(&next.stage) >= progress_stage_rank(&current.stage) {
+        current.stage = next.stage;
+    }
+    current.processed_events = current.processed_events.max(next.processed_events);
+    current.total_events = current.total_events.max(next.total_events);
+    current.processed_signals = current.processed_signals.max(next.processed_signals);
+    current.total_signals = current.total_signals.max(next.total_signals);
+    current.processed_symbols = current.processed_symbols.max(next.processed_symbols);
+    current.total_symbols = current.total_symbols.max(next.total_symbols);
+}
+
+fn remove_oldest_terminal_job(jobs: &mut HashMap<String, BacktestJob>) -> Option<BacktestJob> {
+    let oldest = jobs
+        .iter()
+        .filter(|(_, job)| job.status.is_terminal() && !job.worker_active)
+        .min_by(|(left_id, left), (right_id, right)| {
+            left.completed_at
+                .cmp(&right.completed_at)
+                .then_with(|| left.submitted_at.cmp(&right.submitted_at))
+                .then_with(|| left_id.cmp(right_id))
+        })
+        .map(|(id, _)| id.clone())?;
+    jobs.remove(&oldest)
+}
+
+fn delete_job_artifacts(state: &ServerState, removed: &[BacktestJob]) {
+    for job in removed {
+        if !job.artifact_consumed
+            && let Some(artifact) = job.artifact.as_ref()
+        {
+            let _ = state.artifact_store.delete(&artifact.artifact_id);
+        }
+    }
+}
+
+/// Remove terminal jobs older than `retention` and enforce the configured bound.
+pub fn cleanup_expired_jobs(state: &ServerState, retention: Duration) -> usize {
+    let removed = {
+        let mut jobs = state.jobs.lock().unwrap();
+        let expired = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.status.is_terminal()
+                    && !job.worker_active
+                    && job
+                        .completed_at
+                        .is_some_and(|completed| completed.elapsed() >= retention)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut removed = expired
+            .into_iter()
+            .filter_map(|id| jobs.remove(&id))
+            .collect::<Vec<_>>();
+        while jobs.len() > state.max_retained_jobs {
+            let Some(job) = remove_oldest_terminal_job(&mut jobs) else {
+                break;
+            };
+            removed.push(job);
+        }
+        removed
+    };
+    delete_job_artifacts(state, &removed);
+    removed.len()
+}
+
+/// Cooperatively cancel every active job during server shutdown.
+pub fn cancel_active_jobs(state: &ServerState) -> usize {
+    let mut cancelled = 0;
+    let mut jobs = state.jobs.lock().unwrap();
+    for job in jobs.values_mut().filter(|job| !job.status.is_terminal()) {
+        job.cancellation.cancel();
+        job.status = JobStatus::Cancelled;
+        job.completed_at = Some(Instant::now());
+        job.result = None;
+        job.artifact = None;
+        job.inline_complete = true;
+        job.artifact_consumed = false;
+        job.error = None;
+        job.progress.stage = "cancelled".into();
+        cancelled += 1;
+    }
+    cancelled
+}
+
+fn update_job_progress(state: &ServerState, job_id: &str, progress: BacktestProgress) {
+    let mut jobs = state.jobs.lock().unwrap();
+    if let Some(job) = jobs.get_mut(job_id)
+        && !job.status.is_terminal()
+    {
+        match progress.stage.as_str() {
+            "loading_data" => job.status = JobStatus::LoadingData,
+            "replay" => job.status = JobStatus::Running,
+            _ => {}
+        }
+        merge_progress(&mut job.progress, progress);
+    }
+}
+
+impl std::str::FromStr for JobStatus {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "Queued" => Some(Self::Queued),
-            "LoadingData" => Some(Self::LoadingData),
-            "Running" => Some(Self::Running),
-            "Completed" => Some(Self::Completed),
-            "Failed" => Some(Self::Failed),
-            "Cancelled" => Some(Self::Cancelled),
-            _ => None,
+            "Queued" => Ok(Self::Queued),
+            "LoadingData" => Ok(Self::LoadingData),
+            "Running" => Ok(Self::Running),
+            "Completed" => Ok(Self::Completed),
+            "Failed" => Ok(Self::Failed),
+            "Cancelled" => Ok(Self::Cancelled),
+            _ => Err("invalid job status"),
         }
     }
 }
@@ -162,17 +479,9 @@ pub fn handle_list_symbols(
             true
         })
         .map(|row| {
-            // Extract timeframe from data_type if it's a bar (e.g. "bar(1m)").
-            let (data_type, timeframe) = if row.data_type.starts_with("bar") {
-                let tf = row
-                    .data_type
-                    .strip_prefix("bar(")
-                    .and_then(|s| s.strip_suffix(')'))
-                    .map(|s| s.to_string());
-                ("bar".to_string(), tf)
-            } else {
-                (row.data_type.clone(), None)
-            };
+            // The store reports bars as `bar (1m)`; tolerate the historical
+            // no-space spelling too so existing data remains discoverable.
+            let (data_type, timeframe) = parse_availability_data_type(&row.data_type);
 
             SymbolAvailability {
                 exchange: row.exchange,
@@ -189,93 +498,264 @@ pub fn handle_list_symbols(
     Ok(ListSymbolsResponse { symbols })
 }
 
+fn parse_availability_data_type(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("bar") else {
+        return (trimmed.to_string(), None);
+    };
+    let timeframe = rest
+        .trim()
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    ("bar".into(), timeframe)
+}
+
 // ── Run Backtest ────────────────────────────────────────────────────────────
 
-/// Handle `run_backtest` — loads data, applies profile, runs backtest, returns result.
-pub fn handle_run_backtest(state: &ServerState, req: &RunBacktestRequest) -> RunBacktestResponse {
+/// Handle the versioned FutureQuoteV1 execution endpoint.
+pub fn handle_run_backtest_v2(
+    state: &ServerState,
+    req: &RunBacktestV2Request,
+) -> RunBacktestV2Response {
     let start = Instant::now();
-
-    match execute_backtest(state, req) {
-        Ok(result) => {
-            let msg = result_to_msg(&result);
-            RunBacktestResponse {
-                success: true,
-                error: None,
-                result: Some(msg),
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            }
-        }
-        Err(e) => RunBacktestResponse {
+    if req.schema_version != 2 {
+        return RunBacktestResponse {
             success: false,
-            error: Some(e.to_string()),
+            error: Some(format!(
+                "unsupported schema_version: {}",
+                req.schema_version
+            )),
             result: None,
             elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        };
+    }
+    if let Err(error) = validate_future_quote_scalars(&req.future) {
+        return RunBacktestResponse {
+            success: false,
+            error: Some(error.to_string()),
+            result: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        };
+    }
+    match execute_backtest_with_future(state, &req.request, &req.future, &req.evaluation) {
+        Ok(result) => single_response_from_result(
+            state,
+            result_to_msg(&result),
+            start,
+            Some(req.result_delivery),
+        ),
+        Err(error) => RunBacktestResponse {
+            success: false,
+            error: Some(error.to_string()),
+            result: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
         },
     }
 }
 
-/// Internal implementation: validate, load data, transform signals, run backtest.
-fn execute_backtest(state: &ServerState, req: &RunBacktestRequest) -> Result<BacktestResult> {
-    // 1. Validate request.
-    validate_request(req)?;
+fn execute_backtest_with_future(
+    state: &ServerState,
+    req: &RunBacktestRequest,
+    future: &FutureQuoteConfigMsg,
+    evaluation: &ProviderEvaluationOptionsMsg,
+) -> Result<BacktestResult> {
+    execute_backtest_with_future_controlled(state, req, future, evaluation, None, &mut |_| {})
+}
 
-    // 1b. Validate inline profile early (before expensive data loading).
+fn ensure_not_cancelled(cancellation: Option<&JobCancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(JobCancellationToken::is_cancelled) {
+        Err(BacktestServerError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn map_streaming_replay_error(
+    error: StreamingReplayError<MarketStreamError>,
+) -> BacktestServerError {
+    match error {
+        StreamingReplayError::Cancelled(_) => BacktestServerError::Cancelled,
+        StreamingReplayError::Feed(KWayMergeError::Source {
+            error: EventBatchFeedError::Source(error),
+            ..
+        }) => error,
+        StreamingReplayError::Feed(error) => BacktestServerError::MarketStream(error.to_string()),
+    }
+}
+
+fn execute_backtest_with_future_controlled(
+    state: &ServerState,
+    req: &RunBacktestRequest,
+    future: &FutureQuoteConfigMsg,
+    evaluation: &ProviderEvaluationOptionsMsg,
+    cancellation: Option<&JobCancellationToken>,
+    progress: &mut dyn FnMut(BacktestProgress),
+) -> Result<BacktestResult> {
+    ensure_not_cancelled(cancellation)?;
+    validate_request(req)?;
+    validate_future_quote_scalars(future)?;
+
+    // Validate and resolve profiles before expensive data loading.
     if let Some(ref profile_msg) = req.profile_def {
         let profile = profile_from_msg(profile_msg)?;
-        profile.validate().map_err(|e| {
-            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {e}"))
+        profile.validate().map_err(|error| {
+            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {error}"))
         })?;
     }
+    let profile = resolve_profile(state, req)?;
 
-    // 2. Resolve one or more symbols via registry.
-    let symbols = resolve_request_symbols(
-        &state.symbol_registry,
+    let from = parse_optional_datetime(&req.from)?;
+    let to = parse_optional_datetime(&req.to)?;
+    let plan = build_replay_plan(
+        state,
         &req.symbol,
         &req.symbols,
         req.all_symbols,
         &req.raw_signals,
+        from,
+        to,
+        future.signal_latency_ms,
     )?;
+    validate_replay_sizing(req, &plan)?;
+    let evaluation_options = evaluation_options_from_msg_for_symbols(
+        evaluation,
+        &state.symbol_registry,
+        plan.requested_symbols(),
+    )?;
+    let config = config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols())?;
+    let account_currency = account_currency_from_msg(future)?;
     let exchange = req.exchange.to_lowercase();
     tracing::info!(
-        "run_backtest: symbols={:?} exchange={} data_type={}",
-        symbols,
+        "run_backtest: requested_symbols={:?} active_symbols={:?} idle_symbols={:?} loading_start={:?} exchange={} data_type={}",
+        plan.requested_symbols(),
+        plan.active_symbols(),
+        plan.idle_explicit_symbols(),
+        plan.loading_start(),
         exchange,
         req.data_type
     );
-
-    // 3. Parse date range filters.
-    let from = parse_optional_datetime(&req.from)?;
-    let to = parse_optional_datetime(&req.to)?;
-
-    // 4. Load and merge market data for every requested symbol.
-    tracing::info!(
-        "run_backtest: loading market data for {} symbols...",
-        symbols.len()
-    );
-    let mut feed = load_market_data_for_symbols(
-        &state.data_dir,
-        &exchange,
-        &symbols,
-        &req.data_type,
-        req.timeframe.as_deref(),
-        from,
-        to,
-    )?;
-    tracing::info!("run_backtest: market data loaded, {} events", feed.total());
-
-    // 5. Convert raw signals, filter by date range, and run backtest.
-    let mut raw_signals = build_raw_signals_for_symbols(state, &req.raw_signals, &symbols)?;
-    tracing::info!("run_backtest: {} raw signals converted", raw_signals.len());
-    raw_signals = filter_signals_by_date(raw_signals, from, to);
     tracing::info!(
         "run_backtest: {} signals after date filtering",
-        raw_signals.len()
+        plan.retained_signals().len()
     );
-    let profile = resolve_profile(state, req)?;
-    let config = config_from_msg(&req.config, &state.symbol_registry, &symbols);
-    let runner = BacktestRunner::new(config);
-    tracing::info!("run_backtest: starting backtest engine...");
-    let result = runner.run_raw_signals(&mut feed, raw_signals, profile.as_ref());
+    ensure_not_cancelled(cancellation)?;
+
+    let total_symbols = plan.active_symbols().len() as u64;
+    let total_signals = plan.retained_signals().len() as u64;
+    progress(BacktestProgress {
+        stage: "loading_data".into(),
+        total_signals,
+        total_symbols,
+        ..BacktestProgress::default()
+    });
+    tracing::info!(
+        "run_backtest: loading market data for {} active symbols...",
+        plan.active_symbols().len()
+    );
+    let mut result = {
+        let mut cancelled = || cancellation.is_some_and(JobCancellationToken::is_cancelled);
+        let primary = describe_primary_market_stream(
+            &state.data_dir,
+            &exchange,
+            plan.active_symbols(),
+            &req.data_type,
+            req.timeframe.as_deref(),
+            plan.loading_start(),
+            to,
+            &mut cancelled,
+            &mut |processed_symbols| {
+                progress(BacktestProgress {
+                    stage: "loading_data".into(),
+                    processed_symbols,
+                    total_symbols,
+                    total_signals,
+                    ..BacktestProgress::default()
+                });
+            },
+        )?;
+        progress(BacktestProgress {
+            stage: "loading_conversion_data".into(),
+            processed_symbols: total_symbols,
+            total_symbols,
+            total_signals,
+            ..BacktestProgress::default()
+        });
+        let bundle = describe_future_stream(
+            &state.data_dir,
+            &exchange,
+            &state.symbol_registry,
+            &account_currency,
+            plan.active_symbols(),
+            &req.data_type,
+            plan.loading_start(),
+            primary,
+            &mut cancelled,
+        )?;
+        let primary_eod = bundle.description.primary_eod();
+        let future_config = future_config_from_msg(future, bundle.currency_plan)?;
+        let cancellation_token = cancellation.cloned();
+        let stream_cancellation: CancellationCheck = Arc::new(move || {
+            cancellation_token
+                .as_ref()
+                .is_some_and(JobCancellationToken::is_cancelled)
+        });
+        let mut feed = bundle.description.open(stream_cancellation)?;
+        ensure_not_cancelled(cancellation)?;
+        progress(BacktestProgress {
+            stage: "replay".into(),
+            total_signals,
+            processed_symbols: total_symbols,
+            total_symbols,
+            ..BacktestProgress::default()
+        });
+        tracing::info!("run_backtest: starting streaming FutureQuote engine...");
+        let mut runner = BacktestRunner::new_future(config, future_config);
+        runner = runner.with_evaluation_options(evaluation_options.clone());
+        runner
+            .run_raw_signals_future_streaming_controlled(
+                &mut feed,
+                primary_eod,
+                plan.retained_signals().to_vec(),
+                profile.as_ref(),
+                || cancellation.is_some_and(JobCancellationToken::is_cancelled),
+                |ReplayProgress {
+                     processed_events,
+                     total_events,
+                     processed_signals,
+                     total_signals,
+                 }| {
+                    progress(BacktestProgress {
+                        stage: "replay".into(),
+                        processed_events: processed_events as u64,
+                        total_events: total_events as u64,
+                        processed_signals: processed_signals as u64,
+                        total_signals: total_signals as u64,
+                        processed_symbols: total_symbols,
+                        total_symbols,
+                    });
+                },
+            )
+            .map_err(map_streaming_replay_error)?
+    };
+    ensure_not_cancelled(cancellation)?;
+
+    attach_future_reproducibility_metadata(
+        &mut result,
+        state,
+        req,
+        &plan,
+        future,
+        profile.as_ref(),
+    );
     tracing::info!(
         "run_backtest: done, {} trades, {} positions",
         result.total_trades,
@@ -284,28 +764,193 @@ fn execute_backtest(state: &ServerState, req: &RunBacktestRequest) -> Result<Bac
     Ok(result)
 }
 
-// ── Run Backtest Multi ──────────────────────────────────────────────────────
-
-/// Handle `run_backtest_multi` — compares multiple profiles on the same data.
-pub fn handle_run_backtest_multi(
+fn attach_future_reproducibility_metadata(
+    result: &mut BacktestResult,
     state: &ServerState,
-    req: &RunBacktestMultiRequest,
-) -> RunBacktestMultiResponse {
-    let start = Instant::now();
+    req: &RunBacktestRequest,
+    plan: &ReplayPlan,
+    future: &FutureQuoteConfigMsg,
+    profile: Option<&ManagementProfile>,
+) {
+    let Some(metadata) = result.execution_metadata.as_mut() else {
+        return;
+    };
+    let tags = &mut metadata.tags;
+    tags.insert("data.exchange".into(), req.exchange.to_lowercase());
+    tags.insert("data.type".into(), req.data_type.to_lowercase());
+    tags.insert(
+        "data.timeframe".into(),
+        req.timeframe.clone().unwrap_or_else(|| "none".into()),
+    );
+    tags.insert(
+        "data.requested_from".into(),
+        req.from.clone().unwrap_or_else(|| "unbounded".into()),
+    );
+    tags.insert(
+        "data.requested_to".into(),
+        req.to.clone().unwrap_or_else(|| "unbounded".into()),
+    );
+    tags.insert("data.symbols".into(), plan.active_symbols().join(","));
+    tags.insert(
+        "data.requested_symbols".into(),
+        plan.requested_symbols().join(","),
+    );
+    tags.insert(
+        "data.active_symbols".into(),
+        plan.active_symbols().join(","),
+    );
+    tags.insert(
+        "data.idle_symbols".into(),
+        plan.idle_explicit_symbols().join(","),
+    );
+    tags.insert("data.idle_run".into(), plan.is_idle().to_string());
+    tags.insert(
+        "data.loading_from".into(),
+        plan.loading_start()
+            .map(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "none".into()),
+    );
+    tags.insert(
+        "execution.signal_latency_ms".into(),
+        future.signal_latency_ms.max(0).to_string(),
+    );
+    if req.data_type.eq_ignore_ascii_case("bar") {
+        tags.insert(
+            "data.bar_quote_convention".into(),
+            "close_only_zero_spread".into(),
+        );
+        tags.insert("data.intrabar_simulation".into(), "false".into());
+    }
 
-    let results = execute_backtest_multi(state, req);
+    match profile {
+        Some(profile) => {
+            tags.insert("profile.identity".into(), profile.name.clone());
+            tags.insert(
+                "profile.options".into(),
+                serde_json::to_string(profile).unwrap_or_else(|_| "unavailable".into()),
+            );
+        }
+        None => {
+            tags.insert("profile.identity".into(), "none".into());
+            tags.insert("profile.options".into(), "null".into());
+        }
+    }
+    match req.config.sizing.as_ref() {
+        Some(sizing) => {
+            let identity = match sizing {
+                SizingPolicyMsg::FixedLot { .. } => "fixed_lot",
+                SizingPolicyMsg::FixedRiskAmount { .. } => "fixed_risk_amount",
+                SizingPolicyMsg::BalanceRiskPercent { .. } => "balance_risk_percent",
+            };
+            tags.insert("sizing.identity".into(), identity.into());
+            tags.insert(
+                "sizing.options".into(),
+                serde_json::to_string(sizing).unwrap_or_else(|_| "unavailable".into()),
+            );
+        }
+        None => {
+            tags.insert("sizing.identity".into(), "signal_size".into());
+            tags.insert("sizing.options".into(), "null".into());
+        }
+    }
 
-    RunBacktestMultiResponse {
-        results,
-        elapsed_ms: start.elapsed().as_millis() as u64,
+    for symbol in plan.active_symbols() {
+        let Some(spec) = state.symbol_registry.spec(symbol) else {
+            continue;
+        };
+        let prefix = format!("symbol.{symbol}");
+        tags.insert(format!("{prefix}.canonical"), spec.canonical.clone());
+        tags.insert(
+            format!("{prefix}.pip_position"),
+            spec.pip_position.to_string(),
+        );
+        tags.insert(format!("{prefix}.digits"), spec.digits.to_string());
+        tags.insert(format!("{prefix}.category"), spec.category.clone());
+        tags.insert(
+            format!("{prefix}.lot_base_units"),
+            spec.lot_base_units.to_string(),
+        );
+        tags.insert(
+            format!("{prefix}.lot_step_units"),
+            spec.lot_step_units.to_string(),
+        );
+        tags.insert(
+            format!("{prefix}.lot_min_steps"),
+            spec.lot_min_steps.to_string(),
+        );
+        tags.insert(
+            format!("{prefix}.lot_max_steps"),
+            spec.lot_max_steps.to_string(),
+        );
     }
 }
 
-/// Internal: validate once, load data once, run each profile.
-fn execute_backtest_multi(
+// ── Run Backtest Multi ──────────────────────────────────────────────────────
+
+pub fn handle_run_backtest_multi_v2(
+    state: &ServerState,
+    req: &RunBacktestMultiV2Request,
+) -> RunBacktestMultiV2Response {
+    let start = Instant::now();
+    if req.request.profiles.is_empty() {
+        return RunBacktestMultiResponse {
+            success: false,
+            error: Some("At least one profile is required.".into()),
+            results: Vec::new(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        };
+    }
+    if req.schema_version != 2 {
+        let error = format!("unsupported schema_version: {}", req.schema_version);
+        let results = req
+            .request
+            .profiles
+            .iter()
+            .map(|profile| ProfileResult {
+                profile: profile_ref_name(profile),
+                success: false,
+                error: Some(error.clone()),
+                result: None,
+            })
+            .collect();
+        return RunBacktestMultiResponse {
+            success: false,
+            error: Some(error),
+            results,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        };
+    }
+    if let Err(error) = validate_future_quote_scalars(&req.future) {
+        let error = error.to_string();
+        return RunBacktestMultiResponse {
+            success: false,
+            error: Some(error.clone()),
+            results: profile_error_results(&req.request, error),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        };
+    }
+
+    let results =
+        execute_backtest_multi_with_future(state, &req.request, &req.future, &req.evaluation);
+    multi_response_from_results(state, results, start, Some(req.result_delivery))
+}
+
+fn execute_backtest_multi_with_future(
     state: &ServerState,
     req: &RunBacktestMultiRequest,
+    future: &FutureQuoteConfigMsg,
+    evaluation: &ProviderEvaluationOptionsMsg,
 ) -> Vec<ProfileResult> {
+    if let Err(error) = validate_future_quote_scalars(future) {
+        return profile_error_results(req, error.to_string());
+    }
+
     // Early validation common to all profiles.
     let data_type = req.data_type.to_lowercase();
     if data_type != "tick" && data_type != "bar" {
@@ -350,146 +995,170 @@ fn execute_backtest_multi(
             .collect();
     }
 
-    let symbols = match resolve_request_symbols(
-        &state.symbol_registry,
+    let from = match parse_optional_datetime(&req.from) {
+        Ok(value) => value,
+        Err(error) => return profile_error_results(req, error.to_string()),
+    };
+    let to = match parse_optional_datetime(&req.to) {
+        Ok(value) => value,
+        Err(error) => return profile_error_results(req, error.to_string()),
+    };
+    let plan = match build_replay_plan(
+        state,
         &req.symbol,
         &req.symbols,
         req.all_symbols,
         &req.raw_signals,
+        from,
+        to,
+        future.signal_latency_ms,
     ) {
-        Ok(v) => v,
-        Err(e) => {
+        Ok(plan) => plan,
+        Err(error) => return profile_error_results(req, error.to_string()),
+    };
+    if let Err(error) = validate_replay_sizing_for_config(&req.config, &plan) {
+        return profile_error_results(req, error.to_string());
+    }
+    let evaluation_options = match evaluation_options_from_msg_for_symbols(
+        evaluation,
+        &state.symbol_registry,
+        plan.requested_symbols(),
+    ) {
+        Ok(options) => options,
+        Err(error) => {
             return req
                 .profiles
                 .iter()
-                .map(|pr| ProfileResult {
-                    profile: profile_ref_name(pr),
+                .map(|profile| ProfileResult {
+                    profile: profile_ref_name(profile),
                     success: false,
-                    error: Some(e.to_string()),
+                    error: Some(error.to_string()),
                     result: None,
                 })
                 .collect();
+        }
+    };
+    let config = match config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols()) {
+        Ok(config) => config,
+        Err(error) => {
+            return profile_error_results(req, error.to_string());
+        }
+    };
+    let account_currency = match account_currency_from_msg(future) {
+        Ok(account_currency) => account_currency,
+        Err(error) => {
+            return profile_error_results(req, error.to_string());
         }
     };
     let exchange = req.exchange.to_lowercase();
 
-    let from = match parse_optional_datetime(&req.from) {
-        Ok(v) => v,
-        Err(e) => {
-            return req
-                .profiles
-                .iter()
-                .map(|pr| ProfileResult {
-                    profile: profile_ref_name(pr),
-                    success: false,
-                    error: Some(e.to_string()),
-                    result: None,
-                })
-                .collect();
-        }
-    };
-
-    let to = match parse_optional_datetime(&req.to) {
-        Ok(v) => v,
-        Err(e) => {
-            return req
-                .profiles
-                .iter()
-                .map(|pr| ProfileResult {
-                    profile: profile_ref_name(pr),
-                    success: false,
-                    error: Some(e.to_string()),
-                    result: None,
-                })
-                .collect();
-        }
-    };
-
-    // Load market data once - shared across all profile runs.
-    let events = match load_market_events_for_symbols(
-        &state.data_dir,
-        &exchange,
-        &symbols,
-        &data_type,
-        req.timeframe.as_deref(),
-        from,
-        to,
-    ) {
-        Ok(events) => events,
-        Err(e) => {
-            return req
-                .profiles
-                .iter()
-                .map(|pr| ProfileResult {
-                    profile: profile_ref_name(pr),
-                    success: false,
-                    error: Some(e.to_string()),
-                    result: None,
-                })
-                .collect();
-        }
-    };
-
-    let config = config_from_msg(&req.config, &state.symbol_registry, &symbols);
-
-    // Convert raw signal messages to internal format once, then filter by date.
-    let raw_signals_vec: Vec<RawSignal> =
-        match build_raw_signals_for_symbols(state, &req.raw_signals, &symbols) {
-            Ok(v) => v,
-            Err(e) => {
-                return req
-                    .profiles
-                    .iter()
-                    .map(|pr| ProfileResult {
-                        profile: profile_ref_name(pr),
-                        success: false,
-                        error: Some(e.to_string()),
-                        result: None,
-                    })
-                    .collect();
-            }
+    {
+        let mut never_cancelled = || false;
+        let primary = match describe_primary_market_stream(
+            &state.data_dir,
+            &exchange,
+            plan.active_symbols(),
+            &data_type,
+            req.timeframe.as_deref(),
+            plan.loading_start(),
+            to,
+            &mut never_cancelled,
+            &mut |_| {},
+        ) {
+            Ok(primary) => primary,
+            Err(error) => return profile_error_results(req, error.to_string()),
         };
-    let raw_signals_vec = filter_signals_by_date(raw_signals_vec, from, to);
+        let bundle = match describe_future_stream(
+            &state.data_dir,
+            &exchange,
+            &state.symbol_registry,
+            &account_currency,
+            plan.active_symbols(),
+            &data_type,
+            plan.loading_start(),
+            primary,
+            &mut never_cancelled,
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => return profile_error_results(req, error.to_string()),
+        };
+        let future_config = match future_config_from_msg(future, bundle.currency_plan) {
+            Ok(config) => config,
+            Err(error) => return profile_error_results(req, error.to_string()),
+        };
+        let primary_eod = bundle.description.primary_eod();
+        let metadata_request = single_request_from_multi(req);
 
-    // Run each profile independently.
-    req.profiles
-        .iter()
-        .map(|pr| {
-            let name = profile_ref_name(pr);
-            let run_result = match pr {
-                ProfileRef::Named(profile_name) => {
-                    let registry = state.profile_registry.read().unwrap();
-                    run_single_profile(&registry, profile_name, &raw_signals_vec, &events, &config)
+        req.profiles
+            .iter()
+            .map(|profile_ref| {
+                let name = profile_ref_name(profile_ref);
+                let profile = match profile_ref {
+                    ProfileRef::Named(profile_name) => state
+                        .profile_registry
+                        .read()
+                        .unwrap()
+                        .get(profile_name)
+                        .cloned()
+                        .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.clone())),
+                    ProfileRef::Inline(message) => profile_from_msg(message).and_then(|profile| {
+                        profile.validate().map_err(|error| {
+                            BacktestServerError::InvalidRequest(format!(
+                                "Invalid inline profile: {error}"
+                            ))
+                        })?;
+                        Ok(profile)
+                    }),
+                };
+                let run_result = profile.and_then(|profile| {
+                    run_profile_streaming(
+                        &profile,
+                        plan.retained_signals(),
+                        &bundle.description,
+                        primary_eod,
+                        &config,
+                        &future_config,
+                        future,
+                        Some(&evaluation_options),
+                        state,
+                        &metadata_request,
+                        &plan,
+                    )
+                });
+                match run_result {
+                    Ok(result) => ProfileResult {
+                        profile: name,
+                        success: true,
+                        error: None,
+                        result: Some(result_to_msg(&result)),
+                    },
+                    Err(error) => ProfileResult {
+                        profile: name,
+                        success: false,
+                        error: Some(error.to_string()),
+                        result: None,
+                    },
                 }
-                ProfileRef::Inline(msg) => match profile_from_msg(msg) {
-                    Ok(profile) => {
-                        if let Err(e) = profile.validate() {
-                            Err(BacktestServerError::InvalidRequest(format!(
-                                "Invalid inline profile: {e}"
-                            )))
-                        } else {
-                            run_profile_direct(&profile, &raw_signals_vec, &events, &config)
-                        }
-                    }
-                    Err(e) => Err(e),
-                },
-            };
-            match run_result {
-                Ok(result) => ProfileResult {
-                    profile: name,
-                    success: true,
-                    error: None,
-                    result: Some(result_to_msg(&result)),
-                },
-                Err(e) => ProfileResult {
-                    profile: name,
-                    success: false,
-                    error: Some(e.to_string()),
-                    result: None,
-                },
-            }
-        })
-        .collect()
+            })
+            .collect()
+    }
+}
+
+fn single_request_from_multi(req: &RunBacktestMultiRequest) -> RunBacktestRequest {
+    RunBacktestRequest {
+        symbol: req.symbol.clone(),
+        symbols: req.symbols.clone(),
+        all_symbols: req.all_symbols,
+        exchange: req.exchange.clone(),
+        data_type: req.data_type.clone(),
+        timeframe: req.timeframe.clone(),
+        from: req.from.clone(),
+        to: req.to.clone(),
+        raw_signals: req.raw_signals.clone(),
+        profile: None,
+        profile_def: None,
+        config: req.config.clone(),
+    }
 }
 
 /// Extract the profile name from a `ProfileRef`.
@@ -500,59 +1169,99 @@ fn profile_ref_name(pr: &ProfileRef) -> String {
     }
 }
 
-/// Run a single named profile against pre-loaded events (acquires read lock).
-fn run_single_profile(
-    registry: &ProfileRegistry,
-    profile_name: &str,
-    raw_signals: &[RawSignal],
-    events: &[qs_backtest::data_feed::MarketEvent],
-    config: &BacktestConfig,
-) -> Result<BacktestResult> {
-    let profile = registry
-        .get(profile_name)
-        .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.into()))?;
-
-    let mut feed = VecFeed::new(events.to_vec());
-    let runner = BacktestRunner::new(config.clone());
-    let result = runner.run_raw_signals(&mut feed, raw_signals.to_vec(), Some(profile));
-    Ok(result)
+fn profile_error_results(req: &RunBacktestMultiRequest, error: String) -> Vec<ProfileResult> {
+    req.profiles
+        .iter()
+        .map(|profile| ProfileResult {
+            profile: profile_ref_name(profile),
+            success: false,
+            error: Some(error.clone()),
+            result: None,
+        })
+        .collect()
 }
 
-/// Run a profile directly (already converted from inline definition).
-fn run_profile_direct(
+#[allow(clippy::too_many_arguments)]
+fn run_profile_streaming(
     profile: &ManagementProfile,
     raw_signals: &[RawSignal],
-    events: &[qs_backtest::data_feed::MarketEvent],
+    description: &MarketStreamDescription,
+    primary_eod: Option<NaiveDateTime>,
     config: &BacktestConfig,
+    future_config: &FutureQuoteConfig,
+    future: &FutureQuoteConfigMsg,
+    evaluation: Option<&EvaluationOptions>,
+    state: &ServerState,
+    metadata_request: &RunBacktestRequest,
+    plan: &ReplayPlan,
 ) -> Result<BacktestResult> {
-    let mut feed = VecFeed::new(events.to_vec());
-    let runner = BacktestRunner::new(config.clone());
-    let result = runner.run_raw_signals(&mut feed, raw_signals.to_vec(), Some(profile));
+    let cancellation: CancellationCheck = Arc::new(|| false);
+    let mut feed = description.open(cancellation)?;
+    let mut runner = BacktestRunner::new_future(config.clone(), future_config.clone());
+    if let Some(options) = evaluation {
+        runner = runner.with_evaluation_options(options.clone());
+    }
+    let mut result = runner
+        .run_raw_signals_future_streaming_controlled(
+            &mut feed,
+            primary_eod,
+            raw_signals.to_vec(),
+            Some(profile),
+            || false,
+            |_| {},
+        )
+        .map_err(map_streaming_replay_error)?;
+    attach_future_reproducibility_metadata(
+        &mut result,
+        state,
+        metadata_request,
+        plan,
+        future,
+        Some(profile),
+    );
     Ok(result)
 }
 
 // ── Signal Conversion ───────────────────────────────────────────────────────
 
-/// Resolve the market-data symbols requested for one portfolio backtest.
-fn resolve_request_symbols(
+#[allow(clippy::too_many_arguments)]
+fn build_replay_plan(
+    state: &ServerState,
+    symbol: &str,
+    symbols: &[String],
+    all_symbols: bool,
+    raw_signal_msgs: &[RawSignalMsg],
+    requested_from: Option<NaiveDateTime>,
+    requested_to: Option<NaiveDateTime>,
+    signal_latency_ms: i64,
+) -> Result<ReplayPlan> {
+    let scope =
+        resolve_requested_symbol_scope(&state.symbol_registry, symbol, symbols, all_symbols)?;
+    let raw_signals = raw_signal_msgs
+        .iter()
+        .map(|signal| raw_signal_from_msg(signal, scope.default_symbol(), &state.symbol_registry))
+        .collect::<Result<Vec<_>>>()?;
+    ReplayPlan::build(
+        scope,
+        raw_signals,
+        requested_from,
+        requested_to,
+        signal_latency_ms,
+    )
+}
+
+fn resolve_requested_symbol_scope(
     registry: &SymbolRegistry,
     symbol: &str,
     symbols: &[String],
     all_symbols: bool,
-    raw_signals: &[RawSignalMsg],
-) -> Result<Vec<String>> {
-    let mut resolved = BTreeSet::new();
-
+) -> Result<RequestedSymbolScope> {
     if all_symbols {
-        for signal in raw_signals {
-            collect_raw_signal_symbols(registry, signal, &mut resolved);
-        }
-        if resolved.is_empty() {
-            return Err(BacktestServerError::InvalidRequest(
-                "all_symbols requested, but no symbols were found in raw entry signals".into(),
-            ));
-        }
-    } else if !symbols.is_empty() {
+        return Ok(RequestedSymbolScope::Inferred);
+    }
+
+    let mut resolved = BTreeSet::new();
+    if !symbols.is_empty() {
         for raw in symbols {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
@@ -574,97 +1283,7 @@ fn resolve_request_symbols(
         resolved.insert(normalize_symbol(registry, trimmed));
     }
 
-    Ok(resolved.into_iter().collect())
-}
-
-fn collect_raw_signal_symbols(
-    registry: &SymbolRegistry,
-    signal: &RawSignalMsg,
-    symbols: &mut BTreeSet<String>,
-) {
-    match signal {
-        RawSignalMsg::Entry { symbol, .. }
-        | RawSignalMsg::CloseAllOf { symbol, .. }
-        | RawSignalMsg::ModifyAllStoploss { symbol, .. } => {
-            let trimmed = symbol.trim();
-            if !trimmed.is_empty() {
-                symbols.insert(normalize_symbol(registry, trimmed));
-            }
-        }
-        RawSignalMsg::Close { position, .. }
-        | RawSignalMsg::ClosePartial { position, .. }
-        | RawSignalMsg::ModifyStoploss { position, .. }
-        | RawSignalMsg::MoveStoplossToEntry { position, .. }
-        | RawSignalMsg::AddTarget { position, .. }
-        | RawSignalMsg::RemoveTarget { position, .. }
-        | RawSignalMsg::AddRule { position, .. }
-        | RawSignalMsg::RemoveRule { position, .. }
-        | RawSignalMsg::ScaleIn { position, .. }
-        | RawSignalMsg::CancelPending { position, .. } => {
-            if let PositionRefMsg::AllOnSymbol { symbol } = position {
-                let trimmed = symbol.trim();
-                if !trimmed.is_empty() {
-                    symbols.insert(normalize_symbol(registry, trimmed));
-                }
-            }
-        }
-        RawSignalMsg::CloseAll { .. }
-        | RawSignalMsg::CancelAllPending { .. }
-        | RawSignalMsg::CloseAllInGroup { .. }
-        | RawSignalMsg::ModifyAllStoplossInGroup { .. } => {}
-    }
-}
-
-/// Build `Vec<RawSignal>` from the `raw_signals` field.
-fn build_raw_signals_for_symbols(
-    state: &ServerState,
-    raw_signal_msgs: &[RawSignalMsg],
-    symbols: &[String],
-) -> Result<Vec<RawSignal>> {
-    let default_symbol = if symbols.len() == 1 {
-        symbols[0].as_str()
-    } else {
-        ""
-    };
-    let raw_signals = raw_signal_msgs
-        .iter()
-        .map(|s| raw_signal_from_msg(s, default_symbol, &state.symbol_registry))
-        .collect::<Result<Vec<_>>>()?;
-
-    if symbols.len() > 1 {
-        ensure_entry_symbols_are_explicit(raw_signal_msgs)?;
-        ensure_entry_symbols_are_loaded(&raw_signals, symbols)?;
-    }
-
-    Ok(raw_signals)
-}
-
-fn ensure_entry_symbols_are_explicit(raw_signal_msgs: &[RawSignalMsg]) -> Result<()> {
-    for signal in raw_signal_msgs {
-        if let RawSignalMsg::Entry { symbol, .. } = signal {
-            if symbol.trim().is_empty() {
-                return Err(BacktestServerError::InvalidRequest(
-                    "Entry signal symbol is required for multi-symbol backtests".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_entry_symbols_are_loaded(raw_signals: &[RawSignal], symbols: &[String]) -> Result<()> {
-    let loaded: BTreeSet<&str> = symbols.iter().map(String::as_str).collect();
-    for signal in raw_signals {
-        if let RawSignal::Entry { symbol, .. } = signal {
-            if !loaded.contains(symbol.as_str()) {
-                return Err(BacktestServerError::InvalidRequest(format!(
-                    "Entry signal symbol '{symbol}' is not included in requested market-data symbols: {}",
-                    symbols.join(",")
-                )));
-            }
-        }
-    }
-    Ok(())
+    Ok(RequestedSymbolScope::explicit(resolved))
 }
 
 /// Resolve the management profile from a request (inline or named).
@@ -691,64 +1310,8 @@ fn resolve_profile(
 
 // ── Data Loading ────────────────────────────────────────────────────────────
 
-/// Load market data from Parquet and return a VecFeed.
-fn load_market_data(
-    data_dir: &str,
-    exchange: &str,
-    symbol: &str,
-    data_type: &str,
-    timeframe: Option<&str>,
-    from: Option<NaiveDateTime>,
-    to: Option<NaiveDateTime>,
-) -> Result<VecFeed> {
-    let events = load_market_events(data_dir, exchange, symbol, data_type, timeframe, from, to)?;
-    Ok(VecFeed::new(events))
-}
-
-/// Load market data for multiple symbols and merge the events into one timeline.
-fn load_market_data_for_symbols(
-    data_dir: &str,
-    exchange: &str,
-    symbols: &[String],
-    data_type: &str,
-    timeframe: Option<&str>,
-    from: Option<NaiveDateTime>,
-    to: Option<NaiveDateTime>,
-) -> Result<VecFeed> {
-    if symbols.is_empty() {
-        return Err(BacktestServerError::InvalidRequest(
-            "At least one symbol is required".into(),
-        ));
-    }
-
-    let mut feeds = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        tracing::info!("run_backtest: loading {}...", symbol);
-        feeds.push(load_market_data(
-            data_dir, exchange, symbol, data_type, timeframe, from, to,
-        )?);
-        tracing::info!("run_backtest: loaded {}", symbol);
-    }
-
-    Ok(merge_feeds(feeds))
-}
-
-/// Load raw market events for one or more symbols.
-fn load_market_events_for_symbols(
-    data_dir: &str,
-    exchange: &str,
-    symbols: &[String],
-    data_type: &str,
-    timeframe: Option<&str>,
-    from: Option<NaiveDateTime>,
-    to: Option<NaiveDateTime>,
-) -> Result<Vec<MarketEvent>> {
-    Ok(feed_to_events(load_market_data_for_symbols(
-        data_dir, exchange, symbols, data_type, timeframe, from, to,
-    )?))
-}
-
 /// Load raw market events from Parquet (shared between single and multi runs).
+#[cfg(test)]
 fn load_market_events(
     data_dir: &str,
     exchange: &str,
@@ -758,18 +1321,38 @@ fn load_market_events(
     from: Option<NaiveDateTime>,
     to: Option<NaiveDateTime>,
 ) -> Result<Vec<MarketEvent>> {
+    load_market_events_controlled(
+        data_dir, exchange, symbol, data_type, timeframe, from, to, None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn load_market_events_controlled(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    cancellation: Option<&JobCancellationToken>,
+) -> Result<Vec<MarketEvent>> {
+    ensure_not_cancelled(cancellation)?;
     let store = ParquetStore::open(data_dir)?;
     let dt = data_type.to_lowercase();
 
     if dt == "tick" {
-        let disk_exchange = resolve_partition_value(data_dir, "ticks", "exchange", exchange, "");
+        let disk_exchange =
+            resolve_partition_value(data_dir, "ticks", "exchange", exchange, "", cancellation)?;
         let disk_symbol = resolve_partition_value(
             data_dir,
             "ticks",
             "symbol",
             symbol,
             &format!("exchange={disk_exchange}"),
-        );
+            cancellation,
+        )?;
         let opts = QueryOpts {
             exchange: disk_exchange.clone(),
             symbol: disk_symbol.clone(),
@@ -779,7 +1362,11 @@ fn load_market_events(
             tail: false,
             descending: false,
         };
-        let (ticks, _total) = store.query_ticks(&opts)?;
+        let (ticks, _total) = store
+            .query_ticks_cancellable(&opts, || {
+                cancellation.is_some_and(JobCancellationToken::is_cancelled)
+            })
+            .map_err(map_data_cancellation)?;
         if ticks.is_empty() {
             return Err(BacktestServerError::NoDataFound {
                 symbol: disk_symbol,
@@ -799,21 +1386,24 @@ fn load_market_events(
         let tf = Timeframe::parse(tf_str).map_err(|_| {
             BacktestServerError::InvalidRequest(format!("Invalid timeframe: '{tf_str}'"))
         })?;
-        let disk_exchange = resolve_partition_value(data_dir, "bars", "exchange", exchange, "");
+        let disk_exchange =
+            resolve_partition_value(data_dir, "bars", "exchange", exchange, "", cancellation)?;
         let disk_symbol = resolve_partition_value(
             data_dir,
             "bars",
             "symbol",
             symbol,
             &format!("exchange={disk_exchange}"),
-        );
+            cancellation,
+        )?;
         let disk_timeframe = resolve_partition_value(
             data_dir,
             "bars",
             "timeframe",
             tf.as_str(),
             &format!("exchange={disk_exchange}/symbol={disk_symbol}"),
-        );
+            cancellation,
+        )?;
         let opts = BarQueryOpts {
             exchange: disk_exchange.clone(),
             symbol: disk_symbol.clone(),
@@ -824,7 +1414,11 @@ fn load_market_events(
             tail: false,
             descending: false,
         };
-        let (bars, _total) = store.query_bars(&opts)?;
+        let (bars, _total) = store
+            .query_bars_cancellable(&opts, || {
+                cancellation.is_some_and(JobCancellationToken::is_cancelled)
+            })
+            .map_err(map_data_cancellation)?;
         if bars.is_empty() {
             return Err(BacktestServerError::NoDataFound {
                 symbol: disk_symbol,
@@ -845,14 +1439,24 @@ fn load_market_events(
     }
 }
 
+#[cfg(test)]
+fn map_data_cancellation(error: DataError) -> BacktestServerError {
+    match error {
+        DataError::Cancelled => BacktestServerError::Cancelled,
+        other => BacktestServerError::Database(other),
+    }
+}
+
 /// Resolve a Hive partition value by scanning child directories case-insensitively.
+#[cfg(test)]
 fn resolve_partition_value(
     data_dir: &str,
     data_subdir: &str,
     key: &str,
     requested: &str,
     parent: &str,
-) -> String {
+    cancellation: Option<&JobCancellationToken>,
+) -> Result<String> {
     let dir = if parent.is_empty() {
         Path::new(data_dir).join(data_subdir)
     } else {
@@ -861,15 +1465,17 @@ fn resolve_partition_value(
     let prefix = format!("{key}=");
     let mut case_insensitive_match = None;
 
+    ensure_not_cancelled(cancellation)?;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            ensure_not_cancelled(cancellation)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let Some(value) = name.strip_prefix(&prefix) else {
                 continue;
             };
             if value == requested {
-                return value.to_string();
+                return Ok(value.to_string());
             }
             if case_insensitive_match.is_none() && value.eq_ignore_ascii_case(requested) {
                 case_insensitive_match = Some(value.to_string());
@@ -877,10 +1483,12 @@ fn resolve_partition_value(
         }
     }
 
-    case_insensitive_match.unwrap_or_else(|| requested.to_string())
+    ensure_not_cancelled(cancellation)?;
+    Ok(case_insensitive_match.unwrap_or_else(|| requested.to_string()))
 }
 
 /// Rewrite loaded market events to the canonical symbol used by signals.
+#[cfg(test)]
 fn canonicalize_market_event_symbols(
     mut events: Vec<MarketEvent>,
     canonical_symbol: &str,
@@ -896,6 +1504,7 @@ fn canonicalize_market_event_symbols(
 }
 
 /// Drain a VecFeed into its underlying Vec<MarketEvent>.
+#[cfg(test)]
 fn feed_to_events(mut feed: VecFeed) -> Vec<MarketEvent> {
     let mut events = Vec::with_capacity(feed.total());
     while let Some(event) = feed.next_event() {
@@ -923,6 +1532,19 @@ fn validate_request(req: &RunBacktestRequest) -> Result<()> {
     if req.raw_signals.is_empty() {
         return Err(BacktestServerError::InvalidRequest(
             "At least one raw_signal is required.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replay_sizing(req: &RunBacktestRequest, plan: &ReplayPlan) -> Result<()> {
+    validate_replay_sizing_for_config(&req.config, plan)
+}
+
+fn validate_replay_sizing_for_config(config: &BacktestConfigMsg, plan: &ReplayPlan) -> Result<()> {
+    if !plan.is_idle() && config.sizing.is_none() {
+        return Err(BacktestServerError::InvalidRequest(
+            "Entry signals require an account sizing policy.".into(),
         ));
     }
     Ok(())
@@ -965,30 +1587,6 @@ fn parse_optional_datetime(s: &Option<String>) -> Result<Option<NaiveDateTime>> 
         Some(v) => parse_datetime(v).map(Some),
         None => Ok(None),
     }
-}
-
-/// Filter raw signals to only those within the requested date range.
-///
-/// Signals outside the range are dropped.  When both `from` and `to` are
-/// `None` the full list is returned unchanged.  This is the authoritative
-/// server-side filter; correctness must not depend on client behaviour.
-fn filter_signals_by_date(
-    signals: Vec<RawSignal>,
-    from: Option<NaiveDateTime>,
-    to: Option<NaiveDateTime>,
-) -> Vec<RawSignal> {
-    if from.is_none() && to.is_none() {
-        return signals;
-    }
-    signals
-        .into_iter()
-        .filter(|s| {
-            let ts = s.ts();
-            let after_from = from.map_or(true, |f| ts >= f);
-            let before_to = to.map_or(true, |t| ts <= t);
-            after_from && before_to
-        })
-        .collect()
 }
 
 // ── Phase 2: Profile Management Handlers ────────────────────────────────────
@@ -1074,41 +1672,115 @@ pub fn handle_reload_profiles(state: &ServerState) -> ReloadProfilesResponse {
 
 // ── Async Job API Handlers (Issue 2) ─────────────────────────────────────────
 
-/// Handle `submit_backtest` — queue a backtest for async execution.
-///
-/// Returns immediately with a job_id.  The caller polls
-/// `get_backtest_status` and fetches results via `get_backtest_result`.
-pub fn handle_submit_backtest(
-    state: &ServerState,
-    req: &SubmitBacktestRequest,
-) -> SubmitBacktestResponse {
-    // Validate request before creating job.
-    if let Err(e) = validate_request(&req.request) {
-        return SubmitBacktestResponse {
-            success: false,
-            job_id: None,
-            error: Some(e.to_string()),
-        };
-    }
-
+/// Admit a validated V2 request to the bounded async job store.
+fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
     let job_id = format!("job-{}", uuid_v4_simple());
     let job = BacktestJob {
         status: JobStatus::Queued,
         submitted_at: Instant::now(),
         completed_at: None,
-        progress: None,
+        progress: BacktestProgress {
+            stage: "queued".into(),
+            ..BacktestProgress::default()
+        },
         result: None,
+        artifact: None,
+        inline_complete: false,
+        artifact_consumed: false,
         error: None,
+        cancellation: JobCancellationToken::default(),
+        worker_active: true,
     };
+    if state.max_retained_jobs == 0 {
+        return SubmitBacktestResponse {
+            success: false,
+            job_id: None,
+            error: Some("Async job retention limit is zero".into()),
+        };
+    }
+    let mut evicted = Vec::new();
     {
         let mut jobs = state.jobs.lock().unwrap();
+        while jobs.len() >= state.max_retained_jobs {
+            let Some(removed) = remove_oldest_terminal_job(&mut jobs) else {
+                break;
+            };
+            evicted.push(removed);
+        }
+        if jobs.len() >= state.max_retained_jobs {
+            drop(jobs);
+            delete_job_artifacts(state, &evicted);
+            return SubmitBacktestResponse {
+                success: false,
+                job_id: None,
+                error: Some(format!(
+                    "Async job limit reached (max {})",
+                    state.max_retained_jobs
+                )),
+            };
+        }
         jobs.insert(job_id.clone(), job);
     }
+    delete_job_artifacts(state, &evicted);
     SubmitBacktestResponse {
         success: true,
         job_id: Some(job_id),
         error: None,
     }
+}
+
+pub fn handle_submit_backtest_v2(
+    state: &ServerState,
+    req: &SubmitBacktestV2Request,
+) -> SubmitBacktestResponse {
+    if req.request.schema_version != 2 {
+        return SubmitBacktestResponse {
+            success: false,
+            job_id: None,
+            error: Some(format!(
+                "unsupported schema_version: {}",
+                req.request.schema_version
+            )),
+        };
+    }
+    let validation = (|| -> Result<()> {
+        let request = &req.request.request;
+        validate_future_quote_scalars(&req.request.future)?;
+        validate_request(request)?;
+        let from = parse_optional_datetime(&request.from)?;
+        let to = parse_optional_datetime(&request.to)?;
+        let plan = build_replay_plan(
+            state,
+            &request.symbol,
+            &request.symbols,
+            request.all_symbols,
+            &request.raw_signals,
+            from,
+            to,
+            req.request.future.signal_latency_ms,
+        )?;
+        validate_replay_sizing(request, &plan)?;
+        account_currency_from_msg(&req.request.future)?;
+        config_from_msg(
+            &request.config,
+            &state.symbol_registry,
+            plan.active_symbols(),
+        )?;
+        evaluation_options_from_msg_for_symbols(
+            &req.request.evaluation,
+            &state.symbol_registry,
+            plan.requested_symbols(),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        return SubmitBacktestResponse {
+            success: false,
+            job_id: None,
+            error: Some(error.to_string()),
+        };
+    }
+    admit_backtest_job(state)
 }
 
 /// Handle `get_backtest_status` — poll the status of a submitted job.
@@ -1128,6 +1800,7 @@ pub fn handle_get_backtest_status(
                 status: job.status.as_str().to_string(),
                 error: job.error.clone(),
                 elapsed_ms,
+                progress: job.progress.clone(),
             }
         }
         None => BacktestStatusResponse {
@@ -1136,6 +1809,7 @@ pub fn handle_get_backtest_status(
             status: "NotFound".into(),
             error: Some(format!("Job '{}' not found", req.job_id)),
             elapsed_ms: None,
+            progress: BacktestProgress::default(),
         },
     }
 }
@@ -1147,11 +1821,25 @@ pub fn handle_get_backtest_result(
 ) -> GetBacktestResultResponse {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(&req.job_id) {
+        Some(job) if job.status == JobStatus::Completed && job.artifact_consumed => {
+            GetBacktestResultResponse {
+                success: false,
+                job_id: req.job_id.clone(),
+                result: job.result.clone(),
+                error: Some("Job result artifact has already been consumed".into()),
+                artifact: None,
+                inline_complete: false,
+                artifact_consumed: true,
+            }
+        }
         Some(job) if job.status == JobStatus::Completed => GetBacktestResultResponse {
             success: true,
             job_id: req.job_id.clone(),
             result: job.result.clone(),
             error: None,
+            artifact: job.artifact.clone(),
+            inline_complete: job.inline_complete,
+            artifact_consumed: false,
         },
         Some(job) => GetBacktestResultResponse {
             success: false,
@@ -1161,12 +1849,85 @@ pub fn handle_get_backtest_result(
                 "Job is not completed (status: {})",
                 job.status.as_str()
             )),
+            artifact: None,
+            inline_complete: true,
+            artifact_consumed: false,
         },
         None => GetBacktestResultResponse {
             success: false,
             job_id: req.job_id.clone(),
             result: None,
             error: Some(format!("Job '{}' not found", req.job_id)),
+            artifact: None,
+            inline_complete: true,
+            artifact_consumed: false,
+        },
+    }
+}
+
+/// Return one base64-encoded raw result artifact chunk.
+pub fn handle_get_result_artifact_chunk(
+    state: &ServerState,
+    req: &GetResultArtifactChunkRequest,
+) -> GetResultArtifactChunkResponse {
+    match state
+        .artifact_store
+        .read_chunk(&req.artifact_id, req.offset)
+    {
+        Ok(chunk) => GetResultArtifactChunkResponse {
+            success: true,
+            artifact_id: req.artifact_id.clone(),
+            offset: chunk.offset,
+            data_base64: BASE64_STANDARD.encode(chunk.bytes),
+            eof: chunk.eof,
+            error: None,
+        },
+        Err(error) => GetResultArtifactChunkResponse {
+            success: false,
+            artifact_id: req.artifact_id.clone(),
+            offset: req.offset,
+            data_base64: String::new(),
+            eof: false,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+/// Delete a complete result artifact.
+pub fn handle_delete_result_artifact(
+    state: &ServerState,
+    req: &DeleteResultArtifactRequest,
+) -> DeleteResultArtifactResponse {
+    let mut jobs = state.jobs.lock().unwrap();
+    match state.artifact_store.delete(&req.artifact_id) {
+        Ok(deleted) => {
+            for job in jobs.values_mut().filter(|job| {
+                job.artifact
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.artifact_id == req.artifact_id)
+            }) {
+                job.artifact = None;
+                job.artifact_consumed = true;
+                job.inline_complete = false;
+            }
+            if deleted {
+                DeleteResultArtifactResponse {
+                    success: true,
+                    artifact_id: req.artifact_id.clone(),
+                    error: None,
+                }
+            } else {
+                DeleteResultArtifactResponse {
+                    success: false,
+                    artifact_id: req.artifact_id.clone(),
+                    error: Some(format!("Artifact '{}' not found", req.artifact_id)),
+                }
+            }
+        }
+        Err(error) => DeleteResultArtifactResponse {
+            success: false,
+            artifact_id: req.artifact_id.clone(),
+            error: Some(error.to_string()),
         },
     }
 }
@@ -1183,8 +1944,15 @@ pub fn handle_cancel_backtest(
                 || job.status == JobStatus::LoadingData
                 || job.status == JobStatus::Running =>
         {
+            job.cancellation.cancel();
             job.status = JobStatus::Cancelled;
             job.completed_at = Some(Instant::now());
+            job.result = None;
+            job.artifact = None;
+            job.inline_complete = true;
+            job.artifact_consumed = false;
+            job.error = None;
+            job.progress.stage = "cancelled".into();
             CancelBacktestResponse {
                 success: true,
                 job_id: req.job_id.clone(),
@@ -1207,56 +1975,114 @@ pub fn handle_cancel_backtest(
     }
 }
 
-/// Run a submitted backtest job synchronously and store the result.
-/// Called from spawn_blocking in the server binary.
-pub fn run_job_and_store(state: Arc<ServerState>, job_id: String, req: RunBacktestRequest) {
-    {
+pub fn run_job_and_store_v2(state: Arc<ServerState>, job_id: String, req: RunBacktestV2Request) {
+    run_job_and_store_inner(
+        state,
+        job_id,
+        req.request,
+        req.future,
+        req.evaluation,
+        req.result_delivery,
+    );
+}
+
+fn run_job_and_store_inner(
+    state: Arc<ServerState>,
+    job_id: String,
+    req: RunBacktestRequest,
+    future: FutureQuoteConfigMsg,
+    evaluation: ProviderEvaluationOptionsMsg,
+    delivery: ResultDeliveryMsg,
+) {
+    let cancellation = {
         let mut jobs = state.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(&job_id) {
-            if job.status == JobStatus::Cancelled {
-                return;
-            }
-            job.status = JobStatus::LoadingData;
-        } else {
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        if job.status == JobStatus::Cancelled || job.cancellation.is_cancelled() {
+            job.worker_active = false;
             return;
         }
-    }
+        job.status = JobStatus::LoadingData;
+        job.progress.stage = "loading_data".into();
+        job.cancellation.clone()
+    };
 
-    // Transition to Running before the backtest engine starts.
-    {
-        let mut jobs = state.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(&job_id) {
-            if job.status == JobStatus::Cancelled {
-                return;
-            }
-            job.status = JobStatus::Running;
+    let result = execute_backtest_with_future_controlled(
+        &state,
+        &req,
+        &future,
+        &evaluation,
+        Some(&cancellation),
+        &mut |progress| update_job_progress(&state, &job_id, progress),
+    );
+
+    let execution_cancelled = matches!(&result, Err(BacktestServerError::Cancelled));
+    let prepared = if execution_cancelled {
+        None
+    } else {
+        Some(match result {
+            Ok(backtest_result) => prepare_result(
+                &state,
+                result_to_msg(&backtest_result),
+                Some(delivery),
+                compact_result_for_console,
+            ),
+            Err(error) => Err(error.to_string()),
+        })
+    };
+
+    let mut jobs = state.jobs.lock().unwrap();
+    let Some(job) = jobs.get_mut(&job_id) else {
+        return;
+    };
+    job.worker_active = false;
+    if cancellation.is_cancelled() || job.status == JobStatus::Cancelled || execution_cancelled {
+        if let Some(Ok(PreparedResult::Artifact { reference, .. })) = prepared.as_ref() {
+            let _ = state.artifact_store.delete(&reference.artifact_id);
         }
+        job.cancellation.cancel();
+        job.status = JobStatus::Cancelled;
+        job.result = None;
+        job.artifact = None;
+        job.inline_complete = true;
+        job.artifact_consumed = false;
+        job.error = None;
+        job.progress.stage = "cancelled".into();
+        job.completed_at.get_or_insert_with(Instant::now);
+        return;
     }
 
-    let result = execute_backtest(&state, &req);
-
-    {
-        let mut jobs = state.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(&job_id) {
-            if job.status == JobStatus::Cancelled {
-                return;
-            }
-            match result {
-                Ok(backtest_result) => {
-                    job.status = JobStatus::Completed;
-                    job.result = Some(result_to_msg(&backtest_result));
-                    job.progress = Some(format!(
-                        "{} trades, {} positions",
-                        backtest_result.total_trades, backtest_result.total_positions
-                    ));
-                    job.completed_at = Some(Instant::now());
-                }
-                Err(e) => {
-                    job.status = JobStatus::Failed;
-                    job.error = Some(e.to_string());
-                    job.completed_at = Some(Instant::now());
-                }
-            }
+    match prepared.expect("non-cancelled execution has a prepared result") {
+        Ok(PreparedResult::Inline(result)) => {
+            job.status = JobStatus::Completed;
+            job.result = Some(result);
+            job.artifact = None;
+            job.inline_complete = true;
+            job.artifact_consumed = false;
+            job.error = None;
+            job.progress.stage = "completed".into();
+            job.completed_at = Some(Instant::now());
+        }
+        Ok(PreparedResult::Artifact { reference, summary }) => {
+            job.status = JobStatus::Completed;
+            job.result = summary;
+            job.artifact = Some(reference);
+            job.inline_complete = false;
+            job.artifact_consumed = false;
+            job.error = None;
+            job.progress.stage = "completed".into();
+            job.completed_at = Some(Instant::now());
+        }
+        Err(error) => {
+            job.status = JobStatus::Failed;
+            job.result = None;
+            job.artifact = None;
+            job.inline_complete = true;
+            job.artifact_consumed = false;
+            job.error = Some(error);
+            job.progress.stage = "failed".into();
+            job.completed_at = Some(Instant::now());
         }
     }
 }
@@ -1271,21 +2097,7 @@ fn uuid_v4_simple() -> String {
     format!("{:x}", nanos)
 }
 
-/// Remove expired jobs from the job map.
-/// Completed/Failed/Cancelled jobs older than `max_age_secs` are removed.
-pub fn cleanup_expired_jobs(state: &ServerState, max_age_secs: u64) {
-    let now = Instant::now();
-    let max_duration = std::time::Duration::from_secs(max_age_secs);
-    let mut jobs = state.jobs.lock().unwrap();
-    jobs.retain(|_, job| {
-        let completed = match job.completed_at {
-            Some(c) => c,
-            None => return true, // still running, keep
-        };
-        now.duration_since(completed) < max_duration
-    });
-}
-
+#[cfg(test)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]
@@ -1294,6 +2106,59 @@ mod tests {
     use qs_core::types::{OrderType, Side};
     #[allow(unused_imports)]
     use std::sync::Arc;
+
+    fn test_v2_request(request: RunBacktestRequest) -> RunBacktestV2Request {
+        RunBacktestV2Request {
+            schema_version: 2,
+            request,
+            future: FutureQuoteConfigMsg {
+                account_currency: "USD".into(),
+                ..FutureQuoteConfigMsg::default()
+            },
+            evaluation: ProviderEvaluationOptionsMsg::default(),
+            result_delivery: ResultDeliveryMsg::Auto,
+        }
+    }
+
+    fn submit_v2_for_test(
+        state: &ServerState,
+        request: &RunBacktestRequest,
+    ) -> SubmitBacktestResponse {
+        handle_submit_backtest_v2(
+            state,
+            &SubmitBacktestV2Request {
+                request: test_v2_request(request.clone()),
+            },
+        )
+    }
+
+    fn run_job_v2_for_test(state: Arc<ServerState>, job_id: String, request: RunBacktestRequest) {
+        run_job_and_store_v2(state, job_id, test_v2_request(request));
+    }
+
+    fn test_state() -> ServerState {
+        let artifact_directory = std::env::temp_dir().join(format!(
+            "qs_backtest_server_handler_artifacts_{}",
+            std::process::id()
+        ));
+        ServerState {
+            symbol_registry: SymbolRegistry::empty(),
+            profile_registry: RwLock::new(ProfileRegistry::empty()),
+            data_dir: "/tmp/test".into(),
+            profiles_path: String::new(),
+            start_time: Instant::now(),
+            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_retained_jobs: 1_000,
+            artifact_store: ArtifactStore::new(
+                artifact_directory,
+                12 * 1024 * 1024,
+                1024 * 1024,
+                Duration::from_secs(3_600),
+                1024 * 1024 * 1024,
+            )
+            .unwrap(),
+        }
+    }
 
     #[test]
     fn parse_datetime_iso() {
@@ -1336,34 +2201,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_request_symbols_uses_explicit_symbols() {
-        let reg = SymbolRegistry::empty();
-        let signals = vec![RawSignalMsg::Entry {
-            ts: "2026-01-15T10:00:00".into(),
-            symbol: "xauusd".into(),
-            side: "Buy".into(),
-            order_type: "Market".into(),
-            price: Some(2000.0),
-            size: 1.0,
-            stoploss: None,
-            targets: vec![],
-            group: None,
-            trade_id: None,
-        }];
-        let symbols = resolve_request_symbols(
-            &reg,
+    fn requested_symbol_scope_normalizes_explicit_symbols() {
+        let scope = resolve_requested_symbol_scope(
+            &SymbolRegistry::empty(),
             "",
             &["XAU/USD".into(), " GBPJPY ".into()],
             false,
-            &signals,
         )
         .unwrap();
-        assert_eq!(symbols, vec!["gbpjpy", "xauusd"]);
+
+        assert_eq!(
+            scope,
+            RequestedSymbolScope::explicit(["gbpjpy".into(), "xauusd".into()])
+        );
     }
 
     #[test]
-    fn resolve_request_symbols_derives_all_symbols_from_entries() {
-        let reg = SymbolRegistry::empty();
+    fn replay_plan_derives_inferred_symbols_from_retained_entries() {
+        let state = test_state();
         let signals = vec![
             RawSignalMsg::Entry {
                 ts: "2026-01-15T10:00:00".into(),
@@ -1371,7 +2226,7 @@ mod tests {
                 side: "Buy".into(),
                 order_type: "Market".into(),
                 price: Some(2000.0),
-                size: 1.0,
+                risk: 1.0,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1383,43 +2238,67 @@ mod tests {
                 side: "Sell".into(),
                 order_type: "Market".into(),
                 price: Some(190.0),
-                size: 1.0,
+                risk: 1.0,
                 stoploss: None,
                 targets: vec![],
                 group: None,
                 trade_id: None,
             },
         ];
-        let symbols = resolve_request_symbols(&reg, "", &[], true, &signals).unwrap();
-        assert_eq!(symbols, vec!["gbpjpy", "xauusd"]);
+        let plan = build_replay_plan(&state, "", &[], true, &signals, None, None, 0).unwrap();
+
+        assert_eq!(plan.active_symbols(), ["gbpjpy", "xauusd"]);
     }
 
     #[test]
-    fn build_raw_signals_for_multi_symbol_rejects_empty_entry_symbol() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+    fn replay_plan_preserves_explicit_single_symbol_default() {
+        let state = test_state();
         let signals = vec![RawSignalMsg::Entry {
             ts: "2026-01-15T10:00:00".into(),
             symbol: "".into(),
             side: "Buy".into(),
             order_type: "Market".into(),
             price: Some(2000.0),
-            size: 1.0,
+            risk: 1.0,
             stoploss: None,
             targets: vec![],
             group: None,
             trade_id: None,
         }];
-        let err =
-            build_raw_signals_for_symbols(&state, &signals, &["xauusd".into(), "gbpjpy".into()])
-                .unwrap_err();
-        assert!(err.to_string().contains("symbol is required"));
+        let replay =
+            build_replay_plan(&state, "XAU/USD", &[], false, &signals, None, None, 0).unwrap();
+
+        assert_eq!(replay.active_symbols(), ["xauusd"]);
+    }
+
+    #[test]
+    fn replay_plan_rejects_missing_entry_symbol_in_explicit_multi_scope() {
+        let state = test_state();
+        let signals = vec![RawSignalMsg::Entry {
+            ts: "2026-01-15T10:00:00".into(),
+            symbol: "".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            price: Some(2000.0),
+            risk: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+            trade_id: None,
+        }];
+        let error = build_replay_plan(
+            &state,
+            "",
+            &["xauusd".into(), "gbpjpy".into()],
+            false,
+            &signals,
+            None,
+            None,
+            0,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("symbol is required"));
     }
 
     #[test]
@@ -1463,7 +2342,7 @@ mod tests {
                 side: "Buy".into(),
                 order_type: "Market".into(),
                 price: None,
-                size: 1.0,
+                risk: 1.0,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1498,7 +2377,7 @@ mod tests {
                 side: "Buy".into(),
                 order_type: "Market".into(),
                 price: None,
-                size: 1.0,
+                risk: 1.0,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1533,7 +2412,7 @@ mod tests {
                 side: "Buy".into(),
                 order_type: "Market".into(),
                 price: None,
-                size: 1.0,
+                risk: 1.0,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1545,22 +2424,65 @@ mod tests {
                 initial_balance: None,
                 close_on_finish: None,
                 fill_model: None,
-                sizing: None,
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
             },
         };
         assert!(validate_request(&req).is_ok());
     }
 
     #[test]
-    fn ping_returns_ok() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+    fn validate_request_rejects_entry_without_sizing() {
+        let mut req = RunBacktestRequest {
+            symbol: "eurusd".into(),
+            symbols: Vec::new(),
+            all_symbols: false,
+            exchange: "ctrader".into(),
+            data_type: "tick".into(),
+            timeframe: None,
+            from: None,
+            to: None,
+            raw_signals: vec![RawSignalMsg::Entry {
+                ts: "2026-01-15T10:00:00".into(),
+                symbol: "eurusd".into(),
+                side: "Buy".into(),
+                order_type: "Market".into(),
+                price: None,
+                risk: 1.0,
+                stoploss: None,
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            }],
+            profile: None,
+            profile_def: None,
+            config: BacktestConfigMsg {
+                initial_balance: None,
+                close_on_finish: None,
+                fill_model: None,
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+            },
         };
+        req.config.sizing = None;
+        let state = test_state();
+        let replay = build_replay_plan(
+            &state,
+            &req.symbol,
+            &req.symbols,
+            req.all_symbols,
+            &req.raw_signals,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert!(validate_request(&req).is_ok());
+        assert!(validate_replay_sizing(&req, &replay).is_err());
+    }
+
+    #[test]
+    fn ping_returns_ok() {
+        let state = test_state();
         let resp = handle_ping(&state);
         assert_eq!(resp.status, "OK");
         assert_eq!(resp.data_dir, "/tmp/test");
@@ -1589,8 +2511,15 @@ mod tests {
         std::fs::create_dir_all(&symbol_dir).unwrap();
         let root_str = root.to_string_lossy().to_string();
 
-        let resolved =
-            resolve_partition_value(&root_str, "ticks", "symbol", "audcad", "exchange=icmarkets");
+        let resolved = resolve_partition_value(
+            &root_str,
+            "ticks",
+            "symbol",
+            "audcad",
+            "exchange=icmarkets",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(resolved, "AUDCAD");
         std::fs::remove_dir_all(root).unwrap();
@@ -1676,31 +2605,18 @@ mod tests {
 
     #[test]
     fn list_profiles_empty_registry() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let resp = handle_list_profiles(&state);
         assert!(resp.profiles.is_empty());
     }
 
     #[test]
     fn add_profile_success() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "new_prof".into(),
+                target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
                 stoploss_mode: None,
@@ -1718,17 +2634,11 @@ mod tests {
 
     #[test]
     fn add_profile_duplicate_rejected() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "dup".into(),
+                target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
                 stoploss_mode: None,
@@ -1747,17 +2657,11 @@ mod tests {
 
     #[test]
     fn add_profile_overwrite_success() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let req1 = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "ow".into(),
+                target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
                 stoploss_mode: None,
@@ -1771,6 +2675,7 @@ mod tests {
         let req2 = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "ow".into(),
+                target_selection: None,
                 use_targets: vec![1, 2],
                 close_ratios: vec![0.5, 0.5],
                 stoploss_mode: None,
@@ -1787,17 +2692,11 @@ mod tests {
 
     #[test]
     fn add_profile_invalid_rejected() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let req = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "bad".into(),
+                target_selection: None,
                 use_targets: vec![1, 2],
                 close_ratios: vec![1.0], // mismatch
                 stoploss_mode: None,
@@ -1815,18 +2714,12 @@ mod tests {
 
     #[test]
     fn remove_profile_success() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         // Add a profile first.
         let add_req = AddProfileRequest {
             profile: ManagementProfileMsg {
                 name: "rm_me".into(),
+                target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
                 stoploss_mode: None,
@@ -1850,14 +2743,7 @@ mod tests {
 
     #[test]
     fn remove_profile_not_found() {
-        let state = ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        };
+        let state = test_state();
         let resp = handle_remove_profile(
             &state,
             &RemoveProfileRequest {
@@ -1888,7 +2774,7 @@ mod tests {
                 side: Side::Buy,
                 order_type: OrderType::Market,
                 price: None,
-                size: 0.01,
+                risk_multiplier: 0.01,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1900,7 +2786,7 @@ mod tests {
                 side: Side::Sell,
                 order_type: OrderType::Market,
                 price: None,
-                size: 0.01,
+                risk_multiplier: 0.01,
                 stoploss: None,
                 targets: vec![],
                 group: None,
@@ -1912,15 +2798,22 @@ mod tests {
                 side: Side::Buy,
                 order_type: OrderType::Market,
                 price: None,
-                size: 0.01,
+                risk_multiplier: 0.01,
                 stoploss: None,
                 targets: vec![],
                 group: None,
                 trade_id: None,
             },
         ];
-        let filtered = filter_signals_by_date(signals, Some(t(8)), Some(t(11)));
-        assert_eq!(filtered.len(), 2);
+        let replay = ReplayPlan::build(
+            RequestedSymbolScope::explicit(["X".into()]),
+            signals,
+            Some(t(8)),
+            Some(t(11)),
+            0,
+        )
+        .unwrap();
+        assert_eq!(replay.retained_signals().len(), 2);
     }
 
     #[test]
@@ -1935,14 +2828,21 @@ mod tests {
             side: Side::Buy,
             order_type: OrderType::Market,
             price: None,
-            size: 0.01,
+            risk_multiplier: 0.01,
             stoploss: None,
             targets: vec![],
             group: None,
             trade_id: None,
         }];
-        let filtered = filter_signals_by_date(signals, None, None);
-        assert_eq!(filtered.len(), 1);
+        let replay = ReplayPlan::build(
+            RequestedSymbolScope::explicit(["X".into()]),
+            signals,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(replay.retained_signals().len(), 1);
     }
 
     //
@@ -1951,48 +2851,39 @@ mod tests {
 
     #[allow(dead_code)]
     fn job_test_state() -> ServerState {
-        ServerState {
-            symbol_registry: SymbolRegistry::empty(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: "/tmp/test".into(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
+        test_state()
     }
 
     #[allow(dead_code)]
-    fn valid_submit_request() -> SubmitBacktestRequest {
-        SubmitBacktestRequest {
-            request: RunBacktestRequest {
-                symbol: "XAUUSD".into(),
-                symbols: vec![],
-                all_symbols: false,
-                exchange: "icmarkets".into(),
-                data_type: "tick".into(),
-                timeframe: None,
-                from: None,
-                to: None,
-                raw_signals: vec![RawSignalMsg::Entry {
-                    ts: "2026-01-01T00:00:00".into(),
-                    symbol: "xauusd".into(),
-                    side: "Buy".into(),
-                    order_type: "Market".into(),
-                    price: Some(5000.0),
-                    size: 0.01,
-                    stoploss: Some(4990.0),
-                    targets: vec![],
-                    group: None,
-                    trade_id: None,
-                }],
-                profile: None,
-                profile_def: None,
-                config: BacktestConfigMsg {
-                    initial_balance: Some(10_000.0),
-                    close_on_finish: Some(true),
-                    fill_model: Some("BidAsk".into()),
-                    sizing: None,
-                },
+    fn valid_submit_request() -> RunBacktestRequest {
+        RunBacktestRequest {
+            symbol: "XAUUSD".into(),
+            symbols: vec![],
+            all_symbols: false,
+            exchange: "icmarkets".into(),
+            data_type: "tick".into(),
+            timeframe: None,
+            from: None,
+            to: None,
+            raw_signals: vec![RawSignalMsg::Entry {
+                ts: "2026-01-01T00:00:00".into(),
+                symbol: "xauusd".into(),
+                side: "Buy".into(),
+                order_type: "Market".into(),
+                price: Some(5000.0),
+                risk: 1.0,
+                stoploss: Some(4990.0),
+                targets: vec![],
+                group: None,
+                trade_id: None,
+            }],
+            profile: None,
+            profile_def: None,
+            config: BacktestConfigMsg {
+                initial_balance: Some(10_000.0),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
             },
         }
     }
@@ -2000,7 +2891,7 @@ mod tests {
     #[test]
     fn submit_and_cancel_job() {
         let state = job_test_state();
-        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        let submit = submit_v2_for_test(&state, &valid_submit_request());
         assert!(submit.success);
         let job_id = submit.job_id.unwrap();
 
@@ -2020,8 +2911,8 @@ mod tests {
     fn submit_invalid_request_rejected() {
         let state = job_test_state();
         let mut req = valid_submit_request();
-        req.request.raw_signals = vec![];
-        let submit = handle_submit_backtest(&state, &req);
+        req.raw_signals = vec![];
+        let submit = submit_v2_for_test(&state, &req);
         assert!(!submit.success);
         assert!(submit.job_id.is_none());
     }
@@ -2064,6 +2955,9 @@ aliases = ["gold"]
 pip_position = 1
 digits = 2
 category = "metal"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
 lot_base_units = 100
 lot_step_units = 1
 lot_min_steps = 1
@@ -2075,6 +2969,9 @@ aliases = []
 pip_position = 2
 digits = 3
 category = "forex"
+base_currency = "GBP"
+quote_currency = "JPY"
+pnl_currency = "JPY"
 lot_base_units = 100000
 lot_step_units = 1000
 lot_min_steps = 1
@@ -2088,7 +2985,7 @@ lot_max_steps = 0
             fill_model: Some("BidAsk".into()),
             sizing: None,
         };
-        let config = config_from_msg(&msg, &registry, &symbols);
+        let config = config_from_msg(&msg, &registry, &symbols).unwrap();
         assert_eq!(config.contract_sizes.get("xauusd"), Some(&100.0));
         assert_eq!(config.contract_sizes.get("gbpjpy"), Some(&100_000.0));
         assert!(!config.symbol_specs.is_empty());
@@ -2100,7 +2997,7 @@ lot_max_steps = 0
         let state = Arc::new(job_test_state());
 
         // Submit a valid job.
-        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        let submit = submit_v2_for_test(&state, &valid_submit_request());
         assert!(submit.success);
         let job_id = submit.job_id.unwrap();
 
@@ -2113,10 +3010,10 @@ lot_max_steps = 0
         );
         assert_eq!(status.status, "Queued");
 
-        // Run the job via run_job_and_store (will fail since no real data,
+        // Run the job via the V2 worker (will fail since no real data,
         // but should transition through LoadingData -> Failed).
-        let req = valid_submit_request().request;
-        run_job_and_store(state.clone(), job_id.clone(), req);
+        let req = valid_submit_request();
+        run_job_v2_for_test(state.clone(), job_id.clone(), req);
 
         // Status should be Failed (no market data at /tmp/test).
         let status = handle_get_backtest_status(
@@ -2143,8 +3040,8 @@ lot_max_steps = 0
         let state = job_test_state();
 
         // Submit two jobs.
-        let submit1 = handle_submit_backtest(&state, &valid_submit_request());
-        let submit2 = handle_submit_backtest(&state, &valid_submit_request());
+        let submit1 = submit_v2_for_test(&state, &valid_submit_request());
+        let submit2 = submit_v2_for_test(&state, &valid_submit_request());
 
         assert!(submit1.success);
         assert!(submit2.success);
@@ -2192,7 +3089,7 @@ lot_max_steps = 0
         let state = job_test_state();
 
         // Submit and cancel a job.
-        let submit = handle_submit_backtest(&state, &valid_submit_request());
+        let submit = submit_v2_for_test(&state, &valid_submit_request());
         let job_id = submit.job_id.unwrap();
         handle_cancel_backtest(
             &state,
@@ -2207,8 +3104,17 @@ lot_max_steps = 0
             assert!(jobs.contains_key(&job_id));
         }
 
+        // Simulate the spawned worker acknowledging the pre-start cancellation.
+        state
+            .jobs
+            .lock()
+            .unwrap()
+            .get_mut(&job_id)
+            .unwrap()
+            .worker_active = false;
+
         // Cleanup with max_age=0 removes completed/cancelled jobs.
-        cleanup_expired_jobs(&state, 0);
+        assert_eq!(cleanup_expired_jobs(&state, Duration::ZERO), 1);
 
         // Job should be gone.
         {
@@ -2226,11 +3132,11 @@ lot_max_steps = 0
         assert_eq!(JobStatus::Failed.as_str(), "Failed");
         assert_eq!(JobStatus::Cancelled.as_str(), "Cancelled");
 
-        assert_eq!(JobStatus::from_str("Queued"), Some(JobStatus::Queued));
+        assert_eq!("Queued".parse::<JobStatus>(), Ok(JobStatus::Queued));
         assert_eq!(
-            JobStatus::from_str("LoadingData"),
-            Some(JobStatus::LoadingData)
+            "LoadingData".parse::<JobStatus>(),
+            Ok(JobStatus::LoadingData)
         );
-        assert_eq!(JobStatus::from_str("invalid"), None);
+        assert_eq!("invalid".parse::<JobStatus>(), Err("invalid job status"));
     }
 }

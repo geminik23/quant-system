@@ -25,7 +25,7 @@ pub fn ticks_to_dataframe(ticks: &[Tick]) -> Result<DataFrame> {
         Column::new("symbol".into(), &symbols),
         Column::new("ts".into(), &timestamps)
             .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
-            .map_err(|e| crate::error::DataError::Polars(e))?,
+            .map_err(crate::error::DataError::Polars)?,
         Column::new("bid".into(), &bids),
         Column::new("ask".into(), &asks),
         Column::new("last".into(), &lasts),
@@ -91,7 +91,7 @@ pub fn bars_to_dataframe(bars: &[Bar]) -> Result<DataFrame> {
         Column::new("timeframe".into(), &timeframes),
         Column::new("ts".into(), &timestamps)
             .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
-            .map_err(|e| crate::error::DataError::Polars(e))?,
+            .map_err(crate::error::DataError::Polars)?,
         Column::new("open".into(), &opens),
         Column::new("high".into(), &highs),
         Column::new("low".into(), &lows),

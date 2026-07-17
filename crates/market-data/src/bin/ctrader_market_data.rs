@@ -283,10 +283,10 @@ fn spawn_client_handler(
                 let handler = handler.clone();
                 let state = state.clone();
                 async move {
-                    if let Some(owner) = state.owner_of(&req.alert_id).await {
-                        if owner != client_id {
-                            return Ok(CommandAck::error("not owner"));
-                        }
+                    if let Some(owner) = state.owner_of(&req.alert_id).await
+                        && owner != client_id
+                    {
+                        return Ok(CommandAck::error("not owner"));
                     }
                     let removed = handler
                         .remove_price_alert(req.alert_id.clone())
@@ -350,8 +350,8 @@ fn spawn_client_handler(
                                 Some(set) => set.contains(&tick.symbol),
                             };
                             drop(f);
-                            if should_send {
-                                if sender
+                            if should_send
+                                && sender
                                     .send(PriceTick {
                                         symbol: tick.symbol,
                                         bid: tick.bid,
@@ -359,9 +359,8 @@ fn spawn_client_handler(
                                         ts_ms: tick.ts_ms,
                                     })
                                     .is_err()
-                                {
-                                    break;
-                                }
+                            {
+                                break;
                             }
                         }
                         let _ = sender.end();

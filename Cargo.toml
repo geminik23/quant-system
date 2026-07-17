@@ -16,6 +16,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/geminik23/quant-system"
 
 [workspace.dependencies]
+criterion = "0.5"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

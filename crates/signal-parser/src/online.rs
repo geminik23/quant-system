@@ -128,10 +128,10 @@ impl OnlineServer {
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| SignalParserError::Io(e))?;
+            .map_err(SignalParserError::Io)?;
         axum::serve(listener, app)
             .await
-            .map_err(|e| SignalParserError::Io(e))?;
+            .map_err(SignalParserError::Io)?;
 
         Ok(())
     }
@@ -226,12 +226,25 @@ fn process_relay(
                 history: &history_slice,
             };
 
-            // Route to parse_root or parse_reply.
+            let current = RawTgMessage {
+                chat_id: ch_id,
+                msg_id,
+                ts: ts.to_string(),
+                message: message.clone(),
+                reply_to: data.reply_to,
+            };
+            // Route through the source-identity-aware wrappers.
             let action = if let Some(reply_to_id) = data.reply_to {
                 let parent = chan_history.iter().find(|m| m.msg_id == reply_to_id);
-                parser.parse_reply(&message, ts, parent, &ctx)
+                if parent.is_none() {
+                    ParsedAction::Rejected(crate::types::ParseFailure::MissingParent {
+                        reply_to: reply_to_id,
+                    })
+                } else {
+                    parser.parse_reply_message(&current, ts, parent, &ctx)
+                }
             } else {
-                parser.parse_root(&message, ts, &ctx)
+                parser.parse_root_message(&current, ts, &ctx)
             };
 
             // Build handler context.
@@ -243,30 +256,38 @@ fn process_relay(
             };
 
             // Call handler based on event type and parse result.
-            match action {
-                ParsedAction::Signals(signals) => {
-                    if relay.t == "EDIT" {
-                        handler.on_signal_edit(signals, &signal_ctx);
-                    } else {
-                        handler.on_signals(signals, &signal_ctx);
+            let retain_in_history = match action {
+                ParsedAction::Signals(signals) => match crate::pipeline::validate_signals(&signals)
+                {
+                    Ok(()) => {
+                        if relay.t == "EDIT" {
+                            handler.on_signal_edit(signals, &signal_ctx);
+                        } else {
+                            handler.on_signals(signals, &signal_ctx);
+                        }
+                        true
                     }
-                }
+                    Err(failure) => {
+                        tracing::warn!(?failure, "online parser emitted invalid signals");
+                        handler.on_skip(&message, &signal_ctx);
+                        false
+                    }
+                },
                 ParsedAction::Skip => {
                     handler.on_skip(&message, &signal_ctx);
+                    true
                 }
-            }
+                ParsedAction::Rejected(failure) => {
+                    tracing::warn!(?failure, "online parser rejected message");
+                    handler.on_skip(&message, &signal_ctx);
+                    false
+                }
+            };
 
-            // Push into history.
+            // Push successful and intentionally skipped messages into history.
             let max_hist = parser.max_history();
-            if max_hist > 0 {
-                let raw_msg = RawTgMessage {
-                    chat_id: ch_id,
-                    msg_id,
-                    ts: ts.to_string(),
-                    message,
-                    reply_to: data.reply_to,
-                };
-                chan_history.push_back(raw_msg);
+            if retain_in_history && max_hist > 0 {
+                chan_history.push_back(current);
                 while chan_history.len() > max_hist {
                     chan_history.pop_front();
                 }
@@ -276,10 +297,10 @@ fn process_relay(
         "DEL" => {
             let ch_id = relay.data.ch_id;
             let mut ids = relay.data.del_ids.unwrap_or_default();
-            if let Some(single) = relay.data.del_id {
-                if !ids.contains(&single) {
-                    ids.push(single);
-                }
+            if let Some(single) = relay.data.del_id
+                && !ids.contains(&single)
+            {
+                ids.push(single);
             }
             if !ids.is_empty() {
                 handler.on_signal_delete(ch_id, ids);
@@ -352,7 +373,7 @@ mod tests {
     fn make_registry() -> ParserRegistry {
         let mut reg = ParserRegistry::new();
         let parser =
-            crate::template::TemplateParser::new("test-chan", vec![100], 0.01, Some("test".into()));
+            crate::template::TemplateParser::new("test-chan", vec![100], 1.0, Some("test".into()));
         reg.register(Box::new(parser));
         reg
     }
@@ -409,7 +430,14 @@ mod tests {
         assert_eq!(handler.new_count.load(Ordering::Relaxed), 1);
         let signals = handler.last_signals.lock().unwrap();
         assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].as_entry().unwrap().symbol, "eurusd");
+        assert!(matches!(
+            &signals[0],
+            RawSignal::Entry {
+                symbol,
+                risk_multiplier: 1.0,
+                ..
+            } if symbol == "eurusd"
+        ));
     }
 
     #[test]
@@ -539,7 +567,7 @@ mod tests {
         // Use a parser with max_history > 0 to verify history accumulates.
         let mut reg = ParserRegistry::new();
         let parser =
-            crate::template::TemplateParser::new("hist-chan", vec![200], 0.01, Some("hist".into()));
+            crate::template::TemplateParser::new("hist-chan", vec![200], 1.0, Some("hist".into()));
         reg.register(Box::new(parser));
 
         let handler = TestHandler::new();

@@ -10,7 +10,7 @@ use crate::types::{ParseContext, ParsedAction, RawTgMessage};
 pub struct TemplateParser {
     name: String,
     channel_ids: Vec<i64>,
-    default_size: f64,
+    default_risk_multiplier: f64,
     group_prefix: String,
 }
 
@@ -18,7 +18,7 @@ impl TemplateParser {
     pub fn new(
         name: impl Into<String>,
         channel_ids: Vec<i64>,
-        default_size: f64,
+        default_risk_multiplier: f64,
         group_prefix: Option<String>,
     ) -> Self {
         let name = name.into();
@@ -26,7 +26,7 @@ impl TemplateParser {
         Self {
             name,
             channel_ids,
-            default_size,
+            default_risk_multiplier,
             group_prefix,
         }
     }
@@ -113,20 +113,20 @@ impl TemplateParser {
             let tok = tokens[idx];
             if tok == "SL" || tok == "STOPLOSS" {
                 idx += 1;
-                if idx < tokens.len() {
-                    if let Some(v) = Self::parse_price(tokens[idx]) {
-                        stoploss = Some(v);
-                        idx += 1;
-                    }
+                if idx < tokens.len()
+                    && let Some(v) = Self::parse_price(tokens[idx])
+                {
+                    stoploss = Some(v);
+                    idx += 1;
                 }
             } else if tok == "TP" || tok.starts_with("TP") && tok.len() <= 4 {
                 // Matches TP, TP1, TP2, etc.
                 idx += 1;
-                if idx < tokens.len() {
-                    if let Some(v) = Self::parse_price(tokens[idx]) {
-                        targets.push(v);
-                        idx += 1;
-                    }
+                if idx < tokens.len()
+                    && let Some(v) = Self::parse_price(tokens[idx])
+                {
+                    targets.push(v);
+                    idx += 1;
                 }
             } else {
                 idx += 1;
@@ -144,7 +144,7 @@ impl TemplateParser {
             side,
             order_type,
             price,
-            size: self.default_size,
+            risk_multiplier: self.default_risk_multiplier,
             stoploss,
             targets,
             group: Some(self.group_prefix.clone()),
@@ -197,13 +197,14 @@ mod tests {
     }
 
     fn parser() -> TemplateParser {
-        TemplateParser::new("test-chan", vec![123], 0.01, None)
+        TemplateParser::new("test-chan", vec![123], 1.0, None)
     }
 
     fn entries(action: ParsedAction) -> Vec<RawSignal> {
         match action {
             ParsedAction::Signals(v) => v,
             ParsedAction::Skip => panic!("expected Signals, got Skip"),
+            ParsedAction::Rejected(error) => panic!("expected Signals, got {error:?}"),
         }
     }
 
@@ -219,6 +220,7 @@ mod tests {
                 side,
                 order_type,
                 price,
+                risk_multiplier,
                 stoploss,
                 targets,
                 ..
@@ -227,6 +229,7 @@ mod tests {
                 assert_eq!(*side, Side::Buy);
                 assert_eq!(*order_type, OrderType::Market);
                 assert_eq!(*price, None);
+                assert_eq!(*risk_multiplier, 1.0);
                 assert!((stoploss.unwrap() - 1.08).abs() < 1e-9);
                 assert_eq!(*targets, vec![1.09]);
             }

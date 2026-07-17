@@ -37,9 +37,9 @@
 //! The example will:
 //! 1. Load data from Parquet store
 //! 2. Print a summary of loaded events (count, time range, price range)
-//! 3. Generate dummy raw signals from the actual data (entries + management)
-//! 4. Run the backtest using `run_raw_signals()` (with optional profile)
-//! 5. Print the full BacktestResult report
+//! 3. Generate dummy raw signals from the actual data (risk-multiplier entries + management)
+//! 4. Size entries with a fixed-lot policy and run `run_raw_signals()` (with optional profile)
+//! 5. Print the full BacktestResult report, including each executed final lot
 //!
 //! ## Modes
 //!
@@ -55,12 +55,15 @@ use data_preprocess::{BarQueryOpts, ParquetStore, QueryOpts, Timeframe};
 use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
 use qs_backtest::profile::{PositionRef, ProfileRegistry, RawSignal};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
+use qs_backtest::sizing::SizingPolicy;
 use qs_core::types::{OrderType, Side};
 use qs_symbols::SymbolRegistry;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::process;
+
+const ENTRY_FIXED_LOT: f64 = 0.10;
 
 // ── CLI Args (manual parsing to avoid adding clap as a dep) ─────────────────
 
@@ -154,6 +157,7 @@ fn parse_args() -> Args {
                 eprintln!("  --data-dir <DIR>       Parquet root directory");
                 eprintln!("  --exchange <NAME>      Exchange partition (e.g. ctrader)");
                 eprintln!("  --symbol <NAME>        Symbol name (e.g. eurusd)");
+                eprintln!("  --symbols-path <FILE>  Path to symbols.toml for sizing and P&L");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --data-type <TYPE>     tick (default) or bar");
@@ -164,9 +168,7 @@ fn parse_args() -> Args {
                 eprintln!("  --to <DATETIME>        End filter");
                 eprintln!("  --profiles-path <FILE> Path to profiles.toml");
                 eprintln!("  --profile <NAME>       Profile name to apply");
-                eprintln!(
-                    "  --symbols-path <FILE>  Path to symbols.toml (for contract sizes / P&L)"
-                );
+
                 eprintln!("  --balance <AMOUNT>     Initial balance (default: 10000)");
                 eprintln!("  --mode <MODE>          Signal mode:");
                 eprintln!(
@@ -185,8 +187,8 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    if data_dir.is_empty() || exchange.is_empty() || symbol.is_empty() {
-        eprintln!("Error: --data-dir, --exchange, and --symbol are required.");
+    if data_dir.is_empty() || exchange.is_empty() || symbol.is_empty() || symbols_path.is_none() {
+        eprintln!("Error: --data-dir, --exchange, --symbol, and --symbols-path are required.");
         eprintln!("Run with --help for usage.");
         process::exit(1);
     }
@@ -271,10 +273,10 @@ fn resolve_partition(
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(val) = name_str.strip_prefix(&prefix) {
-                if val.to_lowercase() == lower {
-                    return val.to_string();
-                }
+            if let Some(val) = name_str.strip_prefix(&prefix)
+                && val.to_lowercase() == lower
+            {
+                return val.to_string();
             }
         }
     }
@@ -492,7 +494,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             side: Side::Buy,
             order_type: OrderType::Market,
             price: None,
-            size: 0.10,
+            risk_multiplier: 1.0,
             stoploss: Some(buy_sl),
             targets: vec![buy_tp1, buy_tp2, buy_tp3],
             group: Some("alpha".into()),
@@ -528,7 +530,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             side: Side::Sell,
             order_type: OrderType::Market,
             price: None,
-            size: 0.05,
+            risk_multiplier: 0.5,
             stoploss: Some(sell_sl),
             targets: vec![sell_tp1],
             group: Some("beta".into()),
@@ -560,7 +562,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
             side: Side::Buy,
             order_type: OrderType::Market,
             price: None,
-            size: 0.08,
+            risk_multiplier: 0.8,
             stoploss: Some(buy3_sl),
             targets: vec![buy3_tp1, buy3_tp2],
             group: Some("alpha".into()),
@@ -584,9 +586,15 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
     for (i, sig) in signals.iter().enumerate() {
         let desc = match sig {
             RawSignal::Entry {
-                side, size, group, ..
+                side,
+                risk_multiplier,
+                group,
+                ..
             } => {
-                format!("Entry {:?} size={:.2} group={:?}", side, size, group)
+                format!(
+                    "Entry {:?} risk_multiplier={:.2} group={:?}",
+                    side, risk_multiplier, group
+                )
             }
             RawSignal::ModifyStoploss { price, .. } => {
                 format!("ModifyStoploss price={:.5}", price)
@@ -632,46 +640,43 @@ fn main() {
         .map(|ev| ev.to_quote().symbol.clone())
         .unwrap_or_else(|| args.symbol.clone());
 
-    // 2. Load symbol registry for contract sizes (P&L calculation).
-    //    Without this, P&L = price_diff × lots (meaningless tiny numbers).
-    //    With it,    P&L = price_diff × lots × contract_size (real USD values).
-    let contract_sizes: HashMap<String, f64> = if let Some(ref sp) = args.symbols_path {
-        let registry = SymbolRegistry::load(sp).unwrap_or_else(|e| {
-            eprintln!("Error loading symbol registry from '{sp}': {e}");
-            process::exit(1);
-        });
-        // Build contract_sizes for every known symbol.
-        // Key must match the data_symbol (on-disk case) since that's what
-        // the engine and executor see.
-        let mut sizes = HashMap::new();
-        let canonical = registry.normalize_or_passthrough(&data_symbol);
-        if let Some(spec) = registry.spec(&canonical) {
-            // Map both the canonical name and the data symbol name
-            sizes.insert(data_symbol.clone(), spec.lot_base_units as f64);
-            if canonical != data_symbol {
-                sizes.insert(canonical.to_string(), spec.lot_base_units as f64);
-            }
-            println!(
-                "Contract size for {}: {} (from {})",
-                data_symbol, spec.lot_base_units, sp
-            );
-        } else {
-            eprintln!(
-                "Warning: symbol '{}' not found in registry, P&L will use raw multiplier 1.0",
-                data_symbol
-            );
-        }
-        sizes
-    } else {
-        println!("Tip: use --symbols-path crates/symbols/symbols.toml for correct P&L values");
-        HashMap::new()
-    };
+    // 2. Load symbol metadata for entry sizing and P&L calculation.
+    let symbols_path = args.symbols_path.as_ref().unwrap();
+    let registry = SymbolRegistry::load(symbols_path).unwrap_or_else(|e| {
+        eprintln!("Error loading symbol registry from '{symbols_path}': {e}");
+        process::exit(1);
+    });
+    let canonical = registry.normalize_or_passthrough(&data_symbol);
+    let spec = registry.spec(&canonical).cloned().unwrap_or_else(|| {
+        eprintln!("Error: symbol '{data_symbol}' not found in '{symbols_path}'");
+        process::exit(1);
+    });
+    let mut contract_sizes = HashMap::from([(data_symbol.clone(), spec.lot_base_units as f64)]);
+    let mut symbol_specs = HashMap::from([(data_symbol.clone(), spec.clone())]);
+    if canonical != data_symbol {
+        contract_sizes.insert(canonical.clone(), spec.lot_base_units as f64);
+        symbol_specs.insert(canonical.clone(), spec.clone());
+    }
+    println!(
+        "Symbol metadata for {}: contract_size={} lot_step={} (from {})",
+        data_symbol,
+        spec.lot_base_units,
+        spec.lot_step_units as f64 / spec.lot_base_units as f64,
+        symbols_path
+    );
+    println!(
+        "Entry sizing: fixed_lot={ENTRY_FIXED_LOT:.2}; final lot is computed from the signal risk multiplier"
+    );
 
     // 3. Build config
     let config = BacktestConfig {
         initial_balance: args.initial_balance,
         close_on_finish: true,
         contract_sizes,
+        sizing: Some(SizingPolicy::FixedLot {
+            lots: ENTRY_FIXED_LOT,
+        }),
+        symbol_specs,
         ..Default::default()
     };
 
@@ -726,7 +731,7 @@ fn main() {
         println!("═══ TRADE LOG ══════════════════════════════════════════════════");
         for (i, trade) in result.trade_log.iter().enumerate() {
             println!(
-                "  #{:<3} {} {:<4} | entry={:.5} exit={:.5} size={:.2} pnl={:+.2} reason={:?} group={:?}",
+                "  #{:<3} {} {:<4} | entry={:.5} exit={:.5} final_lot={:.2} pnl={:+.2} reason={:?} group={:?}",
                 i + 1,
                 trade.symbol,
                 format!("{:?}", trade.side),

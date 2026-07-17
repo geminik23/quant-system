@@ -7,7 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CloseReason, Effect, FillModel, PositionStatus, PriceQuote, RuleConfig, Side};
+use crate::types::{
+    CloseReason, Effect, FillModel, PositionStatus, PriceQuote, RuleConfig, Side,
+    position_size_tolerance,
+};
 
 // ─── PositionData view (passed to rules for evaluation) ─────────────────────
 
@@ -257,7 +260,7 @@ impl Rule {
                     let actual_ratio = close_ratio.min(data.remaining_ratio);
 
                     // If this closes the remaining position, emit CloseFull.
-                    if (data.remaining_ratio - actual_ratio).abs() < f64::EPSILON {
+                    if data.remaining_ratio - actual_ratio <= position_size_tolerance(1.0) {
                         vec![Effect::PositionClosed {
                             id: data.id.to_owned(),
                             reason: CloseReason::Target,

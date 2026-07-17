@@ -698,7 +698,7 @@ fn render_alerts(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(format!("  {:.2}", a.ref_price)),
                 Span::raw("  "),
                 Span::styled(
-                    format!("[{}]", &a.alert_id),
+                    format!("[{}]", a.alert_id),
                     Style::new().fg(Color::DarkGray),
                 ),
             ]);
@@ -1055,22 +1055,22 @@ async fn run(
         tokio::select! {
             // Terminal key events
             maybe_event = event_reader.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_event {
-                    if key.kind == KeyEventKind::Press {
-                        let should_fire_rpc = handle_key(app, key.code);
+                if let Some(Ok(Event::Key(key))) = maybe_event
+                    && key.kind == KeyEventKind::Press
+                {
+                    let should_fire_rpc = handle_key(app, key.code);
 
-                        if should_fire_rpc {
-                            let item = app.current_item;
-                            let inputs = app.collect_inputs();
-                            let tx = app.rpc_tx.clone();
-                            let c = client.clone();
-                            let label = item.label().to_string();
-                            tokio::spawn(async move {
-                                let result = execute_rpc(&c, item, inputs).await;
-                                let _ = tx.send((label, result)).await;
-                            });
-                            app.input_fields.clear();
-                        }
+                    if should_fire_rpc {
+                        let item = app.current_item;
+                        let inputs = app.collect_inputs();
+                        let tx = app.rpc_tx.clone();
+                        let c = client.clone();
+                        let label = item.label().to_string();
+                        tokio::spawn(async move {
+                            let result = execute_rpc(&c, item, inputs).await;
+                            let _ = tx.send((label, result)).await;
+                        });
+                        app.input_fields.clear();
                     }
                 }
                 if app.should_quit { break; }

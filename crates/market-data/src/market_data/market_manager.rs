@@ -271,7 +271,7 @@ impl MarketManager {
         let state_broadcast_tx = self.state_broadcast_tx.clone();
         let connection_state = self.connection_state.clone();
 
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             while let Ok(message) = receiver.recv().await {
                 match message {
                     MarketMessage::OnPriceAlert(alert_id) => {
@@ -332,9 +332,7 @@ impl MarketManager {
                     }
                 }
             }
-        });
-
-        handle
+        })
     }
 
     /// Initialize the connection and run the market manager forever in the background.

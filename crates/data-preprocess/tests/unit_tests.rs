@@ -913,6 +913,125 @@ mod parquet_tests {
         cleanup(&dir);
     }
 
+    #[test]
+    fn parquet_query_checks_cancellation_between_partition_entries_and_files() {
+        let (store, dir) = temp_store("query_cancellation");
+        let ticks = [
+            ndt(2026, 2, 16, 10, 0, 0),
+            ndt(2026, 2, 17, 10, 0, 0),
+            ndt(2026, 2, 18, 10, 0, 0),
+        ]
+        .into_iter()
+        .map(|ts| make_tick("ctrader", "BTCUSD", ts, 100.0, 101.0))
+        .collect::<Vec<_>>();
+        assert_eq!(store.insert_ticks(&ticks).unwrap(), 3);
+
+        let mut cancellation_checks = 0;
+        let error = store
+            .query_ticks_cancellable(
+                &QueryOpts {
+                    exchange: "ctrader".into(),
+                    symbol: "BTCUSD".into(),
+                    from: None,
+                    to: None,
+                    limit: 0,
+                    tail: false,
+                    descending: false,
+                },
+                || {
+                    cancellation_checks += 1;
+                    cancellation_checks >= 8
+                },
+            )
+            .expect_err("query should stop after the first atomic file read");
+
+        assert!(matches!(error, data_preprocess::DataError::Cancelled));
+        assert!(cancellation_checks >= 8);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn parquet_latest_valid_tick_is_strict_before_without_lookahead() {
+        let (store, dir) = temp_store("latest_valid_tick_strict_before");
+        let valid_ts = ndt(2026, 2, 16, 23, 59, 59);
+        let missing_ts = ndt(2026, 2, 17, 8, 0, 0);
+        let non_positive_ts = ndt(2026, 2, 17, 9, 0, 0);
+        let non_finite_ts = ndt(2026, 2, 17, 9, 30, 0);
+        let crossed_ts = ndt(2026, 2, 17, 10, 0, 0);
+        let cutoff = ndt(2026, 2, 17, 11, 0, 0);
+        let future_ts = ndt(2026, 2, 17, 12, 0, 0);
+
+        let mut missing = make_tick("ctrader", "BTCUSD", missing_ts, 101.0, 102.0);
+        missing.ask = None;
+        let non_positive = make_tick("ctrader", "BTCUSD", non_positive_ts, 0.0, 102.0);
+        let non_finite = make_tick("ctrader", "BTCUSD", non_finite_ts, f64::NAN, 102.0);
+        let crossed = make_tick("ctrader", "BTCUSD", crossed_ts, 103.0, 102.0);
+        let ticks = vec![
+            make_tick("ctrader", "BTCUSD", valid_ts, 100.0, 101.0),
+            missing,
+            non_positive,
+            non_finite,
+            crossed,
+            make_tick("ctrader", "BTCUSD", cutoff, 104.0, 105.0),
+            make_tick("ctrader", "BTCUSD", future_ts, 106.0, 107.0),
+        ];
+        assert_eq!(store.insert_ticks(&ticks).unwrap(), 7);
+
+        let latest = store
+            .latest_valid_tick_before("ctrader", "BTCUSD", cutoff)
+            .unwrap()
+            .expect("an older valid tick should be found");
+        assert_eq!(latest.ts, valid_ts);
+        assert_eq!(latest.bid, Some(100.0));
+        assert_eq!(latest.ask, Some(101.0));
+
+        let (inclusive, total) = store
+            .query_ticks(&QueryOpts {
+                exchange: "ctrader".into(),
+                symbol: "BTCUSD".into(),
+                from: Some(cutoff),
+                to: Some(cutoff),
+                limit: 0,
+                tail: false,
+                descending: false,
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(inclusive[0].ts, cutoff);
+
+        assert!(
+            store
+                .latest_valid_tick_before("ctrader", "BTCUSD", valid_ts)
+                .unwrap()
+                .is_none()
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn parquet_latest_valid_tick_lookup_is_cancellable() {
+        let (store, dir) = temp_store("latest_valid_tick_cancellation");
+        let tick = make_tick(
+            "ctrader",
+            "BTCUSD",
+            ndt(2026, 2, 17, 10, 0, 0),
+            100.0,
+            101.0,
+        );
+        store.insert_ticks(&[tick]).unwrap();
+
+        let error = store
+            .latest_valid_tick_before_cancellable(
+                "ctrader",
+                "BTCUSD",
+                ndt(2026, 2, 17, 11, 0, 0),
+                || true,
+            )
+            .expect_err("lookup should honor cancellation before storage access");
+        assert!(matches!(error, data_preprocess::DataError::Cancelled));
+        cleanup(&dir);
+    }
+
     // ── Empty insert ──
 
     #[test]

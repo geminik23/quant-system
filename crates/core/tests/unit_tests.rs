@@ -953,11 +953,11 @@ fn modify_all_stoploss_on_symbol() {
         .apply_action(
             Action::Open {
                 symbol: "EURUSD".into(),
-                side: Side::Sell,
+                side: Side::Buy,
                 order_type: OrderType::Market,
                 price: Some(1.0850),
                 size: 1.0,
-                stoploss: Some(1.0900),
+                stoploss: Some(1.0790),
                 targets: vec![],
                 rules: vec![],
                 group: None,
@@ -977,7 +977,7 @@ fn modify_all_stoploss_on_symbol() {
         .apply_action(
             Action::ModifyAllStoploss {
                 symbol: "EURUSD".into(),
-                price: 1.0850,
+                price: 1.0820,
             },
             ts(10, 1, 0),
         )
@@ -989,7 +989,7 @@ fn modify_all_stoploss_on_symbol() {
             .unwrap()
             .current_stoploss()
             .unwrap()
-            - 1.0850)
+            - 1.0820)
             .abs()
             < f64::EPSILON
     );
@@ -999,7 +999,7 @@ fn modify_all_stoploss_on_symbol() {
             .unwrap()
             .current_stoploss()
             .unwrap()
-            - 1.0850)
+            - 1.0820)
             .abs()
             < f64::EPSILON
     );

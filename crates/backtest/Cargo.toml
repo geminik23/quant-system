@@ -21,5 +21,10 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serde_json = { workspace = true }
 qs-data-preprocess = { path = "../data-preprocess", features = ["parquet"] }
+
+[[bench]]
+name = "future_quote_scaling"
+harness = false
