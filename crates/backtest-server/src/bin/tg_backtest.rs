@@ -91,7 +91,7 @@ fn parse_breakdown(value: &str) -> Result<BreakdownDimensionMsg, String> {
         "group" => Ok(BreakdownDimensionMsg::Group),
         "close_reason" => Ok(BreakdownDimensionMsg::CloseReason),
         _ if value.trim().to_ascii_lowercase().starts_with("tag:") => Err(
-            "unsupported evaluation selector: tag breakdowns are not supported by integrated V2 backtests because completed positions have no tags".into(),
+            "unsupported evaluation selector: tag breakdowns are not supported by integrated backtests because completed positions have no tags".into(),
         ),
         _ => Err(format!(
             "unknown breakdown `{value}`; expected symbol, side, group, or close-reason"
@@ -113,7 +113,7 @@ fn parse_filter(value: &str) -> Result<CliPositionFilter, String> {
         .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case("tag"))
     {
         return Err(
-            "unsupported evaluation selector: tag filters are not supported by integrated V2 backtests because completed positions have no tags".into(),
+            "unsupported evaluation selector: tag filters are not supported by integrated backtests because completed positions have no tags".into(),
         );
     }
 
@@ -203,7 +203,7 @@ struct Args {
     #[arg(long)]
     output: Option<String>,
 
-    /// Deliver V2 results automatically, inline, or through an artifact.
+    /// Deliver results automatically, inline, or through an artifact.
     #[arg(long, value_enum, default_value_t = ResultDeliveryMode::Auto)]
     result_delivery: ResultDeliveryMode,
 
@@ -1009,12 +1009,12 @@ where
     FetchFuture:
         Future<Output = Result<GetResultArtifactChunkResponse, Box<dyn std::error::Error>>>,
 {
-    if reference.schema_version != RESULT_ARTIFACT_SCHEMA_VERSION {
+    if reference.format_version != RESULT_FORMAT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported result artifact schema_version: {}",
-                reference.schema_version
+                "unsupported result artifact format_version: {}",
+                reference.format_version
             ),
         )
         .into());
@@ -1737,7 +1737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sizing = sizing_policy(&args);
 
-    let request = RunBacktestRequest {
+    let request = BacktestRunSpec {
         symbol: request_symbol,
         symbols: request_symbols,
         all_symbols: args.all_symbols,
@@ -1757,8 +1757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let future_request = RunBacktestV2Request {
-        schema_version: 2,
+    let future_request = RunBacktestRequest {
         request: request.clone(),
         future: future_config_message(&args),
         evaluation: provider_evaluation_options(&args, source_coverage),
@@ -1769,8 +1768,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Async mode: submit job, poll status, fetch result.
         let submit: SubmitBacktestResponse = client
             .call(
-                "submit_backtest_v2",
-                &SubmitBacktestV2Request {
+                "submit_backtest",
+                &SubmitBacktestRequest {
                     request: future_request.clone(),
                 },
             )
@@ -1863,7 +1862,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let resp: RunBacktestResponse = client
             .call_with_timeout(
-                "run_backtest_v2",
+                "run_backtest",
                 &future_request,
                 std::time::Duration::from_secs(300),
             )
@@ -2226,7 +2225,7 @@ mod tests {
         let payload = br#"{"result":"complete","values":[1,2,3,4]}"#;
         let chunk_size = 9_usize;
         let reference = ResultArtifactRefMsg {
-            schema_version: RESULT_ARTIFACT_SCHEMA_VERSION,
+            format_version: RESULT_FORMAT_VERSION,
             artifact_id: "result_test_download".into(),
             byte_len: payload.len() as u64,
             sha256: backtest_server::artifact_store::sha256_hex(payload),
@@ -2297,7 +2296,7 @@ mod tests {
     async fn artifact_download_helper_rejects_checksum_mismatch() {
         let payload = b"payload";
         let reference = ResultArtifactRefMsg {
-            schema_version: RESULT_ARTIFACT_SCHEMA_VERSION,
+            format_version: RESULT_FORMAT_VERSION,
             artifact_id: "result_bad_checksum".into(),
             byte_len: payload.len() as u64,
             sha256: "00".repeat(32),

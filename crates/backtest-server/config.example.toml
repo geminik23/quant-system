@@ -10,8 +10,8 @@ shm_name = "backtest"
 
 # Per-client SHM buffer size in bytes (default: 16 MB).
 # Increase if FutureQuoteV1 results or artifacts exceed the buffer.
-# run_backtest_v2, submit_backtest_v2, and run_backtest_multi_v2 use the same
-# server/SHM settings; unversioned execution methods are not registered.
+# run_backtest, submit_backtest, and run_backtest_multi use the same
+# server/SHM settings; version-suffixed execution methods are not registered.
 shm_buffer_size = 16777216
 
 [database]
@@ -25,7 +25,7 @@ registry_path = "crates/symbols/symbols.toml"
 
 [profiles]
 # Path to the management profiles TOML (qs-backtest / F09).
-# Profiles should include explicit target_selection. Existing schema-2 payloads with
+# Profiles should include explicit target_selection. Existing serialized profiles with
 # only use_targets remain readable. Dynamic RPC additions are not persisted.
 profiles_path = "crates/backtest/profiles.toml"
 

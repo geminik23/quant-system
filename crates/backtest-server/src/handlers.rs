@@ -515,25 +515,9 @@ fn parse_availability_data_type(raw: &str) -> (String, Option<String>) {
 
 // ── Run Backtest ────────────────────────────────────────────────────────────
 
-/// Handle the versioned FutureQuoteV1 execution endpoint.
-pub fn handle_run_backtest_v2(
-    state: &ServerState,
-    req: &RunBacktestV2Request,
-) -> RunBacktestV2Response {
+/// Handle the canonical FutureQuoteV1 execution endpoint.
+pub fn handle_run_backtest(state: &ServerState, req: &RunBacktestRequest) -> RunBacktestResponse {
     let start = Instant::now();
-    if req.schema_version != 2 {
-        return RunBacktestResponse {
-            success: false,
-            error: Some(format!(
-                "unsupported schema_version: {}",
-                req.schema_version
-            )),
-            result: None,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            artifact: None,
-            inline_complete: true,
-        };
-    }
     if let Err(error) = validate_future_quote_scalars(&req.future) {
         return RunBacktestResponse {
             success: false,
@@ -564,7 +548,7 @@ pub fn handle_run_backtest_v2(
 
 fn execute_backtest_with_future(
     state: &ServerState,
-    req: &RunBacktestRequest,
+    req: &BacktestRunSpec,
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
 ) -> Result<BacktestResult> {
@@ -594,7 +578,7 @@ fn map_streaming_replay_error(
 
 fn execute_backtest_with_future_controlled(
     state: &ServerState,
-    req: &RunBacktestRequest,
+    req: &BacktestRunSpec,
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
     cancellation: Option<&JobCancellationToken>,
@@ -767,7 +751,7 @@ fn execute_backtest_with_future_controlled(
 fn attach_future_reproducibility_metadata(
     result: &mut BacktestResult,
     state: &ServerState,
-    req: &RunBacktestRequest,
+    req: &BacktestRunSpec,
     plan: &ReplayPlan,
     future: &FutureQuoteConfigMsg,
     profile: Option<&ManagementProfile>,
@@ -887,38 +871,16 @@ fn attach_future_reproducibility_metadata(
 
 // ── Run Backtest Multi ──────────────────────────────────────────────────────
 
-pub fn handle_run_backtest_multi_v2(
+pub fn handle_run_backtest_multi(
     state: &ServerState,
-    req: &RunBacktestMultiV2Request,
-) -> RunBacktestMultiV2Response {
+    req: &RunBacktestMultiRequest,
+) -> RunBacktestMultiResponse {
     let start = Instant::now();
     if req.request.profiles.is_empty() {
         return RunBacktestMultiResponse {
             success: false,
             error: Some("At least one profile is required.".into()),
             results: Vec::new(),
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            artifact: None,
-            inline_complete: true,
-        };
-    }
-    if req.schema_version != 2 {
-        let error = format!("unsupported schema_version: {}", req.schema_version);
-        let results = req
-            .request
-            .profiles
-            .iter()
-            .map(|profile| ProfileResult {
-                profile: profile_ref_name(profile),
-                success: false,
-                error: Some(error.clone()),
-                result: None,
-            })
-            .collect();
-        return RunBacktestMultiResponse {
-            success: false,
-            error: Some(error),
-            results,
             elapsed_ms: start.elapsed().as_millis() as u64,
             artifact: None,
             inline_complete: true,
@@ -943,7 +905,7 @@ pub fn handle_run_backtest_multi_v2(
 
 fn execute_backtest_multi_with_future(
     state: &ServerState,
-    req: &RunBacktestMultiRequest,
+    req: &BacktestMultiRunSpec,
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
 ) -> Vec<ProfileResult> {
@@ -1144,8 +1106,8 @@ fn execute_backtest_multi_with_future(
     }
 }
 
-fn single_request_from_multi(req: &RunBacktestMultiRequest) -> RunBacktestRequest {
-    RunBacktestRequest {
+fn single_request_from_multi(req: &BacktestMultiRunSpec) -> BacktestRunSpec {
+    BacktestRunSpec {
         symbol: req.symbol.clone(),
         symbols: req.symbols.clone(),
         all_symbols: req.all_symbols,
@@ -1169,7 +1131,7 @@ fn profile_ref_name(pr: &ProfileRef) -> String {
     }
 }
 
-fn profile_error_results(req: &RunBacktestMultiRequest, error: String) -> Vec<ProfileResult> {
+fn profile_error_results(req: &BacktestMultiRunSpec, error: String) -> Vec<ProfileResult> {
     req.profiles
         .iter()
         .map(|profile| ProfileResult {
@@ -1192,7 +1154,7 @@ fn run_profile_streaming(
     future: &FutureQuoteConfigMsg,
     evaluation: Option<&EvaluationOptions>,
     state: &ServerState,
-    metadata_request: &RunBacktestRequest,
+    metadata_request: &BacktestRunSpec,
     plan: &ReplayPlan,
 ) -> Result<BacktestResult> {
     let cancellation: CancellationCheck = Arc::new(|| false);
@@ -1289,7 +1251,7 @@ fn resolve_requested_symbol_scope(
 /// Resolve the management profile from a request (inline or named).
 fn resolve_profile(
     state: &ServerState,
-    req: &RunBacktestRequest,
+    req: &BacktestRunSpec,
 ) -> Result<Option<ManagementProfile>> {
     if let Some(ref profile_msg) = req.profile_def {
         let profile = profile_from_msg(profile_msg)?;
@@ -1516,7 +1478,7 @@ fn feed_to_events(mut feed: VecFeed) -> Vec<MarketEvent> {
 // ── Validation ──────────────────────────────────────────────────────────────
 
 /// Validate the common fields of a run_backtest request.
-fn validate_request(req: &RunBacktestRequest) -> Result<()> {
+fn validate_request(req: &BacktestRunSpec) -> Result<()> {
     let dt = req.data_type.to_lowercase();
     if dt != "tick" && dt != "bar" {
         return Err(BacktestServerError::InvalidRequest(format!(
@@ -1537,7 +1499,7 @@ fn validate_request(req: &RunBacktestRequest) -> Result<()> {
     Ok(())
 }
 
-fn validate_replay_sizing(req: &RunBacktestRequest, plan: &ReplayPlan) -> Result<()> {
+fn validate_replay_sizing(req: &BacktestRunSpec, plan: &ReplayPlan) -> Result<()> {
     validate_replay_sizing_for_config(&req.config, plan)
 }
 
@@ -1672,7 +1634,7 @@ pub fn handle_reload_profiles(state: &ServerState) -> ReloadProfilesResponse {
 
 // ── Async Job API Handlers (Issue 2) ─────────────────────────────────────────
 
-/// Admit a validated V2 request to the bounded async job store.
+/// Admit a validated request to the bounded async job store.
 fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
     let job_id = format!("job-{}", uuid_v4_simple());
     let job = BacktestJob {
@@ -1729,20 +1691,10 @@ fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
     }
 }
 
-pub fn handle_submit_backtest_v2(
+pub fn handle_submit_backtest(
     state: &ServerState,
-    req: &SubmitBacktestV2Request,
+    req: &SubmitBacktestRequest,
 ) -> SubmitBacktestResponse {
-    if req.request.schema_version != 2 {
-        return SubmitBacktestResponse {
-            success: false,
-            job_id: None,
-            error: Some(format!(
-                "unsupported schema_version: {}",
-                req.request.schema_version
-            )),
-        };
-    }
     let validation = (|| -> Result<()> {
         let request = &req.request.request;
         validate_future_quote_scalars(&req.request.future)?;
@@ -1975,7 +1927,7 @@ pub fn handle_cancel_backtest(
     }
 }
 
-pub fn run_job_and_store_v2(state: Arc<ServerState>, job_id: String, req: RunBacktestV2Request) {
+pub fn run_job_and_store(state: Arc<ServerState>, job_id: String, req: RunBacktestRequest) {
     run_job_and_store_inner(
         state,
         job_id,
@@ -1989,7 +1941,7 @@ pub fn run_job_and_store_v2(state: Arc<ServerState>, job_id: String, req: RunBac
 fn run_job_and_store_inner(
     state: Arc<ServerState>,
     job_id: String,
-    req: RunBacktestRequest,
+    req: BacktestRunSpec,
     future: FutureQuoteConfigMsg,
     evaluation: ProviderEvaluationOptionsMsg,
     delivery: ResultDeliveryMsg,
@@ -2107,9 +2059,8 @@ mod tests {
     #[allow(unused_imports)]
     use std::sync::Arc;
 
-    fn test_v2_request(request: RunBacktestRequest) -> RunBacktestV2Request {
-        RunBacktestV2Request {
-            schema_version: 2,
+    fn test_request(request: BacktestRunSpec) -> RunBacktestRequest {
+        RunBacktestRequest {
             request,
             future: FutureQuoteConfigMsg {
                 account_currency: "USD".into(),
@@ -2120,20 +2071,17 @@ mod tests {
         }
     }
 
-    fn submit_v2_for_test(
-        state: &ServerState,
-        request: &RunBacktestRequest,
-    ) -> SubmitBacktestResponse {
-        handle_submit_backtest_v2(
+    fn submit_for_test(state: &ServerState, request: &BacktestRunSpec) -> SubmitBacktestResponse {
+        handle_submit_backtest(
             state,
-            &SubmitBacktestV2Request {
-                request: test_v2_request(request.clone()),
+            &SubmitBacktestRequest {
+                request: test_request(request.clone()),
             },
         )
     }
 
-    fn run_job_v2_for_test(state: Arc<ServerState>, job_id: String, request: RunBacktestRequest) {
-        run_job_and_store_v2(state, job_id, test_v2_request(request));
+    fn run_job_for_test(state: Arc<ServerState>, job_id: String, request: BacktestRunSpec) {
+        run_job_and_store(state, job_id, test_request(request));
     }
 
     fn test_state() -> ServerState {
@@ -2303,7 +2251,7 @@ mod tests {
 
     #[test]
     fn validate_request_rejects_empty_signals() {
-        let req = RunBacktestRequest {
+        let req = BacktestRunSpec {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -2327,7 +2275,7 @@ mod tests {
 
     #[test]
     fn validate_request_rejects_invalid_data_type() {
-        let req = RunBacktestRequest {
+        let req = BacktestRunSpec {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -2362,7 +2310,7 @@ mod tests {
 
     #[test]
     fn validate_request_rejects_bar_without_timeframe() {
-        let req = RunBacktestRequest {
+        let req = BacktestRunSpec {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -2397,7 +2345,7 @@ mod tests {
 
     #[test]
     fn validate_request_accepts_valid_tick() {
-        let req = RunBacktestRequest {
+        let req = BacktestRunSpec {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -2432,7 +2380,7 @@ mod tests {
 
     #[test]
     fn validate_request_rejects_entry_without_sizing() {
-        let mut req = RunBacktestRequest {
+        let mut req = BacktestRunSpec {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -2855,8 +2803,8 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn valid_submit_request() -> RunBacktestRequest {
-        RunBacktestRequest {
+    fn valid_submit_request() -> BacktestRunSpec {
+        BacktestRunSpec {
             symbol: "XAUUSD".into(),
             symbols: vec![],
             all_symbols: false,
@@ -2891,7 +2839,7 @@ mod tests {
     #[test]
     fn submit_and_cancel_job() {
         let state = job_test_state();
-        let submit = submit_v2_for_test(&state, &valid_submit_request());
+        let submit = submit_for_test(&state, &valid_submit_request());
         assert!(submit.success);
         let job_id = submit.job_id.unwrap();
 
@@ -2912,7 +2860,7 @@ mod tests {
         let state = job_test_state();
         let mut req = valid_submit_request();
         req.raw_signals = vec![];
-        let submit = submit_v2_for_test(&state, &req);
+        let submit = submit_for_test(&state, &req);
         assert!(!submit.success);
         assert!(submit.job_id.is_none());
     }
@@ -2997,7 +2945,7 @@ lot_max_steps = 0
         let state = Arc::new(job_test_state());
 
         // Submit a valid job.
-        let submit = submit_v2_for_test(&state, &valid_submit_request());
+        let submit = submit_for_test(&state, &valid_submit_request());
         assert!(submit.success);
         let job_id = submit.job_id.unwrap();
 
@@ -3010,10 +2958,10 @@ lot_max_steps = 0
         );
         assert_eq!(status.status, "Queued");
 
-        // Run the job via the V2 worker (will fail since no real data,
+        // Run the job via the canonical worker (will fail since no real data,
         // but should transition through LoadingData -> Failed).
         let req = valid_submit_request();
-        run_job_v2_for_test(state.clone(), job_id.clone(), req);
+        run_job_for_test(state.clone(), job_id.clone(), req);
 
         // Status should be Failed (no market data at /tmp/test).
         let status = handle_get_backtest_status(
@@ -3040,8 +2988,8 @@ lot_max_steps = 0
         let state = job_test_state();
 
         // Submit two jobs.
-        let submit1 = submit_v2_for_test(&state, &valid_submit_request());
-        let submit2 = submit_v2_for_test(&state, &valid_submit_request());
+        let submit1 = submit_for_test(&state, &valid_submit_request());
+        let submit2 = submit_for_test(&state, &valid_submit_request());
 
         assert!(submit1.success);
         assert!(submit2.success);
@@ -3089,7 +3037,7 @@ lot_max_steps = 0
         let state = job_test_state();
 
         // Submit and cancel a job.
-        let submit = submit_v2_for_test(&state, &valid_submit_request());
+        let submit = submit_for_test(&state, &valid_submit_request());
         let job_id = submit.job_id.unwrap();
         handle_cancel_backtest(
             &state,

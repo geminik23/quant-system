@@ -11,22 +11,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_legacy_result_delivery() -> ResultDeliveryMsg {
-    ResultDeliveryMsg::Inline
-}
-
-fn default_legacy_mtm_output() -> MtmOutputPolicyMsg {
-    MtmOutputPolicyMsg::Full
-}
-
-fn default_legacy_future_quote_config() -> FutureQuoteConfigMsg {
-    FutureQuoteConfigMsg {
-        mtm_output: default_legacy_mtm_output(),
-        ..FutureQuoteConfigMsg::default()
-    }
-}
-
-pub const RESULT_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+/// Current format version for complete result JSON artifacts.
+pub const RESULT_FORMAT_VERSION: u32 = 1;
 
 // ── Connection Handshake ────────────────────────────────────────────────────
 
@@ -205,9 +191,9 @@ pub struct CancelBacktestResponse {
     pub error: Option<String>,
 }
 
-// ── Versioned FutureQuote execution ─────────────────────────────────────────
+// ── FutureQuote execution ───────────────────────────────────────────────────
 
-/// Requested delivery mode for a complete V2 result JSON payload.
+/// Requested delivery mode for a complete result JSON payload.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultDeliveryMsg {
@@ -220,7 +206,7 @@ pub enum ResultDeliveryMsg {
 /// Reference to a complete result JSON artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultArtifactRefMsg {
-    pub schema_version: u32,
+    pub format_version: u32,
     pub artifact_id: String,
     pub byte_len: u64,
     pub sha256: String,
@@ -276,7 +262,7 @@ impl Default for MtmOutputPolicyMsg {
     }
 }
 
-/// FutureQuoteV1 execution settings used by the V2 RPC methods.
+/// FutureQuoteV1 execution settings used by the backtest RPC methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FutureQuoteConfigMsg {
@@ -286,7 +272,6 @@ pub struct FutureQuoteConfigMsg {
     pub pnl_epsilon: f64,
     pub account_currency: String,
     pub conversion_stale_after_ms: i64,
-    #[serde(default = "default_legacy_mtm_output")]
     pub mtm_output: MtmOutputPolicyMsg,
 }
 
@@ -406,7 +391,7 @@ pub struct SourceCoverageCountsMsg {
     pub emitted_entry_signals: u64,
 }
 
-/// Typed provider-evaluation selection for V2 requests.
+/// Typed provider-evaluation selection for canonical requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderEvaluationOptionsMsg {
@@ -444,10 +429,9 @@ impl Default for ProviderEvaluationOptionsMsg {
 
 // ── Run Backtest ────────────────────────────────────────────────────────────
 
-/// Request to execute a single backtest run. Only `raw_signals` is accepted
-/// as signal input (the legacy `signals` field has been removed).
+/// Execution scope and inputs for one backtest run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunBacktestRequest {
+pub struct BacktestRunSpec {
     pub symbol: String,
     #[serde(default)]
     pub symbols: Vec<String>,
@@ -481,11 +465,10 @@ pub struct RunBacktestResponse {
     pub inline_complete: bool,
 }
 
-/// Strict schema-2 FutureQuoteV1 request.
+/// Strict FutureQuoteV1 request accepted by `run_backtest`.
 #[derive(Debug, Clone, Serialize)]
-pub struct RunBacktestV2Request {
-    pub schema_version: u32,
-    pub request: RunBacktestRequest,
+pub struct RunBacktestRequest {
+    pub request: BacktestRunSpec,
     #[serde(default)]
     pub future: FutureQuoteConfigMsg,
     #[serde(default)]
@@ -494,19 +477,17 @@ pub struct RunBacktestV2Request {
     pub result_delivery: ResultDeliveryMsg,
 }
 
-pub type RunBacktestV2Response = RunBacktestResponse;
-
 /// Asynchronous FutureQuoteV1 submission.
 #[derive(Debug, Clone, Serialize)]
-pub struct SubmitBacktestV2Request {
-    pub request: RunBacktestV2Request,
+pub struct SubmitBacktestRequest {
+    pub request: RunBacktestRequest,
 }
 
 // ── Run Backtest Multi ──────────────────────────────────────────────────────
 
-/// Request to compare multiple profiles on the same data and signals.
+/// Execution scope and inputs for a multi-profile comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunBacktestMultiRequest {
+pub struct BacktestMultiRunSpec {
     pub symbol: String,
     #[serde(default)]
     pub symbols: Vec<String>,
@@ -551,9 +532,8 @@ pub struct RunBacktestMultiResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct RunBacktestMultiV2Request {
-    pub schema_version: u32,
-    pub request: RunBacktestMultiRequest,
+pub struct RunBacktestMultiRequest {
+    pub request: BacktestMultiRunSpec,
     #[serde(default)]
     pub future: FutureQuoteConfigMsg,
     #[serde(default)]
@@ -561,8 +541,6 @@ pub struct RunBacktestMultiV2Request {
     #[serde(default)]
     pub result_delivery: ResultDeliveryMsg,
 }
-
-pub type RunBacktestMultiV2Response = RunBacktestMultiResponse;
 
 // ── Backtest Result Message ─────────────────────────────────────────────────
 
@@ -628,12 +606,12 @@ impl Default for MtmOutputSummaryMsg {
     }
 }
 
-/// Versioned execution/accounting payload. Complex internal records remain
+/// Format-versioned execution/accounting payload. Complex internal records remain
 /// JSON values so new additive fields do not require synchronized positional
 /// wire changes; the transport itself uses JsonCodec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FutureBacktestResultMsg {
-    pub schema_version: u32,
+    pub format_version: u32,
     pub execution_metadata: serde_json::Value,
     pub recorded_fills: serde_json::Value,
     pub action_dispositions: serde_json::Value,
@@ -803,7 +781,7 @@ pub struct TradeResultMsg {
 
 // ── Dynamic Profiles (F13) ──────────────────────────────────────────────────
 
-/// Wire-safe strict V2 target selection.
+/// Wire-safe strict target selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetSelectionMsg {
     /// Use every target supplied by the entry signal, in signal order.
@@ -818,11 +796,11 @@ pub enum TargetSelectionMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagementProfileMsg {
     pub name: String,
-    /// Explicit strict V2 selection. This wins over `use_targets` when present;
+    /// Explicit strict selection. This wins over `use_targets` when present;
     /// omission preserves the legacy `use_targets`-derived default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_selection: Option<TargetSelectionMsg>,
-    /// Schema-2 compatibility selection retained for older serialized profiles.
+    /// Compatibility selection retained for older serialized profiles.
     pub use_targets: Vec<usize>,
     pub close_ratios: Vec<f64>,
     #[serde(default)]
@@ -1018,7 +996,7 @@ pub enum PositionRefMsg {
     AllInGroup { group_id: String },
 }
 
-// ── Strict V2 request decoding ───────────────────────────────────────────────
+// ── Strict request decoding ──────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -1186,7 +1164,7 @@ enum StrictRawSignalMsg {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictRunBacktestRequest {
+struct StrictBacktestRunSpec {
     symbol: String,
     #[serde(default)]
     symbols: Vec<String>,
@@ -1214,7 +1192,7 @@ enum StrictProfileRef {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictRunBacktestMultiRequest {
+struct StrictBacktestMultiRunSpec {
     symbol: String,
     #[serde(default)]
     symbols: Vec<String>,
@@ -1233,52 +1211,49 @@ struct StrictRunBacktestMultiRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictRunBacktestV2Request {
-    schema_version: u32,
-    request: StrictRunBacktestRequest,
-    #[serde(default = "default_legacy_future_quote_config")]
+struct StrictRunBacktestRequest {
+    request: StrictBacktestRunSpec,
+    #[serde(default)]
     future: FutureQuoteConfigMsg,
     #[serde(default)]
     evaluation: ProviderEvaluationOptionsMsg,
-    #[serde(default = "default_legacy_result_delivery")]
+    #[serde(default)]
     result_delivery: ResultDeliveryMsg,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictSubmitBacktestV2Request {
-    request: RunBacktestV2Request,
+struct StrictSubmitBacktestRequest {
+    request: RunBacktestRequest,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StrictRunBacktestMultiV2Request {
-    schema_version: u32,
-    request: StrictRunBacktestMultiRequest,
-    #[serde(default = "default_legacy_future_quote_config")]
+struct StrictRunBacktestMultiRequest {
+    request: StrictBacktestMultiRunSpec,
+    #[serde(default)]
     future: FutureQuoteConfigMsg,
     #[serde(default)]
     evaluation: ProviderEvaluationOptionsMsg,
-    #[serde(default = "default_legacy_result_delivery")]
+    #[serde(default)]
     result_delivery: ResultDeliveryMsg,
 }
 
-fn strict_into_legacy<T>(value: impl Serialize) -> Result<T, serde_json::Error>
+fn strict_into_wire<T>(value: impl Serialize) -> Result<T, serde_json::Error>
 where
     T: DeserializeOwned,
 {
     serde_json::from_value(serde_json::to_value(value)?)
 }
 
-impl<'de> Deserialize<'de> for RunBacktestV2Request {
+impl<'de> Deserialize<'de> for RunBacktestRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let strict = StrictRunBacktestV2Request::deserialize(deserializer)?;
+        let strict = StrictRunBacktestRequest::deserialize(deserializer)?;
         Ok(Self {
-            schema_version: strict.schema_version,
-            request: strict_into_legacy(strict.request).map_err(serde::de::Error::custom)?,
+            request: strict_into_wire(strict.request).map_err(serde::de::Error::custom)?,
             future: strict.future,
             evaluation: strict.evaluation,
             result_delivery: strict.result_delivery,
@@ -1286,27 +1261,26 @@ impl<'de> Deserialize<'de> for RunBacktestV2Request {
     }
 }
 
-impl<'de> Deserialize<'de> for SubmitBacktestV2Request {
+impl<'de> Deserialize<'de> for SubmitBacktestRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let strict = StrictSubmitBacktestV2Request::deserialize(deserializer)?;
+        let strict = StrictSubmitBacktestRequest::deserialize(deserializer)?;
         Ok(Self {
             request: strict.request,
         })
     }
 }
 
-impl<'de> Deserialize<'de> for RunBacktestMultiV2Request {
+impl<'de> Deserialize<'de> for RunBacktestMultiRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let strict = StrictRunBacktestMultiV2Request::deserialize(deserializer)?;
+        let strict = StrictRunBacktestMultiRequest::deserialize(deserializer)?;
         Ok(Self {
-            schema_version: strict.schema_version,
-            request: strict_into_legacy(strict.request).map_err(serde::de::Error::custom)?,
+            request: strict_into_wire(strict.request).map_err(serde::de::Error::custom)?,
             future: strict.future,
             evaluation: strict.evaluation,
             result_delivery: strict.result_delivery,
@@ -1429,7 +1403,10 @@ mod tests {
         .unwrap();
         assert_eq!(future.account_currency, "USD");
         assert_eq!(future.conversion_stale_after_ms, 15_000);
-        assert_eq!(future.mtm_output, MtmOutputPolicyMsg::Full);
+        assert_eq!(
+            future.mtm_output,
+            MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
+        );
         assert!(
             serde_json::from_value::<FutureQuoteConfigMsg>(json!({
                 "account_currency": "USD",
@@ -1465,7 +1442,7 @@ mod tests {
     #[test]
     fn future_result_defaults_missing_mtm_output_summary() {
         let result: FutureBacktestResultMsg = serde_json::from_value(json!({
-            "schema_version": 2,
+            "format_version": 1,
             "execution_metadata": null,
             "recorded_fills": null,
             "action_dispositions": null,
@@ -1495,9 +1472,8 @@ mod tests {
         assert_eq!(summary.policy, MtmOutputPolicyMsg::Full);
     }
 
-    fn legacy_v2_request_json() -> serde_json::Value {
+    fn minimal_request_json() -> serde_json::Value {
         json!({
-            "schema_version": 2,
             "request": {
                 "symbol": "EURUSD",
                 "exchange": "fixture",
@@ -1520,46 +1496,50 @@ mod tests {
     }
 
     #[test]
-    fn omitted_v2_delivery_and_mtm_fields_keep_legacy_behavior() {
-        let request: RunBacktestV2Request =
-            serde_json::from_value(legacy_v2_request_json()).unwrap();
-        assert_eq!(request.result_delivery, ResultDeliveryMsg::Inline);
-        assert_eq!(request.future.mtm_output, MtmOutputPolicyMsg::Full);
-
-        let submitted: SubmitBacktestV2Request = serde_json::from_value(json!({
-            "request": legacy_v2_request_json()
-        }))
-        .unwrap();
-        assert_eq!(submitted.request.result_delivery, ResultDeliveryMsg::Inline);
+    fn omitted_delivery_and_mtm_fields_use_current_defaults() {
+        let request: RunBacktestRequest = serde_json::from_value(minimal_request_json()).unwrap();
+        assert_eq!(request.result_delivery, ResultDeliveryMsg::Auto);
         assert_eq!(
-            submitted.request.future.mtm_output,
-            MtmOutputPolicyMsg::Full
+            request.future.mtm_output,
+            MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
         );
 
-        let mut explicit = legacy_v2_request_json();
+        let submitted: SubmitBacktestRequest = serde_json::from_value(json!({
+            "request": minimal_request_json()
+        }))
+        .unwrap();
+        assert_eq!(submitted.request.result_delivery, ResultDeliveryMsg::Auto);
+        assert_eq!(
+            submitted.request.future.mtm_output,
+            MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
+        );
+
+        let mut explicit = minimal_request_json();
         explicit["result_delivery"] = json!("auto");
         explicit["future"]["mtm_output"] = json!({
             "bounded": { "max_points": 4_096 }
         });
-        let explicit: RunBacktestV2Request = serde_json::from_value(explicit).unwrap();
+        let explicit: RunBacktestRequest = serde_json::from_value(explicit).unwrap();
         assert_eq!(explicit.result_delivery, ResultDeliveryMsg::Auto);
         assert_eq!(
             explicit.future.mtm_output,
             MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
         );
 
-        let mut multi_request = legacy_v2_request_json()["request"].clone();
+        let mut multi_request = minimal_request_json()["request"].clone();
         let fields = multi_request.as_object_mut().unwrap();
         fields.remove("profile");
         fields.insert("profiles".into(), json!([]));
-        let multi: RunBacktestMultiV2Request = serde_json::from_value(json!({
-            "schema_version": 2,
+        let multi: RunBacktestMultiRequest = serde_json::from_value(json!({
             "request": multi_request,
             "future": { "account_currency": "USD" }
         }))
         .unwrap();
-        assert_eq!(multi.result_delivery, ResultDeliveryMsg::Inline);
-        assert_eq!(multi.future.mtm_output, MtmOutputPolicyMsg::Full);
+        assert_eq!(multi.result_delivery, ResultDeliveryMsg::Auto);
+        assert_eq!(
+            multi.future.mtm_output,
+            MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
+        );
     }
 
     #[test]

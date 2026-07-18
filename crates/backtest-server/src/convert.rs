@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 
 use chrono::NaiveDateTime;
-use qs_backtest::artifacts::{PendingOrderLifecycleEvent, PendingOrderLifecycleState};
+use qs_backtest::artifacts::{
+    FUTURE_ARTIFACT_FORMAT_VERSION, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+};
 use qs_backtest::currency::RunCurrencyPlan;
 use qs_backtest::evaluation::{
     BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationSection,
@@ -177,7 +179,7 @@ pub fn future_config_from_msg(
     })
 }
 
-/// Convert and validate the strict V2 provider-evaluation configuration.
+/// Convert and validate the strict provider-evaluation configuration.
 pub fn evaluation_options_from_msg(
     msg: &ProviderEvaluationOptionsMsg,
     registry: &SymbolRegistry,
@@ -236,7 +238,7 @@ pub fn evaluation_options_from_msg_for_symbols(
     }
     if !msg.filter.tags.is_empty() {
         return Err(invalid(
-            "unsupported evaluation selector: tag filters are not supported by integrated V2 backtests because completed positions have no tags".into(),
+            "unsupported evaluation selector: tag filters are not supported by integrated backtests because completed positions have no tags".into(),
         ));
     }
     if msg
@@ -245,7 +247,7 @@ pub fn evaluation_options_from_msg_for_symbols(
         .any(|dimension| matches!(dimension, BreakdownDimensionMsg::Tag(_)))
     {
         return Err(invalid(
-            "unsupported evaluation selector: tag breakdowns are not supported by integrated V2 backtests because completed positions have no tags".into(),
+            "unsupported evaluation selector: tag breakdowns are not supported by integrated backtests because completed positions have no tags".into(),
         ));
     }
 
@@ -452,7 +454,7 @@ fn target_selection_to_msg(selection: &TargetSelection) -> TargetSelectionMsg {
 
 /// Convert a wire-format `ManagementProfileMsg` into the internal `ManagementProfile`.
 ///
-/// An explicit `target_selection` is preserved and takes precedence during V2
+/// An explicit `target_selection` is preserved and takes precedence during strict
 /// application. Omission remains `None`, allowing the internal profile to derive
 /// its current selection from compatibility `use_targets` only for older payloads.
 pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<ManagementProfile> {
@@ -621,7 +623,9 @@ pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
             .execution_metadata
             .as_ref()
             .map(|metadata| FutureBacktestResultMsg {
-                schema_version: metadata.schema_version,
+                format_version: r
+                    .future_format_version
+                    .unwrap_or(FUTURE_ARTIFACT_FORMAT_VERSION),
                 execution_metadata: serde_json::to_value(metadata)
                     .unwrap_or(serde_json::Value::Null),
                 recorded_fills: serde_json::to_value(&r.recorded_fills)
@@ -1559,10 +1563,10 @@ mod tests {
     fn position_ref_from_msg_all_in_group() {
         let reg = qs_symbols::SymbolRegistry::empty();
         let msg = PositionRefMsg::AllInGroup {
-            group_id: "scalp_v2".into(),
+            group_id: "scalp".into(),
         };
         let result = position_ref_from_msg(&msg, &reg);
-        assert!(matches!(result, PositionRef::AllInGroup { group_id } if group_id == "scalp_v2"));
+        assert!(matches!(result, PositionRef::AllInGroup { group_id } if group_id == "scalp"));
     }
 
     #[test]

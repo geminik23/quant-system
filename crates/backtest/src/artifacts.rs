@@ -17,14 +17,14 @@ use crate::ledger::LifecycleLedger;
 use crate::mtm::MtmOutputSummary;
 use crate::portfolio::EquityPoint;
 
-/// Current on-disk schema version for [`FutureBacktestArtifacts`].
-pub const ARTIFACT_SCHEMA_VERSION: u32 = 2;
+/// Current on-disk format version for [`FutureBacktestArtifacts`].
+pub const FUTURE_ARTIFACT_FORMAT_VERSION: u32 = 1;
 
 /// Default absolute tolerance used to classify net P&L as breakeven.
 pub const DEFAULT_PNL_EPSILON: f64 = 1.0e-9;
 
-fn default_schema_version() -> u32 {
-    ARTIFACT_SCHEMA_VERSION
+fn default_format_version() -> u32 {
+    FUTURE_ARTIFACT_FORMAT_VERSION
 }
 
 fn default_pnl_epsilon() -> f64 {
@@ -35,8 +35,6 @@ fn default_pnl_epsilon() -> f64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExecutionMetadata {
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
     pub run_id: Option<String>,
     pub execution_model: ExecutionModel,
     pub initial_balance: f64,
@@ -56,7 +54,6 @@ pub struct ExecutionMetadata {
 impl Default for ExecutionMetadata {
     fn default() -> Self {
         Self {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
             run_id: None,
             execution_model: ExecutionModel::default(),
             initial_balance: 0.0,
@@ -796,9 +793,11 @@ impl Default for PendingOrderSnapshot {
 }
 
 /// Complete additive artifact payload for a future backtest run.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FutureBacktestArtifacts {
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
     pub execution: ExecutionMetadata,
     pub fills: Vec<RecordedFill>,
     pub close_events: Vec<CloseEvent>,
@@ -811,6 +810,26 @@ pub struct FutureBacktestArtifacts {
     pub mtm_output_summary: MtmOutputSummary,
     pub max_drawdown: Option<f64>,
     pub max_drawdown_pct: Option<f64>,
+}
+
+impl Default for FutureBacktestArtifacts {
+    fn default() -> Self {
+        Self {
+            format_version: FUTURE_ARTIFACT_FORMAT_VERSION,
+            execution: ExecutionMetadata::default(),
+            fills: Vec::new(),
+            close_events: Vec::new(),
+            completed_positions: Vec::new(),
+            open_positions: Vec::new(),
+            pending_orders: Vec::new(),
+            pending_order_lifecycle: Vec::new(),
+            lifecycle: LifecycleLedger::default(),
+            equity_curve: Vec::new(),
+            mtm_output_summary: MtmOutputSummary::default(),
+            max_drawdown: None,
+            max_drawdown_pct: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -840,7 +859,6 @@ mod tests {
     #[test]
     fn execution_metadata_is_serializable_and_defaults_new_fields() {
         let decoded: ExecutionMetadata = serde_json::from_str("{}").unwrap();
-        assert_eq!(decoded.schema_version, ARTIFACT_SCHEMA_VERSION);
         assert_eq!(decoded.pnl_epsilon, DEFAULT_PNL_EPSILON);
         assert_eq!(decoded.execution_model, ExecutionModel::default());
 
@@ -1071,12 +1089,11 @@ mod tests {
     #[test]
     fn aggregate_deserializes_additive_fields_from_empty_object() {
         let artifacts: FutureBacktestArtifacts = serde_json::from_str("{}").unwrap();
-        assert_eq!(artifacts.execution.schema_version, ARTIFACT_SCHEMA_VERSION);
+        assert_eq!(artifacts.format_version, FUTURE_ARTIFACT_FORMAT_VERSION);
         assert!(artifacts.fills.is_empty());
         assert!(artifacts.completed_positions.is_empty());
         assert!(artifacts.equity_curve.is_empty());
         assert_eq!(artifacts.mtm_output_summary, MtmOutputSummary::default());
-        assert_eq!(artifacts.execution.schema_version, 2);
         assert_eq!(artifacts.max_drawdown, None);
     }
 

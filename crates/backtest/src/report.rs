@@ -908,6 +908,8 @@ pub struct BacktestResult {
 
     // ── FutureQuoteV1 additive artifacts ─────────────────────────────
     #[serde(default)]
+    pub future_format_version: Option<u32>,
+    #[serde(default)]
     pub execution_metadata: Option<ExecutionMetadata>,
     #[serde(default)]
     pub recorded_fills: Vec<RecordedFill>,
@@ -1107,6 +1109,7 @@ impl BacktestResult {
             winning_positions,
             losing_positions,
             position_win_rate,
+            future_format_version: None,
             execution_metadata: None,
             recorded_fills: Vec::new(),
             action_dispositions: Vec::new(),
@@ -1138,6 +1141,7 @@ impl BacktestResult {
         let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
         let mut result = Self::from_trade_log(artifacts.execution.initial_balance, trade_log);
         result.replace_position_statistics(&artifacts.completed_positions);
+        result.future_format_version = Some(artifacts.format_version);
         result.execution_metadata = Some(artifacts.execution);
         result.recorded_fills = artifacts.fills;
         result.action_dispositions = artifacts.lifecycle.as_slice().to_vec();

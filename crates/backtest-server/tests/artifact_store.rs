@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use backtest_server::artifact_store::{ArtifactStore, ArtifactStoreError, sha256_hex};
-use backtest_server::rpc_types::RESULT_ARTIFACT_SCHEMA_VERSION;
+use backtest_server::rpc_types::RESULT_FORMAT_VERSION;
 
 struct TempDirectory {
     path: PathBuf,
@@ -57,7 +57,7 @@ fn artifact_store_roundtrips_chunks_and_checksum() {
     let payload = br#"{"schema":"two","values":[1,2,3,4,5]}"#;
 
     let reference = store.persist_json(payload).unwrap();
-    assert_eq!(reference.schema_version, RESULT_ARTIFACT_SCHEMA_VERSION);
+    assert_eq!(reference.format_version, RESULT_FORMAT_VERSION);
     assert_eq!(reference.byte_len, payload.len() as u64);
     assert_eq!(reference.sha256, sha256_hex(payload));
     assert_eq!(reference.chunk_size, 7);

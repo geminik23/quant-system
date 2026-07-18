@@ -18,8 +18,7 @@ use backtest_server::handlers::{
     handle_cancel_backtest, handle_delete_result_artifact, handle_get_backtest_result,
     handle_get_backtest_status, handle_get_result_artifact_chunk, handle_list_profiles,
     handle_list_symbols, handle_ping, handle_reload_profiles, handle_remove_profile,
-    handle_run_backtest_multi_v2, handle_run_backtest_v2, handle_submit_backtest_v2,
-    run_job_and_store_v2,
+    handle_run_backtest, handle_run_backtest_multi, handle_submit_backtest, run_job_and_store,
 };
 use backtest_server::rpc_types::*;
 
@@ -175,38 +174,35 @@ fn spawn_client_handler(
             });
         }
 
-        // ── Register: run_backtest_v2 ──
+        // ── Register: run_backtest ──
         {
             let state = state.clone();
-            server.register_typed("run_backtest_v2", move |req: RunBacktestV2Request| {
+            server.register_typed("run_backtest", move |req: RunBacktestRequest| {
                 let state = state.clone();
                 async move {
                     let resp =
-                        tokio::task::spawn_blocking(move || handle_run_backtest_v2(&state, &req))
+                        tokio::task::spawn_blocking(move || handle_run_backtest(&state, &req))
                             .await
                             .map_err(|e| {
-                                xrpc::RpcError::ServerError(format!("backtest v2 task failed: {e}"))
+                                xrpc::RpcError::ServerError(format!("backtest task failed: {e}"))
                             })?;
                     Ok(resp)
                 }
             });
         }
 
-        // ── Register: run_backtest_multi_v2 ──
+        // ── Register: run_backtest_multi ──
         {
             let state = state.clone();
-            server.register_typed(
-                "run_backtest_multi_v2",
-                move |req: RunBacktestMultiV2Request| {
-                    let state = state.clone();
-                    async move {
-                        run_blocking_rpc("multi v2 backtest", move || {
-                            handle_run_backtest_multi_v2(&state, &req)
-                        })
-                        .await
-                    }
-                },
-            );
+            server.register_typed("run_backtest_multi", move |req: RunBacktestMultiRequest| {
+                let state = state.clone();
+                async move {
+                    run_blocking_rpc("multi-profile backtest", move || {
+                        handle_run_backtest_multi(&state, &req)
+                    })
+                    .await
+                }
+            });
         }
 
         // ── Register: add_profile ──
@@ -245,21 +241,21 @@ fn spawn_client_handler(
             });
         }
 
-        // ── Register: submit_backtest_v2 ──
+        // ── Register: submit_backtest ──
         {
             let state = state.clone();
             let blocking_jobs = blocking_jobs.clone();
-            server.register_typed("submit_backtest_v2", move |req: SubmitBacktestV2Request| {
+            server.register_typed("submit_backtest", move |req: SubmitBacktestRequest| {
                 let state = state.clone();
                 let blocking_jobs = blocking_jobs.clone();
                 async move {
-                    let submitted = handle_submit_backtest_v2(&state, &req);
+                    let submitted = handle_submit_backtest(&state, &req);
                     if let Some(ref id) = submitted.job_id {
                         let id = id.clone();
                         let inner_req = req.request.clone();
                         let st = state.clone();
                         let handle = tokio::task::spawn_blocking(move || {
-                            run_job_and_store_v2(st, id, inner_req);
+                            run_job_and_store(st, id, inner_req);
                         });
                         track_blocking_job(&blocking_jobs, handle);
                     }
@@ -621,19 +617,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_v2_backtest_execution_methods_are_registered() {
+    fn only_canonical_backtest_execution_methods_are_registered() {
         let source = include_str!("backtest_server.rs");
-        for method in ["run_backtest", "run_backtest_multi", "submit_backtest"] {
-            assert!(
-                !source.contains(&format!("register_typed(\"{method}\"")),
-                "unversioned method `{method}` must not be registered"
-            );
-        }
         for method in [
             "run_backtest_v2",
             "run_backtest_multi_v2",
             "submit_backtest_v2",
         ] {
+            assert!(
+                !source.contains(&format!("register_typed(\"{method}\"")),
+                "version-suffixed method `{method}` must not be registered"
+            );
+        }
+        for method in ["run_backtest", "run_backtest_multi", "submit_backtest"] {
             assert!(
                 source.contains(&format!("\"{method}\"")),
                 "current method `{method}` must remain registered"

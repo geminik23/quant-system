@@ -61,7 +61,7 @@ pub enum ProfileError {
     NotFound(String),
 }
 
-/// Strict validation failures returned by the additive V2 entry resolvers.
+/// Strict validation failures returned by the canonical entry resolvers.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProfileApplicationError {
     #[error("{field} must be finite and greater than zero, got {value}")]
@@ -580,7 +580,7 @@ impl RuleConfigDef {
     }
 }
 
-// ─── Strict V2 target resolution ─────────────────────────────────────────────
+// ─── Strict target resolution ────────────────────────────────────────────────
 
 /// Which 1-based target indices participate in strict target resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,13 +649,13 @@ pub struct ManagementProfile {
 
     /// Explicit current target selection. When present, this takes precedence
     /// over `use_targets` for [`Self::apply_entry_signal`]. When omitted,
-    /// schema-2 compatibility decoding derives the prior behavior from `use_targets`: an empty vector means
+    /// compatibility decoding derives the prior behavior from `use_targets`: an empty vector means
     /// [`TargetSelection::None`], otherwise it means [`TargetSelection::Selected`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_selection: Option<TargetSelection>,
 
-    /// Compatibility target selection (1-indexed), retained so existing schema-2
-    /// serialized profiles remain readable.
+    /// Compatibility target selection (1-indexed), retained so existing serialized
+    /// profiles remain readable.
     pub use_targets: Vec<usize>,
 
     /// Close ratio for each selected target. In current application, an empty
@@ -688,7 +688,7 @@ impl ManagementProfile {
     /// Return the target selection used by current application.
     ///
     /// The explicit `target_selection` field wins when present. Otherwise this
-    /// preserves existing schema-2 profile behavior by deriving `None`/`Selected` from
+    /// preserves existing profile behavior by deriving `None`/`Selected` from
     /// `use_targets`.
     pub fn effective_target_selection(&self) -> TargetSelection {
         self.target_selection.clone().unwrap_or_else(|| {
@@ -755,7 +755,7 @@ impl ManagementProfile {
         validate_entry_numbers(*price, *risk_multiplier, *signal_stoploss, signal_targets)?;
 
         let selection = self.effective_target_selection();
-        let (targets, target_resolution) = resolve_targets_v2(
+        let (targets, target_resolution) = resolve_targets(
             signal_targets,
             *side,
             *price,
@@ -763,8 +763,8 @@ impl ManagementProfile {
             &self.close_ratios,
             self.let_remainder_run,
         )?;
-        let stoploss = resolve_stoploss_v2(&self.stoploss_mode, *signal_stoploss, *price, *side)?;
-        let rules = resolve_rules_v2(&self.rules, *price, *side)?;
+        let stoploss = resolve_stoploss(&self.stoploss_mode, *signal_stoploss, *price, *side)?;
+        let rules = resolve_rules(&self.rules, *price, *side)?;
 
         Ok(Some(ResolvedEntry {
             risk_multiplier: *risk_multiplier,
@@ -850,7 +850,7 @@ fn validate_weights(
     })
 }
 
-fn resolve_targets_v2(
+fn resolve_targets(
     signal_targets: &[f64],
     side: Side,
     entry_price: Option<f64>,
@@ -951,7 +951,7 @@ fn resolve_targets_v2(
     ))
 }
 
-fn validate_stop_geometry_v2(
+fn validate_stop_geometry(
     side: Side,
     entry: f64,
     stoploss: f64,
@@ -971,7 +971,7 @@ fn validate_stop_geometry_v2(
     }
 }
 
-fn validate_target_geometry_v2(
+fn validate_target_geometry(
     index: usize,
     side: Side,
     entry: f64,
@@ -993,7 +993,7 @@ fn validate_target_geometry_v2(
     }
 }
 
-fn resolve_stoploss_v2(
+fn resolve_stoploss(
     mode: &StoplossMode,
     signal_stoploss: Option<f64>,
     entry_price: Option<f64>,
@@ -1017,13 +1017,13 @@ fn resolve_stoploss_v2(
     if let Some(stoploss) = stoploss {
         require_positive_finite("resolved stoploss", stoploss)?;
         if let Some(entry) = entry_price {
-            validate_stop_geometry_v2(side, entry, stoploss)?;
+            validate_stop_geometry(side, entry, stoploss)?;
         }
     }
     Ok(stoploss)
 }
 
-fn resolve_rules_v2(
+fn resolve_rules(
     definitions: &[RuleConfigDef],
     entry_price: Option<f64>,
     side: Side,
@@ -1035,7 +1035,7 @@ fn resolve_rules_v2(
             RuleConfigDef::FixedStoploss { price } => {
                 require_positive_finite(format!("rule {position} fixed stoploss price"), *price)?;
                 if let Some(entry) = entry_price {
-                    validate_stop_geometry_v2(side, entry, *price)?;
+                    validate_stop_geometry(side, entry, *price)?;
                 }
             }
             RuleConfigDef::TrailingStop { distance } => {
@@ -1049,7 +1049,7 @@ fn resolve_rules_v2(
                         format!("rule {position} initial trailing stop"),
                         initial_stop,
                     )?;
-                    validate_stop_geometry_v2(side, entry, initial_stop)?;
+                    validate_stop_geometry(side, entry, initial_stop)?;
                 }
             }
             RuleConfigDef::TakeProfit { price, close_ratio } => {
@@ -1065,7 +1065,7 @@ fn resolve_rules_v2(
                     });
                 }
                 if let Some(entry) = entry_price {
-                    validate_target_geometry_v2(position, side, entry, *price)?;
+                    validate_target_geometry(position, side, entry, *price)?;
                 }
             }
             RuleConfigDef::BreakevenWhen { trigger_price } => {
@@ -1074,7 +1074,7 @@ fn resolve_rules_v2(
                     *trigger_price,
                 )?;
                 if let Some(entry) = entry_price {
-                    validate_target_geometry_v2(position, side, entry, *trigger_price)?;
+                    validate_target_geometry(position, side, entry, *trigger_price)?;
                 }
             }
             RuleConfigDef::BreakevenWhenOffset {
@@ -1110,7 +1110,7 @@ fn resolve_rules_v2(
                     *trigger_price,
                 )?;
                 if let Some(entry) = entry_price {
-                    validate_target_geometry_v2(position, side, entry, *trigger_price)?;
+                    validate_target_geometry(position, side, entry, *trigger_price)?;
                 }
             }
             rules.push(rule);
@@ -1123,7 +1123,7 @@ fn resolve_rules_v2(
 ///
 /// Every signal target is retained and receives an equal `1 / N` close weight.
 /// Non-entry signals return `Ok(None)`.
-pub fn resolve_unprofiled_entry_v2(
+pub fn resolve_unprofiled_entry(
     signal: &RawSignal,
 ) -> Result<Option<ResolvedEntry>, ProfileApplicationError> {
     let (
@@ -1163,7 +1163,7 @@ pub fn resolve_unprofiled_entry_v2(
     };
 
     validate_entry_numbers(*price, *risk_multiplier, *stoploss, signal_targets)?;
-    let (targets, target_resolution) = resolve_targets_v2(
+    let (targets, target_resolution) = resolve_targets(
         signal_targets,
         *side,
         *price,
@@ -1339,7 +1339,7 @@ impl ProfileRegistry {
     pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileError> {
         let selection = p.effective_target_selection();
 
-        // Empty ratios are the strict V2 sentinel for equal target weights.
+        // Empty ratios are the strict sentinel for equal target weights.
         // Explicit ratios must correspond one-to-one when the selected target
         // count is profile-known. `All` is signal-dependent and is checked by
         // `apply_entry_signal` once the signal targets are available.
@@ -1359,7 +1359,7 @@ impl ProfileRegistry {
             });
         }
 
-        // Keep both the legacy field and the effective V2 selection safe even
+        // Keep both the legacy field and the effective strict selection safe even
         // when an explicit selection takes precedence.
         let mut seen = HashSet::new();
         for &index in &p.use_targets {
@@ -1392,13 +1392,13 @@ impl ProfileRegistry {
             }
         }
 
-        resolve_stoploss_v2(&p.stoploss_mode, None, None, Side::Buy).map_err(|error| {
+        resolve_stoploss(&p.stoploss_mode, None, None, Side::Buy).map_err(|error| {
             ProfileError::InvalidConfiguration {
                 profile: p.name.clone(),
                 reason: error.to_string(),
             }
         })?;
-        resolve_rules_v2(&p.rules, None, Side::Buy).map_err(|error| {
+        resolve_rules(&p.rules, None, Side::Buy).map_err(|error| {
             ProfileError::InvalidConfiguration {
                 profile: p.name.clone(),
                 reason: error.to_string(),
@@ -1681,7 +1681,7 @@ close_ratios = []
 
     #[test]
     fn legacy_empty_close_ratios_resolve_to_equal_weights() {
-        let profile = v2_profile(vec![1, 2], vec![], false);
+        let profile = strict_profile(vec![1, 2], vec![], false);
         let resolved = profile.apply_entry_signal(&buy_signal()).unwrap().unwrap();
 
         assert_eq!(resolved.target_resolution.weights, vec![0.5, 0.5]);
@@ -1789,7 +1789,7 @@ close_ratios = [0.0]
     #[test]
     fn non_finite_ratios_are_rejected() {
         for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let profile = v2_profile(vec![1], vec![ratio], false);
+            let profile = strict_profile(vec![1], vec![ratio], false);
             assert!(matches!(
                 profile.validate(),
                 Err(ProfileError::ZeroRatio { .. })
@@ -3733,15 +3733,15 @@ close_ratios = [1.0]
         assert_eq!(resolved.trade_id.as_deref(), Some("t1"));
     }
 
-    // ── Strict V2 profile and target resolution ─────────────────────────
+    // ── Strict strict profile and target resolution ─────────────────────────
 
-    fn v2_profile(
+    fn strict_profile(
         use_targets: Vec<usize>,
         close_ratios: Vec<f64>,
         let_remainder_run: bool,
     ) -> ManagementProfile {
         ManagementProfile {
-            name: "v2".into(),
+            name: "strict".into(),
             target_selection: None,
             use_targets,
             close_ratios,
@@ -3757,20 +3757,20 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_non_entry_returns_none() {
+    fn non_entry_returns_none() {
         let signal = RawSignal::CloseAll { ts: ts(10, 0, 0) };
         assert!(
-            v2_profile(vec![1], vec![1.0], false)
+            strict_profile(vec![1], vec![1.0], false)
                 .apply_entry_signal(&signal)
                 .unwrap()
                 .is_none()
         );
-        assert!(resolve_unprofiled_entry_v2(&signal).unwrap().is_none());
+        assert!(resolve_unprofiled_entry(&signal).unwrap().is_none());
     }
 
     #[test]
     fn explicit_selection_wins_over_compatibility_field() {
-        let mut profile = v2_profile(vec![1], vec![1.0], false);
+        let mut profile = strict_profile(vec![1], vec![1.0], false);
         profile.target_selection = Some(TargetSelection::Selected(vec![2]));
 
         let resolved = profile.apply_entry_signal(&buy_signal()).unwrap().unwrap();
@@ -3782,8 +3782,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_explicit_all_and_none_are_honored() {
-        let mut all = v2_profile(vec![1], vec![], false);
+    fn explicit_all_and_none_are_honored() {
+        let mut all = strict_profile(vec![1], vec![], false);
         all.target_selection = Some(TargetSelection::All);
         let all_resolved = all.apply_entry_signal(&buy_signal()).unwrap().unwrap();
         assert_eq!(
@@ -3793,7 +3793,7 @@ close_ratios = [1.0]
         assert_eq!(all_resolved.target_resolution.weights, vec![0.5, 0.5]);
         assert_eq!(resolved_targets(&all_resolved).len(), 2);
 
-        let mut none = v2_profile(vec![1], vec![], false);
+        let mut none = strict_profile(vec![1], vec![], false);
         none.target_selection = Some(TargetSelection::None);
         let none_resolved = none.apply_entry_signal(&buy_signal()).unwrap().unwrap();
         assert_eq!(
@@ -3804,8 +3804,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_selected_targets_preserve_selection_order_and_metadata() {
-        let resolved = v2_profile(vec![2, 1], vec![0.6, 0.4], false)
+    fn selected_targets_preserve_selection_order_and_metadata() {
+        let resolved = strict_profile(vec![2, 1], vec![0.6, 0.4], false)
             .apply_entry_signal(&buy_signal())
             .unwrap()
             .unwrap();
@@ -3824,8 +3824,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_empty_explicit_weights_default_to_equal_selected_weights() {
-        let resolved = v2_profile(vec![1, 2], vec![], false)
+    fn empty_explicit_weights_default_to_equal_selected_weights() {
+        let resolved = strict_profile(vec![1, 2], vec![], false)
             .apply_entry_signal(&buy_signal())
             .unwrap()
             .unwrap();
@@ -3837,8 +3837,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_empty_profile_selection_means_none() {
-        let resolved = v2_profile(vec![], vec![], false)
+    fn empty_profile_selection_means_none() {
+        let resolved = strict_profile(vec![], vec![], false)
             .apply_entry_signal(&buy_signal())
             .unwrap()
             .unwrap();
@@ -3851,7 +3851,7 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_unprofiled_uses_all_targets_with_equal_weights() {
+    fn unprofiled_uses_all_targets_with_equal_weights() {
         let mut signal = buy_signal();
         if let RawSignal::Entry {
             group, trade_id, ..
@@ -3860,7 +3860,7 @@ close_ratios = [1.0]
             *group = Some("source".into());
             *trade_id = Some("trade-1".into());
         }
-        let resolved = resolve_unprofiled_entry_v2(&signal).unwrap().unwrap();
+        let resolved = resolve_unprofiled_entry(&signal).unwrap().unwrap();
 
         assert_eq!(resolved.target_resolution.selection, TargetSelection::All);
         assert_eq!(resolved.target_resolution.selected_indices, vec![1, 2]);
@@ -3889,25 +3889,25 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_unprofiled_with_no_targets_is_valid() {
+    fn unprofiled_with_no_targets_is_valid() {
         let mut signal = buy_signal();
         if let RawSignal::Entry { targets, .. } = &mut signal {
             targets.clear();
         }
-        let resolved = resolve_unprofiled_entry_v2(&signal).unwrap().unwrap();
+        let resolved = resolve_unprofiled_entry(&signal).unwrap().unwrap();
         assert_eq!(resolved.target_resolution.selection, TargetSelection::All);
         assert_eq!(resolved.target_resolution.remainder, 1.0);
         assert!(resolved_targets(&resolved).is_empty());
     }
 
     #[test]
-    fn v2_rejects_zero_duplicate_and_missing_target_indices() {
-        let zero = v2_profile(vec![0], vec![1.0], false)
+    fn rejects_zero_duplicate_and_missing_target_indices() {
+        let zero = strict_profile(vec![0], vec![1.0], false)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert_eq!(zero, ProfileApplicationError::ZeroTargetIndex);
 
-        let duplicate = v2_profile(vec![1, 1], vec![0.5, 0.5], false)
+        let duplicate = strict_profile(vec![1, 1], vec![0.5, 0.5], false)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert_eq!(
@@ -3915,7 +3915,7 @@ close_ratios = [1.0]
             ProfileApplicationError::DuplicateTargetIndex { index: 1 }
         );
 
-        let missing = v2_profile(vec![3], vec![1.0], false)
+        let missing = strict_profile(vec![3], vec![1.0], false)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert_eq!(
@@ -3928,8 +3928,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_rejects_explicit_weight_count_mismatch() {
-        let error = v2_profile(vec![1, 2], vec![1.0], false)
+    fn rejects_explicit_weight_count_mismatch() {
+        let error = strict_profile(vec![1, 2], vec![1.0], false)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert_eq!(
@@ -3942,9 +3942,9 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_rejects_non_positive_and_non_finite_weights() {
+    fn rejects_non_positive_and_non_finite_weights() {
         for weight in [0.0, -0.1, f64::NAN, f64::INFINITY] {
-            let error = v2_profile(vec![1], vec![weight], false)
+            let error = strict_profile(vec![1], vec![weight], false)
                 .apply_entry_signal(&buy_signal())
                 .unwrap_err();
             assert!(matches!(
@@ -3955,8 +3955,8 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_enforces_weight_sum_and_reports_remainder() {
-        let exceeded = v2_profile(vec![1, 2], vec![0.6, 0.5], true)
+    fn enforces_weight_sum_and_reports_remainder() {
+        let exceeded = strict_profile(vec![1, 2], vec![0.6, 0.5], true)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert!(matches!(
@@ -3964,7 +3964,7 @@ close_ratios = [1.0]
             ProfileApplicationError::TargetWeightSumExceeded { .. }
         ));
 
-        let incomplete = v2_profile(vec![1, 2], vec![0.3, 0.3], false)
+        let incomplete = strict_profile(vec![1, 2], vec![0.3, 0.3], false)
             .apply_entry_signal(&buy_signal())
             .unwrap_err();
         assert!(matches!(
@@ -3972,7 +3972,7 @@ close_ratios = [1.0]
             ProfileApplicationError::TargetWeightSumIncomplete { .. }
         ));
 
-        let resolved = v2_profile(vec![1, 2], vec![0.3, 0.3], true)
+        let resolved = strict_profile(vec![1, 2], vec![0.3, 0.3], true)
             .apply_entry_signal(&buy_signal())
             .unwrap()
             .unwrap();
@@ -3980,12 +3980,12 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_validates_buy_and_sell_target_geometry_when_entry_known() {
+    fn validates_buy_and_sell_target_geometry_when_entry_known() {
         let mut buy = buy_signal();
         if let RawSignal::Entry { targets, .. } = &mut buy {
             targets[0] = 1.0800;
         }
-        let buy_error = v2_profile(vec![1], vec![1.0], false)
+        let buy_error = strict_profile(vec![1], vec![1.0], false)
             .apply_entry_signal(&buy)
             .unwrap_err();
         assert!(matches!(
@@ -4001,7 +4001,7 @@ close_ratios = [1.0]
         if let RawSignal::Entry { targets, .. } = &mut sell {
             targets[0] = 1.0900;
         }
-        let sell_error = v2_profile(vec![1], vec![1.0], false)
+        let sell_error = strict_profile(vec![1], vec![1.0], false)
             .apply_entry_signal(&sell)
             .unwrap_err();
         assert!(matches!(
@@ -4015,13 +4015,13 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_skips_geometry_check_when_entry_price_is_unknown() {
+    fn skips_geometry_check_when_entry_price_is_unknown() {
         let mut signal = buy_signal();
         if let RawSignal::Entry { price, targets, .. } = &mut signal {
             *price = None;
             targets[0] = 1.0;
         }
-        let resolved = v2_profile(vec![1], vec![1.0], false)
+        let resolved = strict_profile(vec![1], vec![1.0], false)
             .apply_entry_signal(&signal)
             .unwrap()
             .unwrap();
@@ -4029,7 +4029,7 @@ close_ratios = [1.0]
     }
 
     #[test]
-    fn v2_rejects_invalid_entry_numeric_inputs() {
+    fn rejects_invalid_entry_numeric_inputs() {
         for risk_multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut signal = buy_signal();
             if let RawSignal::Entry {
@@ -4040,7 +4040,7 @@ close_ratios = [1.0]
                 *value = risk_multiplier;
             }
             assert!(matches!(
-                resolve_unprofiled_entry_v2(&signal),
+                resolve_unprofiled_entry(&signal),
                 Err(ProfileApplicationError::InvalidNumericInput { .. })
             ));
         }
@@ -4050,28 +4050,28 @@ close_ratios = [1.0]
             targets[1] = f64::NAN;
         }
         assert!(matches!(
-            v2_profile(vec![1], vec![1.0], false).apply_entry_signal(&signal),
+            strict_profile(vec![1], vec![1.0], false).apply_entry_signal(&signal),
             Err(ProfileApplicationError::InvalidNumericInput { .. })
         ));
     }
 
     #[test]
-    fn v2_rejects_invalid_profile_numeric_inputs() {
-        let mut profile = v2_profile(vec![1], vec![1.0], false);
+    fn rejects_invalid_profile_numeric_inputs() {
+        let mut profile = strict_profile(vec![1], vec![1.0], false);
         profile.stoploss_mode = StoplossMode::FixedDistance { distance: 0.0 };
         assert!(matches!(
             profile.apply_entry_signal(&buy_signal()),
             Err(ProfileApplicationError::InvalidNumericInput { .. })
         ));
 
-        let mut profile = v2_profile(vec![1], vec![1.0], false);
+        let mut profile = strict_profile(vec![1], vec![1.0], false);
         profile.rules = vec![RuleConfigDef::TrailingStop { distance: f64::NAN }];
         assert!(matches!(
             profile.apply_entry_signal(&buy_signal()),
             Err(ProfileApplicationError::InvalidNumericInput { .. })
         ));
 
-        let mut profile = v2_profile(vec![1], vec![1.0], false);
+        let mut profile = strict_profile(vec![1], vec![1.0], false);
         profile.rules = vec![RuleConfigDef::TimeExit { max_seconds: 0 }];
         assert!(matches!(
             profile.apply_entry_signal(&buy_signal()),
@@ -4081,7 +4081,7 @@ close_ratios = [1.0]
 
     #[test]
     fn canonical_apply_rejects_missing_target() {
-        let profile = v2_profile(vec![3], vec![1.0], false);
+        let profile = strict_profile(vec![3], vec![1.0], false);
         assert!(matches!(
             profile.apply_entry_signal(&buy_signal()),
             Err(ProfileApplicationError::MissingTargetIndex { index: 3, .. })

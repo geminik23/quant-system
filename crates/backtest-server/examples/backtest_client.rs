@@ -578,7 +578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let_remainder_run: false,
     };
 
-    let f14_request = RunBacktestRequest {
+    let f14_request = BacktestRunSpec {
         symbol: args.symbol.clone(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -600,9 +600,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let f14_resp: RunBacktestResponse = client
         .call(
-            "run_backtest_v2",
-            &RunBacktestV2Request {
-                schema_version: 2,
+            "run_backtest",
+            &RunBacktestRequest {
                 request: f14_request,
                 future: FutureQuoteConfigMsg {
                     account_currency: "USD".into(),

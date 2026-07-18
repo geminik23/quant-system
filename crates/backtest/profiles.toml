@@ -6,17 +6,17 @@
 # Fields:
 #   name              — unique profile identifier
 #   target_selection  — current selector: All, None, or Selected(1-based indices)
-#   use_targets       — compatibility mirror for older schema-2 profile consumers
+#   use_targets       — compatibility mirror for older serialized profiles
 #   close_ratios      — target weights. An empty list means equal 1/N weights; explicit weights must match
 #                       the effective selection and sum to <= 1.0.
 #   stoploss_mode     — FromSignal, None, FixedDistance, or FixedPrice
 #   rules             — additional management rules to attach
 #   group_override    — if set, overrides the signal's group tag
-#   let_remainder_run — required in strict V2 when explicit weights sum below 1.0;
+#   let_remainder_run — required in strict resolution when explicit weights sum below 1.0;
 #                       the unallocated remainder rides with SL/rules only
 #
 # Shipped profiles state current target intent explicitly. `use_targets` is retained as
-# a compatibility mirror while older schema-2 profile payloads remain readable.
+# a compatibility mirror while older serialized profile payloads remain readable.
 
 [[profile]]
 name = "conservative"

@@ -11,8 +11,7 @@ use backtest_server::handlers::{
     handle_add_profile, handle_cancel_backtest, handle_delete_result_artifact,
     handle_get_backtest_result, handle_get_backtest_status, handle_get_result_artifact_chunk,
     handle_list_profiles, handle_list_symbols, handle_ping, handle_remove_profile,
-    handle_run_backtest_multi_v2, handle_run_backtest_v2, handle_submit_backtest_v2,
-    run_job_and_store_v2,
+    handle_run_backtest, handle_run_backtest_multi, handle_submit_backtest, run_job_and_store,
 };
 use backtest_server::rpc_types::*;
 
@@ -27,9 +26,8 @@ use qs_backtest::report::BacktestResult;
 use qs_core::types::{FillModel, Side};
 use qs_symbols::SymbolRegistry;
 
-fn test_v2_request(request: RunBacktestRequest) -> RunBacktestV2Request {
-    RunBacktestV2Request {
-        schema_version: 2,
+fn test_request(request: BacktestRunSpec) -> RunBacktestRequest {
+    RunBacktestRequest {
         request,
         future: FutureQuoteConfigMsg {
             account_currency: "USD".into(),
@@ -40,31 +38,30 @@ fn test_v2_request(request: RunBacktestRequest) -> RunBacktestV2Request {
     }
 }
 
-fn run_v2_for_test(state: &ServerState, request: &RunBacktestRequest) -> RunBacktestResponse {
-    handle_run_backtest_v2(state, &test_v2_request(request.clone()))
+fn run_for_test(state: &ServerState, request: &BacktestRunSpec) -> RunBacktestResponse {
+    handle_run_backtest(state, &test_request(request.clone()))
 }
 
-fn submit_v2_for_test(state: &ServerState, request: &RunBacktestRequest) -> SubmitBacktestResponse {
-    handle_submit_backtest_v2(
+fn submit_for_test(state: &ServerState, request: &BacktestRunSpec) -> SubmitBacktestResponse {
+    handle_submit_backtest(
         state,
-        &SubmitBacktestV2Request {
-            request: test_v2_request(request.clone()),
+        &SubmitBacktestRequest {
+            request: test_request(request.clone()),
         },
     )
 }
 
-fn run_job_v2_for_test(state: Arc<ServerState>, job_id: String, request: RunBacktestRequest) {
-    run_job_and_store_v2(state, job_id, test_v2_request(request));
+fn run_job_for_test(state: Arc<ServerState>, job_id: String, request: BacktestRunSpec) {
+    run_job_and_store(state, job_id, test_request(request));
 }
 
-fn run_multi_v2_for_test(
+fn run_multi_for_test(
     state: &ServerState,
-    request: &RunBacktestMultiRequest,
+    request: &BacktestMultiRunSpec,
 ) -> RunBacktestMultiResponse {
-    handle_run_backtest_multi_v2(
+    handle_run_backtest_multi(
         state,
-        &RunBacktestMultiV2Request {
-            schema_version: 2,
+        &RunBacktestMultiRequest {
             request: request.clone(),
             future: FutureQuoteConfigMsg {
                 account_currency: "USD".into(),
@@ -154,8 +151,8 @@ fn sample_raw_signal() -> RawSignalMsg {
     }
 }
 
-fn sample_run_request() -> RunBacktestRequest {
-    RunBacktestRequest {
+fn sample_run_request() -> BacktestRunSpec {
+    BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -176,12 +173,12 @@ fn sample_run_request() -> RunBacktestRequest {
     }
 }
 
-struct V2PathFixture {
+struct ReplayPathFixture {
     state: Arc<ServerState>,
     data_dir: PathBuf,
 }
 
-impl Drop for V2PathFixture {
+impl Drop for ReplayPathFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -194,13 +191,13 @@ fn fixture_ts(second: u32) -> NaiveDateTime {
         .unwrap()
 }
 
-fn v2_path_fixture() -> V2PathFixture {
+fn replay_path_fixture() -> ReplayPathFixture {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let data_dir = std::env::temp_dir().join(format!(
-        "qs_backtest_server_v2_path_parity_{}_{}",
+        "qs_backtest_server_replay_path_parity_{}_{}",
         std::process::id(),
         unique
     ));
@@ -225,7 +222,7 @@ fn v2_path_fixture() -> V2PathFixture {
     .collect::<Vec<_>>();
     assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
 
-    V2PathFixture {
+    ReplayPathFixture {
         state: Arc::new(ServerState {
             symbol_registry: evaluation_symbol_registry(),
             profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -240,7 +237,7 @@ fn v2_path_fixture() -> V2PathFixture {
     }
 }
 
-fn v2_inline_profile() -> ManagementProfileMsg {
+fn fixture_inline_profile() -> ManagementProfileMsg {
     ManagementProfileMsg {
         name: "future-parity".into(),
         target_selection: Some(TargetSelectionMsg::Selected(vec![1])),
@@ -253,10 +250,9 @@ fn v2_inline_profile() -> ManagementProfileMsg {
     }
 }
 
-fn v2_path_request() -> RunBacktestV2Request {
-    RunBacktestV2Request {
-        schema_version: 2,
-        request: RunBacktestRequest {
+fn replay_request() -> RunBacktestRequest {
+    RunBacktestRequest {
+        request: BacktestRunSpec {
             symbol: "EUR/USD".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -292,7 +288,7 @@ fn v2_path_request() -> RunBacktestV2Request {
                 },
             ],
             profile: None,
-            profile_def: Some(v2_inline_profile()),
+            profile_def: Some(fixture_inline_profile()),
             config: BacktestConfigMsg {
                 initial_balance: Some(25_000.0),
                 close_on_finish: Some(true),
@@ -347,11 +343,10 @@ fn v2_path_request() -> RunBacktestV2Request {
     }
 }
 
-fn multi_v2_request(single: &RunBacktestV2Request) -> RunBacktestMultiV2Request {
+fn multi_request(single: &RunBacktestRequest) -> RunBacktestMultiRequest {
     let request = &single.request;
-    RunBacktestMultiV2Request {
-        schema_version: single.schema_version,
-        request: RunBacktestMultiRequest {
+    RunBacktestMultiRequest {
+        request: BacktestMultiRunSpec {
             symbol: request.symbol.clone(),
             symbols: request.symbols.clone(),
             all_symbols: request.all_symbols,
@@ -403,7 +398,7 @@ lot_step_units = 1000
     .unwrap()
 }
 
-fn active_symbol_fixture() -> V2PathFixture {
+fn active_symbol_fixture() -> ReplayPathFixture {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -434,7 +429,7 @@ fn active_symbol_fixture() -> V2PathFixture {
     .collect::<Vec<_>>();
     assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
 
-    V2PathFixture {
+    ReplayPathFixture {
         state: Arc::new(ServerState {
             symbol_registry: active_symbol_registry(),
             profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -449,10 +444,9 @@ fn active_symbol_fixture() -> V2PathFixture {
     }
 }
 
-fn active_symbol_request() -> RunBacktestV2Request {
-    RunBacktestV2Request {
-        schema_version: 2,
-        request: RunBacktestRequest {
+fn active_symbol_request() -> RunBacktestRequest {
+    RunBacktestRequest {
+        request: BacktestRunSpec {
             symbol: "XAUUSD".into(),
             symbols: vec!["XAU/USD".into(), "GBPJPY".into()],
             all_symbols: false,
@@ -488,7 +482,7 @@ fn active_symbol_request() -> RunBacktestV2Request {
                 },
             ],
             profile: None,
-            profile_def: Some(v2_inline_profile()),
+            profile_def: Some(fixture_inline_profile()),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -547,8 +541,8 @@ fn assert_future_quote_results_equal(
         .unwrap_or_else(|| panic!("{path} FutureQuote result"));
 
     assert_eq!(
-        expected_future.schema_version, actual_future.schema_version,
-        "{path} schema_version"
+        expected_future.format_version, actual_future.format_version,
+        "{path} format_version"
     );
     assert_eq!(
         expected_future.execution_metadata, actual_future.execution_metadata,
@@ -659,7 +653,7 @@ fn backtest_config_msg_serde_roundtrip() {
 
 #[test]
 fn run_backtest_request_serde_roundtrip() {
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -679,7 +673,7 @@ fn run_backtest_request_serde_roundtrip() {
         },
     };
     let json = serde_json::to_string(&req).unwrap();
-    let decoded: RunBacktestRequest = serde_json::from_str(&json).unwrap();
+    let decoded: BacktestRunSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.symbol, "eurusd");
     assert_eq!(decoded.exchange, "ctrader");
     assert_eq!(decoded.raw_signals.len(), 1);
@@ -687,9 +681,8 @@ fn run_backtest_request_serde_roundtrip() {
 }
 
 #[test]
-fn v2_evaluation_serde_defaults_and_conversion_are_backward_compatible() {
-    let request = RunBacktestV2Request {
-        schema_version: 2,
+fn evaluation_serde_defaults_and_conversion_use_current_defaults() {
+    let request = RunBacktestRequest {
         request: sample_run_request(),
         future: FutureQuoteConfigMsg {
             account_currency: "USD".into(),
@@ -699,17 +692,17 @@ fn v2_evaluation_serde_defaults_and_conversion_are_backward_compatible() {
         evaluation: ProviderEvaluationOptionsMsg::default(),
         result_delivery: ResultDeliveryMsg::Auto,
     };
-    let mut legacy_json = serde_json::to_value(&request).unwrap();
-    legacy_json
+    let mut omitted_fields = serde_json::to_value(&request).unwrap();
+    omitted_fields
         .as_object_mut()
         .expect("request object")
         .remove("evaluation");
-    legacy_json
+    omitted_fields
         .as_object_mut()
         .expect("request object")
         .remove("result_delivery");
-    let decoded: RunBacktestV2Request = serde_json::from_value(legacy_json).unwrap();
-    assert_eq!(decoded.result_delivery, ResultDeliveryMsg::Inline);
+    let decoded: RunBacktestRequest = serde_json::from_value(omitted_fields).unwrap();
+    assert_eq!(decoded.result_delivery, ResultDeliveryMsg::Auto);
     assert_eq!(decoded.evaluation.sections, EvaluationSectionMsg::ALL);
     assert_eq!(decoded.evaluation.rolling_window, 20);
     assert_eq!(decoded.evaluation.minimum_breakdown_bucket_count, 1);
@@ -718,13 +711,14 @@ fn v2_evaluation_serde_defaults_and_conversion_are_backward_compatible() {
     assert!(!decoded.evaluation.include_positions);
     assert_eq!(decoded.evaluation.maximum_position_rows, None);
 
-    let mut legacy_multi = serde_json::to_value(multi_v2_request(&v2_path_request())).unwrap();
-    legacy_multi
+    let mut omitted_multi_fields = serde_json::to_value(multi_request(&replay_request())).unwrap();
+    omitted_multi_fields
         .as_object_mut()
         .expect("multi request object")
         .remove("result_delivery");
-    let decoded_multi: RunBacktestMultiV2Request = serde_json::from_value(legacy_multi).unwrap();
-    assert_eq!(decoded_multi.result_delivery, ResultDeliveryMsg::Inline);
+    let decoded_multi: RunBacktestMultiRequest =
+        serde_json::from_value(omitted_multi_fields).unwrap();
+    assert_eq!(decoded_multi.result_delivery, ResultDeliveryMsg::Auto);
 
     let custom = ProviderEvaluationOptionsMsg {
         context: EvaluationContextMsg {
@@ -795,25 +789,25 @@ fn v2_evaluation_serde_defaults_and_conversion_are_backward_compatible() {
 }
 
 #[test]
-fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
-    let request = v2_path_request();
+fn recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
+    let request = replay_request();
     let mut unknown_selector = serde_json::to_value(&request).unwrap();
     unknown_selector["evaluation"]["sections"] = serde_json::json!(["mystery"]);
-    let selector_error = serde_json::from_value::<RunBacktestV2Request>(unknown_selector)
+    let selector_error = serde_json::from_value::<RunBacktestRequest>(unknown_selector)
         .expect_err("unknown section must fail typed deserialization");
     assert!(selector_error.to_string().contains("unknown variant"));
 
     let mut unknown_config = serde_json::to_value(&request).unwrap();
     unknown_config["evaluation"]["mystery_limit"] = serde_json::json!(3);
-    let config_error = serde_json::from_value::<RunBacktestV2Request>(unknown_config)
+    let config_error = serde_json::from_value::<RunBacktestRequest>(unknown_config)
         .expect_err("unknown evaluation config must fail typed deserialization");
     assert!(config_error.to_string().contains("unknown field"));
 
     let mut request_typo = serde_json::to_value(&request).unwrap();
     request_typo["request"]["data_typo"] = serde_json::json!("tick");
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(request_typo)
-            .expect_err("nested V2 request typos must be rejected")
+        serde_json::from_value::<RunBacktestRequest>(request_typo)
+            .expect_err("nested canonical request typos must be rejected")
             .to_string()
             .contains("data_typo")
     );
@@ -821,8 +815,8 @@ fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
     let mut config_typo = serde_json::to_value(&request).unwrap();
     config_typo["request"]["config"]["initial_balnce"] = serde_json::json!(10_000.0);
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(config_typo)
-            .expect_err("nested V2 config typos must be rejected")
+        serde_json::from_value::<RunBacktestRequest>(config_typo)
+            .expect_err("nested canonical config typos must be rejected")
             .to_string()
             .contains("initial_balnce")
     );
@@ -830,31 +824,29 @@ fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
     let mut signal_typo = serde_json::to_value(&request).unwrap();
     signal_typo["request"]["raw_signals"][0]["stop_loss"] = serde_json::json!(1.09);
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(signal_typo)
-            .expect_err("nested V2 raw signal typos must be rejected")
+        serde_json::from_value::<RunBacktestRequest>(signal_typo)
+            .expect_err("nested canonical raw signal typos must be rejected")
             .to_string()
             .contains("stop_loss")
     );
 
     let mut missing_entry_risk = serde_json::to_value(&request).unwrap();
-    assert_eq!(missing_entry_risk["schema_version"], 2);
     missing_entry_risk["request"]["raw_signals"][0]
         .as_object_mut()
         .expect("entry object")
         .remove("risk");
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(missing_entry_risk)
-            .expect_err("V2 entries must require risk")
+        serde_json::from_value::<RunBacktestRequest>(missing_entry_risk)
+            .expect_err("canonical entries must require risk")
             .to_string()
             .contains("missing field `risk`")
     );
 
     let mut obsolete_entry_size = serde_json::to_value(&request).unwrap();
-    assert_eq!(obsolete_entry_size["schema_version"], 2);
     obsolete_entry_size["request"]["raw_signals"][0]["size"] = serde_json::json!(1.0);
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(obsolete_entry_size)
-            .expect_err("V2 entries must reject obsolete size")
+        serde_json::from_value::<RunBacktestRequest>(obsolete_entry_size)
+            .expect_err("canonical entries must reject obsolete size")
             .to_string()
             .contains("unknown field `size`")
     );
@@ -862,22 +854,22 @@ fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
     let mut profile_typo = serde_json::to_value(&request).unwrap();
     profile_typo["request"]["profile_def"]["close_ratio"] = serde_json::json!([1.0]);
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(profile_typo)
-            .expect_err("nested V2 profile typos must be rejected")
+        serde_json::from_value::<RunBacktestRequest>(profile_typo)
+            .expect_err("nested canonical profile typos must be rejected")
             .to_string()
             .contains("close_ratio")
     );
 
     let mut future_typo = serde_json::to_value(&request).unwrap();
     future_typo["future"]["signal_lattency_ms"] = serde_json::json!(250);
-    let typo_error = serde_json::from_value::<RunBacktestV2Request>(future_typo)
+    let typo_error = serde_json::from_value::<RunBacktestRequest>(future_typo)
         .expect_err("FutureQuote field typos must not silently default");
     assert!(typo_error.to_string().contains("signal_lattency_ms"));
 
     let mut delivery_typo = serde_json::to_value(&request).unwrap();
     delivery_typo["result_delivry"] = serde_json::json!("artifact");
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(delivery_typo)
+        serde_json::from_value::<RunBacktestRequest>(delivery_typo)
             .expect_err("delivery field typos must be rejected")
             .to_string()
             .contains("result_delivry")
@@ -886,80 +878,80 @@ fn v2_recursively_rejects_unknown_fields_across_sync_submit_and_multi() {
     let mut invalid_delivery = serde_json::to_value(&request).unwrap();
     invalid_delivery["result_delivery"] = serde_json::json!("stream");
     assert!(
-        serde_json::from_value::<RunBacktestV2Request>(invalid_delivery)
+        serde_json::from_value::<RunBacktestRequest>(invalid_delivery)
             .expect_err("unknown delivery modes must be rejected")
             .to_string()
             .contains("unknown variant")
     );
 
     let mut outer_typo = serde_json::to_value(&request).unwrap();
-    outer_typo["schema_verison"] = serde_json::json!(2);
-    let outer_error = serde_json::from_value::<RunBacktestV2Request>(outer_typo)
-        .expect_err("V2 outer envelope typos must be rejected");
-    assert!(outer_error.to_string().contains("schema_verison"));
+    outer_typo["unexpected_outer"] = serde_json::json!(true);
+    let outer_error = serde_json::from_value::<RunBacktestRequest>(outer_typo)
+        .expect_err("outer envelope typos must be rejected");
+    assert!(outer_error.to_string().contains("unexpected_outer"));
 
-    let mut submit_outer = serde_json::to_value(SubmitBacktestV2Request {
+    let mut submit_outer = serde_json::to_value(SubmitBacktestRequest {
         request: request.clone(),
     })
     .unwrap();
     submit_outer["requset"] = submit_outer["request"].clone();
     assert!(
-        serde_json::from_value::<SubmitBacktestV2Request>(submit_outer)
-            .expect_err("async V2 outer typos must be rejected")
+        serde_json::from_value::<SubmitBacktestRequest>(submit_outer)
+            .expect_err("async canonical outer typos must be rejected")
             .to_string()
             .contains("requset")
     );
 
-    let mut submit_nested = serde_json::to_value(SubmitBacktestV2Request {
+    let mut submit_nested = serde_json::to_value(SubmitBacktestRequest {
         request: request.clone(),
     })
     .unwrap();
     submit_nested["request"]["request"]["raw_signals"][0]["tradeid"] = serde_json::json!("typo");
     assert!(
-        serde_json::from_value::<SubmitBacktestV2Request>(submit_nested)
-            .expect_err("async V2 nested typos must be rejected")
+        serde_json::from_value::<SubmitBacktestRequest>(submit_nested)
+            .expect_err("async canonical nested typos must be rejected")
             .to_string()
             .contains("tradeid")
     );
 
-    let mut multi_outer = serde_json::to_value(multi_v2_request(&request)).unwrap();
-    multi_outer["schema_verison"] = serde_json::json!(2);
+    let mut multi_outer = serde_json::to_value(multi_request(&request)).unwrap();
+    multi_outer["unexpected_outer"] = serde_json::json!(true);
     assert!(
-        serde_json::from_value::<RunBacktestMultiV2Request>(multi_outer)
-            .expect_err("multi V2 outer typos must be rejected")
+        serde_json::from_value::<RunBacktestMultiRequest>(multi_outer)
+            .expect_err("multi outer typos must be rejected")
             .to_string()
-            .contains("schema_verison")
+            .contains("unexpected_outer")
     );
 
-    let mut multi_nested = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    let mut multi_nested = serde_json::to_value(multi_request(&request)).unwrap();
     multi_nested["request"]["config"]["close_on_finsih"] = serde_json::json!(true);
     assert!(
-        serde_json::from_value::<RunBacktestMultiV2Request>(multi_nested)
-            .expect_err("multi V2 nested config typos must be rejected")
+        serde_json::from_value::<RunBacktestMultiRequest>(multi_nested)
+            .expect_err("multi canonical nested config typos must be rejected")
             .to_string()
             .contains("close_on_finsih")
     );
 
-    let mut multi_profile = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    let mut multi_profile = serde_json::to_value(multi_request(&request)).unwrap();
     multi_profile["request"]["profiles"][0]["group_overide"] = serde_json::json!("typo");
-    serde_json::from_value::<RunBacktestMultiV2Request>(multi_profile)
-        .expect_err("multi V2 inline profile typos must be rejected");
+    serde_json::from_value::<RunBacktestMultiRequest>(multi_profile)
+        .expect_err("multi canonical inline profile typos must be rejected");
 
-    let mut v1 = serde_json::to_value(sample_run_request()).unwrap();
-    v1["legacy_extension"] = serde_json::json!(true);
-    v1["config"]["legacy_config_extension"] = serde_json::json!(true);
-    let decoded = serde_json::from_value::<RunBacktestRequest>(v1)
-        .expect("V1 request and config must retain unknown-field compatibility");
+    let mut unwrapped_spec = serde_json::to_value(sample_run_request()).unwrap();
+    unwrapped_spec["compatibility_extension"] = serde_json::json!(true);
+    unwrapped_spec["config"]["compatibility_config_extension"] = serde_json::json!(true);
+    let decoded = serde_json::from_value::<BacktestRunSpec>(unwrapped_spec)
+        .expect("unwrapped run specs retain unknown-field compatibility");
 
-    let mut v1_profile = serde_json::to_value(v2_inline_profile()).unwrap();
-    v1_profile["legacy_profile_extension"] = serde_json::json!(true);
-    serde_json::from_value::<ManagementProfileMsg>(v1_profile)
-        .expect("V1 inline profiles must retain unknown-field compatibility");
+    let mut unwrapped_profile = serde_json::to_value(fixture_inline_profile()).unwrap();
+    unwrapped_profile["compatibility_profile_extension"] = serde_json::json!(true);
+    serde_json::from_value::<ManagementProfileMsg>(unwrapped_profile)
+        .expect("unwrapped inline profiles retain unknown-field compatibility");
     assert_eq!(decoded.raw_signals.len(), 1);
 }
 
 #[test]
-fn v2_evaluation_conversion_rejects_inconsistent_config() {
+fn evaluation_conversion_rejects_inconsistent_config() {
     let config = ProviderEvaluationOptionsMsg {
         sections: vec![EvaluationSectionMsg::Coverage],
         breakdowns: vec![BreakdownDimensionMsg::Symbol],
@@ -971,7 +963,7 @@ fn v2_evaluation_conversion_rejects_inconsistent_config() {
 }
 
 #[test]
-fn v2_evaluation_conversion_rejects_integrated_tag_selectors() {
+fn evaluation_conversion_rejects_integrated_tag_selectors() {
     let registry = evaluation_symbol_registry();
     let tag_filter = ProviderEvaluationOptionsMsg {
         filter: PositionFilterMsg {
@@ -994,7 +986,7 @@ fn v2_evaluation_conversion_rejects_integrated_tag_selectors() {
 }
 
 #[test]
-fn v2_evaluation_conversion_rejects_unknown_filter_symbols() {
+fn evaluation_conversion_rejects_unknown_filter_symbols() {
     let config = ProviderEvaluationOptionsMsg {
         filter: PositionFilterMsg {
             symbols: vec!["not-a-market".into()],
@@ -1012,11 +1004,11 @@ fn v2_evaluation_conversion_rejects_unknown_filter_symbols() {
 }
 
 #[test]
-fn v2_artifact_response_is_compact_and_reconstructs_the_complete_result() {
-    let fixture = v2_path_fixture();
-    let mut artifact_request = v2_path_request();
+fn artifact_response_is_compact_and_reconstructs_the_complete_result() {
+    let fixture = replay_path_fixture();
+    let mut artifact_request = replay_request();
     artifact_request.result_delivery = ResultDeliveryMsg::Artifact;
-    let response = handle_run_backtest_v2(&fixture.state, &artifact_request);
+    let response = handle_run_backtest(&fixture.state, &artifact_request);
     assert!(response.success, "artifact: {:?}", response.error);
     let summary = response.result.as_ref().expect("compact result summary");
     assert!(summary.equity_curve.is_empty());
@@ -1025,7 +1017,7 @@ fn v2_artifact_response_is_compact_and_reconstructs_the_complete_result() {
     assert!(!response.inline_complete);
     let reference = response.artifact.clone().expect("artifact reference");
     assert!(serde_json::to_vec(&response).unwrap().len() < reference.byte_len as usize);
-    assert_eq!(reference.schema_version, RESULT_ARTIFACT_SCHEMA_VERSION);
+    assert_eq!(reference.format_version, RESULT_FORMAT_VERSION);
 
     let bytes = read_artifact_bytes(&fixture.state, &reference);
     let artifact_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1043,8 +1035,8 @@ fn v2_artifact_response_is_compact_and_reconstructs_the_complete_result() {
 }
 
 #[test]
-fn v2_inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
-    let fixture = v2_path_fixture();
+fn inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
+    let fixture = replay_path_fixture();
     let state = ServerState {
         symbol_registry: evaluation_symbol_registry(),
         profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -1062,10 +1054,10 @@ fn v2_inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
         )
         .unwrap(),
     };
-    let mut request = v2_path_request();
+    let mut request = replay_request();
     request.result_delivery = ResultDeliveryMsg::Inline;
 
-    let response = handle_run_backtest_v2(&state, &request);
+    let response = handle_run_backtest(&state, &request);
     assert!(!response.success);
     assert!(response.result.is_none());
     assert!(response.artifact.is_none());
@@ -1078,7 +1070,7 @@ fn v2_inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
     );
 
     request.result_delivery = ResultDeliveryMsg::Auto;
-    let auto = handle_run_backtest_v2(&state, &request);
+    let auto = handle_run_backtest(&state, &request);
     assert!(auto.success, "auto: {:?}", auto.error);
     assert!(auto.result.is_none());
     assert!(auto.artifact.is_some());
@@ -1087,13 +1079,13 @@ fn v2_inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
 }
 
 #[test]
-fn v2_multi_artifact_response_reconstructs_all_profile_results() {
-    let fixture = v2_path_fixture();
-    let request = v2_path_request();
-    let mut multi = multi_v2_request(&request);
+fn multi_artifact_response_reconstructs_all_profile_results() {
+    let fixture = replay_path_fixture();
+    let request = replay_request();
+    let mut multi = multi_request(&request);
     multi.result_delivery = ResultDeliveryMsg::Artifact;
 
-    let response = handle_run_backtest_multi_v2(&fixture.state, &multi);
+    let response = handle_run_backtest_multi(&fixture.state, &multi);
     assert!(response.success, "multi artifact: {:?}", response.error);
     assert_eq!(response.results.len(), 1);
     assert!(response.results[0].result.is_some());
@@ -1108,19 +1100,19 @@ fn v2_multi_artifact_response_reconstructs_all_profile_results() {
 }
 
 #[test]
-fn v2_async_artifact_job_retains_only_a_compact_result_summary() {
-    let fixture = v2_path_fixture();
-    let mut request = v2_path_request();
+fn async_artifact_job_retains_only_a_compact_result_summary() {
+    let fixture = replay_path_fixture();
+    let mut request = replay_request();
     request.result_delivery = ResultDeliveryMsg::Artifact;
-    let submission = handle_submit_backtest_v2(
+    let submission = handle_submit_backtest(
         &fixture.state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
     assert!(submission.success, "submit: {:?}", submission.error);
     let job_id = submission.job_id.unwrap();
-    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request);
+    run_job_and_store(fixture.state.clone(), job_id.clone(), request);
 
     {
         let jobs = fixture.state.jobs.lock().unwrap();
@@ -1160,11 +1152,11 @@ fn v2_async_artifact_job_retains_only_a_compact_result_summary() {
 }
 
 #[test]
-fn v2_sync_async_and_multi_profile_future_quote_results_are_equivalent() {
-    let fixture = v2_path_fixture();
-    let request = v2_path_request();
+fn sync_async_and_multi_profile_future_quote_results_are_equivalent() {
+    let fixture = replay_path_fixture();
+    let request = replay_request();
 
-    let sync_response = handle_run_backtest_v2(&fixture.state, &request);
+    let sync_response = handle_run_backtest(&fixture.state, &request);
     assert!(sync_response.success, "sync: {:?}", sync_response.error);
     let sync_result = sync_response.result.expect("sync result");
     let sync_future = sync_result
@@ -1212,15 +1204,15 @@ fn v2_sync_async_and_multi_profile_future_quote_results_are_equivalent() {
     assert!(rows[0]["r_multiple"].is_number());
     assert_eq!(rows[0]["outcome_classification"], "win");
 
-    let submission = handle_submit_backtest_v2(
+    let submission = handle_submit_backtest(
         &fixture.state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
     assert!(submission.success, "async submit: {:?}", submission.error);
     let job_id = submission.job_id.expect("submitted job id");
-    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request.clone());
+    run_job_and_store(fixture.state.clone(), job_id.clone(), request.clone());
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1240,7 +1232,7 @@ fn v2_sync_async_and_multi_profile_future_quote_results_are_equivalent() {
     assert!(async_response.success, "async: {:?}", async_response.error);
     let async_result = async_response.result.expect("async result");
 
-    let multi_response = handle_run_backtest_multi_v2(&fixture.state, &multi_v2_request(&request));
+    let multi_response = handle_run_backtest_multi(&fixture.state, &multi_request(&request));
     assert!(multi_response.success, "multi: {:?}", multi_response.error);
     assert_eq!(multi_response.results.len(), 1);
     let profile_result = &multi_response.results[0];
@@ -1279,18 +1271,18 @@ fn v2_sync_async_and_multi_profile_future_quote_results_are_equivalent() {
 }
 
 #[test]
-fn v2_multi_profile_reopens_future_stream_for_each_profile() {
-    let fixture = v2_path_fixture();
-    let request = v2_path_request();
-    let mut multi = multi_v2_request(&request);
-    let mut second_profile = v2_inline_profile();
+fn multi_profile_reopens_future_stream_for_each_profile() {
+    let fixture = replay_path_fixture();
+    let request = replay_request();
+    let mut multi = multi_request(&request);
+    let mut second_profile = fixture_inline_profile();
     second_profile.name = "future-reopen-second".into();
     multi
         .request
         .profiles
         .push(ProfileRef::Inline(second_profile));
 
-    let response = handle_run_backtest_multi_v2(&fixture.state, &multi);
+    let response = handle_run_backtest_multi(&fixture.state, &multi);
     assert!(response.success, "multi reopen: {:?}", response.error);
     assert_eq!(response.results.len(), 2);
     for result in &response.results {
@@ -1306,11 +1298,11 @@ fn v2_multi_profile_reopens_future_stream_for_each_profile() {
 }
 
 #[test]
-fn v2_prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
+fn prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
     let fixture = active_symbol_fixture();
     let request = active_symbol_request();
 
-    let sync_response = handle_run_backtest_v2(&fixture.state, &request);
+    let sync_response = handle_run_backtest(&fixture.state, &request);
     assert!(sync_response.success, "sync: {:?}", sync_response.error);
     let sync_result = sync_response.result.expect("sync result");
     let metadata = &sync_result
@@ -1332,15 +1324,15 @@ fn v2_prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
         serde_json::json!(["xauusd"])
     );
 
-    let submission = handle_submit_backtest_v2(
+    let submission = handle_submit_backtest(
         &fixture.state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
     assert!(submission.success, "async submit: {:?}", submission.error);
     let job_id = submission.job_id.expect("submitted job id");
-    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request.clone());
+    run_job_and_store(fixture.state.clone(), job_id.clone(), request.clone());
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1359,7 +1351,7 @@ fn v2_prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
     assert!(async_response.success, "async: {:?}", async_response.error);
     let async_result = async_response.result.expect("async result");
 
-    let multi_response = handle_run_backtest_multi_v2(&fixture.state, &multi_v2_request(&request));
+    let multi_response = handle_run_backtest_multi(&fixture.state, &multi_request(&request));
     assert!(multi_response.success, "multi: {:?}", multi_response.error);
     let multi_result = multi_response.results[0]
         .result
@@ -1371,11 +1363,10 @@ fn v2_prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
 }
 
 #[test]
-fn v2_filtered_entry_and_management_only_run_is_idle_without_market_data() {
+fn filtered_entry_and_management_only_run_is_idle_without_market_data() {
     let state = empty_state();
-    let request = RunBacktestV2Request {
-        schema_version: 2,
-        request: RunBacktestRequest {
+    let request = RunBacktestRequest {
+        request: BacktestRunSpec {
             symbol: "XAUUSD".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -1420,7 +1411,7 @@ fn v2_filtered_entry_and_management_only_run_is_idle_without_market_data() {
         result_delivery: ResultDeliveryMsg::Auto,
     };
 
-    let response = handle_run_backtest_v2(&state, &request);
+    let response = handle_run_backtest(&state, &request);
     assert!(response.success, "idle run: {:?}", response.error);
     let result = response.result.expect("idle result");
     assert_eq!(result.total_trades, 0);
@@ -1446,12 +1437,12 @@ fn v2_filtered_entry_and_management_only_run_is_idle_without_market_data() {
 }
 
 #[test]
-fn v2_effective_start_after_requested_end_returns_zero_trade_result() {
+fn effective_start_after_requested_end_returns_zero_trade_result() {
     let fixture = active_symbol_fixture();
     let mut request = active_symbol_request();
     request.request.to = Some("2026-01-15T10:00:00".into());
 
-    let response = handle_run_backtest_v2(&fixture.state, &request);
+    let response = handle_run_backtest(&fixture.state, &request);
     assert!(response.success, "early-load window: {:?}", response.error);
     let result = response.result.expect("early-load result");
     assert_eq!(result.total_trades, 0);
@@ -1513,9 +1504,8 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
         max_retained_jobs: 1_000,
         artifact_store: test_artifact_store(data_dir.join("artifacts")),
     };
-    let request = RunBacktestV2Request {
-        schema_version: 2,
-        request: RunBacktestRequest {
+    let request = RunBacktestRequest {
+        request: BacktestRunSpec {
             symbol: "EUR/USD".into(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -1537,7 +1527,7 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
                 trade_id: Some("bar-metadata".into()),
             }],
             profile: None,
-            profile_def: Some(v2_inline_profile()),
+            profile_def: Some(fixture_inline_profile()),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -1555,7 +1545,7 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
         result_delivery: ResultDeliveryMsg::Auto,
     };
 
-    let response = handle_run_backtest_v2(&state, &request);
+    let response = handle_run_backtest(&state, &request);
     assert!(response.success, "bar run: {:?}", response.error);
     let metadata = &response.result.unwrap().future.unwrap().execution_metadata;
     let tags = &metadata["tags"];
@@ -1581,12 +1571,12 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
 }
 
 #[test]
-fn v2_cancelled_job_remains_cancelled_and_never_stores_a_result() {
-    let fixture = v2_path_fixture();
-    let request = v2_path_request();
-    let submission = handle_submit_backtest_v2(
+fn cancelled_job_remains_cancelled_and_never_stores_a_result() {
+    let fixture = replay_path_fixture();
+    let request = replay_request();
+    let submission = handle_submit_backtest(
         &fixture.state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
@@ -1599,7 +1589,7 @@ fn v2_cancelled_job_remains_cancelled_and_never_stores_a_result() {
     );
     assert!(cancelled.success);
 
-    run_job_and_store_v2(fixture.state.clone(), job_id.clone(), request);
+    run_job_and_store(fixture.state.clone(), job_id.clone(), request);
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1620,7 +1610,7 @@ fn cancelled_active_worker_remains_capacity_accounted_until_it_releases_ownershi
         ..empty_state()
     });
     let request = sample_run_request();
-    let first = submit_v2_for_test(&state, &request);
+    let first = submit_for_test(&state, &request);
     let first_id = first.job_id.unwrap();
 
     assert!(
@@ -1632,13 +1622,13 @@ fn cancelled_active_worker_remains_capacity_accounted_until_it_releases_ownershi
         )
         .success
     );
-    let blocked = submit_v2_for_test(&state, &request);
+    let blocked = submit_for_test(&state, &request);
     assert!(!blocked.success);
     assert!(blocked.error.unwrap().contains("job limit"));
 
-    run_job_v2_for_test(state.clone(), first_id.clone(), request.clone());
+    run_job_for_test(state.clone(), first_id.clone(), request.clone());
     assert!(!state.jobs.lock().unwrap()[&first_id].worker_active);
-    assert!(submit_v2_for_test(&state, &request).success);
+    assert!(submit_for_test(&state, &request).success);
 }
 
 #[test]
@@ -1648,10 +1638,10 @@ fn async_job_store_is_bounded_and_cleanup_removes_terminal_jobs() {
         ..empty_state()
     };
     let request = sample_run_request();
-    let first = submit_v2_for_test(&state, &request);
-    let second = submit_v2_for_test(&state, &request);
+    let first = submit_for_test(&state, &request);
+    let second = submit_for_test(&state, &request);
     assert!(first.success && second.success);
-    let full = submit_v2_for_test(&state, &request);
+    let full = submit_for_test(&state, &request);
     assert!(!full.success);
     assert!(full.error.unwrap().contains("job limit"));
 
@@ -1669,7 +1659,7 @@ fn async_job_store_is_bounded_and_cleanup_removes_terminal_jobs() {
         .get_mut(&first_id)
         .unwrap()
         .worker_active = false;
-    let replacement = submit_v2_for_test(&state, &request);
+    let replacement = submit_for_test(&state, &request);
     assert!(
         replacement.success,
         "worker-released terminal jobs should be evictable"
@@ -1735,7 +1725,7 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
     ));
 
     let evicted = insert_completed_artifact_job("evicted-artifact-job");
-    let replacement = submit_v2_for_test(&state, &sample_run_request());
+    let replacement = submit_for_test(&state, &sample_run_request());
     assert!(replacement.success, "replacement: {:?}", replacement.error);
     assert!(matches!(
         state.artifact_store.read_chunk(&evicted.artifact_id, 0),
@@ -1744,19 +1734,19 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
 }
 
 #[test]
-fn v2_future_scalar_validation_matches_sync_async_and_multi_before_planning() {
+fn future_scalar_validation_matches_sync_async_and_multi_before_planning() {
     let state = empty_state();
-    let mut request = v2_path_request();
+    let mut request = replay_request();
     request.future.slippage_pips = f64::NAN;
 
-    let sync = handle_run_backtest_v2(&state, &request);
+    let sync = handle_run_backtest(&state, &request);
     assert!(!sync.success);
     let expected = sync.error.expect("sync scalar error");
     assert!(expected.contains("slippage_pips must be finite"));
 
-    let asynchronous = handle_submit_backtest_v2(
+    let asynchronous = handle_submit_backtest(
         &state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
@@ -1765,7 +1755,7 @@ fn v2_future_scalar_validation_matches_sync_async_and_multi_before_planning() {
     assert_eq!(asynchronous.error.as_deref(), Some(expected.as_str()));
     assert!(state.jobs.lock().unwrap().is_empty());
 
-    let multi = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    let multi = handle_run_backtest_multi(&state, &multi_request(&request));
     assert!(!multi.success);
     assert_eq!(multi.error.as_deref(), Some(expected.as_str()));
     assert_eq!(multi.results.len(), 1);
@@ -1773,42 +1763,13 @@ fn v2_future_scalar_validation_matches_sync_async_and_multi_before_planning() {
 }
 
 #[test]
-fn v2_invalid_schema_is_rejected_consistently_across_paths() {
+fn multi_rejects_empty_profiles_with_top_level_error() {
     let state = empty_state();
-    let mut request = v2_path_request();
-    request.schema_version = 1;
-    let expected = "unsupported schema_version: 1";
-
-    let sync_response = handle_run_backtest_v2(&state, &request);
-    assert!(!sync_response.success);
-    assert_eq!(sync_response.error.as_deref(), Some(expected));
-
-    let async_response = handle_submit_backtest_v2(
-        &state,
-        &SubmitBacktestV2Request {
-            request: request.clone(),
-        },
-    );
-    assert!(!async_response.success);
-    assert!(async_response.job_id.is_none());
-    assert_eq!(async_response.error.as_deref(), Some(expected));
-
-    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
-    assert!(!multi_response.success);
-    assert_eq!(multi_response.error.as_deref(), Some(expected));
-    assert_eq!(multi_response.results.len(), 1);
-    assert!(!multi_response.results[0].success);
-    assert_eq!(multi_response.results[0].error.as_deref(), Some(expected));
-}
-
-#[test]
-fn v2_multi_rejects_empty_profiles_with_top_level_error() {
-    let state = empty_state();
-    let request = v2_path_request();
-    let mut multi = multi_v2_request(&request);
+    let request = replay_request();
+    let mut multi = multi_request(&request);
     multi.request.profiles.clear();
 
-    let response = handle_run_backtest_multi_v2(&state, &multi);
+    let response = handle_run_backtest_multi(&state, &multi);
     assert!(!response.success);
     assert_eq!(
         response.error.as_deref(),
@@ -1826,20 +1787,20 @@ fn v2_multi_rejects_empty_profiles_with_top_level_error() {
 }
 
 #[test]
-fn v2_invalid_evaluation_is_rejected_consistently_across_paths() {
+fn invalid_evaluation_is_rejected_consistently_across_paths() {
     let state = empty_state();
-    let mut request = v2_path_request();
+    let mut request = replay_request();
     request.evaluation.sections = vec![EvaluationSectionMsg::Coverage];
     request.evaluation.breakdowns = vec![BreakdownDimensionMsg::Symbol];
 
-    let sync_response = handle_run_backtest_v2(&state, &request);
+    let sync_response = handle_run_backtest(&state, &request);
     assert!(!sync_response.success);
     let expected = sync_response.error.expect("sync evaluation error");
     assert!(expected.contains("breakdowns report section"));
 
-    let async_response = handle_submit_backtest_v2(
+    let async_response = handle_submit_backtest(
         &state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
@@ -1847,7 +1808,7 @@ fn v2_invalid_evaluation_is_rejected_consistently_across_paths() {
     assert!(async_response.job_id.is_none());
     assert_eq!(async_response.error.as_deref(), Some(expected.as_str()));
 
-    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    let multi_response = handle_run_backtest_multi(&state, &multi_request(&request));
     assert_eq!(multi_response.results.len(), 1);
     assert!(!multi_response.results[0].success);
     assert_eq!(
@@ -1857,12 +1818,12 @@ fn v2_invalid_evaluation_is_rejected_consistently_across_paths() {
 }
 
 #[test]
-fn v2_unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
+fn unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
     let state = empty_state();
-    let mut request = v2_path_request();
+    let mut request = replay_request();
     request.evaluation.filter.symbols = vec!["not-a-market".into()];
 
-    let sync_response = handle_run_backtest_v2(&state, &request);
+    let sync_response = handle_run_backtest(&state, &request);
     assert!(!sync_response.success);
     assert!(
         sync_response
@@ -1871,9 +1832,9 @@ fn v2_unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
             .is_some_and(|error| error.contains("unknown evaluation symbol `not-a-market`"))
     );
 
-    let async_response = handle_submit_backtest_v2(
+    let async_response = handle_submit_backtest(
         &state,
-        &SubmitBacktestV2Request {
+        &SubmitBacktestRequest {
             request: request.clone(),
         },
     );
@@ -1886,7 +1847,7 @@ fn v2_unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
             .is_some_and(|error| error.contains("unknown evaluation symbol `not-a-market`"))
     );
 
-    let multi_response = handle_run_backtest_multi_v2(&state, &multi_v2_request(&request));
+    let multi_response = handle_run_backtest_multi(&state, &multi_request(&request));
     assert_eq!(multi_response.results.len(), 1);
     assert!(!multi_response.results[0].success);
     assert!(
@@ -1898,27 +1859,27 @@ fn v2_unknown_evaluation_symbol_is_rejected_consistently_across_paths() {
 }
 
 #[test]
-fn v2_unknown_evaluation_selector_deserialization_is_consistent_across_paths() {
-    let request = v2_path_request();
+fn unknown_evaluation_selector_deserialization_is_consistent_across_paths() {
+    let request = replay_request();
 
     let mut sync_json = serde_json::to_value(&request).unwrap();
     sync_json["evaluation"]["sections"] = serde_json::json!(["mystery"]);
-    let sync_error = serde_json::from_value::<RunBacktestV2Request>(sync_json)
+    let sync_error = serde_json::from_value::<RunBacktestRequest>(sync_json)
         .expect_err("sync selector must fail")
         .to_string();
 
-    let mut async_json = serde_json::to_value(SubmitBacktestV2Request {
+    let mut async_json = serde_json::to_value(SubmitBacktestRequest {
         request: request.clone(),
     })
     .unwrap();
     async_json["request"]["evaluation"]["sections"] = serde_json::json!(["mystery"]);
-    let async_error = serde_json::from_value::<SubmitBacktestV2Request>(async_json)
+    let async_error = serde_json::from_value::<SubmitBacktestRequest>(async_json)
         .expect_err("async selector must fail")
         .to_string();
 
-    let mut multi_json = serde_json::to_value(multi_v2_request(&request)).unwrap();
+    let mut multi_json = serde_json::to_value(multi_request(&request)).unwrap();
     multi_json["evaluation"]["sections"] = serde_json::json!(["mystery"]);
-    let multi_error = serde_json::from_value::<RunBacktestMultiV2Request>(multi_json)
+    let multi_error = serde_json::from_value::<RunBacktestMultiRequest>(multi_json)
         .expect_err("multi-profile selector must fail")
         .to_string();
 
@@ -1929,7 +1890,7 @@ fn v2_unknown_evaluation_selector_deserialization_is_consistent_across_paths() {
 
 #[test]
 fn run_backtest_multi_request_serde_roundtrip() {
-    let req = RunBacktestMultiRequest {
+    let req = BacktestMultiRunSpec {
         symbol: "xauusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -1951,7 +1912,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
         },
     };
     let json = serde_json::to_string(&req).unwrap();
-    let decoded: RunBacktestMultiRequest = serde_json::from_str(&json).unwrap();
+    let decoded: BacktestMultiRunSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.profiles.len(), 2);
     assert_eq!(decoded.data_type, "bar");
     assert_eq!(decoded.timeframe, Some("1h".into()));
@@ -2300,7 +2261,7 @@ fn handler_list_symbols_parses_actual_bar_timeframe_format() {
 #[test]
 fn handler_run_backtest_invalid_data_type() {
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2319,7 +2280,7 @@ fn handler_run_backtest_invalid_data_type() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.is_some());
     assert!(resp.error.unwrap().contains("Invalid data_type"));
@@ -2329,7 +2290,7 @@ fn handler_run_backtest_invalid_data_type() {
 #[test]
 fn handler_run_backtest_bar_without_timeframe() {
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2348,7 +2309,7 @@ fn handler_run_backtest_bar_without_timeframe() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("timeframe"));
 }
@@ -2356,7 +2317,7 @@ fn handler_run_backtest_bar_without_timeframe() {
 #[test]
 fn handler_run_backtest_empty_signals() {
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2375,7 +2336,7 @@ fn handler_run_backtest_empty_signals() {
             sizing: None,
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("signal"));
 }
@@ -2396,7 +2357,7 @@ fn handler_run_backtest_no_data_returns_error() {
         max_retained_jobs: 1_000,
         artifact_store: test_artifact_store(tmp.join("artifacts")),
     };
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2415,7 +2376,7 @@ fn handler_run_backtest_no_data_returns_error() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("No market data found"));
 
@@ -2426,7 +2387,7 @@ fn handler_run_backtest_no_data_returns_error() {
 #[test]
 fn handler_run_backtest_unknown_profile() {
     let state = empty_state();
-    let req = RunBacktestMultiRequest {
+    let req = BacktestMultiRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2444,7 +2405,7 @@ fn handler_run_backtest_unknown_profile() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_multi_v2_for_test(&state, &req);
+    let resp = run_multi_for_test(&state, &req);
     assert_eq!(resp.results.len(), 1);
     assert!(!resp.results[0].success);
     assert!(resp.results[0].error.is_some());
@@ -2453,7 +2414,7 @@ fn handler_run_backtest_unknown_profile() {
 #[test]
 fn handler_run_backtest_multi_invalid_data_type_all_fail() {
     let state = empty_state();
-    let req = RunBacktestMultiRequest {
+    let req = BacktestMultiRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2471,7 +2432,7 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_multi_v2_for_test(&state, &req);
+    let resp = run_multi_for_test(&state, &req);
     assert_eq!(resp.results.len(), 2);
     assert!(resp.results.iter().all(|r| !r.success));
 }
@@ -2897,7 +2858,7 @@ fn profile_ref_inline_serde() {
 
 #[test]
 fn run_backtest_request_with_profile_def_serde() {
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2926,7 +2887,7 @@ fn run_backtest_request_with_profile_def_serde() {
         },
     };
     let json = serde_json::to_string(&req).unwrap();
-    let decoded: RunBacktestRequest = serde_json::from_str(&json).unwrap();
+    let decoded: BacktestRunSpec = serde_json::from_str(&json).unwrap();
     assert!(decoded.profile_def.is_some());
     assert_eq!(decoded.profile_def.unwrap().name, "inline");
     assert!(decoded.profile.is_none());
@@ -2938,7 +2899,7 @@ fn run_backtest_request_with_profile_def_serde() {
 fn inline_profile_validation_error() {
     // An inline profile with mismatched targets/ratios should fail validation
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -2966,7 +2927,7 @@ fn inline_profile_validation_error() {
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(
         resp.error
@@ -2980,7 +2941,7 @@ fn inline_profile_validation_error() {
 fn backward_compat_no_profile_def() {
     // A request without profile_def (None) should still work (no regression)
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -3000,7 +2961,7 @@ fn backward_compat_no_profile_def() {
         },
     };
     // This will fail at data loading (no data), but should NOT fail at profile validation
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     // The error should be about data, not profiles
     if let Some(ref err) = resp.error {
         assert!(
@@ -3022,7 +2983,7 @@ fn backward_compat_multi_string_profiles() {
         "profiles": ["conservative", "aggressive"],
         "config": {}
     }"#;
-    let decoded: RunBacktestMultiRequest = serde_json::from_str(json).unwrap();
+    let decoded: BacktestMultiRunSpec = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.profiles.len(), 2);
     assert!(matches!(&decoded.profiles[0], ProfileRef::Named(n) if n == "conservative"));
     assert!(matches!(&decoded.profiles[1], ProfileRef::Named(n) if n == "aggressive"));
@@ -3365,7 +3326,7 @@ fn position_ref_msg_serde_all_variants() {
 
 #[test]
 fn run_backtest_request_raw_signals_serde() {
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -3402,7 +3363,7 @@ fn run_backtest_request_raw_signals_serde() {
         },
     };
     let json = serde_json::to_string(&req).unwrap();
-    let decoded: RunBacktestRequest = serde_json::from_str(&json).unwrap();
+    let decoded: BacktestRunSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.raw_signals.len(), 2);
 }
 
@@ -3645,7 +3606,7 @@ fn raw_signal_from_msg_invalid_timestamp_errors() {
 
 #[test]
 fn run_backtest_multi_request_raw_signals_serde() {
-    let req = RunBacktestMultiRequest {
+    let req = BacktestMultiRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -3675,14 +3636,14 @@ fn run_backtest_multi_request_raw_signals_serde() {
         },
     };
     let json = serde_json::to_string(&req).unwrap();
-    let decoded: RunBacktestMultiRequest = serde_json::from_str(&json).unwrap();
+    let decoded: BacktestMultiRunSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.raw_signals.len(), 1);
 }
 
 #[test]
 fn handler_run_backtest_empty_raw_signals_rejected() {
     let state = empty_state();
-    let req = RunBacktestRequest {
+    let req = BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
@@ -3701,7 +3662,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
             sizing: None,
         },
     };
-    let resp = run_v2_for_test(&state, &req);
+    let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.as_ref().unwrap().contains("signal"));
 }

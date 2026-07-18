@@ -10,7 +10,7 @@ use nanoid::nanoid;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::rpc_types::{RESULT_ARTIFACT_SCHEMA_VERSION, ResultArtifactRefMsg};
+use crate::rpc_types::{RESULT_FORMAT_VERSION, ResultArtifactRefMsg};
 
 const ARTIFACT_EXTENSION: &str = "json";
 const PART_EXTENSION: &str = "part";
@@ -135,7 +135,7 @@ impl ArtifactStore {
         }
 
         Ok(ResultArtifactRefMsg {
-            schema_version: RESULT_ARTIFACT_SCHEMA_VERSION,
+            format_version: RESULT_FORMAT_VERSION,
             artifact_id,
             byte_len,
             sha256: sha256_hex(bytes),

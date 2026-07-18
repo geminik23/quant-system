@@ -24,7 +24,10 @@ use qs_core::types::{
 };
 use qs_core::{ExecutionPricer, FutureApplyError, TradeEngine};
 
-use crate::artifacts::{ExecutionMetadata, FutureBacktestArtifacts, PendingOrderSnapshot};
+use crate::artifacts::{
+    ExecutionMetadata, FUTURE_ARTIFACT_FORMAT_VERSION, FutureBacktestArtifacts,
+    PendingOrderSnapshot,
+};
 use crate::currency::{ConversionQuoteBook, RunCurrencyPlan};
 use crate::data_feed::{DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch};
 use crate::evaluation::EvaluationOptions;
@@ -35,7 +38,7 @@ use crate::mtm::{MtmCurveCollector, MtmOutputPolicy, MtmOutputSummary};
 use crate::portfolio::{EquityPoint, PortfolioRecorder};
 use crate::profile::{
     ManagementProfile, PositionRef, PositionResolver, RawSignal, ResolvedEntry,
-    allocate_target_steps, resolve_signal, resolve_unprofiled_entry_v2,
+    allocate_target_steps, resolve_signal, resolve_unprofiled_entry,
 };
 use crate::report::BacktestResult;
 use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
@@ -725,7 +728,7 @@ impl BacktestRunner {
             }
             let resolved = match profile {
                 Some(profile) => profile.apply_entry_signal(&signal),
-                None => resolve_unprofiled_entry_v2(&signal),
+                None => resolve_unprofiled_entry(&signal),
             };
             if let Ok(Some(resolved)) = resolved
                 && let Ok(action) =
@@ -1557,6 +1560,7 @@ impl BacktestRunner {
         );
         let (equity_curve, mtm_output_summary) = mtm_curve.into_parts();
         let artifacts = FutureBacktestArtifacts {
+            format_version: FUTURE_ARTIFACT_FORMAT_VERSION,
             execution: ExecutionMetadata {
                 execution_model,
                 initial_balance: self.config.initial_balance,
@@ -1752,7 +1756,7 @@ impl BacktestRunner {
         if scheduled.signal.is_entry() {
             let resolved = match profile {
                 Some(profile) => profile.apply_entry_signal(&scheduled.signal),
-                None => resolve_unprofiled_entry_v2(&scheduled.signal),
+                None => resolve_unprofiled_entry(&scheduled.signal),
             };
             match resolved {
                 Ok(Some(resolved)) => {
@@ -1937,7 +1941,7 @@ impl BacktestRunner {
                 action.execution = Some(execution);
                 let resolved = match action.entry_profile.as_ref() {
                     Some(profile) => profile.apply_entry_signal(&signal),
-                    None => resolve_unprofiled_entry_v2(&signal),
+                    None => resolve_unprofiled_entry(&signal),
                 };
                 match resolved {
                     Ok(Some(resolved)) => match self.finalize_resolved_entry(

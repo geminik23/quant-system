@@ -1,112 +1,182 @@
 # quant-system
 
-A modular Rust workspace for algorithmic trading: historical data, deterministic backtesting, structured signal ingestion, real-time market data, and shared-memory RPC services.
+A modular Rust workspace for historical market data, deterministic backtesting, structured trading signals, and real-time market-data distribution.
 
-## Crates
+The current server execution path consumes normalized `RawSignalMsg` actions and historical tick or bar data through strict shared-memory RPC. Real-time market data is available, but generic strategy orchestration, live order execution, source-neutral ingestion, and complete cryptocurrency economics are not current production features.
 
-| Crate | Description |
+## Capability status
+
+| Capability | Status | Current boundary |
+|---|---|---|
+| Historical tick and OHLCV storage | Implemented | Parquet/Polars by default; DuckDB is optional |
+| Deterministic signal backtesting | Implemented | Strict `FutureQuoteV1` RPC over stored tick or close-only bar data |
+| Strategy simulation library | Implemented | Generic in-memory library API; not exposed as the production RPC path |
+| Structured signal execution | Implemented | `RawSignalMsg` Entry and management actions |
+| Telegram parsing | Implemented | Telegram-specific message, channel, history, and reply semantics |
+| Real-time market data | Implemented | CTrader FIX bid/ask distribution over shared-memory IPC |
+| Generic ingestion and strategy runtime | Not implemented | The current parser and server contracts do not provide a source-neutral live strategy runtime |
+| Live order execution | Not implemented | Venue-neutral order gateways and trading-platform adapters are not included |
+| General cryptocurrency trading | Not implemented | Instrument economics, accounting, and venue behavior are not yet generalized for crypto trading |
+
+## Architecture
+
+```text
+historical CSV
+     |
+     v
+qs-data-preprocess -----> partitioned Parquet tick/bar data
+                                      |
+external parser                       v
+or qs-signal-parser ---> RawSignalMsg ---> qs-backtest-server (strict RPC)
+                                                  |
+                                                  v
+                                      deterministic FutureQuote replay
+                                                  |
+                                                  v
+                                      inline or artifact result
+
+CTrader FIX ---> qs-market-data ---> real-time bid/ask SHM consumers
+                                      (market data only; no live orders)
+```
+
+`RawSignalMsg` is the compatibility boundary between signal producers and the backtest service. Signal parsing is not required when actions are produced by a manual tool, another service, or an external parser.
+
+## Workspace crates
+
+| Crate | Responsibility |
 |---|---|
-| [`qs-core`](crates/core/) | Pure synchronous trade engine with composable stoploss, trailing-stop, take-profit, breakeven, and time-exit rules. FutureQuote uses fill-bearing effects, absolute size accounting, remaining-inventory cost basis, stop provenance, and in-place rollback transactions. |
-| [`qs-backtest`](crates/backtest/) | Strategy and raw-signal replay over ticks or close-only synthetic bar quotes. Production replay uses deterministic `FutureQuoteV1`, targeted rollback, exact online account metrics, bounded MTM output, account-currency accounting, evaluation, cancellation, and progress. Generic in-memory strategy APIs remain available for library simulations. |
-| [`qs-market-data`](crates/market-data/) | Real-time bid/ask distribution over shared-memory IPC, with per-client subscriptions, one-shot alerts, and reconnection. |
-| [`qs-data-preprocess`](crates/data-preprocess/) | Historical tick/OHLCV import and query CLI. Parquet/Polars is the default backend and provides bounded ascending cursors with cooperative cancellation; DuckDB remains optional behind `duckdb-backend`. |
-| [`qs-symbols`](crates/symbols/) | TOML symbol registry for canonical names, aliases, pip/digit and lot metadata, and explicit P&L/base/quote currency metadata. |
-| [`qs-backtest-server`](crates/backtest-server/) | Multi-client shared-memory RPC server. Strict recursive schema-2 sync, async, and multi-profile methods expose streaming `FutureQuoteV1`, typed evaluation, bounded jobs, progress, cancellation, and inline/artifact result delivery. |
-| [`qs-signal-parser`](crates/signal-parser/) | Reusable structured-message parser framework with offline/online runners, per-message outcomes, deterministic source ordering, source identity, and reply-root resolution. |
+| [`qs-core`](crates/core/) | Synchronous trade engine and composable stoploss, trailing-stop, take-profit, breakeven, and time-exit rules |
+| [`qs-backtest`](crates/backtest/) | Strategy and raw-signal simulation, FutureQuote execution, sizing, accounting, metrics, and reporting |
+| [`qs-data-preprocess`](crates/data-preprocess/) | Historical tick/OHLCV import, partitioned Parquet storage, bounded queries, and optional DuckDB storage |
+| [`qs-symbols`](crates/symbols/) | TOML symbol registry, aliases, price/lot metadata, and explicit P&L/base/quote currencies |
+| [`qs-backtest-server`](crates/backtest-server/) | Multi-client shared-memory RPC, sync/async/multi-profile replay, jobs, cancellation, and result artifacts |
+| [`qs-signal-parser`](crates/signal-parser/) | Telegram-focused offline/online parsing that emits generic raw-signal actions |
+| [`qs-market-data`](crates/market-data/) | Real-time CTrader FIX bid/ask distribution, subscriptions, alerts, and reconnection |
 
-## Execution and accounting
+## Quick start
 
-The server and `tg_backtest` use `BacktestRunner::new_future` and streaming `FutureQuoteV1` exclusively. `BacktestRunner::new` remains a generic library constructor for in-memory strategy simulations and is not exposed through RPC.
+### Prerequisites
 
-- both modes reject non-finite, non-positive, crossed, and per-symbol time-regressing quotes;
-- FutureQuote consumes timestamp batches, records every conversion-role tick before processing any primary-role event at that timestamp, and lets one event carry both roles;
-- only primary-role events drive signal execution, pending/rule settlement, and end-of-data time; conversion-only ticks update FX state and valuation without extending EOD;
-- FutureQuote uses the first eligible matching-symbol primary quote and gives existing pending/rules exact-timestamp priority;
-- one core `ExecutionFill` is carried by every fill-bearing `FutureEffect`; the executor validates it without repricing;
-- in-place core mutations carry rollback checkpoints; accounting snapshots only affected position state and append lengths, and portfolio updates commit after successful accounting, so accumulated histories are not cloned per settlement;
-- pending orders emit `Placed` and exactly one terminal `Filled`, `Cancelled`, or `UnfilledAtEnd` event;
-- absolute entered/closed/open size and active remaining-inventory average cost are conserved;
-- target/stop/rule mutations validate state and geometry and remain synchronized with the optional alert register.
+- a Rust toolchain compatible with the workspace;
+- Linux shared memory (`/dev/shm`) for the RPC services;
+- tick or bar CSV data supported by `qs-data-preprocess`;
+- timestamps and symbols in the signal file that match the imported data.
 
-A validated run currency plan freezes primary and conversion symbol roles, P&L currencies, routes, and strict-before warmup quotes. Historical FX ticks from the same exchange provide identity, direct, inverse, or deterministic two-leg routes. Signed conversion uses executable bid/ask sides, and all FutureQuote monetary accounting and report aggregates are in account currency; close, risk, mark, and exposure artifacts retain native amounts and conversion audits. During monotonic replay, old conversion history is pruned while retaining the latest causal predecessor needed by the next signal and current batch.
+### 1. Import historical data
 
-`ModifyTarget` is atomic and ratio-preserving, supports repeated updates, and is available through core, raw signals, and RPC.
+The default backend writes partitioned Parquet data under `market_data/`.
 
-## FutureQuote replay and output bounds
+```bash
+cargo run -p qs-data-preprocess --bin data-preprocess -- \
+  --data-dir market_data \
+  input tick \
+  --exchange icmarkets \
+  --symbol XAUUSD \
+  /path/to/ticks.csv
+```
 
-V2 server planning filters signals first, derives active primary symbols only from retained Entry signals, and records explicitly requested symbols with no retained Entry as idle metadata. Data loading starts at the earliest retained effective signal. Management-only input on the empty engine produces an idle result without loading market data.
+For bar input, use `input bar --timeframe 1h`. See the [`qs-data-preprocess` guide](crates/data-preprocess/README.md) for supported CSV formats, time-zone handling, queries, and removal commands.
 
-Active primary and required conversion series are opened as bounded ascending Parquet cursors. A deterministic lookahead k-way merge emits complete batches ordered by `(timestamp, series_rank, row_sequence)`; replay still records all conversion-role ticks before primary work at a shared timestamp. After a complete batch, streaming replay stops only when scheduled signals, queued actions, open positions, and pending orders are all empty. Multi-profile V2 runs reopen the immutable stream description for each profile rather than cloning a materialized feed.
+### 2. Prepare a raw-signal JSONL file
 
-Exact online equity, drawdown, and campaign MAE/MFE are maintained independently from returned MTM points. `MtmOutputPolicy` supports `none`, deterministic `bounded`, and `full`; the default is bounded to 4096 points, with valid bounds from 8 through 16384. `none` returns no curve and `full` retains every observation, while both preserve the same exact online metrics. Output summaries report observed, retained, and omitted point counts.
+Each line is one tagged `RawSignalMsg`. An Entry requires a finite positive `risk`; `size` is not an Entry field.
 
-Request and artifact schema values remain `2`. V2 result delivery supports `auto`, `inline`, and `artifact`: `auto` uses inline delivery up to the configured 12 MiB default and otherwise stores complete JSON as an artifact; `inline` rejects oversized JSON; `artifact` always stores it. Artifact references include byte length, SHA-256, and chunk size. The client retrieves ordered base64 chunks, verifies offsets, length, and checksum, writes through a temporary file before rename when an output is requested, and requests cleanup after a successful download.
+```json
+{"action":"Entry","ts":"2026-03-10T10:00:00","symbol":"XAUUSD","side":"Buy","order_type":"Market","price":null,"risk":1.0,"stoploss":2010.0,"targets":[2040.0,2060.0],"group":"example","trade_id":"example-1"}
+```
 
-## In-place Entry and sizing contract
+Entries and later management actions can be mixed in the same JSONL stream.
 
-Wire `Entry` objects require a finite positive `risk` and do not accept an Entry `size`. Internally it is retained as `risk_multiplier` until sizing. Core `Action::Open.size` has not changed: it is the final lot quantity passed to the engine.
+### 3. Start the backtest server
 
-Exactly one sizing policy resolves each Entry:
+Copy the example configuration and adjust the data, symbol-registry, profile, and artifact paths if needed.
 
-- `FixedLot { lots }` scales configured lots and may open without a stop;
-- `FixedRiskAmount { amount }` risks a fixed account-currency amount and requires a protective stop;
-- `BalanceRiskPercent { percent }` risks a percentage of realized balance immediately before entry and requires a protective stop.
+```bash
+cp crates/backtest-server/config.example.toml backtest-server.toml
 
-The Entry multiplier is applied exactly once to the policy basis before lot constraints. Authoritative integer lot steps are then floored to the symbol step, checked against the minimum, capped at the optional maximum, and converted back to final lots. Target weights are allocated only after those steps are final. Without a profile, FutureQuote retains every target with equal `1/N` weights; two targets therefore receive `0.5/0.5`, and any selected target that receives zero lot steps is rejected.
+cargo run -p qs-backtest-server --bin backtest_server -- \
+  --config backtest-server.toml
+```
 
-For a FutureQuote market Entry, the actual execution price is established before final profile resolution and sizing. Pending Entries are profiled and sized when placed, and that final size remains frozen until fill or terminal cancellation.
+### 4. Run a backtest
 
-Run `tg_backtest` with exactly one account sizing option:
+In another terminal:
 
 ```bash
 cargo run -p qs-backtest-server --bin tg_backtest -- \
-  --input <signals.jsonl> \
+  --input signals.jsonl \
   --shm-name backtest \
-  --symbols XAUUSD,GBPJPY \
+  --all-symbols \
   --exchange icmarkets \
   --data-type tick \
-  --from 2026-03-08 \
-  --to 2026-03-11 \
-  --profile conservative \
   --balance 10000 \
   --account-currency USD \
-  --risk-percent 1.0 \
-  --output <result.json>
+  --base-lot 0.02 \
+  --output result.json
 ```
 
-Use `--base-lot 0.02` to set the account's fixed lot basis, `--risk-per-trade 100` to risk a fixed account-currency amount, or `--risk-percent 1.0` to risk one percent of realized balance. These options are mutually exclusive. Each Entry's parsed `risk` then scales the selected basis, so `risk: 0.5` uses half of it.
+When at least one Entry is present, select exactly one account sizing basis: `--base-lot`, `--risk-per-trade`, or `--risk-percent`. `--account-currency` is also required. Run either binary with `--help` for the complete option list.
 
-## Signal outcomes and evaluation
+## Current server contract
 
-Structured parsing returns deterministic per-source outcomes in original input order while timestamp-sorting successful signals for replay. Identity-aware parsing can resolve reply chains to the ultimate source root and returns structured failures for malformed or unresolved actions.
+Production backtest execution registers only:
 
-Typed source-coverage counts can be included in evaluation. Integrated V2 evaluation normalizes symbol filters, rejects unsupported tag filters and breakdowns because completed positions have no tags, and can include deterministically capped normalized position rows selected by the same filter. Empty signal input is an error for normal reports but can produce a valid zero-trade coverage report.
+- `run_backtest` for synchronous single-profile execution;
+- `run_backtest_multi` for multi-profile comparison;
+- `submit_backtest` for asynchronous jobs.
 
-## Services and reproducibility
+Requests do not carry an API schema magic number or use version-suffixed method names. Recursive strict decoding rejects unknown fields throughout nested configuration, profile, and signal objects. The server and `tg_backtest` use streaming `FutureQuoteV1` exclusively and accept only the strict raw-signal path.
 
-Async backtests cooperatively cancel at planning boundaries and during partition discovery, bounded Parquet reads, stream refill, timestamp batches, signals, queued actions, and primary-EOD liquidation. Status reports structured loading/conversion/replay progress with event, signal, and symbol counts. Jobs are bounded, terminal jobs and artifacts are periodically cleaned up, active jobs are cancelled on shutdown, and tracked blocking workers are awaited. Multi and multi-V2 handlers run in `spawn_blocking`; empty multi-profile requests fail explicitly.
+`BacktestRunner::new` and materialized `DataFeed` APIs remain available for direct library simulations. They are compatibility surfaces and are not reachable through the production backtest RPC or `tg_backtest`.
 
-FutureQuote server results record deterministic metadata for requested, active, and idle symbols, requested and effective loading bounds, timeframe, execution latency, account currency, the immutable run currency plan, profile and sizing identity/options, and active-symbol lot metadata. Bar runs declare `close_only_zero_spread` and no intrabar simulation.
+Persisted FutureQuote artifacts and downloadable result JSON references carry an independent `format_version` starting at `1`. This format marker is not an RPC API version.
 
-## Validation
+## Production backtesting guarantees
 
-Use the workspace test and strict lint commands for release validation:
+- Replay planning filters signals before loading data, derives active symbols from retained Entries, and reports requested but inactive symbols as idle.
+- Active primary and required conversion series are read through bounded ascending Parquet streams. Timestamp batches are deterministic, and FX is processed before primary events at a shared timestamp.
+- All monetary accounting is performed in the requested account currency using causal same-exchange identity, direct, inverse, or deterministic two-leg FX routes.
+- Exact online equity, drawdown, exposure, and campaign MAE/MFE are independent of the returned MTM curve size.
+- MTM output supports `none`, `bounded`, and `full`. New clients default to a deterministic bound of 4096 points; valid bounded sizes are 8 through 16384.
+- Results support `auto`, `inline`, and `artifact` delivery. `auto` returns results inline up to the configured 12 MiB default and otherwise uses a length- and SHA-256-verified artifact.
+- Async jobs provide progress, cooperative cancellation, bounded retention, and scheduled cleanup. Results include the effective data scope, currency plan, profile, sizing identity, and other reproducibility metadata.
 
-```text
+## Entry risk, sizing, and management
+
+Each wire Entry carries `risk`, which remains a multiplier until exactly one sizing policy resolves it to a final lot quantity:
+
+- `FixedLot { lots }` scales configured lots and may open without a stop;
+- `FixedRiskAmount { amount }` risks an account-currency amount and requires a protective stop;
+- `BalanceRiskPercent { percent }` risks a percentage of realized balance and requires a protective stop.
+
+The risk multiplier is applied once before integer lot-step flooring and minimum/maximum validation. Target weights are allocated after the final lot steps are known. Pending Entries are profiled and sized when placed, and their quantity remains frozen until fill or cancellation.
+
+Raw signals can also close or partially close positions, modify stops and targets, add or remove rules, scale in, cancel pending orders, and operate on symbol or group scopes. TOML management profiles provide reusable Entry management policy without changing the source signal.
+
+## Signal parsing and evaluation
+
+The current `qs-signal-parser` implementation is Telegram-specific. It preserves channel/message identity, source ordering, history, and reply-root resolution, then emits generic `RawSignal` actions. General source events, decoder/parser/normalizer separation, idempotency, and non-Telegram adapters are not yet implemented.
+
+Backtest evaluation can include typed source-coverage counts, deterministic position samples, and supported symbol/side/group/close-reason breakdowns. Unsupported tag-based selection is rejected explicitly because completed positions do not yet retain tags.
+
+## Known boundaries of the current backtest path
+
+1. Several complex RPC artifacts still cross the wire as JSON `Value` objects rather than fully typed wire models.
+2. Bars are replayed as close-only, zero-spread quotes; exact intrabar execution is not simulated.
+3. `ScaleIn` carries an explicit final size. Policy-sized scale-in is not implemented, and FutureQuote rejects scale-in after a campaign begins closing.
+4. During cancellation, one bounded low-level Polars Parquet read may complete atomically before cancellation is observed.
+5. Explicit `full` MTM retains the complete curve in memory before artifact serialization. Bounded output is the recommended default.
+6. Live order execution, restart-safe live strategy state, general crypto accounting, and source-neutral ingestion are not current runtime features.
+
+## Development and validation
+
+Use the full workspace checks before release:
+
+```bash
+cargo fmt --all -- --check
 cargo test --workspace --all-features --all-targets
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 ```
-
-The replay optimization is implemented; its final broad validation and completion summary are tracked separately.
-
-## Current boundaries
-
-Only these boundaries remain:
-
-1. Several complex FutureQuote RPC artifacts still cross the wire as JSON `Value` objects rather than fully typed wire models.
-2. Exact intrabar simulation is not implemented; bars are close-only zero-spread quotes.
-3. Policy-sized `ScaleIn` is not implemented. Scale-in still carries an explicit final size, and FutureQuote rejects scale-in after a campaign has begun closing.
-4. During cancellation, one low-level bounded Polars Parquet read may complete atomically before cancellation is observed.
 
 ## License
 
