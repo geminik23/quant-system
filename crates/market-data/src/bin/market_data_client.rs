@@ -8,6 +8,7 @@
 //!   cargo run -p qs-market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +27,47 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 use market_data::rpc_types::*;
-use xrpc::{MessageChannelAdapter, RpcClient, SharedMemoryConfig, SharedMemoryFrameTransport};
+use xrpc::{
+    MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryConfig,
+    SharedMemoryFrameTransport,
+};
 
 // ── Types ──
 
 type MarketClient = RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport>>;
+
+struct MarketClientSession {
+    client: Arc<MarketClient>,
+    handle: RpcClientHandle,
+}
+
+impl MarketClientSession {
+    fn client(&self) -> Arc<MarketClient> {
+        Arc::clone(&self.client)
+    }
+
+    async fn shutdown(self, graceful_timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+        match tokio::time::timeout(graceful_timeout, self.client.close()).await {
+            Ok(close_result) => {
+                let join_result = self.handle.join().await;
+                close_result?;
+                join_result?;
+                Ok(())
+            }
+            Err(_) => {
+                self.handle.shutdown().await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "market-data RPC client did not close within {}ms; receive task was forced down",
+                        graceful_timeout.as_millis()
+                    ),
+                )
+                .into())
+            }
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,25 +93,31 @@ struct Args {
 async fn connect(
     shm_name: &str,
     client_name: &str,
-) -> Result<(MarketClient, ConnectResponse), Box<dyn std::error::Error>> {
+) -> Result<(MarketClientSession, ConnectResponse), Box<dyn std::error::Error>> {
     let accept_name = format!("{}-accept", shm_name);
 
     let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
     let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
     let acceptor_client = RpcClient::new(acceptor_channel);
-    let _handle = acceptor_client.start();
+    let acceptor_handle = acceptor_client.try_start()?;
 
-    let resp: ConnectResponse = acceptor_client
+    let response: Result<ConnectResponse, _> = acceptor_client
         .call(
             "connect",
             &ConnectRequest {
                 client_name: client_name.into(),
             },
         )
-        .await?;
+        .await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    acceptor_client.close().await?;
+    if response.is_ok() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let acceptor_close_result = acceptor_client.close().await;
+    let acceptor_join_result = acceptor_handle.join().await;
+    let resp = response?;
+    acceptor_close_result?;
+    acceptor_join_result?;
 
     let cfg = SharedMemoryConfig::new()
         .with_read_timeout(Duration::from_secs(300))
@@ -82,9 +125,15 @@ async fn connect(
     let transport = SharedMemoryFrameTransport::connect_client_with_config(&resp.slot_name, cfg)?;
     let channel = MessageChannelAdapter::new(transport);
     let client = RpcClient::new(channel);
-    let _handle = client.start();
+    let handle = client.try_start()?;
 
-    Ok((client, resp))
+    Ok((
+        MarketClientSession {
+            client: Arc::new(client),
+            handle,
+        },
+        resp,
+    ))
 }
 
 // ── Helpers ──
@@ -1114,7 +1163,6 @@ async fn run(
         }
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
     Ok(())
 }
 
@@ -1134,7 +1182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();
 
     // Connect before entering TUI (errors print to stderr before alternate screen)
-    let (client, resp) = match connect(&args.shm_name, &args.client_name).await {
+    let (session, resp) = match connect(&args.shm_name, &args.client_name).await {
         Ok(r) => r,
         Err(e) => {
             ratatui::restore();
@@ -1147,7 +1195,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.slot_name = resp.slot_name;
     app.conn_status = ConnStatus::Connected;
 
-    let result = run(&mut terminal, &mut app, Arc::new(client)).await;
+    let result = run(&mut terminal, &mut app, session.client()).await;
     ratatui::restore();
-    result
+    let shutdown_result = session.shutdown(Duration::from_secs(2)).await;
+
+    match (result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(shutdown_error)) => {
+            eprintln!("Client shutdown also failed: {shutdown_error}");
+            Err(operation_error)
+        }
+    }
 }

@@ -34,7 +34,9 @@ use std::sync::Arc;
 use clap::Parser;
 
 use backtest_server::rpc_types::*;
-use xrpc::{JsonCodec, MessageChannelAdapter, RpcClient, SharedMemoryFrameTransport};
+use xrpc::{
+    JsonCodec, MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryFrameTransport,
+};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -83,18 +85,34 @@ struct Args {
 
 // ── Connection Helper ───────────────────────────────────────────────────────
 
-/// Connect to the acceptor endpoint, receive a dedicated slot, and return an
-/// `RpcClient` bound to that slot.
+type BacktestRpcClient =
+    RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>;
+
+struct BacktestClientSession {
+    client: Arc<BacktestRpcClient>,
+    handle: RpcClientHandle,
+}
+
+impl BacktestClientSession {
+    fn client(&self) -> Arc<BacktestRpcClient> {
+        Arc::clone(&self.client)
+    }
+
+    async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
+        let close_result = self.client.close().await;
+        let join_result = self.handle.join().await;
+        close_result?;
+        join_result?;
+        Ok(())
+    }
+}
+
+/// Connect to the acceptor endpoint, receive a dedicated slot, and retain the
+/// dedicated client's receive-task handle.
 async fn connect(
     shm_name: &str,
     client_name: &str,
-) -> Result<
-    (
-        RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>,
-        ConnectResponse,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(BacktestClientSession, ConnectResponse), Box<dyn std::error::Error>> {
     let accept_name = format!("{}-accept", shm_name);
     println!("  Connecting to acceptor shm://{} ...", accept_name);
 
@@ -102,35 +120,45 @@ async fn connect(
     let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
     let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
     let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
-    let _handle = acceptor_client.start();
+    let acceptor_handle = acceptor_client.try_start()?;
 
-    let resp: ConnectResponse = acceptor_client
+    let response: Result<ConnectResponse, _> = acceptor_client
         .call(
             "connect",
             &ConnectRequest {
                 client_name: client_name.into(),
             },
         )
-        .await?;
+        .await;
+
+    if response.is_ok() {
+        // Give the server time to publish the dedicated SHM mapping.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let acceptor_close_result = acceptor_client.close().await;
+    let acceptor_join_result = acceptor_handle.join().await;
+    let resp = response?;
+    acceptor_close_result?;
+    acceptor_join_result?;
 
     println!(
         "  Assigned client_id={}, slot=shm://{}",
         resp.client_id, resp.slot_name
     );
 
-    // Give the server a moment to create the dedicated SHM slot.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Close the acceptor connection - we no longer need it.
-    acceptor_client.close().await?;
-
     // Step 2: Connect to the dedicated per-client slot.
     let transport = SharedMemoryFrameTransport::connect_client(&resp.slot_name)?;
     let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
     let client = RpcClient::with_codec(channel, JsonCodec);
-    let _handle = client.start();
+    let handle = client.try_start()?;
 
-    Ok((client, resp))
+    Ok((
+        BacktestClientSession {
+            client: Arc::new(client),
+            handle,
+        },
+        resp,
+    ))
 }
 
 // ── Display Helpers ─────────────────────────────────────────────────────────
@@ -425,213 +453,228 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 1. Connect ──────────────────────────────────────────────────────
     print_header("Connecting to Backtest Server");
-    let (client, _info) = connect(&args.shm_name, "example-backtest-client").await?;
-    let client = Arc::new(client);
-    println!("  ✓ Connected successfully");
+    let (session, _info) = connect(&args.shm_name, "example-backtest-client").await?;
+    let client = session.client();
 
-    // ── 2. Ping ─────────────────────────────────────────────────────────
-    print_header("Ping");
-    let ping: PingResponse = client.call("ping", &()).await?;
-    println!("  Status:   {}", ping.status);
-    println!("  Uptime:   {}s", ping.uptime_secs);
-    println!("  Data Dir: {}", ping.data_dir);
+    let operation_result: Result<(), Box<dyn std::error::Error>> = async {
+        println!("  ✓ Connected successfully");
 
-    // ── 3. List Profiles ────────────────────────────────────────────────
-    print_header("Available Profiles");
-    let profiles_resp: ListProfilesResponse = client.call("list_profiles", &()).await?;
-    if profiles_resp.profiles.is_empty() {
-        println!("  (no profiles loaded on server)");
-    } else {
-        println!(
-            "  {:<20} {:<15} {:<15} {:<12} {:<6}",
-            "NAME", "TARGETS", "RATIOS", "SL_MODE", "RULES"
-        );
-        println!("  {}", "-".repeat(70));
-        for p in &profiles_resp.profiles {
+        // ── 2. Ping ─────────────────────────────────────────────────────────
+        print_header("Ping");
+        let ping: PingResponse = client.call("ping", &()).await?;
+        println!("  Status:   {}", ping.status);
+        println!("  Uptime:   {}s", ping.uptime_secs);
+        println!("  Data Dir: {}", ping.data_dir);
+
+        // ── 3. List Profiles ────────────────────────────────────────────────
+        print_header("Available Profiles");
+        let profiles_resp: ListProfilesResponse = client.call("list_profiles", &()).await?;
+        if profiles_resp.profiles.is_empty() {
+            println!("  (no profiles loaded on server)");
+        } else {
             println!(
                 "  {:<20} {:<15} {:<15} {:<12} {:<6}",
-                p.name,
-                format!("{:?}", p.use_targets),
-                format!("{:?}", p.close_ratios),
-                p.stoploss_mode,
-                p.rules_count,
+                "NAME", "TARGETS", "RATIOS", "SL_MODE", "RULES"
             );
+            println!("  {}", "-".repeat(70));
+            for p in &profiles_resp.profiles {
+                println!(
+                    "  {:<20} {:<15} {:<15} {:<12} {:<6}",
+                    p.name,
+                    format!("{:?}", p.use_targets),
+                    format!("{:?}", p.close_ratios),
+                    p.stoploss_mode,
+                    p.rules_count,
+                );
+            }
         }
-    }
 
-    // ── 4. List Symbols ─────────────────────────────────────────────────
-    print_header("Available Data");
-    let symbols_resp: ListSymbolsResponse = client
-        .call(
-            "list_symbols",
-            &ListSymbolsRequest {
-                exchange: Some(args.exchange.clone()),
-                data_type: None,
-            },
-        )
-        .await?;
+        // ── 4. List Symbols ─────────────────────────────────────────────────
+        print_header("Available Data");
+        let symbols_resp: ListSymbolsResponse = client
+            .call(
+                "list_symbols",
+                &ListSymbolsRequest {
+                    exchange: Some(args.exchange.clone()),
+                    data_type: None,
+                },
+            )
+            .await?;
 
-    if symbols_resp.symbols.is_empty() {
-        println!("  (no data found for exchange '{}')", args.exchange);
-    } else {
-        let show_count = symbols_resp.symbols.len().min(20);
-        println!(
-            "  Found {} datasets (showing first {}):",
-            symbols_resp.symbols.len(),
-            show_count
-        );
-        println!(
-            "  {:<10} {:<10} {:<6} {:<6} {:>10} {:<22} {:<22}",
-            "EXCHANGE", "SYMBOL", "TYPE", "TF", "ROWS", "EARLIEST", "LATEST"
-        );
-        println!("  {}", "-".repeat(90));
-        for s in &symbols_resp.symbols[..show_count] {
+        if symbols_resp.symbols.is_empty() {
+            println!("  (no data found for exchange '{}')", args.exchange);
+        } else {
+            let show_count = symbols_resp.symbols.len().min(20);
+            println!(
+                "  Found {} datasets (showing first {}):",
+                symbols_resp.symbols.len(),
+                show_count
+            );
             println!(
                 "  {:<10} {:<10} {:<6} {:<6} {:>10} {:<22} {:<22}",
-                s.exchange,
-                s.symbol,
-                s.data_type,
-                s.timeframe.as_deref().unwrap_or("-"),
-                s.row_count,
-                s.earliest,
-                s.latest,
+                "EXCHANGE", "SYMBOL", "TYPE", "TF", "ROWS", "EARLIEST", "LATEST"
+            );
+            println!("  {}", "-".repeat(90));
+            for s in &symbols_resp.symbols[..show_count] {
+                println!(
+                    "  {:<10} {:<10} {:<6} {:<6} {:>10} {:<22} {:<22}",
+                    s.exchange,
+                    s.symbol,
+                    s.data_type,
+                    s.timeframe.as_deref().unwrap_or("-"),
+                    s.row_count,
+                    s.earliest,
+                    s.latest,
+                );
+            }
+            if symbols_resp.symbols.len() > show_count {
+                println!("  ... and {} more", symbols_resp.symbols.len() - show_count);
+            }
+        }
+
+        // ── 5. Run Backtest — F14 Raw Signals ───────────────────────────────
+        print_header("Run Backtest — F14 Full Signal Actions");
+
+        let f14_signals = generate_f14_signals(&args.symbol);
+        println!(
+            "  Sending {} F14 raw signals (entries + management) ...",
+            f14_signals.len()
+        );
+
+        // Show what signals we're sending
+        print_section("F14 Signal Stream");
+        for (i, sig) in f14_signals.iter().enumerate() {
+            let desc = match sig {
+                RawSignalMsg::Entry { side, risk, .. } => {
+                    format!("Entry {} risk={}", side, risk)
+                }
+                RawSignalMsg::ModifyStoploss { ts: _, price, .. } => {
+                    format!("ModifyStoploss price={}", price)
+                }
+                RawSignalMsg::ClosePartial { ts: _, ratio, .. } => {
+                    format!("ClosePartial ratio={}", ratio)
+                }
+                RawSignalMsg::MoveStoplossToEntry { .. } => "MoveStoplossToEntry".into(),
+                RawSignalMsg::ScaleIn { ts: _, size, .. } => {
+                    format!("ScaleIn size={}", size)
+                }
+                RawSignalMsg::AddRule { rule, .. } => {
+                    format!("AddRule {:?}", rule)
+                }
+                RawSignalMsg::CloseAllInGroup { group_id, .. } => {
+                    format!("CloseAllInGroup {}", group_id)
+                }
+                RawSignalMsg::ModifyAllStoploss { ts: _, price, .. } => {
+                    format!("ModifyAllStoploss price={}", price)
+                }
+                RawSignalMsg::CloseAll { .. } => "CloseAll".into(),
+                other => format!("{:?}", other),
+            };
+
+            // Extract ts from each variant for display
+            let ts = match sig {
+                RawSignalMsg::Entry { ts, .. }
+                | RawSignalMsg::Close { ts, .. }
+                | RawSignalMsg::ClosePartial { ts, .. }
+                | RawSignalMsg::ModifyStoploss { ts, .. }
+                | RawSignalMsg::MoveStoplossToEntry { ts, .. }
+                | RawSignalMsg::AddTarget { ts, .. }
+                | RawSignalMsg::RemoveTarget { ts, .. }
+                | RawSignalMsg::ModifyTarget { ts, .. }
+                | RawSignalMsg::AddRule { ts, .. }
+                | RawSignalMsg::RemoveRule { ts, .. }
+                | RawSignalMsg::ScaleIn { ts, .. }
+                | RawSignalMsg::CancelPending { ts, .. }
+                | RawSignalMsg::CloseAllOf { ts, .. }
+                | RawSignalMsg::CloseAll { ts }
+                | RawSignalMsg::CancelAllPending { ts }
+                | RawSignalMsg::ModifyAllStoploss { ts, .. }
+                | RawSignalMsg::CloseAllInGroup { ts, .. }
+                | RawSignalMsg::ModifyAllStoplossInGroup { ts, .. } => ts.as_str(),
+            };
+            println!("  {:>2}. [{}] {}", i + 1, ts, desc);
+        }
+
+        // Use an inline profile definition to demonstrate profile_def (no server
+        // profile needed).
+        let inline_profile = ManagementProfileMsg {
+            name: "inline-demo".into(),
+            target_selection: Some(TargetSelectionMsg::Selected(vec![1, 2])),
+            use_targets: vec![1, 2],
+            close_ratios: vec![0.5, 0.5],
+            stoploss_mode: Some(StoplossModeMsg::FromSignal),
+            rules: vec![RuleConfigDefMsg::BreakevenAfterTargets { after_n: 1 }],
+            group_override: None,
+            let_remainder_run: false,
+        };
+
+        let f14_request = BacktestRunSpec {
+            symbol: args.symbol.clone(),
+            symbols: Vec::new(),
+            all_symbols: false,
+            exchange: args.exchange.clone(),
+            data_type: args.data_type.clone(),
+            timeframe: args.timeframe.clone(),
+            from: args.from.clone(),
+            to: args.to.clone(),
+            raw_signals: f14_signals,
+            profile: None,
+            profile_def: Some(inline_profile),
+            config: BacktestConfigMsg {
+                initial_balance: Some(args.balance),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            },
+        };
+
+        let f14_resp: RunBacktestResponse = client
+            .call(
+                "run_backtest",
+                &RunBacktestRequest {
+                    request: f14_request,
+                    future: FutureQuoteConfigMsg {
+                        account_currency: "USD".into(),
+                        ..FutureQuoteConfigMsg::default()
+                    },
+                    evaluation: ProviderEvaluationOptionsMsg::default(),
+                    result_delivery: ResultDeliveryMsg::Auto,
+                },
+            )
+            .await?;
+        println!("  Elapsed: {}ms", f14_resp.elapsed_ms);
+
+        if f14_resp.success {
+            if let Some(ref result) = f14_resp.result {
+                print_result_summary(result);
+                print_trade_log(&result.trade_log, 20);
+                print_positions(&result.positions, 10);
+            }
+        } else {
+            println!(
+                "  ✗ Backtest failed: {}",
+                f14_resp.error.as_deref().unwrap_or("unknown error")
             );
         }
-        if symbols_resp.symbols.len() > show_count {
-            println!("  ... and {} more", symbols_resp.symbols.len() - show_count);
-        }
+
+        Ok(())
     }
+    .await;
 
-    // ── 5. Run Backtest — F14 Raw Signals ───────────────────────────────
-    print_header("Run Backtest — F14 Full Signal Actions");
-
-    let f14_signals = generate_f14_signals(&args.symbol);
-    println!(
-        "  Sending {} F14 raw signals (entries + management) ...",
-        f14_signals.len()
-    );
-
-    // Show what signals we're sending
-    print_section("F14 Signal Stream");
-    for (i, sig) in f14_signals.iter().enumerate() {
-        let desc = match sig {
-            RawSignalMsg::Entry { side, risk, .. } => {
-                format!("Entry {} risk={}", side, risk)
-            }
-            RawSignalMsg::ModifyStoploss { ts: _, price, .. } => {
-                format!("ModifyStoploss price={}", price)
-            }
-            RawSignalMsg::ClosePartial { ts: _, ratio, .. } => {
-                format!("ClosePartial ratio={}", ratio)
-            }
-            RawSignalMsg::MoveStoplossToEntry { .. } => "MoveStoplossToEntry".into(),
-            RawSignalMsg::ScaleIn { ts: _, size, .. } => {
-                format!("ScaleIn size={}", size)
-            }
-            RawSignalMsg::AddRule { rule, .. } => {
-                format!("AddRule {:?}", rule)
-            }
-            RawSignalMsg::CloseAllInGroup { group_id, .. } => {
-                format!("CloseAllInGroup {}", group_id)
-            }
-            RawSignalMsg::ModifyAllStoploss { ts: _, price, .. } => {
-                format!("ModifyAllStoploss price={}", price)
-            }
-            RawSignalMsg::CloseAll { .. } => "CloseAll".into(),
-            other => format!("{:?}", other),
-        };
-
-        // Extract ts from each variant for display
-        let ts = match sig {
-            RawSignalMsg::Entry { ts, .. }
-            | RawSignalMsg::Close { ts, .. }
-            | RawSignalMsg::ClosePartial { ts, .. }
-            | RawSignalMsg::ModifyStoploss { ts, .. }
-            | RawSignalMsg::MoveStoplossToEntry { ts, .. }
-            | RawSignalMsg::AddTarget { ts, .. }
-            | RawSignalMsg::RemoveTarget { ts, .. }
-            | RawSignalMsg::ModifyTarget { ts, .. }
-            | RawSignalMsg::AddRule { ts, .. }
-            | RawSignalMsg::RemoveRule { ts, .. }
-            | RawSignalMsg::ScaleIn { ts, .. }
-            | RawSignalMsg::CancelPending { ts, .. }
-            | RawSignalMsg::CloseAllOf { ts, .. }
-            | RawSignalMsg::CloseAll { ts }
-            | RawSignalMsg::CancelAllPending { ts }
-            | RawSignalMsg::ModifyAllStoploss { ts, .. }
-            | RawSignalMsg::CloseAllInGroup { ts, .. }
-            | RawSignalMsg::ModifyAllStoplossInGroup { ts, .. } => ts.as_str(),
-        };
-        println!("  {:>2}. [{}] {}", i + 1, ts, desc);
-    }
-
-    // Use an inline profile definition to demonstrate profile_def (no server
-    // profile needed).
-    let inline_profile = ManagementProfileMsg {
-        name: "inline-demo".into(),
-        target_selection: Some(TargetSelectionMsg::Selected(vec![1, 2])),
-        use_targets: vec![1, 2],
-        close_ratios: vec![0.5, 0.5],
-        stoploss_mode: Some(StoplossModeMsg::FromSignal),
-        rules: vec![RuleConfigDefMsg::BreakevenAfterTargets { after_n: 1 }],
-        group_override: None,
-        let_remainder_run: false,
-    };
-
-    let f14_request = BacktestRunSpec {
-        symbol: args.symbol.clone(),
-        symbols: Vec::new(),
-        all_symbols: false,
-        exchange: args.exchange.clone(),
-        data_type: args.data_type.clone(),
-        timeframe: args.timeframe.clone(),
-        from: args.from.clone(),
-        to: args.to.clone(),
-        raw_signals: f14_signals,
-        profile: None,
-        profile_def: Some(inline_profile),
-        config: BacktestConfigMsg {
-            initial_balance: Some(args.balance),
-            close_on_finish: Some(true),
-            fill_model: Some("BidAsk".into()),
-            sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
-        },
-    };
-
-    let f14_resp: RunBacktestResponse = client
-        .call(
-            "run_backtest",
-            &RunBacktestRequest {
-                request: f14_request,
-                future: FutureQuoteConfigMsg {
-                    account_currency: "USD".into(),
-                    ..FutureQuoteConfigMsg::default()
-                },
-                evaluation: ProviderEvaluationOptionsMsg::default(),
-                result_delivery: ResultDeliveryMsg::Auto,
-            },
-        )
-        .await?;
-    println!("  Elapsed: {}ms", f14_resp.elapsed_ms);
-
-    if f14_resp.success {
-        if let Some(ref result) = f14_resp.result {
-            print_result_summary(result);
-            print_trade_log(&result.trade_log, 20);
-            print_positions(&result.positions, 10);
-        }
-    } else {
-        println!(
-            "  ✗ Backtest failed: {}",
-            f14_resp.error.as_deref().unwrap_or("unknown error")
-        );
-    }
-
-    // ── Done ────────────────────────────────────────────────────────────
     print_header("Done");
     println!("  Closing connection...");
-    client.close().await?;
-    println!("  ✓ Client disconnected cleanly");
+    let shutdown_result = session.close().await;
 
-    Ok(())
+    match (operation_result, shutdown_result) {
+        (Ok(()), Ok(())) => {
+            println!("  ✓ Client disconnected cleanly");
+            Ok(())
+        }
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(shutdown_error)) => {
+            eprintln!("  Client shutdown also failed: {shutdown_error}");
+            Err(operation_error)
+        }
+    }
 }

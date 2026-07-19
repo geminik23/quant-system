@@ -298,6 +298,8 @@ fn help_documents_current_sizing_currency_and_future_defaults() {
         "--mtm-output",
         "--mtm-max-points",
         "--result-delivery",
+        "--execution-mode",
+        "--cancel-on-interrupt",
     ] {
         assert!(stdout.contains(option), "help omitted {option}: {stdout}");
     }
@@ -307,6 +309,10 @@ fn help_documents_current_sizing_currency_and_future_defaults() {
     );
     assert!(stdout.contains("[default: standard]"), "stdout: {stdout}");
     assert!(stdout.contains("[default: bounded]"), "stdout: {stdout}");
+    assert!(stdout.contains("[default: stream]"), "stdout: {stdout}");
+    for value in ["- stream:", "- poll:", "- sync:"] {
+        assert!(stdout.contains(value), "help omitted {value}: {stdout}");
+    }
     assert!(stdout.contains("Default: 4096"), "stdout: {stdout}");
     assert!(
         stdout.contains("--risk-per-trade 100 --account-currency USD"),

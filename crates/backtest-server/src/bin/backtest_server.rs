@@ -19,6 +19,7 @@ use backtest_server::handlers::{
     handle_get_backtest_status, handle_get_result_artifact_chunk, handle_list_profiles,
     handle_list_symbols, handle_ping, handle_reload_profiles, handle_remove_profile,
     handle_run_backtest, handle_run_backtest_multi, handle_submit_backtest, run_job_and_store,
+    watch_backtest_stream,
 };
 use backtest_server::rpc_types::*;
 
@@ -274,6 +275,14 @@ fn spawn_client_handler(
                     async move { Ok(handle_get_backtest_status(&state, &req)) }
                 },
             );
+        }
+
+        // ── Register: watch_backtest ──
+        {
+            let state = state.clone();
+            server.register_stream("watch_backtest", move |req: WatchBacktestRequest| {
+                watch_backtest_stream(state.clone(), req, Duration::from_secs(15))
+            });
         }
 
         // ── Register: get_backtest_result (Issue 2) ──
@@ -635,6 +644,10 @@ mod tests {
                 "current method `{method}` must remain registered"
             );
         }
+        assert!(
+            source.contains("register_stream(\"watch_backtest\""),
+            "retained backtest status streaming must remain registered"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -661,6 +674,15 @@ mod tests {
                     error: None,
                     cancellation: JobCancellationToken::default(),
                     worker_active: false,
+                    updates: tokio::sync::watch::channel(BacktestStatusResponse {
+                        success: true,
+                        job_id: "expired".into(),
+                        status: "Cancelled".into(),
+                        error: None,
+                        elapsed_ms: Some(0),
+                        progress: BacktestProgress::default(),
+                    })
+                    .0,
                 },
             )])),
             max_retained_jobs: 10,

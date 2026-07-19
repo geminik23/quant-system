@@ -25,7 +25,8 @@ use qs_backtest::runner::{BacktestConfig, BacktestRunner};
 use qs_backtest::{DEFAULT_MTM_MAX_POINTS, MAX_MTM_MAX_POINTS, MIN_MTM_MAX_POINTS, VecFeed};
 use qs_symbols::SymbolRegistry;
 use xrpc::{
-    JsonCodec, MessageChannelAdapter, RpcClient, SharedMemoryConfig, SharedMemoryFrameTransport,
+    JsonCodec, MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryConfig,
+    SharedMemoryFrameTransport,
 };
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -54,6 +55,17 @@ enum ResultDeliveryMode {
     Auto,
     Inline,
     Artifact,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ExecutionMode {
+    /// Submit a retained job and follow it through server-streaming.
+    #[default]
+    Stream,
+    /// Submit a retained job and poll its status with a total deadline.
+    Poll,
+    /// Execute the legacy finite unary RPC.
+    Sync,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,14 +288,21 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     rolling_window: usize,
 
-    /// Use async job submission mode (Issue 2).
-    /// Submits job, polls status, then fetches result.
-    #[arg(long, default_value_t = false)]
-    r#async: bool,
+    /// Remote execution mode. Streaming is retained, reconnectable, and has no total job deadline.
+    #[arg(long, value_enum, default_value_t = ExecutionMode::Stream)]
+    execution_mode: ExecutionMode,
+
+    /// Deprecated compatibility alias for --execution-mode poll.
+    #[arg(long = "async", default_value_t = false)]
+    legacy_async: bool,
 
     /// Maximum time to poll an async job before returning a process error.
     #[arg(long, default_value_t = 300)]
     poll_timeout_secs: u64,
+
+    /// Explicitly cancel a streamed job when Ctrl-C interrupts the client; default is detach.
+    #[arg(long, default_value_t = false)]
+    cancel_on_interrupt: bool,
 
     /// Base lot quantity scaled by each Entry risk multiplier.
     #[arg(long, group = "sizing")]
@@ -335,8 +354,27 @@ struct Args {
 type BacktestRpcClient =
     RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>;
 
-/// Connect via the SHM acceptor pattern and return an RPC client on a dedicated slot.
-async fn connect(shm_name: &str) -> Result<BacktestRpcClient, Box<dyn std::error::Error>> {
+struct BacktestClientSession {
+    client: Arc<BacktestRpcClient>,
+    handle: RpcClientHandle,
+}
+
+impl BacktestClientSession {
+    fn client(&self) -> Arc<BacktestRpcClient> {
+        Arc::clone(&self.client)
+    }
+
+    async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
+        let close_result = self.client.close().await;
+        let join_result = self.handle.join().await;
+        close_result?;
+        join_result?;
+        Ok(())
+    }
+}
+
+/// Connect via the SHM acceptor pattern and retain the dedicated receive-task handle.
+async fn connect(shm_name: &str) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
     let accept_name = format!("{}-accept", shm_name);
     eprintln!("[connect] acceptor shm://{}", accept_name);
 
@@ -349,25 +387,31 @@ async fn connect(shm_name: &str) -> Result<BacktestRpcClient, Box<dyn std::error
     )?;
     let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
     let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
-    let _handle = acceptor_client.start();
+    let acceptor_handle = acceptor_client.try_start()?;
 
-    let resp: ConnectResponse = acceptor_client
+    let response: Result<ConnectResponse, _> = acceptor_client
         .call(
             "connect",
             &ConnectRequest {
                 client_name: "tg-backtest".into(),
             },
         )
-        .await?;
+        .await;
+
+    if response.is_ok() {
+        // Give the server time to publish the dedicated SHM mapping.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let acceptor_close_result = acceptor_client.close().await;
+    let acceptor_join_result = acceptor_handle.join().await;
+    let resp = response?;
+    acceptor_close_result?;
+    acceptor_join_result?;
 
     eprintln!(
         "[connect] assigned client_id={}, slot=shm://{}",
         resp.client_id, resp.slot_name
     );
-
-    // Brief pause for the server to create the dedicated SHM slot.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    acceptor_client.close().await?;
 
     // Reconnect on the dedicated per-client slot.
     let transport = SharedMemoryFrameTransport::connect_client_with_config(
@@ -379,9 +423,12 @@ async fn connect(shm_name: &str) -> Result<BacktestRpcClient, Box<dyn std::error
     )?;
     let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
     let client = RpcClient::with_codec(channel, JsonCodec);
-    let _handle = client.start();
+    let handle = client.try_start()?;
 
-    Ok(client)
+    Ok(BacktestClientSession {
+        client: Arc::new(client),
+        handle,
+    })
 }
 
 // ── Signal Loading ──────────────────────────────────────────────────────────
@@ -729,6 +776,14 @@ fn uses_provider_options(args: &Args) -> bool {
         || args.rolling_window != 20
 }
 
+fn execution_mode(args: &Args) -> ExecutionMode {
+    if args.legacy_async {
+        ExecutionMode::Poll
+    } else {
+        args.execution_mode
+    }
+}
+
 fn validate_evaluation_args(args: &Args) -> Result<(), String> {
     if args.poll_timeout_secs == 0 {
         return Err("--poll-timeout-secs must be positive".into());
@@ -959,6 +1014,235 @@ where
 
         let remaining = poll_timeout.saturating_sub(poll_started.elapsed());
         tokio::time::sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+#[derive(Debug)]
+enum StreamEventDecision {
+    Continue,
+    Completed,
+}
+
+fn evaluate_stream_event(
+    expected_job_id: &str,
+    event: &BacktestEvent,
+) -> Result<StreamEventDecision, String> {
+    match event {
+        BacktestEvent::Heartbeat { job_id, .. } => {
+            if job_id != expected_job_id {
+                return Err(format!(
+                    "Backtest stream job mismatch: expected '{expected_job_id}', received '{job_id}'"
+                ));
+            }
+            Ok(StreamEventDecision::Continue)
+        }
+        BacktestEvent::Snapshot { status } => {
+            if status.job_id != expected_job_id {
+                return Err(format!(
+                    "Backtest stream job mismatch: expected '{expected_job_id}', received '{}'",
+                    status.job_id
+                ));
+            }
+            match evaluate_async_status(status)? {
+                AsyncStatusDecision::Continue => Ok(StreamEventDecision::Continue),
+                AsyncStatusDecision::Completed => Ok(StreamEventDecision::Completed),
+            }
+        }
+    }
+}
+
+enum WatchAttempt {
+    Completed,
+    Retry(String),
+    Failed(String),
+    Interrupted,
+}
+
+async fn watch_backtest_attempt(client: &Arc<BacktestRpcClient>, job_id: &str) -> WatchAttempt {
+    let mut stream = match client
+        .call_server_stream::<_, BacktestEvent>(
+            "watch_backtest",
+            &WatchBacktestRequest {
+                job_id: job_id.to_owned(),
+            },
+        )
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) if !client.is_connected() => return WatchAttempt::Retry(error.to_string()),
+        Err(error) => return WatchAttempt::Failed(error.to_string()),
+    };
+
+    loop {
+        let event = tokio::select! {
+            event = stream.recv() => event,
+            signal = tokio::signal::ctrl_c() => {
+                return match signal {
+                    Ok(()) => WatchAttempt::Interrupted,
+                    Err(error) => WatchAttempt::Failed(format!(
+                        "Failed to listen for Ctrl-C while watching job '{job_id}': {error}"
+                    )),
+                };
+            }
+        };
+
+        let event = match event {
+            Some(Ok(event)) => event,
+            Some(Err(error)) if !client.is_connected() => {
+                return WatchAttempt::Retry(error.to_string());
+            }
+            Some(Err(error)) => return WatchAttempt::Failed(error.to_string()),
+            None => {
+                return WatchAttempt::Retry(format!(
+                    "Backtest stream for job '{job_id}' ended before a terminal snapshot"
+                ));
+            }
+        };
+
+        if let BacktestEvent::Snapshot { status } = &event {
+            println!(
+                "  Status: {} [{} events {}/{}, signals {}/{}, symbols {}/{}]",
+                status.status,
+                status.progress.stage,
+                status.progress.processed_events,
+                status.progress.total_events,
+                status.progress.processed_signals,
+                status.progress.total_signals,
+                status.progress.processed_symbols,
+                status.progress.total_symbols,
+            );
+        }
+
+        match evaluate_stream_event(job_id, &event) {
+            Ok(StreamEventDecision::Continue) => {}
+            Ok(StreamEventDecision::Completed) => return WatchAttempt::Completed,
+            Err(error) => return WatchAttempt::Failed(error),
+        }
+    }
+}
+
+async fn best_effort_cancel_streamed_job(client: &Arc<BacktestRpcClient>, job_id: &str) {
+    let response: Result<CancelBacktestResponse, _> = client
+        .call_with_timeout(
+            "cancel_backtest",
+            &CancelBacktestRequest {
+                job_id: job_id.to_owned(),
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    match response {
+        Ok(response) if response.success => {
+            eprintln!("  Cancellation requested for job '{}'.", response.job_id);
+        }
+        Ok(response) => {
+            eprintln!(
+                "  Cancellation for job '{}' was not accepted: {}",
+                response.job_id,
+                response.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        Err(error) => {
+            eprintln!("  Cancellation request for job '{job_id}' failed: {error}");
+        }
+    }
+}
+
+async fn interrupt_streamed_job(
+    client: &Arc<BacktestRpcClient>,
+    job_id: &str,
+    cancel_on_interrupt: bool,
+) -> Box<dyn std::error::Error> {
+    if cancel_on_interrupt && client.is_connected() {
+        best_effort_cancel_streamed_job(client, job_id).await;
+    } else if cancel_on_interrupt {
+        eprintln!(
+            "  Job '{job_id}' could not be cancelled because no server connection is active."
+        );
+    } else {
+        eprintln!("  Detached from job '{job_id}'; the retained server job was not cancelled.");
+    }
+    Box::new(io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("Interrupted while watching backtest job '{job_id}'"),
+    ))
+}
+
+async fn watch_backtest_with_reconnect(
+    session: &mut BacktestClientSession,
+    shm_name: &str,
+    job_id: &str,
+    cancel_on_interrupt: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let client = session.client();
+        match watch_backtest_attempt(&client, job_id).await {
+            WatchAttempt::Completed => return Ok(()),
+            WatchAttempt::Failed(error) => return Err(io::Error::other(error).into()),
+            WatchAttempt::Interrupted => {
+                return Err(interrupt_streamed_job(&client, job_id, cancel_on_interrupt).await);
+            }
+            WatchAttempt::Retry(error) => {
+                eprintln!(
+                    "  Backtest stream for job '{job_id}' was interrupted: {error}. Reconnecting..."
+                );
+            }
+        }
+
+        let reconnect_delay = tokio::time::sleep(std::time::Duration::from_secs(2));
+        tokio::pin!(reconnect_delay);
+        tokio::select! {
+            _ = &mut reconnect_delay => {}
+            signal = tokio::signal::ctrl_c() => {
+                return match signal {
+                    Ok(()) => Err(interrupt_streamed_job(
+                        &session.client(),
+                        job_id,
+                        cancel_on_interrupt,
+                    ).await),
+                    Err(error) => Err(io::Error::other(format!(
+                        "Failed to listen for Ctrl-C while reconnecting job '{job_id}': {error}"
+                    )).into()),
+                };
+            }
+        }
+
+        let replacement = tokio::select! {
+            result = connect(shm_name) => result,
+            signal = tokio::signal::ctrl_c() => {
+                return match signal {
+                    Ok(()) => Err(interrupt_streamed_job(
+                        &session.client(),
+                        job_id,
+                        cancel_on_interrupt,
+                    ).await),
+                    Err(error) => Err(io::Error::other(format!(
+                        "Failed to listen for Ctrl-C while reconnecting job '{job_id}': {error}"
+                    )).into()),
+                };
+            }
+        };
+
+        match replacement {
+            Ok(replacement) => {
+                let previous = std::mem::replace(session, replacement);
+                match tokio::time::timeout(std::time::Duration::from_secs(2), previous.close())
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("  Previous backtest session close failed: {error}");
+                    }
+                    Err(_) => {
+                        eprintln!("  Previous backtest session did not close within 2 seconds.");
+                    }
+                }
+                eprintln!("  Reconnected; resubscribing to job '{job_id}'.");
+            }
+            Err(error) => {
+                eprintln!("  Reconnect attempt for job '{job_id}' failed: {error}");
+            }
+        }
     }
 }
 
@@ -1710,185 +1994,195 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Connect to backtest server via SHM.
     print_header("Connecting to Backtest Server");
-    let client = connect(&args.shm_name).await?;
-    let client = Arc::new(client);
+    let mut session = connect(&args.shm_name).await?;
+    let client = session.client();
     println!("  ✓ Connected");
 
-    // 3. Ping server to confirm it's alive.
-    let ping: PingResponse = client.call("ping", &()).await?;
-    println!(
-        "  Server status: {}, uptime: {}s",
-        ping.status, ping.uptime_secs
-    );
+    let operation_result: Result<(), Box<dyn std::error::Error>> = async {
+        // 3. Ping server to confirm it's alive.
+        let ping: PingResponse = client.call("ping", &()).await?;
+        println!(
+            "  Server status: {}, uptime: {}s",
+            ping.status, ping.uptime_secs
+        );
 
-    // 4. Build and submit the backtest request.
-    print_header("Running Backtest");
-    println!(
-        "  Symbols: {}, Exchange: {}, DataType: {}, Timeframe: {:?}",
-        symbol_label, args.exchange, args.data_type, args.timeframe
-    );
-    println!("  Date range: {:?} → {:?}", args.from, args.to);
-    println!(
-        "  Profile: {:?}, Balance: {}, Raw signals: {}",
-        args.profile,
-        format_currency(args.balance, args.account_currency.as_deref()),
-        raw_signals.len()
-    );
+        // 4. Build and submit the backtest request.
+        print_header("Running Backtest");
+        println!(
+            "  Symbols: {}, Exchange: {}, DataType: {}, Timeframe: {:?}",
+            symbol_label, args.exchange, args.data_type, args.timeframe
+        );
+        println!("  Date range: {:?} → {:?}", args.from, args.to);
+        println!(
+            "  Profile: {:?}, Balance: {}, Raw signals: {}",
+            args.profile,
+            format_currency(args.balance, args.account_currency.as_deref()),
+            raw_signals.len()
+        );
 
-    let sizing = sizing_policy(&args);
+        let sizing = sizing_policy(&args);
 
-    let request = BacktestRunSpec {
-        symbol: request_symbol,
-        symbols: request_symbols,
-        all_symbols: args.all_symbols,
-        exchange: args.exchange.clone(),
-        data_type: args.data_type.clone(),
-        timeframe: args.timeframe.clone(),
-        from: args.from.clone(),
-        to: args.to.clone(),
-        raw_signals,
-        profile: args.profile.clone(),
-        profile_def: None,
-        config: BacktestConfigMsg {
-            initial_balance: Some(args.balance),
-            close_on_finish: Some(true),
-            fill_model: Some("BidAsk".into()),
-            sizing,
-        },
-    };
-
-    let future_request = RunBacktestRequest {
-        request: request.clone(),
-        future: future_config_message(&args),
-        evaluation: provider_evaluation_options(&args, source_coverage),
-        result_delivery: result_delivery_message(&args),
-    };
-
-    if args.r#async {
-        // Async mode: submit job, poll status, fetch result.
-        let submit: SubmitBacktestResponse = client
-            .call(
-                "submit_backtest",
-                &SubmitBacktestRequest {
-                    request: future_request.clone(),
-                },
-            )
-            .await?;
-        if !submit.success {
-            return Err(server_response_error(submit.error, "backtest submission failed").into());
-        }
-        let job_id = submit.job_id.ok_or_else(|| {
-            server_response_error(submit.error, "successful submission omitted job_id")
-        })?;
-        println!("  Job submitted: {}", job_id);
-
-        let status_client = client.clone();
-        let status_job_id = job_id.clone();
-        let cancel_client = client.clone();
-        let cancel_job_id = job_id.clone();
-        poll_async_job(
-            &job_id,
-            std::time::Duration::from_secs(args.poll_timeout_secs),
-            std::time::Duration::from_secs(2),
-            move |remaining| {
-                let client = status_client.clone();
-                let job_id = status_job_id.clone();
-                async move {
-                    client
-                        .call_with_timeout(
-                            "get_backtest_status",
-                            &GetBacktestStatusRequest { job_id },
-                            remaining,
-                        )
-                        .await
-                        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
-                }
+        let request = BacktestRunSpec {
+            symbol: request_symbol,
+            symbols: request_symbols,
+            all_symbols: args.all_symbols,
+            exchange: args.exchange.clone(),
+            data_type: args.data_type.clone(),
+            timeframe: args.timeframe.clone(),
+            from: args.from.clone(),
+            to: args.to.clone(),
+            raw_signals,
+            profile: args.profile.clone(),
+            profile_def: None,
+            config: BacktestConfigMsg {
+                initial_balance: Some(args.balance),
+                close_on_finish: Some(true),
+                fill_model: Some("BidAsk".into()),
+                sizing,
             },
-            move || {
-                let client = cancel_client.clone();
-                let job_id = cancel_job_id.clone();
-                async move {
-                    let response: Result<CancelBacktestResponse, _> = client
-                        .call_with_timeout(
-                            "cancel_backtest",
-                            &CancelBacktestRequest { job_id },
-                            std::time::Duration::from_secs(2),
-                        )
-                        .await;
-                    match response {
-                        Ok(response) if response.success => {
-                            eprintln!("  Cancellation requested for job '{}'.", response.job_id);
-                        }
-                        Ok(response) => {
-                            eprintln!(
-                                "  Best-effort cancellation for job '{}' was not accepted: {}",
-                                response.job_id,
-                                response.error.as_deref().unwrap_or("unknown error")
-                            );
-                        }
-                        Err(error) => {
-                            eprintln!("  Best-effort cancellation request failed: {error}");
-                        }
-                    }
+        };
+
+        let future_request = RunBacktestRequest {
+            request: request.clone(),
+            future: future_config_message(&args),
+            evaluation: provider_evaluation_options(&args, source_coverage),
+            result_delivery: result_delivery_message(&args),
+        };
+
+        match execution_mode(&args) {
+            ExecutionMode::Stream | ExecutionMode::Poll => {
+                let submit: SubmitBacktestResponse = client
+                    .call(
+                        "submit_backtest",
+                        &SubmitBacktestRequest {
+                            request: future_request.clone(),
+                        },
+                    )
+                    .await?;
+                if !submit.success {
+                    return Err(
+                        server_response_error(submit.error, "backtest submission failed").into(),
+                    );
                 }
-            },
-        )
-        .await?;
+                let job_id = submit.job_id.ok_or_else(|| {
+                    server_response_error(submit.error, "successful submission omitted job_id")
+                })?;
+                println!("  Job submitted: {job_id}");
 
-        let result_resp: GetBacktestResultResponse = client
-            .call(
-                "get_backtest_result",
-                &GetBacktestResultRequest {
-                    job_id: job_id.clone(),
-                },
-            )
-            .await?;
-        if !result_resp.success {
-            return Err(server_response_error(
-                result_resp.error,
-                "completed job result request failed",
-            )
-            .into());
-        }
-        let (result, output_written) = receive_delivered_result(
-            &client,
-            result_resp.result,
-            result_resp.artifact,
-            result_resp.inline_complete,
-            args.output.as_deref(),
-        )
-        .await?;
-        present_result(&result, &args, output_written)?;
-    } else {
-        let resp: RunBacktestResponse = client
-            .call_with_timeout(
-                "run_backtest",
-                &future_request,
-                std::time::Duration::from_secs(300),
-            )
-            .await?;
-        println!("  Elapsed: {}ms", resp.elapsed_ms);
+                if execution_mode(&args) == ExecutionMode::Stream {
+                    watch_backtest_with_reconnect(
+                        &mut session,
+                        &args.shm_name,
+                        &job_id,
+                        args.cancel_on_interrupt,
+                    )
+                    .await?;
+                } else {
+                    let status_client = client.clone();
+                    let status_job_id = job_id.clone();
+                    let cancel_client = client.clone();
+                    let cancel_job_id = job_id.clone();
+                    poll_async_job(
+                        &job_id,
+                        std::time::Duration::from_secs(args.poll_timeout_secs),
+                        std::time::Duration::from_secs(2),
+                        move |remaining| {
+                            let client = status_client.clone();
+                            let job_id = status_job_id.clone();
+                            async move {
+                                client
+                                    .call_with_timeout(
+                                        "get_backtest_status",
+                                        &GetBacktestStatusRequest { job_id },
+                                        remaining,
+                                    )
+                                    .await
+                                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                            }
+                        },
+                        move || {
+                            let client = cancel_client.clone();
+                            let job_id = cancel_job_id.clone();
+                            async move {
+                                best_effort_cancel_streamed_job(&client, &job_id).await;
+                            }
+                        },
+                    )
+                    .await?;
+                }
 
-        if !resp.success {
-            return Err(server_response_error(resp.error, "backtest failed").into());
+                let result_client = session.client();
+                let result_resp: GetBacktestResultResponse = result_client
+                    .call(
+                        "get_backtest_result",
+                        &GetBacktestResultRequest {
+                            job_id: job_id.clone(),
+                        },
+                    )
+                    .await?;
+                if !result_resp.success {
+                    return Err(server_response_error(
+                        result_resp.error,
+                        "completed job result request failed",
+                    )
+                    .into());
+                }
+                let (result, output_written) = receive_delivered_result(
+                    &result_client,
+                    result_resp.result,
+                    result_resp.artifact,
+                    result_resp.inline_complete,
+                    args.output.as_deref(),
+                )
+                .await?;
+                present_result(&result, &args, output_written)?;
+            }
+            ExecutionMode::Sync => {
+                let resp: RunBacktestResponse = client
+                    .call_with_timeout(
+                        "run_backtest",
+                        &future_request,
+                        std::time::Duration::from_secs(300),
+                    )
+                    .await?;
+                println!("  Elapsed: {}ms", resp.elapsed_ms);
+
+                if !resp.success {
+                    return Err(server_response_error(resp.error, "backtest failed").into());
+                }
+                let (result, output_written) = receive_delivered_result(
+                    &client,
+                    resp.result,
+                    resp.artifact,
+                    resp.inline_complete,
+                    args.output.as_deref(),
+                )
+                .await?;
+                present_result(&result, &args, output_written)?;
+            }
         }
-        let (result, output_written) = receive_delivered_result(
-            &client,
-            resp.result,
-            resp.artifact,
-            resp.inline_complete,
-            args.output.as_deref(),
-        )
-        .await?;
-        present_result(&result, &args, output_written)?;
+
+        Ok(())
     }
+    .await;
 
-    // 6. Disconnect.
-    print_header("Done");
-    client.close().await?;
-    println!("  ✓ Disconnected");
+    if operation_result.is_ok() {
+        print_header("Done");
+    }
+    let shutdown_result = session.close().await;
 
-    Ok(())
+    match (operation_result, shutdown_result) {
+        (Ok(()), Ok(())) => {
+            println!("  ✓ Disconnected");
+            Ok(())
+        }
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(shutdown_error)) => {
+            eprintln!("  Client shutdown also failed: {shutdown_error}");
+            Err(operation_error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2633,6 +2927,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_events_preserve_job_identity_and_terminal_status_errors() {
+        let running = BacktestEvent::Snapshot {
+            status: async_status("Running", true, None),
+        };
+        assert!(matches!(
+            evaluate_stream_event("job-test", &running),
+            Ok(StreamEventDecision::Continue)
+        ));
+
+        let completed = BacktestEvent::Snapshot {
+            status: async_status("Completed", true, None),
+        };
+        assert!(matches!(
+            evaluate_stream_event("job-test", &completed),
+            Ok(StreamEventDecision::Completed)
+        ));
+
+        let failed = BacktestEvent::Snapshot {
+            status: async_status("Failed", true, Some("replay failed")),
+        };
+        assert_eq!(
+            evaluate_stream_event("job-test", &failed).unwrap_err(),
+            "replay failed"
+        );
+
+        let wrong_job = BacktestEvent::Heartbeat {
+            job_id: "other-job".into(),
+            elapsed_ms: 1,
+        };
+        assert!(
+            evaluate_stream_event("job-test", &wrong_job)
+                .unwrap_err()
+                .contains("job mismatch")
+        );
+    }
+
     #[tokio::test]
     async fn poll_queries_already_completed_job_before_first_sleep() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2777,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_poll_timeout_has_a_bounded_default_and_rejects_zero() {
+    fn cli_defaults_to_stream_and_retains_poll_and_sync_fallbacks() {
         let args = Args::try_parse_from([
             "tg_backtest",
             "--input",
@@ -2786,7 +3117,38 @@ mod tests {
             "test",
         ])
         .unwrap();
+        assert_eq!(execution_mode(&args), ExecutionMode::Stream);
         assert_eq!(args.poll_timeout_secs, 300);
+        assert!(!args.cancel_on_interrupt);
+
+        for (mode, expected) in [
+            ("stream", ExecutionMode::Stream),
+            ("poll", ExecutionMode::Poll),
+            ("sync", ExecutionMode::Sync),
+        ] {
+            let args = Args::try_parse_from([
+                "tg_backtest",
+                "--input",
+                "signals.jsonl",
+                "--exchange",
+                "test",
+                "--execution-mode",
+                mode,
+            ])
+            .unwrap();
+            assert_eq!(execution_mode(&args), expected);
+        }
+
+        let legacy = Args::try_parse_from([
+            "tg_backtest",
+            "--input",
+            "signals.jsonl",
+            "--exchange",
+            "test",
+            "--async",
+        ])
+        .unwrap();
+        assert_eq!(execution_mode(&legacy), ExecutionMode::Poll);
 
         let zero = Args::try_parse_from([
             "tg_backtest",

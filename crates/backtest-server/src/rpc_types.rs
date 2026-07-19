@@ -129,6 +129,12 @@ pub struct GetBacktestStatusRequest {
     pub job_id: String,
 }
 
+/// Subscribe to status snapshots for a retained backtest job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchBacktestRequest {
+    pub job_id: String,
+}
+
 /// Structured progress for an asynchronous backtest job.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,7 +149,7 @@ pub struct BacktestProgress {
 }
 
 /// Status of a backtest job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BacktestStatusResponse {
     pub success: bool,
     pub job_id: String,
@@ -153,6 +159,21 @@ pub struct BacktestStatusResponse {
     /// Missing in older responses; defaults to an empty progress snapshot.
     #[serde(default)]
     pub progress: BacktestProgress,
+}
+
+impl BacktestStatusResponse {
+    /// Whether this snapshot represents a terminal retained-job state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "Completed" | "Failed" | "Cancelled")
+    }
+}
+
+/// Server-streamed retained-job status and liveness events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BacktestEvent {
+    Snapshot { status: BacktestStatusResponse },
+    Heartbeat { job_id: String, elapsed_ms: u64 },
 }
 
 /// Request the result of a completed backtest job.

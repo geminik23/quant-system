@@ -49,7 +49,7 @@ CTrader FIX ---> qs-market-data ---> real-time bid/ask SHM consumers
 | [`qs-backtest`](crates/backtest/) | Strategy and raw-signal simulation, FutureQuote execution, sizing, accounting, metrics, and reporting |
 | [`qs-data-preprocess`](crates/data-preprocess/) | Historical tick/OHLCV import, partitioned Parquet storage, bounded queries, and optional DuckDB storage |
 | [`qs-symbols`](crates/symbols/) | TOML symbol registry, aliases, price/lot metadata, and explicit P&L/base/quote currencies |
-| [`qs-backtest-server`](crates/backtest-server/) | Multi-client shared-memory RPC, sync/async/multi-profile replay, jobs, cancellation, and result artifacts |
+| [`qs-backtest-server`](crates/backtest-server/) | Multi-client shared-memory RPC, retained-job status streaming, sync/poll fallbacks, multi-profile replay, cancellation, and result artifacts |
 | [`qs-signal-parser`](crates/signal-parser/) | Telegram-focused offline/online parsing that emits generic raw-signal actions |
 | [`qs-market-data`](crates/market-data/) | Real-time CTrader FIX bid/ask distribution, subscriptions, alerts, and reconnection |
 
@@ -57,7 +57,7 @@ CTrader FIX ---> qs-market-data ---> real-time bid/ask SHM consumers
 
 ### Prerequisites
 
-- a Rust toolchain compatible with the workspace;
+- Rust 1.85 or newer;
 - Linux shared memory (`/dev/shm`) for the RPC services;
 - tick or bar CSV data supported by `qs-data-preprocess`;
 - timestamps and symbols in the signal file that match the imported data.
@@ -117,19 +117,25 @@ cargo run -p qs-backtest-server --bin tg_backtest -- \
 
 When at least one Entry is present, select exactly one account sizing basis: `--base-lot`, `--risk-per-trade`, or `--risk-percent`. `--account-currency` is also required. Run either binary with `--help` for the complete option list.
 
+`tg_backtest` defaults to `--execution-mode stream`: it submits a retained job, receives progress and heartbeat events without a total job deadline, and retrieves the bounded inline or artifact result after a terminal snapshot. Use `--execution-mode poll` for the bounded polling fallback or `--execution-mode sync` for the legacy finite unary request. Ctrl-C detaches from a streamed job by default; add `--cancel-on-interrupt` to request cooperative server cancellation.
+
 ## Current server contract
 
 Production backtest execution registers only:
 
 - `run_backtest` for synchronous single-profile execution;
 - `run_backtest_multi` for multi-profile comparison;
-- `submit_backtest` for asynchronous jobs.
+- `submit_backtest` for retained asynchronous jobs;
+- `watch_backtest` for streamed job snapshots and heartbeat events;
+- `get_backtest_status`, `get_backtest_result`, and `cancel_backtest` for polling, result delivery, recovery, and explicit cancellation.
 
 Requests do not carry an API schema magic number or use version-suffixed method names. Recursive strict decoding rejects unknown fields throughout nested configuration, profile, and signal objects. The server and `tg_backtest` use streaming `FutureQuoteV1` exclusively and accept only the strict raw-signal path.
 
 `BacktestRunner::new` and materialized `DataFeed` APIs remain available for direct library simulations. They are compatibility surfaces and are not reachable through the production backtest RPC or `tg_backtest`.
 
 Persisted FutureQuote artifacts and downloadable result JSON references carry an independent `format_version` starting at `1`. This format marker is not an RPC API version.
+
+Shared-memory RPC requires `xrpc-rs` 0.3.1 or newer within the 0.3 line. Version 0.3.1 keeps healthy server sessions active across retry-safe idle receive timeouts and is wire- and SHM-layout-compatible with 0.3.0. The 0.3 SHM generation remains incompatible with 0.2, so transport-layout generation upgrades require a coordinated restart or separate non-overlapping endpoint names. SHM mappings are ephemeral IPC buffers and do not contain historical data or persisted result artifacts.
 
 ## Production backtesting guarantees
 
@@ -139,7 +145,7 @@ Persisted FutureQuote artifacts and downloadable result JSON references carry an
 - Exact online equity, drawdown, exposure, and campaign MAE/MFE are independent of the returned MTM curve size.
 - MTM output supports `none`, `bounded`, and `full`. New clients default to a deterministic bound of 4096 points; valid bounded sizes are 8 through 16384.
 - Results support `auto`, `inline`, and `artifact` delivery. `auto` returns results inline up to the configured 12 MiB default and otherwise uses a length- and SHA-256-verified artifact.
-- Async jobs provide progress, cooperative cancellation, bounded retention, and scheduled cleanup. Results include the effective data scope, currency plan, profile, sizing identity, and other reproducibility metadata.
+- Retained jobs provide coalesced progress streaming, heartbeat events, reconnection by job ID, cooperative cancellation, bounded retention, and scheduled cleanup. Streamed execution has no total job deadline; complete results still use the existing bounded inline/artifact delivery path. Results include the effective data scope, currency plan, profile, sizing identity, and other reproducibility metadata.
 
 ## Entry risk, sizing, and management
 

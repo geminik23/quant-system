@@ -68,6 +68,14 @@ level = "info"
 4. All subsequent RPCs go through the dedicated slot
 5. On disconnect, server cleans up all alerts owned by that client
 
+## Runtime Compatibility
+
+The service uses `xrpc-rs` 0.3.1 with explicit client startup, deterministic close/join semantics, and retry-safe connected idle receive handling. A server and client attached to the same named SHM endpoint must use the same xrpc SHM generation.
+
+Versions 0.3.0 and 0.3.1 are wire- and SHM-layout-compatible. The 0.3 SHM layout is intentionally incompatible with 0.2 mappings. Stop 0.2 peers before reusing an endpoint name; startup cleanup removes stale mappings. The mapping is an ephemeral IPC ring buffer, so historical data and application state require no migration.
+
+For a side-by-side cutover, use non-overlapping base names such as `qsmd02` and `qsmd03`. Cleanup is prefix-based, so do not run endpoint names where one configured base is a prefix of another.
+
 ## RPC Methods
 
 ### Unary

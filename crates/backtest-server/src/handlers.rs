@@ -19,6 +19,8 @@ use data_preprocess::DataError;
 use data_preprocess::ParquetStore;
 #[cfg(test)]
 use data_preprocess::models::{BarQueryOpts, QueryOpts, Timeframe};
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use qs_backtest::BacktestResult;
 #[cfg(test)]
 use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
@@ -29,6 +31,7 @@ use qs_backtest::runner::{
     BacktestConfig, BacktestRunner, FutureQuoteConfig, ReplayProgress, StreamingReplayError,
 };
 use qs_symbols::SymbolRegistry;
+use tokio::sync::watch;
 
 use crate::artifact_store::ArtifactStore;
 use crate::convert::{
@@ -89,6 +92,8 @@ pub struct BacktestJob {
     pub cancellation: JobCancellationToken,
     /// True while a blocking worker slot is reserved or still accessing this job.
     pub worker_active: bool,
+    /// Coalesced current status published to server-streaming subscribers.
+    pub updates: watch::Sender<BacktestStatusResponse>,
 }
 
 /// Lightweight per-job cancellation token without an additional runtime dependency.
@@ -287,6 +292,112 @@ impl JobStatus {
     }
 }
 
+fn job_status_response(job_id: &str, job: &BacktestJob) -> BacktestStatusResponse {
+    let elapsed_ms = job
+        .completed_at
+        .map(|completed| completed.duration_since(job.submitted_at).as_millis() as u64);
+    BacktestStatusResponse {
+        success: true,
+        job_id: job_id.to_owned(),
+        status: job.status.as_str().to_owned(),
+        error: job.error.clone(),
+        elapsed_ms,
+        progress: job.progress.clone(),
+    }
+}
+
+fn publish_job_status(job_id: &str, job: &BacktestJob) {
+    job.updates.send_replace(job_status_response(job_id, job));
+}
+
+/// Subscribe to the current and future coalesced snapshots of a retained job.
+pub fn subscribe_backtest_status(
+    state: &ServerState,
+    job_id: &str,
+) -> std::result::Result<(watch::Receiver<BacktestStatusResponse>, Instant), String> {
+    let jobs = state.jobs.lock().unwrap();
+    let job = jobs
+        .get(job_id)
+        .ok_or_else(|| format!("Job '{job_id}' not found"))?;
+    Ok((job.updates.subscribe(), job.submitted_at))
+}
+
+struct BacktestWatchState {
+    job_id: String,
+    updates: watch::Receiver<BacktestStatusResponse>,
+    submitted_at: Instant,
+    heartbeat: tokio::time::Interval,
+    emit_initial: bool,
+    finished: bool,
+}
+
+/// Build the server stream for a retained backtest job.
+pub fn watch_backtest_stream(
+    state: Arc<ServerState>,
+    req: WatchBacktestRequest,
+    heartbeat_interval: Duration,
+) -> BoxStream<'static, std::result::Result<BacktestEvent, xrpc::RpcError>> {
+    let (updates, submitted_at) = match subscribe_backtest_status(&state, &req.job_id) {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            return stream::once(async move { Err(xrpc::RpcError::ServerError(error)) }).boxed();
+        }
+    };
+
+    let period = heartbeat_interval.max(Duration::from_millis(1));
+    let start = tokio::time::Instant::now() + period;
+    let mut heartbeat = tokio::time::interval_at(start, period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let initial = BacktestWatchState {
+        job_id: req.job_id,
+        updates,
+        submitted_at,
+        heartbeat,
+        emit_initial: true,
+        finished: false,
+    };
+
+    stream::unfold(initial, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+
+        if state.emit_initial {
+            state.emit_initial = false;
+            let status = state.updates.borrow().clone();
+            state.finished = status.is_terminal();
+            return Some((Ok(BacktestEvent::Snapshot { status }), state));
+        }
+
+        tokio::select! {
+            changed = state.updates.changed() => {
+                match changed {
+                    Ok(()) => {
+                        let status = state.updates.borrow().clone();
+                        state.finished = status.is_terminal();
+                        Some((Ok(BacktestEvent::Snapshot { status }), state))
+                    }
+                    Err(_) => {
+                        state.finished = true;
+                        Some((Err(xrpc::RpcError::ServerError(format!(
+                            "Backtest job '{}' update channel closed before a terminal snapshot",
+                            state.job_id
+                        ))), state))
+                    }
+                }
+            }
+            _ = state.heartbeat.tick() => {
+                let event = BacktestEvent::Heartbeat {
+                    job_id: state.job_id.clone(),
+                    elapsed_ms: state.submitted_at.elapsed().as_millis() as u64,
+                };
+                Some((Ok(event), state))
+            }
+        }
+    })
+    .boxed()
+}
+
 fn progress_stage_rank(stage: &str) -> u8 {
     match stage {
         "queued" => 0,
@@ -368,7 +479,7 @@ pub fn cleanup_expired_jobs(state: &ServerState, retention: Duration) -> usize {
 pub fn cancel_active_jobs(state: &ServerState) -> usize {
     let mut cancelled = 0;
     let mut jobs = state.jobs.lock().unwrap();
-    for job in jobs.values_mut().filter(|job| !job.status.is_terminal()) {
+    for (job_id, job) in jobs.iter_mut().filter(|(_, job)| !job.status.is_terminal()) {
         job.cancellation.cancel();
         job.status = JobStatus::Cancelled;
         job.completed_at = Some(Instant::now());
@@ -378,6 +489,7 @@ pub fn cancel_active_jobs(state: &ServerState) -> usize {
         job.artifact_consumed = false;
         job.error = None;
         job.progress.stage = "cancelled".into();
+        publish_job_status(job_id, job);
         cancelled += 1;
     }
     cancelled
@@ -394,6 +506,7 @@ fn update_job_progress(state: &ServerState, job_id: &str, progress: BacktestProg
             _ => {}
         }
         merge_progress(&mut job.progress, progress);
+        publish_job_status(job_id, job);
     }
 }
 
@@ -1637,14 +1750,23 @@ pub fn handle_reload_profiles(state: &ServerState) -> ReloadProfilesResponse {
 /// Admit a validated request to the bounded async job store.
 fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
     let job_id = format!("job-{}", uuid_v4_simple());
+    let initial_progress = BacktestProgress {
+        stage: "queued".into(),
+        ..BacktestProgress::default()
+    };
+    let (updates, _) = watch::channel(BacktestStatusResponse {
+        success: true,
+        job_id: job_id.clone(),
+        status: JobStatus::Queued.as_str().into(),
+        error: None,
+        elapsed_ms: None,
+        progress: initial_progress.clone(),
+    });
     let job = BacktestJob {
         status: JobStatus::Queued,
         submitted_at: Instant::now(),
         completed_at: None,
-        progress: BacktestProgress {
-            stage: "queued".into(),
-            ..BacktestProgress::default()
-        },
+        progress: initial_progress,
         result: None,
         artifact: None,
         inline_complete: false,
@@ -1652,6 +1774,7 @@ fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
         error: None,
         cancellation: JobCancellationToken::default(),
         worker_active: true,
+        updates,
     };
     if state.max_retained_jobs == 0 {
         return SubmitBacktestResponse {
@@ -1742,19 +1865,7 @@ pub fn handle_get_backtest_status(
 ) -> BacktestStatusResponse {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(&req.job_id) {
-        Some(job) => {
-            let elapsed_ms = job
-                .completed_at
-                .map(|c| c.duration_since(job.submitted_at).as_millis() as u64);
-            BacktestStatusResponse {
-                success: true,
-                job_id: req.job_id.clone(),
-                status: job.status.as_str().to_string(),
-                error: job.error.clone(),
-                elapsed_ms,
-                progress: job.progress.clone(),
-            }
-        }
+        Some(job) => job_status_response(&req.job_id, job),
         None => BacktestStatusResponse {
             success: false,
             job_id: req.job_id.clone(),
@@ -1905,6 +2016,7 @@ pub fn handle_cancel_backtest(
             job.artifact_consumed = false;
             job.error = None;
             job.progress.stage = "cancelled".into();
+            publish_job_status(&req.job_id, job);
             CancelBacktestResponse {
                 success: true,
                 job_id: req.job_id.clone(),
@@ -1957,6 +2069,7 @@ fn run_job_and_store_inner(
         }
         job.status = JobStatus::LoadingData;
         job.progress.stage = "loading_data".into();
+        publish_job_status(&job_id, job);
         job.cancellation.clone()
     };
 
@@ -2002,6 +2115,7 @@ fn run_job_and_store_inner(
         job.error = None;
         job.progress.stage = "cancelled".into();
         job.completed_at.get_or_insert_with(Instant::now);
+        publish_job_status(&job_id, job);
         return;
     }
 
@@ -2015,6 +2129,7 @@ fn run_job_and_store_inner(
             job.error = None;
             job.progress.stage = "completed".into();
             job.completed_at = Some(Instant::now());
+            publish_job_status(&job_id, job);
         }
         Ok(PreparedResult::Artifact { reference, summary }) => {
             job.status = JobStatus::Completed;
@@ -2025,6 +2140,7 @@ fn run_job_and_store_inner(
             job.error = None;
             job.progress.stage = "completed".into();
             job.completed_at = Some(Instant::now());
+            publish_job_status(&job_id, job);
         }
         Err(error) => {
             job.status = JobStatus::Failed;
@@ -2035,6 +2151,7 @@ fn run_job_and_store_inner(
             job.error = Some(error);
             job.progress.stage = "failed".into();
             job.completed_at = Some(Instant::now());
+            publish_job_status(&job_id, job);
         }
     }
 }
@@ -2878,6 +2995,149 @@ mod tests {
         assert_eq!(status.status, "NotFound");
     }
 
+    #[tokio::test]
+    async fn watch_stream_emits_initial_progress_terminal_and_end() {
+        let state = Arc::new(job_test_state());
+        let submit = submit_for_test(&state, &valid_submit_request());
+        let job_id = submit.job_id.unwrap();
+        let mut stream = watch_backtest_stream(
+            state.clone(),
+            WatchBacktestRequest {
+                job_id: job_id.clone(),
+            },
+            Duration::from_secs(60),
+        );
+
+        let initial = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            initial,
+            BacktestEvent::Snapshot { ref status }
+                if status.job_id == job_id && status.status == "Queued"
+        ));
+
+        update_job_progress(
+            &state,
+            &job_id,
+            BacktestProgress {
+                stage: "replay".into(),
+                processed_events: 10,
+                total_events: 100,
+                processed_signals: 2,
+                total_signals: 8,
+                processed_symbols: 1,
+                total_symbols: 2,
+            },
+        );
+        let progress = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            progress,
+            BacktestEvent::Snapshot { ref status }
+                if status.status == "Running"
+                    && status.progress.processed_events == 10
+                    && status.progress.total_events == 100
+        ));
+
+        assert!(
+            handle_cancel_backtest(
+                &state,
+                &CancelBacktestRequest {
+                    job_id: job_id.clone(),
+                },
+            )
+            .success
+        );
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            terminal,
+            BacktestEvent::Snapshot { ref status }
+                if status.status == "Cancelled" && status.is_terminal()
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_stream_heartbeats_and_resubscribes_to_terminal_snapshot() {
+        let state = Arc::new(job_test_state());
+        let submit = submit_for_test(&state, &valid_submit_request());
+        let job_id = submit.job_id.unwrap();
+        let mut stream = watch_backtest_stream(
+            state.clone(),
+            WatchBacktestRequest {
+                job_id: job_id.clone(),
+            },
+            Duration::from_millis(5),
+        );
+
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            BacktestEvent::Snapshot { .. }
+        ));
+        let heartbeat = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            heartbeat,
+            BacktestEvent::Heartbeat { job_id: ref id, .. } if id == &job_id
+        ));
+
+        assert!(
+            handle_cancel_backtest(
+                &state,
+                &CancelBacktestRequest {
+                    job_id: job_id.clone(),
+                },
+            )
+            .success
+        );
+        drop(stream);
+
+        let mut resumed = watch_backtest_stream(
+            state,
+            WatchBacktestRequest {
+                job_id: job_id.clone(),
+            },
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            resumed.next().await.unwrap().unwrap(),
+            BacktestEvent::Snapshot { ref status }
+                if status.job_id == job_id && status.status == "Cancelled"
+        ));
+        assert!(resumed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_stream_reports_missing_job_as_stream_error() {
+        let mut stream = watch_backtest_stream(
+            Arc::new(job_test_state()),
+            WatchBacktestRequest {
+                job_id: "missing".into(),
+            },
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(xrpc::RpcError::ServerError(error))) if error == "Job 'missing' not found"
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancellation_publishes_terminal_snapshot() {
+        let state = Arc::new(job_test_state());
+        let submit = submit_for_test(&state, &valid_submit_request());
+        let job_id = submit.job_id.unwrap();
+        let (mut updates, _) = subscribe_backtest_status(&state, &job_id).unwrap();
+
+        assert_eq!(cancel_active_jobs(&state), 1);
+        updates.changed().await.unwrap();
+        let status = updates.borrow().clone();
+        assert_eq!(status.status, "Cancelled");
+        assert!(status.is_terminal());
+    }
+
     #[test]
     fn cancel_nonexistent_job() {
         let state = job_test_state();
@@ -2939,8 +3199,8 @@ lot_max_steps = 0
         assert!(!config.symbol_specs.is_empty());
     }
 
-    #[test]
-    fn job_full_lifecycle_transitions() {
+    #[tokio::test]
+    async fn job_full_lifecycle_transitions_publish_terminal_snapshot() {
         use std::sync::Arc;
         let state = Arc::new(job_test_state());
 
@@ -2957,6 +3217,17 @@ lot_max_steps = 0
             },
         );
         assert_eq!(status.status, "Queued");
+        let mut stream = watch_backtest_stream(
+            state.clone(),
+            WatchBacktestRequest {
+                job_id: job_id.clone(),
+            },
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            BacktestEvent::Snapshot { ref status } if status.status == "Queued"
+        ));
 
         // Run the job via the canonical worker (will fail since no real data,
         // but should transition through LoadingData -> Failed).
@@ -2975,6 +3246,13 @@ lot_max_steps = 0
             "Expected Failed or Completed, got {}",
             status.status
         );
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            terminal,
+            BacktestEvent::Snapshot { ref status }
+                if status.status == "Failed" || status.status == "Completed"
+        ));
+        assert!(stream.next().await.is_none());
 
         // Fetch result should fail since job is not Completed.
         let result_resp = handle_get_backtest_result(&state, &GetBacktestResultRequest { job_id });

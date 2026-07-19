@@ -1104,19 +1104,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3618,6 +3605,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "futures",
  "nanoid",
  "qs-backtest",
  "qs-core",
@@ -5944,15 +5932,14 @@ dependencies = [
 
 [[package]]
 name = "xrpc-rs"
-version = "0.2.2"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68b3c62f87e209398c311b5621bf07a618f1d50daa770f61c4cd1d4995e0793"
+checksum = "43b2204ea9b3f6fb1c6ef52b8e65fb53bdc60c251de423624df42389432bc0e0"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bincode",
  "bytes",
- "crossbeam",
  "futures",
  "lz4",
  "parking_lot",
@@ -5961,6 +5948,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared_memory",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "zstd",

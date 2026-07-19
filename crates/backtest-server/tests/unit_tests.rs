@@ -1712,6 +1712,15 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
                 error: None,
                 cancellation: JobCancellationToken::default(),
                 worker_active: false,
+                updates: tokio::sync::watch::channel(BacktestStatusResponse {
+                    success: true,
+                    job_id: job_id.into(),
+                    status: "Completed".into(),
+                    error: None,
+                    elapsed_ms: Some(0),
+                    progress: BacktestProgress::default(),
+                })
+                .0,
             },
         );
         artifact
