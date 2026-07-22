@@ -3589,9 +3589,9 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
- "qs-core",
  "qs-data-preprocess",
  "qs-symbols",
+ "quant-system-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3622,11 +3622,11 @@ dependencies = [
  "nanoid",
  "qs-backtest",
  "qs-backtest-api",
- "qs-core",
  "qs-data-preprocess",
  "qs-service",
  "qs-service-xrpc",
  "qs-symbols",
+ "quant-system-core",
  "serde",
  "serde_json",
  "sha2",
@@ -3636,18 +3636,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xrpc-rs",
-]
-
-[[package]]
-name = "qs-core"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "nanoid",
- "qs-symbols",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3733,7 +3721,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
- "qs-core",
+ "quant-system-core",
  "regex",
  "serde",
  "serde_json",
@@ -3754,6 +3742,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "quant-system-core"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "nanoid",
+ "qs-symbols",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

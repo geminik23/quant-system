@@ -25,7 +25,7 @@ repository = "https://github.com/geminik23/quant-system"
 criterion = "0.5"
 
 # Workspace crates
-qs-core = { path = "crates/core", version = "0.2.0" }
+qs-core = { package = "quant-system-core", path = "crates/core", version = "0.2.0" }
 qs-backtest = { path = "crates/backtest", version = "0.2.0" }
 qs-backtest-api = { path = "crates/backtest-api", version = "0.2.0" }
 qs-data-preprocess = { path = "crates/data-preprocess", version = "0.2.0", default-features = false }

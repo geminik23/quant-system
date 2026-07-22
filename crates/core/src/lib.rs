@@ -1,4 +1,4 @@
-//! `qs-core` — Core trade engine for the quant-system workspace.
+//! `quant-system-core` package (`qs_core` library) - Core trade engine for the quant-system workspace.
 //!
 //! This crate provides the **synchronous, side-effect-free** trading domain used by backtesting and future live integrations. It contains the trade engine, normalized signal intent, management-policy resolution, position sizing, and currency-conversion logic, but performs no configuration IO, networking, storage, or broker calls.
 //!

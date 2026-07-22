@@ -1,4 +1,4 @@
-//! Integration tests for qs-core trade engine.
+//! Integration tests for the quant-system-core trade engine.
 
 use chrono::NaiveDate;
 use chrono::NaiveDateTime;

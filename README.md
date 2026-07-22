@@ -110,7 +110,7 @@ CTrader FIX ---> Market Data Service ---> real-time bid/ask consumers
 
 | Area | Crates | Responsibility |
 |---|---|---|
-| Trading domain | [`qs-core`](crates/core/), [`qs-symbols`](crates/symbols/) | Trade engine, normalized actions, management policies, sizing, currency conversion, and symbol metadata |
+| Trading domain | [`quant-system-core`](crates/core/) (`qs_core` library), [`qs-symbols`](crates/symbols/) | Trade engine, normalized actions, management policies, sizing, currency conversion, and symbol metadata |
 | Historical replay | [`qs-backtest`](crates/backtest/), [`qs-backtest-server`](crates/backtest-server/) | Deterministic replay, accounting, metrics, profiles, retained jobs, and result delivery |
 | Historical data | [`qs-data-preprocess`](crates/data-preprocess/) | CSV import, partitioned storage, bounded queries, and data management |
 | Service contracts | [`qs-service`](crates/service/), [`qs-backtest-api`](crates/backtest-api/), [`qs-market-data-api`](crates/market-data-api/) | Provider-neutral endpoints, failures, DTOs, events, and typed client ports |
