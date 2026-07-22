@@ -602,28 +602,6 @@ fn assert_future_quote_results_equal(
 // ── RPC Types Serde ─────────────────────────────────────────────────────────
 
 #[test]
-fn connect_request_serde_roundtrip() {
-    let req = ConnectRequest {
-        client_name: "test-client".into(),
-    };
-    let json = serde_json::to_string(&req).unwrap();
-    let decoded: ConnectRequest = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded.client_name, "test-client");
-}
-
-#[test]
-fn connect_response_serde_roundtrip() {
-    let resp = ConnectResponse {
-        client_id: 42,
-        slot_name: "backtest-client-42".into(),
-    };
-    let json = serde_json::to_string(&resp).unwrap();
-    let decoded: ConnectResponse = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded.client_id, 42);
-    assert_eq!(decoded.slot_name, "backtest-client-42");
-}
-
-#[test]
 fn ping_response_serde_roundtrip() {
     let resp = PingResponse {
         status: "OK".into(),
@@ -2138,7 +2116,7 @@ level = "debug"
     assert_eq!(cfg.jobs.retention_secs, 120);
     assert_eq!(cfg.jobs.cleanup_interval_secs, 5);
     assert_eq!(cfg.jobs.max_retained_jobs, 25);
-    assert_eq!(cfg.artifacts.directory, "temp/backtest-artifacts");
+    assert_eq!(cfg.artifacts.directory, "backtest-artifacts");
     assert_eq!(cfg.artifacts.inline_limit_bytes, 12 * 1024 * 1024);
     assert_eq!(cfg.artifacts.chunk_size, 1024 * 1024);
     assert_eq!(cfg.artifacts.retention_secs, 3_600);
@@ -2166,12 +2144,56 @@ profiles_path = "prof.toml"
     assert_eq!(cfg.jobs.retention_secs, 3_600);
     assert_eq!(cfg.jobs.cleanup_interval_secs, 60);
     assert_eq!(cfg.jobs.max_retained_jobs, 1_000);
-    assert_eq!(cfg.artifacts.directory, "temp/backtest-artifacts");
+    assert_eq!(cfg.artifacts.directory, "backtest-artifacts");
     assert_eq!(cfg.artifacts.inline_limit_bytes, 12 * 1024 * 1024);
     assert_eq!(cfg.artifacts.chunk_size, 1024 * 1024);
     assert_eq!(cfg.artifacts.retention_secs, 3_600);
     assert_eq!(cfg.artifacts.max_total_bytes, 1024 * 1024 * 1024);
     assert_eq!(cfg.logging.level, "info"); // default
+}
+
+#[test]
+fn service_endpoint_config_supports_current_legacy_and_conflict_diagnostics() {
+    fn config(server: &str) -> ServerConfig {
+        toml::from_str(&format!(
+            r#"
+[server]
+{server}
+
+[database]
+data_dir = "data"
+
+[symbols]
+registry_path = "sym.toml"
+
+[profiles]
+profiles_path = "prof.toml"
+"#,
+        ))
+        .unwrap()
+    }
+
+    let current = config("endpoint = \"unix:///tmp/backtest.sock\"");
+    assert_eq!(
+        current.server.resolved_endpoint().unwrap().to_string(),
+        "unix:///tmp/backtest.sock"
+    );
+
+    let legacy = config("shm_name = \"legacy-backtest\"");
+    assert_eq!(
+        legacy.server.resolved_endpoint().unwrap().to_string(),
+        "shm://legacy-backtest"
+    );
+
+    let conflicting = config("endpoint = \"tcp://127.0.0.1:41001\"\nshm_name = \"backtest\"");
+    assert!(
+        conflicting
+            .server
+            .resolved_endpoint()
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting server.endpoint")
+    );
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────

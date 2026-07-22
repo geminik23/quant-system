@@ -1,48 +1,32 @@
 # market-data
 
-Real-time market data service that connects to **CTrader FIX API** for live forex/CFD prices and exposes them to local clients via **xrpc-rs shared memory IPC**.
+Real-time market-data service that connects to the CTrader FIX API for live forex/CFD bid and ask prices, then exposes snapshots, subscriptions, source state, and price alerts through a logical service endpoint.
 
 ## Features
 
-- Live bid/ask price streaming from CTrader FIX protocol
-- Multi-client support via shared memory acceptor pattern (one shm segment per client)
+- Live bid/ask streaming from CTrader FIX
 - Per-client price subscriptions with symbol filtering
-- One-shot price alerts with ABOVE/BELOW thresholds
-- Automatic CTrader reconnection on disconnect
-- Alert ownership tracking and cleanup on client disconnect
+- One-shot ABOVE/BELOW price alerts with ownership cleanup
+- Automatic CTrader reconnection
+- Shared-memory default plus Unix-socket and loopback-TCP endpoints
+- One owned client lifecycle with deterministic close and task join
 
-## Quick Start
+## Quick start
 
 ```bash
-# Build the server
 cargo build -p qs-market-data
-
-# Run the server
-cargo run -p qs-market-data --bin ctrader_market_data -- --config path/to/config.toml
-
-# Run tests
+cargo run -p qs-market-data --bin ctrader_market_data -- --config crates/market-data/template_config_market_data.toml
 cargo test -p qs-market-data
-
-# Run the TUI client (streaming + commands)
-cargo run -p qs-market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
-
-# Run the minimal example client
-cargo run -p qs-market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
 ```
 
-### Install via cargo
+Run the optional TUI or minimal example against the default endpoint:
 
 ```bash
-# Install the CTrader server binary
-cargo install qs-market-data --bin ctrader_market_data
-
-# Install the TUI client
-cargo install qs-market-data --bin market_data_client --features tui-client
+cargo run -p qs-market-data --features tui-client --bin market_data_client -- --endpoint shm://market-data --symbols eurusd,xauusd
+cargo run -p qs-market-data --example client -- --endpoint shm://market-data --symbols eurusd,xauusd
 ```
 
 ## Configuration
-
-See `template_config_market_data.toml` for a full template.
 
 ```toml
 [ctrader]
@@ -53,65 +37,56 @@ password = "your_password"
 ssl = false
 
 [market_data]
-shm_name = "market-data"         # base name for shm endpoints
-shm_buffer_size = 4194304        # 4MB per client slot
+endpoint = "shm://market-data"
+shm_buffer_size = 4194304
+max_connections = 256
+allow_insecure_non_loopback = false
 
 [logging]
 level = "info"
 ```
 
-## Client Connection Flow
+Supported endpoints are `shm://NAME`, `unix:///absolute/path.sock`, and `tcp://IP:PORT`. SHM remains the recommended same-host default. Unix sockets provide direct same-host IPC without SHM mappings. TCP is unauthenticated and restricted to loopback unless `allow_insecure_non_loopback = true` explicitly acknowledges a trusted-network boundary; do not expose it directly to the public Internet.
 
-1. Connect to `shm://{shm_name}-accept`
-2. Call `connect` RPC → server assigns a `client_id` and dedicated `shm://{shm_name}-client-{id}`
-3. Disconnect from acceptor, reconnect to the dedicated slot
-4. All subsequent RPCs go through the dedicated slot
-5. On disconnect, server cleans up all alerts owned by that client
+Legacy `shm_name = "market-data"` configuration and the `--shm-name` client argument remain accepted during migration, but new deployments should use `endpoint`.
 
-## Runtime Compatibility
+## Client contract
 
-The service uses `xrpc-rs` 0.3.1 with explicit client startup, deterministic close/join semantics, and retry-safe connected idle receive handling. A server and client attached to the same named SHM endpoint must use the same xrpc SHM generation.
+The provider-neutral `MarketDataClient` trait lives in `qs-market-data-api`. Application consumers work with typed snapshots, commands, and event streams; they do not construct transport handshakes, shared-memory slot names, or RPC receive-task handles.
 
-Versions 0.3.0 and 0.3.1 are wire- and SHM-layout-compatible. The 0.3 SHM layout is intentionally incompatible with 0.2 mappings. Stop 0.2 peers before reusing an endpoint name; startup cleanup removes stale mappings. The mapping is an ephemeral IPC ring buffer, so historical data and application state require no migration.
+### Unary operations
 
-For a side-by-side cutover, use non-overlapping base names such as `qsmd02` and `qsmd03`. Cleanup is prefix-based, so do not run endpoint names where one configured base is a prefix of another.
+| Operation | Request | Response |
+|---|---|---|
+| Ping | `()` | `CommandAck` |
+| Source state | `()` | `GetStateResponse` |
+| Symbols | `()` | `GetSymbolListResponse` |
+| One snapshot | `GetPriceRequest` | `GetPriceResponse` |
+| Multiple snapshots | `GetPricesRequest` | `GetPricesResponse` |
+| Subscribe | `SubscribePricesRequest` | `CommandAck` |
+| Unsubscribe | `UnsubscribePricesRequest` | `CommandAck` |
+| Clear subscription | `()` | `CommandAck` |
+| Set alert | `SetAlertRequest` | `CommandAck` |
+| Remove alert | `RemoveAlertRequest` | `CommandAck` |
+| Owned alerts | `()` | `GetAlertsResponse` |
 
-## RPC Methods
+### Streams
 
-### Unary
+| Stream | Item | Meaning |
+|---|---|---|
+| Price stream | `PriceTick` | Subscription-filtered bid/ask updates |
+| Alert stream | `AlertResult` | Triggers for alerts owned by the client |
+| Combined event stream | `StreamEvent` | Price updates and CTrader source-state changes |
 
-| Method | Request | Response | Description |
-|--------|---------|----------|-------------|
-| `connect` | `ConnectRequest` | `ConnectResponse` | Acceptor handshake, get dedicated slot |
-| `ping` | `()` | `CommandAck` | Health check |
-| `get_state` | `()` | `GetStateResponse` | Connection state |
-| `get_symbols` | `()` | `GetSymbolListResponse` | All available symbols |
-| `get_price` | `GetPriceRequest` | `GetPriceResponse` | Latest bid/ask for one symbol |
-| `get_prices` | `GetPricesRequest` | `GetPricesResponse` | Latest bid/ask for multiple symbols |
-| `subscribe` | `SubscribePricesRequest` | `CommandAck` | Subscribe to price stream |
-| `unsubscribe` | `UnsubscribePricesRequest` | `CommandAck` | Remove symbols from subscription |
-| `clear_subscription` | `()` | `CommandAck` | Clear all subscriptions |
-| `set_alert` | `SetAlertRequest` | `CommandAck` | Set price alert (ABOVE/BELOW) |
-| `remove_alert` | `RemoveAlertRequest` | `CommandAck` | Remove an owned alert |
-| `get_alerts` | `()` | `GetAlertsResponse` | Query active alerts owned by this client |
+Transport connectivity and CTrader source freshness are separate states. A connected service session does not imply that the upstream venue connection is current, so consumers must observe source-state events and treat reconnect/resubscribe as potentially data-loss-visible behavior.
 
-### Server Streaming
+## Provider compatibility
 
-| Method | Request | Stream Item | Description |
-|--------|---------|-------------|-------------|
-| `stream_prices` | `()` | `PriceTick` | Continuous price ticks (filtered by subscription) |
-| `stream_alerts` | `()` | `AlertResult` | Alert trigger notifications (filtered by ownership) |
-| `stream_events` | `()` | `StreamEvent` | Price ticks + connection state changes (recommended) |
-
-## Wire Format
-
-All RPC types derive `serde::{Serialize, Deserialize}`. The xrpc-rs transport uses **Bincode** encoding by default (not JSON). The `serde_json` dependency is only used in tests and error types.
+The current internal provider uses xrpc-rs 0.3.1. Its 0.3.0 and 0.3.1 SHM layouts are compatible with one another, while the 0.3 SHM generation is incompatible with 0.2. Stop old peers before reusing the same SHM endpoint or use non-overlapping endpoint names for a side-by-side cutover. The common service runtime owns exact endpoint cleanup, connection limits, accept loops, and close/join behavior.
 
 ## License
 
-Licensed under either of
+Licensed under either of:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 - MIT License ([LICENSE-MIT](../../LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.

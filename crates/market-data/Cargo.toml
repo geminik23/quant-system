@@ -1,10 +1,11 @@
 [package]
 name = "qs-market-data"
-version = "0.1.0"
+version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Real-time market data service with shared memory IPC"
+description = "Real-time CTrader market-data service with configurable local transports"
 keywords = ["market-data", "ipc", "ctrader", "trading"]
 categories = ["finance"]
 
@@ -39,7 +40,10 @@ nanoid = { workspace = true }
 toml = { workspace = true }
 ctrader-fix = { workspace = true }
 xrpc-rs = { workspace = true }
-qs-symbols = { path = "../symbols" }
+qs-market-data-api = { workspace = true }
+qs-service = { workspace = true }
+qs-service-xrpc = { workspace = true }
+qs-symbols = { workspace = true }
 
 # Optional — only pulled in by the tui-client feature
 ratatui = { workspace = true, optional = true }

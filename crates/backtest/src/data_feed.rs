@@ -5,7 +5,7 @@
 //!
 //! - [`VecFeed`] — wraps a pre-loaded `Vec<MarketEvent>` (useful for tests and
 //!   any data source you can materialise up-front).
-//! - Conversion helpers from `qs-data-preprocess` types ([`Tick`], [`Bar`]) so
+//! - Conversion helpers from `qs-data-preprocess` types (`Tick`, `Bar`) so
 //!   you can query DuckDB, convert the results, and feed them straight in.
 
 use std::cmp::Reverse;

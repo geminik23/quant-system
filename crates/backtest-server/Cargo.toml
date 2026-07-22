@@ -1,10 +1,11 @@
 [package]
 name = "qs-backtest-server"
-version = "0.1.0"
+version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Backtest server with shared memory IPC via xrpc-rs"
+description = "Transport-neutral retained-job backtest service and CLI"
 keywords = ["backtest", "server", "ipc", "trading"]
 categories = ["finance"]
 
@@ -20,10 +21,13 @@ name = "tg_backtest"
 path = "src/bin/tg_backtest.rs"
 
 [dependencies]
-qs-core = { path = "../core" }
-qs-backtest = { path = "../backtest" }
-qs-data-preprocess = { path = "../data-preprocess" }
-qs-symbols = { path = "../symbols" }
+qs-core = { workspace = true }
+qs-backtest = { workspace = true }
+qs-backtest-api = { workspace = true }
+qs-data-preprocess = { workspace = true, features = ["parquet"] }
+qs-service = { workspace = true }
+qs-service-xrpc = { workspace = true }
+qs-symbols = { workspace = true }
 
 tokio = { workspace = true }
 futures = { workspace = true }

@@ -1,24 +1,29 @@
 //! Basic CLI client for the market data service.
 //!
-//! Connects to the market data server via shared memory, subscribes to
-//! price ticks, sets a price alert, and streams prices.
+//! Connects to the market-data service, subscribes to price ticks, sets a
+//! price alert, and streams prices.
 //!
 //! Usage:
 //!   cargo run -p qs-market-data --example client
-//!   cargo run -p qs-market-data --example client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p qs-market-data --example client -- --endpoint shm://market-data --symbols eurusd,xauusd
 
 use std::sync::Arc;
 
 use clap::Parser;
 use market_data::rpc_types::*;
-use xrpc::{MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryFrameTransport};
+use qs_service::ServiceEndpoint;
+use qs_service_xrpc::{BincodeCodec, DynRpcClient, XrpcClientSession, XrpcTransportConfig};
 
 #[derive(Parser, Debug)]
-#[command(about = "Market data xrpc client example")]
+#[command(about = "Market data service client example")]
 struct Args {
-    /// Shared memory acceptor name (must match server config)
+    /// Legacy shared-memory service name (must match server configuration).
     #[arg(long, default_value = "market-data")]
     shm_name: String,
+
+    /// Transport endpoint. When omitted, `--shm-name` is interpreted as `shm://NAME`.
+    #[arg(long)]
+    endpoint: Option<ServiceEndpoint>,
 
     /// Symbols to subscribe to (comma-separated, empty = all)
     #[arg(long, default_value = "")]
@@ -29,11 +34,11 @@ struct Args {
     alert: Option<String>,
 }
 
-type MarketClient = RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport>>;
+type MarketClient = DynRpcClient<BincodeCodec>;
 
 struct MarketClientSession {
     client: Arc<MarketClient>,
-    handle: RpcClientHandle,
+    session: XrpcClientSession<BincodeCodec>,
 }
 
 impl MarketClientSession {
@@ -42,64 +47,29 @@ impl MarketClientSession {
     }
 
     async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
-        let close_result = self.client.close().await;
-        let join_result = self.handle.join().await;
-        close_result?;
-        join_result?;
+        self.session.close().await?;
         Ok(())
     }
 }
 
-/// Connect to the acceptor, get a dedicated slot, and retain its client handle.
+/// Connect through the configured logical service endpoint.
 async fn connect(
-    shm_name: &str,
+    endpoint: &ServiceEndpoint,
     client_name: &str,
-) -> Result<(MarketClientSession, ConnectResponse), Box<dyn std::error::Error>> {
-    let accept_name = format!("{}-accept", shm_name);
-
-    // Step 1: Connect to acceptor
-    let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
-    let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
-    let acceptor_client = RpcClient::new(acceptor_channel);
-    let acceptor_handle = acceptor_client.try_start()?;
-
-    let response: Result<ConnectResponse, _> = acceptor_client
-        .call(
-            "connect",
-            &ConnectRequest {
-                client_name: client_name.into(),
-            },
-        )
-        .await;
-
-    if response.is_ok() {
-        // Give the server time to publish the dedicated SHM mapping.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let acceptor_close_result = acceptor_client.close().await;
-    let acceptor_join_result = acceptor_handle.join().await;
-    let resp = response?;
-    acceptor_close_result?;
-    acceptor_join_result?;
-
+) -> Result<MarketClientSession, Box<dyn std::error::Error>> {
+    let session = qs_service_xrpc::connect(
+        endpoint,
+        client_name,
+        &XrpcTransportConfig::default(),
+        BincodeCodec,
+    )
+    .await?;
     println!(
-        "[connect] assigned client_id={}, slot={}",
-        resp.client_id, resp.slot_name
+        "[connect] endpoint={endpoint} client_id={:?}",
+        session.logical_client_id()
     );
-
-    // Step 2: Connect to dedicated slot
-    let transport = SharedMemoryFrameTransport::connect_client(&resp.slot_name)?;
-    let channel = MessageChannelAdapter::new(transport);
-    let client = RpcClient::new(channel);
-    let handle = client.try_start()?;
-
-    Ok((
-        MarketClientSession {
-            client: Arc::new(client),
-            handle,
-        },
-        resp,
-    ))
+    let client = session.raw_client();
+    Ok(MarketClientSession { client, session })
 }
 
 #[tokio::main]
@@ -107,7 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Connect
-    let (session, _info) = connect(&args.shm_name, "example-client").await?;
+    let endpoint = match args.endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None => format!("shm://{}", args.shm_name).parse()?,
+    };
+    let session = connect(&endpoint, "example-client").await?;
     let client = session.client();
 
     let operation_result: Result<(), Box<dyn std::error::Error>> = async {

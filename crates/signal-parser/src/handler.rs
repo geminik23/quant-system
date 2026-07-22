@@ -1,5 +1,5 @@
 use chrono::NaiveDateTime;
-use qs_backtest::RawSignal;
+use qs_core::RawSignal;
 
 //
 // Context passed to signal handler callbacks.

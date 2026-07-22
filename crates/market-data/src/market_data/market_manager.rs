@@ -237,7 +237,7 @@ impl MarketManager {
                 "Reconnection attempt {}{} in {}s...",
                 attempt,
                 if max_attempts > 0 {
-                    format!("/{}", max_attempts)
+                    format!("/{max_attempts}")
                 } else {
                     String::new()
                 },

@@ -120,7 +120,7 @@ pub fn parse_required_f64(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<f64>().ok())
-        .ok_or_else(|| format!("line {}: missing or invalid {}", line, name))
+        .ok_or_else(|| format!("line {line}: missing or invalid {name}"))
 }
 
 /// Parse a required i64 field; returns None if missing or invalid.

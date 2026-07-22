@@ -341,18 +341,12 @@ fn handle_remove_parquet(
             let exchange = normalize_exchange(&exchange);
             let symbol = symbol.to_uppercase();
             let (t, b) = store.delete_symbol(&exchange, &symbol)?;
-            println!(
-                "Removed {} ticks + {} bars for {}/{}",
-                t, b, exchange, symbol
-            );
+            println!("Removed {t} ticks + {b} bars for {exchange}/{symbol}");
         }
         RemoveType::Exchange { exchange } => {
             let exchange = normalize_exchange(&exchange);
             let (t, b) = store.delete_exchange(&exchange)?;
-            println!(
-                "Removed {} ticks + {} bars for exchange '{}'",
-                t, b, exchange
-            );
+            println!("Removed {t} ticks + {b} bars for exchange '{exchange}'");
         }
     }
     Ok(())
@@ -544,18 +538,12 @@ fn handle_remove_duckdb(
             let exchange = normalize_exchange(&exchange);
             let symbol = symbol.to_uppercase();
             let (t, b) = db.delete_symbol(&exchange, &symbol)?;
-            println!(
-                "Removed {} ticks + {} bars for {}/{}",
-                t, b, exchange, symbol
-            );
+            println!("Removed {t} ticks + {b} bars for {exchange}/{symbol}");
         }
         RemoveType::Exchange { exchange } => {
             let exchange = normalize_exchange(&exchange);
             let (t, b) = db.delete_exchange(&exchange)?;
-            println!(
-                "Removed {} ticks + {} bars for exchange '{}'",
-                t, b, exchange
-            );
+            println!("Removed {t} ticks + {b} bars for exchange '{exchange}'");
         }
     }
     Ok(())

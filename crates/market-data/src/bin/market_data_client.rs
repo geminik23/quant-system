@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   cargo run -p qs-market-data --features tui-client --bin market_data_client
-//!   cargo run -p qs-market-data --features tui-client --bin market_data_client -- --shm-name market-data --symbols eurusd,xauusd
+//!   cargo run -p qs-market-data --features tui-client --bin market_data_client -- --endpoint shm://market-data --symbols eurusd,xauusd
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -27,18 +27,16 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 use market_data::rpc_types::*;
-use xrpc::{
-    MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryConfig,
-    SharedMemoryFrameTransport,
-};
+use qs_service::ServiceEndpoint;
+use qs_service_xrpc::{BincodeCodec, DynRpcClient, XrpcClientSession, XrpcTransportConfig};
 
 // ── Types ──
 
-type MarketClient = RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport>>;
+type MarketClient = DynRpcClient<BincodeCodec>;
 
 struct MarketClientSession {
     client: Arc<MarketClient>,
-    handle: RpcClientHandle,
+    session: XrpcClientSession<BincodeCodec>,
 }
 
 impl MarketClientSession {
@@ -47,24 +45,16 @@ impl MarketClientSession {
     }
 
     async fn shutdown(self, graceful_timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
-        match tokio::time::timeout(graceful_timeout, self.client.close()).await {
-            Ok(close_result) => {
-                let join_result = self.handle.join().await;
-                close_result?;
-                join_result?;
-                Ok(())
-            }
-            Err(_) => {
-                self.handle.shutdown().await;
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "market-data RPC client did not close within {}ms; receive task was forced down",
-                        graceful_timeout.as_millis()
-                    ),
-                )
-                .into())
-            }
+        match tokio::time::timeout(graceful_timeout, self.session.close()).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "market-data RPC client did not close within {}ms",
+                    graceful_timeout.as_millis()
+                ),
+            )
+            .into()),
         }
     }
 }
@@ -75,9 +65,13 @@ impl MarketClientSession {
     about = "Market data TUI client — live prices + command palette"
 )]
 struct Args {
-    /// Shared memory acceptor name (must match server config)
+    /// Legacy shared-memory service name (must match server configuration).
     #[arg(long, default_value = "market-data")]
     shm_name: String,
+
+    /// Transport endpoint. When omitted, `--shm-name` is interpreted as `shm://NAME`.
+    #[arg(long)]
+    endpoint: Option<ServiceEndpoint>,
 
     /// Symbols to subscribe (comma-separated, empty = all)
     #[arg(long, default_value = "")]
@@ -91,48 +85,23 @@ struct Args {
 // ── Connection ──
 
 async fn connect(
-    shm_name: &str,
+    endpoint: &ServiceEndpoint,
     client_name: &str,
-) -> Result<(MarketClientSession, ConnectResponse), Box<dyn std::error::Error>> {
-    let accept_name = format!("{}-accept", shm_name);
-
-    let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
-    let acceptor_channel = MessageChannelAdapter::new(acceptor_transport);
-    let acceptor_client = RpcClient::new(acceptor_channel);
-    let acceptor_handle = acceptor_client.try_start()?;
-
-    let response: Result<ConnectResponse, _> = acceptor_client
-        .call(
-            "connect",
-            &ConnectRequest {
-                client_name: client_name.into(),
-            },
-        )
-        .await;
-
-    if response.is_ok() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let acceptor_close_result = acceptor_client.close().await;
-    let acceptor_join_result = acceptor_handle.join().await;
-    let resp = response?;
-    acceptor_close_result?;
-    acceptor_join_result?;
-
-    let cfg = SharedMemoryConfig::new()
-        .with_read_timeout(Duration::from_secs(300))
-        .with_write_timeout(Duration::from_secs(30));
-    let transport = SharedMemoryFrameTransport::connect_client_with_config(&resp.slot_name, cfg)?;
-    let channel = MessageChannelAdapter::new(transport);
-    let client = RpcClient::new(channel);
-    let handle = client.try_start()?;
-
+) -> Result<(MarketClientSession, usize, String), Box<dyn std::error::Error>> {
+    let session = qs_service_xrpc::connect(
+        endpoint,
+        client_name,
+        &XrpcTransportConfig::default(),
+        BincodeCodec,
+    )
+    .await?;
+    let client_id = session.logical_client_id().unwrap_or_default();
+    let connected_endpoint = session.endpoint().to_string();
+    let client = session.raw_client();
     Ok((
-        MarketClientSession {
-            client: Arc::new(client),
-            handle,
-        },
-        resp,
+        MarketClientSession { client, session },
+        client_id,
+        connected_endpoint,
     ))
 }
 
@@ -374,7 +343,7 @@ struct LogEntry {
 struct App {
     // Connection
     client_id: usize,
-    slot_name: String,
+    endpoint_label: String,
     conn_status: ConnStatus,
     subscribed: Vec<String>,
 
@@ -410,7 +379,7 @@ impl App {
         let (rpc_tx, rpc_rx) = mpsc::channel(4);
         Self {
             client_id: 0,
-            slot_name: String::new(),
+            endpoint_label: String::new(),
             conn_status: ConnStatus::Connecting,
             subscribed: symbols,
 
@@ -614,8 +583,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("Client: ", Style::new().bold()),
         Span::raw(app.client_id.to_string()),
         Span::raw("  "),
-        Span::styled("Slot: ", Style::new().bold()),
-        Span::styled(&app.slot_name, Style::new().fg(Color::DarkGray)),
+        Span::styled("Endpoint: ", Style::new().bold()),
+        Span::styled(&app.endpoint_label, Style::new().fg(Color::DarkGray)),
     ]);
 
     let line2 = Line::from(vec![
@@ -1182,7 +1151,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();
 
     // Connect before entering TUI (errors print to stderr before alternate screen)
-    let (session, resp) = match connect(&args.shm_name, &args.client_name).await {
+    let endpoint = match args.endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None => format!("shm://{}", args.shm_name).parse()?,
+    };
+    let (session, client_id, connected_endpoint) = match connect(&endpoint, &args.client_name).await
+    {
         Ok(r) => r,
         Err(e) => {
             ratatui::restore();
@@ -1191,8 +1165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    app.client_id = resp.client_id;
-    app.slot_name = resp.slot_name;
+    app.client_id = client_id;
+    app.endpoint_label = connected_endpoint;
     app.conn_status = ConnStatus::Connected;
 
     let result = run(&mut terminal, &mut app, session.client()).await;

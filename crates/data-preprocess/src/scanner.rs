@@ -947,9 +947,9 @@ fn list_partitions(
     for entry in fs::read_dir(directory)? {
         ensure_not_cancelled(is_cancelled)?;
         let path = entry?.path();
-        if !path
+        if path
             .extension()
-            .is_some_and(|extension| extension == "parquet")
+            .is_none_or(|extension| extension != "parquet")
         {
             continue;
         }

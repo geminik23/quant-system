@@ -3,10 +3,10 @@
 # Copy this file to config.toml and adjust paths for your environment.
 
 [server]
-# Base name for shared memory endpoints.
-# Acceptor listens on shm://{shm_name}-accept
-# Clients get dedicated slots: shm://{shm_name}-client-{id}
-shm_name = "backtest"
+# Logical service endpoint. SHM is the default local deployment; Unix sockets and
+# loopback TCP are also supported, for example unix:///tmp/backtest.sock or
+# tcp://127.0.0.1:41001. TCP has no built-in authentication or TLS.
+endpoint = "shm://backtest"
 
 # Per-client SHM buffer size in bytes (default: 16 MB).
 # Increase if FutureQuoteV1 results or artifacts exceed the buffer.
@@ -39,7 +39,7 @@ max_retained_jobs = 1000
 
 [artifacts]
 # Filesystem directory for complete result JSON artifacts.
-directory = "temp/backtest-artifacts"
+directory = "backtest-artifacts"
 # Results up to 12 MiB can be returned inline while preserving the 16 MiB transport.
 inline_limit_bytes = 12582912
 # Raw bytes returned per base64-encoded chunk RPC.

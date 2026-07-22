@@ -1,8 +1,7 @@
 //! Backtest server client example.
 //!
-//! Connects to the backtest server over shared memory, demonstrates the full
-//! client workflow: handshake → ping → list profiles → list symbols → run
-//! backtest with F14 raw signals.
+//! Connects to the backtest service and demonstrates ping, profile/symbol
+//! discovery, and a backtest with raw signals.
 //!
 //! # Usage
 //!
@@ -12,7 +11,7 @@
 //!
 //! # With custom options:
 //! cargo run -p qs-backtest-server --example backtest_client -- \
-//!     --shm-name backtest \
+//!     --endpoint shm://backtest \
 //!     --symbol EURUSD \
 //!     --exchange oanda \
 //!     --data-type tick \
@@ -34,21 +33,24 @@ use std::sync::Arc;
 use clap::Parser;
 
 use backtest_server::rpc_types::*;
-use xrpc::{
-    JsonCodec, MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryFrameTransport,
-};
+use qs_service::ServiceEndpoint;
+use qs_service_xrpc::{DynRpcClient, JsonCodec, XrpcClientSession, XrpcTransportConfig};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = "backtest-client",
-    about = "Example client for the backtest RPC server over shared memory"
+    about = "Example client for the backtest service"
 )]
 struct Args {
     /// Shared memory base name (must match server config).
     #[arg(long, default_value = "backtest")]
     shm_name: String,
+
+    /// Transport endpoint. When omitted, `--shm-name` is interpreted as `shm://NAME`.
+    #[arg(long)]
+    endpoint: Option<ServiceEndpoint>,
 
     /// Symbol to backtest (e.g. EURUSD, XAUUSD).
     #[arg(long, default_value = "EURUSD")]
@@ -85,12 +87,11 @@ struct Args {
 
 // ── Connection Helper ───────────────────────────────────────────────────────
 
-type BacktestRpcClient =
-    RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>;
+type BacktestRpcClient = DynRpcClient<JsonCodec>;
 
 struct BacktestClientSession {
     client: Arc<BacktestRpcClient>,
-    handle: RpcClientHandle,
+    session: XrpcClientSession<JsonCodec>,
 }
 
 impl BacktestClientSession {
@@ -99,66 +100,26 @@ impl BacktestClientSession {
     }
 
     async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
-        let close_result = self.client.close().await;
-        let join_result = self.handle.join().await;
-        close_result?;
-        join_result?;
+        self.session.close().await?;
         Ok(())
     }
 }
 
-/// Connect to the acceptor endpoint, receive a dedicated slot, and retain the
-/// dedicated client's receive-task handle.
+/// Connect through the configured logical service endpoint.
 async fn connect(
-    shm_name: &str,
+    endpoint: &ServiceEndpoint,
     client_name: &str,
-) -> Result<(BacktestClientSession, ConnectResponse), Box<dyn std::error::Error>> {
-    let accept_name = format!("{}-accept", shm_name);
-    println!("  Connecting to acceptor shm://{} ...", accept_name);
-
-    // Step 1: Connect to the well-known acceptor endpoint.
-    let acceptor_transport = SharedMemoryFrameTransport::connect_client(&accept_name)?;
-    let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
-    let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
-    let acceptor_handle = acceptor_client.try_start()?;
-
-    let response: Result<ConnectResponse, _> = acceptor_client
-        .call(
-            "connect",
-            &ConnectRequest {
-                client_name: client_name.into(),
-            },
-        )
-        .await;
-
-    if response.is_ok() {
-        // Give the server time to publish the dedicated SHM mapping.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let acceptor_close_result = acceptor_client.close().await;
-    let acceptor_join_result = acceptor_handle.join().await;
-    let resp = response?;
-    acceptor_close_result?;
-    acceptor_join_result?;
-
-    println!(
-        "  Assigned client_id={}, slot=shm://{}",
-        resp.client_id, resp.slot_name
-    );
-
-    // Step 2: Connect to the dedicated per-client slot.
-    let transport = SharedMemoryFrameTransport::connect_client(&resp.slot_name)?;
-    let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
-    let client = RpcClient::with_codec(channel, JsonCodec);
-    let handle = client.try_start()?;
-
-    Ok((
-        BacktestClientSession {
-            client: Arc::new(client),
-            handle,
-        },
-        resp,
-    ))
+) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
+    println!("  Connecting to {endpoint} ...");
+    let session = qs_service_xrpc::connect(
+        endpoint,
+        client_name,
+        &XrpcTransportConfig::default(),
+        JsonCodec,
+    )
+    .await?;
+    let client = session.raw_client();
+    Ok(BacktestClientSession { client, session })
 }
 
 // ── Display Helpers ─────────────────────────────────────────────────────────
@@ -453,7 +414,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 1. Connect ──────────────────────────────────────────────────────
     print_header("Connecting to Backtest Server");
-    let (session, _info) = connect(&args.shm_name, "example-backtest-client").await?;
+    let endpoint = match args.endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None => format!("shm://{}", args.shm_name).parse()?,
+    };
+    let session = connect(&endpoint, "example-backtest-client").await?;
     let client = session.client();
 
     let operation_result: Result<(), Box<dyn std::error::Error>> = async {

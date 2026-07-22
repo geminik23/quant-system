@@ -23,11 +23,9 @@ use backtest_server::rpc_types::*;
 use qs_backtest::currency::{ConversionRoute, RunCurrencyPlan};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
 use qs_backtest::{DEFAULT_MTM_MAX_POINTS, MAX_MTM_MAX_POINTS, MIN_MTM_MAX_POINTS, VecFeed};
+use qs_service::ServiceEndpoint;
+use qs_service_xrpc::{DynRpcClient, JsonCodec, XrpcClientSession, XrpcTransportConfig};
 use qs_symbols::SymbolRegistry;
-use xrpc::{
-    JsonCodec, MessageChannelAdapter, RpcClient, RpcClientHandle, SharedMemoryConfig,
-    SharedMemoryFrameTransport,
-};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -170,6 +168,10 @@ struct Args {
     /// Shared memory base name (must match server config).
     #[arg(long, default_value = "backtest")]
     shm_name: String,
+
+    /// Transport endpoint. When omitted, `--shm-name` is interpreted as `shm://NAME`.
+    #[arg(long)]
+    endpoint: Option<ServiceEndpoint>,
 
     /// Single symbol to backtest (e.g. EURUSD, XAUUSD).
     #[arg(long)]
@@ -351,12 +353,11 @@ struct Args {
 
 // ── Connection ──────────────────────────────────────────────────────────────
 
-type BacktestRpcClient =
-    RpcClient<MessageChannelAdapter<SharedMemoryFrameTransport, JsonCodec>, JsonCodec>;
+type BacktestRpcClient = DynRpcClient<JsonCodec>;
 
 struct BacktestClientSession {
     client: Arc<BacktestRpcClient>,
-    handle: RpcClientHandle,
+    session: XrpcClientSession<JsonCodec>,
 }
 
 impl BacktestClientSession {
@@ -365,70 +366,24 @@ impl BacktestClientSession {
     }
 
     async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
-        let close_result = self.client.close().await;
-        let join_result = self.handle.join().await;
-        close_result?;
-        join_result?;
+        self.session.close().await?;
         Ok(())
     }
 }
 
-/// Connect via the SHM acceptor pattern and retain the dedicated receive-task handle.
-async fn connect(shm_name: &str) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
-    let accept_name = format!("{}-accept", shm_name);
-    eprintln!("[connect] acceptor shm://{}", accept_name);
-
-    // Handshake on the well-known acceptor endpoint.
-    let acceptor_transport = SharedMemoryFrameTransport::connect_client_with_config(
-        &accept_name,
-        SharedMemoryConfig::default()
-            .with_read_timeout(std::time::Duration::from_secs(30))
-            .with_write_timeout(std::time::Duration::from_secs(10)),
-    )?;
-    let acceptor_channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(acceptor_transport);
-    let acceptor_client = RpcClient::with_codec(acceptor_channel, JsonCodec);
-    let acceptor_handle = acceptor_client.try_start()?;
-
-    let response: Result<ConnectResponse, _> = acceptor_client
-        .call(
-            "connect",
-            &ConnectRequest {
-                client_name: "tg-backtest".into(),
-            },
-        )
-        .await;
-
-    if response.is_ok() {
-        // Give the server time to publish the dedicated SHM mapping.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let acceptor_close_result = acceptor_client.close().await;
-    let acceptor_join_result = acceptor_handle.join().await;
-    let resp = response?;
-    acceptor_close_result?;
-    acceptor_join_result?;
-
-    eprintln!(
-        "[connect] assigned client_id={}, slot=shm://{}",
-        resp.client_id, resp.slot_name
-    );
-
-    // Reconnect on the dedicated per-client slot.
-    let transport = SharedMemoryFrameTransport::connect_client_with_config(
-        &resp.slot_name,
-        SharedMemoryConfig::default()
-            .with_buffer_size(16 * 1024 * 1024)
-            .with_read_timeout(std::time::Duration::from_secs(300))
-            .with_write_timeout(std::time::Duration::from_secs(30)),
-    )?;
-    let channel = MessageChannelAdapter::<_, JsonCodec>::with_codec(transport);
-    let client = RpcClient::with_codec(channel, JsonCodec);
-    let handle = client.try_start()?;
-
-    Ok(BacktestClientSession {
-        client: Arc::new(client),
-        handle,
-    })
+async fn connect(
+    endpoint: &ServiceEndpoint,
+) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
+    eprintln!("[connect] endpoint={endpoint}");
+    let session = qs_service_xrpc::connect(
+        endpoint,
+        "tg-backtest",
+        &XrpcTransportConfig::default(),
+        JsonCodec,
+    )
+    .await?;
+    let client = session.raw_client();
+    Ok(BacktestClientSession { client, session })
 }
 
 // ── Signal Loading ──────────────────────────────────────────────────────────
@@ -1170,7 +1125,7 @@ async fn interrupt_streamed_job(
 
 async fn watch_backtest_with_reconnect(
     session: &mut BacktestClientSession,
-    shm_name: &str,
+    endpoint: &ServiceEndpoint,
     job_id: &str,
     cancel_on_interrupt: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1208,7 +1163,7 @@ async fn watch_backtest_with_reconnect(
         }
 
         let replacement = tokio::select! {
-            result = connect(shm_name) => result,
+            result = connect(endpoint) => result,
             signal = tokio::signal::ctrl_c() => {
                 return match signal {
                     Ok(()) => Err(interrupt_streamed_job(
@@ -1992,9 +1947,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    ... and {} more", raw_signals.len() - preview);
     }
 
-    // 2. Connect to backtest server via SHM.
+    let endpoint = match args.endpoint.clone() {
+        Some(endpoint) => endpoint,
+        None => format!("shm://{}", args.shm_name).parse()?,
+    };
+
+    // 2. Connect to the backtest service.
     print_header("Connecting to Backtest Server");
-    let mut session = connect(&args.shm_name).await?;
+    let mut session = connect(&endpoint).await?;
     let client = session.client();
     println!("  ✓ Connected");
 
@@ -2072,7 +2032,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if execution_mode(&args) == ExecutionMode::Stream {
                     watch_backtest_with_reconnect(
                         &mut session,
-                        &args.shm_name,
+                        &endpoint,
                         &job_id,
                         args.cancel_on_interrupt,
                     )

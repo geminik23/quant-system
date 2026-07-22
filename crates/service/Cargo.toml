@@ -1,0 +1,15 @@
+[package]
+name = "qs-service"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider-neutral service endpoints and transport failure policy for quant-system"
+keywords = ["service", "transport", "ipc", "rpc"]
+categories = ["network-programming"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+

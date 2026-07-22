@@ -190,7 +190,7 @@ fn format_bytes(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -208,7 +208,7 @@ fn format_count(n: u64) -> String {
 }
 
 fn fmt_opt_f64(v: Option<f64>) -> String {
-    v.map_or(String::new(), |f| format!("{:.2}", f))
+    v.map_or(String::new(), |f| format!("{f:.2}"))
 }
 
 fn fmt_opt_i32(v: Option<i32>) -> String {

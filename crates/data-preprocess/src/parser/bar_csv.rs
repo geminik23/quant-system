@@ -7,7 +7,7 @@ use crate::models::{Bar, Timeframe};
 
 use super::{parse_datetime_to_utc, parse_required_f64, parse_required_i32, parse_required_i64};
 
-/// Parse a bar CSV file into a Vec<Bar>.
+/// Parse a bar CSV file into a `Vec<Bar>`.
 /// Tab-delimited with header row. Timestamps converted from source_offset to UTC.
 pub fn parse_bar_csv(
     path: &Path,
@@ -30,7 +30,7 @@ pub fn parse_bar_csv(
         let record = match record {
             Ok(r) => r,
             Err(e) => {
-                warnings.push(format!("line {}: {}", line_num, e));
+                warnings.push(format!("line {line_num}: {e}"));
                 continue;
             }
         };
@@ -41,7 +41,7 @@ pub fn parse_bar_csv(
         let ts = match parse_datetime_to_utc(date_str, time_str, source_offset) {
             Ok(t) => t,
             Err(e) => {
-                warnings.push(format!("line {}: {}", line_num, e));
+                warnings.push(format!("line {line_num}: {e}"));
                 continue;
             }
         };

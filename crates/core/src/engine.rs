@@ -5198,8 +5198,7 @@ mod tests {
         // The recorded close price should be bid (realistic), not ask
         assert!(
             (partial_record - 1.0905).abs() < 1e-10,
-            "PartialClose should record bid=1.0905, got {}",
-            partial_record
+            "PartialClose should record bid=1.0905, got {partial_record}"
         );
     }
 
@@ -5257,8 +5256,7 @@ mod tests {
         // Buy closes at bid (realistic)
         assert!(
             (partial_record - 1.0870).abs() < 1e-10,
-            "Manual partial close should record bid=1.0870, got {}",
-            partial_record
+            "Manual partial close should record bid=1.0870, got {partial_record}"
         );
     }
 
@@ -5396,8 +5394,7 @@ mod tests {
         let entry = engine.get_position(&id).unwrap().data.average_entry();
         assert!(
             (entry - 1.0848).abs() < 1e-10,
-            "Entry should be bid=1.0848, got {}",
-            entry
+            "Entry should be bid=1.0848, got {entry}"
         );
 
         // Breakeven trigger: for Sell, triggers when ask <= trigger_price
@@ -5411,15 +5408,13 @@ mod tests {
                 e,
                 Effect::StoplossModified { new_price, .. } if (*new_price - 1.0848).abs() < 1e-10
             )),
-            "Breakeven should move SL to average_entry=1.0848, effects: {:?}",
-            effects
+            "Breakeven should move SL to average_entry=1.0848, effects: {effects:?}"
         );
 
         let sl = engine.get_position(&id).unwrap().current_stoploss();
         assert!(
             (sl.unwrap() - 1.0848).abs() < 1e-10,
-            "SL should be at average_entry=1.0848, got {:?}",
-            sl
+            "SL should be at average_entry=1.0848, got {sl:?}"
         );
     }
 

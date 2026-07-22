@@ -36,7 +36,7 @@ pub fn ticks_to_dataframe(ticks: &[Tick]) -> Result<DataFrame> {
     Ok(df)
 }
 
-/// Convert a Polars DataFrame back into Vec<Tick>.
+/// Convert a Polars DataFrame back into `Vec<Tick>`.
 pub fn dataframe_to_ticks(df: &DataFrame) -> Result<Vec<Tick>> {
     let exchanges = df.column("exchange")?.str()?;
     let symbols = df.column("symbol")?.str()?;
@@ -104,7 +104,7 @@ pub fn bars_to_dataframe(bars: &[Bar]) -> Result<DataFrame> {
     Ok(df)
 }
 
-/// Convert a Polars DataFrame back into Vec<Bar>.
+/// Convert a Polars DataFrame back into `Vec<Bar>`.
 pub fn dataframe_to_bars(df: &DataFrame) -> Result<Vec<Bar>> {
     let exchanges = df.column("exchange")?.str()?;
     let symbols = df.column("symbol")?.str()?;

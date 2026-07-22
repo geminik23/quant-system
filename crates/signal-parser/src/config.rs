@@ -73,7 +73,7 @@ pub fn load_parsers_from_str(toml_str: &str) -> Result<ParserRegistry, SignalPar
 mod tests {
     use super::*;
     use crate::types::{ParseContext, ParsedAction};
-    use qs_backtest::RawSignal;
+    use qs_core::RawSignal;
 
     fn parsed_risk(registry: &ParserRegistry, channel_id: i64) -> f64 {
         let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)

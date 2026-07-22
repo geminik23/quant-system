@@ -1172,8 +1172,7 @@ mod parquet_tests {
         let tick_file = dir.join("ticks/exchange=ctrader/symbol=EURUSD/2026-03-02.parquet");
         assert!(
             tick_file.exists(),
-            "tick parquet file should exist at: {:?}",
-            tick_file
+            "tick parquet file should exist at: {tick_file:?}"
         );
 
         // Verify bar directory layout
@@ -1181,8 +1180,7 @@ mod parquet_tests {
             dir.join("bars/exchange=ctrader/symbol=EURUSD/timeframe=1h/2026-03-02.parquet");
         assert!(
             bar_file.exists(),
-            "bar parquet file should exist at: {:?}",
-            bar_file
+            "bar parquet file should exist at: {bar_file:?}"
         );
 
         cleanup(&dir);

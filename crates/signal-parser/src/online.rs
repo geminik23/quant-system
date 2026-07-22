@@ -318,7 +318,7 @@ fn process_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qs_backtest::RawSignal;
+    use qs_core::RawSignal;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     //

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 
 use clap::Parser;
-use qs_backtest::RawSignal;
+use qs_core::RawSignal;
 
 use crate::error::SignalParserError;
 use crate::handler::{SignalContext, SignalHandler};

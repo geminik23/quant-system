@@ -1,5 +1,6 @@
 //! Server configuration loaded from TOML.
 
+use qs_service::ServiceEndpoint;
 use serde::Deserialize;
 
 /// Top-level server configuration.
@@ -17,14 +18,49 @@ pub struct ServerConfig {
     pub logging: LoggingSection,
 }
 
-/// SHM transport settings.
+/// Service listener and transport settings.
 #[derive(Debug, Deserialize)]
 pub struct ServerSection {
-    /// Base name for shared memory endpoints (e.g. "backtest").
+    /// Provider-neutral listener endpoint. Defaults to the legacy `shm_name`.
+    #[serde(default)]
+    pub endpoint: Option<ServiceEndpoint>,
+    /// Deprecated compatibility name for the shared-memory endpoint.
+    #[serde(default)]
     pub shm_name: String,
-    /// Per-client SHM buffer size in bytes. Default: 16 MB.
+    /// Per-client buffer or maximum frame size. Default: 16 MB.
     #[serde(default = "default_shm_buffer")]
     pub shm_buffer_size: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    #[serde(default)]
+    pub allow_insecure_non_loopback: bool,
+}
+
+impl ServerSection {
+    pub fn resolved_endpoint(&self) -> crate::error::Result<ServiceEndpoint> {
+        let legacy = if self.shm_name.is_empty() {
+            None
+        } else {
+            Some(
+                ServiceEndpoint::shared_memory(self.shm_name.clone()).map_err(|error| {
+                    crate::error::BacktestServerError::Config(error.to_string())
+                })?,
+            )
+        };
+        match (&self.endpoint, legacy) {
+            (Some(endpoint), Some(legacy)) if endpoint != &legacy => {
+                Err(crate::error::BacktestServerError::Config(format!(
+                    "conflicting server.endpoint '{}' and deprecated server.shm_name '{}'",
+                    endpoint, self.shm_name
+                )))
+            }
+            (Some(endpoint), _) => Ok(endpoint.clone()),
+            (None, Some(endpoint)) => Ok(endpoint),
+            (None, None) => Err(crate::error::BacktestServerError::Config(
+                "server.endpoint is required (or provide deprecated server.shm_name)".to_string(),
+            )),
+        }
+    }
 }
 
 /// Path to the Parquet data store root directory.
@@ -121,6 +157,10 @@ fn default_shm_buffer() -> usize {
     16 * 1024 * 1024
 }
 
+fn default_max_connections() -> usize {
+    256
+}
+
 fn default_job_retention_secs() -> u64 {
     3_600
 }
@@ -134,7 +174,7 @@ fn default_max_retained_jobs() -> usize {
 }
 
 fn default_artifact_directory() -> String {
-    "temp/backtest-artifacts".into()
+    "backtest-artifacts".into()
 }
 
 fn default_artifact_inline_limit_bytes() -> usize {

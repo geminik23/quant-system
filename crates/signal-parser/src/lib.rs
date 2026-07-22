@@ -21,7 +21,7 @@ pub use parser::ChannelParser;
 pub use pipeline::{
     parse_messages, parse_messages_v2, parse_messages_with_context, parse_messages_with_context_v2,
 };
-pub use qs_backtest::{PositionRef, RawSignal};
+pub use qs_core::{PositionRef, RawSignal};
 pub use registry::ParserRegistry;
 pub use template::TemplateParser;
 pub use types::{

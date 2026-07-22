@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, NaiveDateTime};
-use qs_backtest::RawSignal;
+use qs_core::RawSignal;
 use qs_core::types::{OrderType, Side};
 
 use crate::error::SignalParserError;
@@ -432,7 +432,7 @@ mod tests {
             assert_eq!(parent.map(|message| message.msg_id), Some(1));
             ParsedAction::one(RawSignal::Close {
                 ts,
-                position: qs_backtest::PositionRef::ByTradeId {
+                position: qs_core::PositionRef::ByTradeId {
                     trade_id: "parent-trade".into(),
                 },
             })
@@ -772,7 +772,7 @@ mod tests {
     fn parse_messages_can_emit_reply_management_signal() {
         use crate::parser::ChannelParser;
         use chrono::NaiveDateTime;
-        use qs_backtest::PositionRef;
+        use qs_core::PositionRef;
 
         struct ReplyParser {
             channels: Vec<i64>,

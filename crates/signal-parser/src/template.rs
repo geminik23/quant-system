@@ -1,5 +1,5 @@
 use chrono::NaiveDateTime;
-use qs_backtest::RawSignal;
+use qs_core::RawSignal;
 use qs_core::{OrderType, Side};
 
 use crate::parser::ChannelParser;

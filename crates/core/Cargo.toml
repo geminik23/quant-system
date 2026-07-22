@@ -1,10 +1,11 @@
 [package]
 name = "qs-core"
-version = "0.1.0"
+version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core trade engine — position management, composable rules, and execution"
+description = "Core trading domain — execution, normalized intent, management policy, sizing, and currency conversion"
 keywords = ["trading", "engine", "position", "backtest"]
 categories = ["finance"]
 
@@ -16,6 +17,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 nanoid = { workspace = true }
 thiserror = { workspace = true }
+qs-symbols = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

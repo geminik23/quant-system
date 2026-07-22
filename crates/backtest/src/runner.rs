@@ -19,7 +19,7 @@ use std::convert::Infallible;
 
 use chrono::{Duration, NaiveDateTime};
 use qs_core::types::{
-    Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, OrderType, PositionId,
+    Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, OrderType,
     PositionStatus, PreparedPendingFill, PriceQuote, Side, SlippageModel, position_size_tolerance,
 };
 use qs_core::{ExecutionPricer, FutureApplyError, TradeEngine};
@@ -37,8 +37,8 @@ use crate::ledger::{ActionDisposition, LifecycleLedger};
 use crate::mtm::{MtmCurveCollector, MtmOutputPolicy, MtmOutputSummary};
 use crate::portfolio::{EquityPoint, PortfolioRecorder};
 use crate::profile::{
-    ManagementProfile, PositionRef, PositionResolver, RawSignal, ResolvedEntry,
-    allocate_target_steps, resolve_signal, resolve_unprofiled_entry,
+    ManagementProfile, RawSignal, ResolvedEntry, allocate_target_steps, resolve_signal,
+    resolve_unprofiled_entry,
 };
 use crate::report::BacktestResult;
 use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
@@ -228,7 +228,7 @@ pub struct BacktestConfig {
     /// Per-symbol contract size (point value) for P&L calculation.
     ///
     /// Maps symbol name → contract size.  For forex, this is typically
-    /// `lot_base_units` from [`SymbolSpec`] (e.g. 100_000 for majors).
+    /// `lot_base_units` from `SymbolSpec` (e.g. 100_000 for majors).
     /// For gold (XAUUSD) it's 100 (1 lot = 100 oz).
     ///
     /// When a symbol is absent from this map the multiplier defaults to `1.0`,
@@ -2678,34 +2678,6 @@ fn raw_signal_kind(signal: &RawSignal) -> &'static str {
         RawSignal::ModifyAllStoploss { .. } => "modify_all_stoploss",
         RawSignal::CloseAllInGroup { .. } => "close_all_in_group",
         RawSignal::ModifyAllStoplossInGroup { .. } => "modify_all_stoploss_in_group",
-    }
-}
-
-// ─── PositionResolver for TradeEngine ────────────────────────────────────
-
-impl PositionResolver for TradeEngine {
-    fn resolve(&self, pr: &PositionRef) -> Vec<PositionId> {
-        match pr {
-            PositionRef::ByTradeId { trade_id } => {
-                self.manager.id_by_trade_id(trade_id).into_iter().collect()
-            }
-            PositionRef::AllOnSymbol { symbol } => self.manager.open_ids_by_symbol_sorted(symbol),
-            PositionRef::AllInGroup { group_id } => {
-                let mut ids = self.manager.open_ids_by_group(group_id);
-                ids.sort();
-                ids
-            }
-        }
-    }
-
-    fn position_entry_info(&self, id: &PositionId) -> Option<(f64, Side)> {
-        self.get_position(id).and_then(|pos| {
-            if pos.data.status == PositionStatus::Open {
-                Some((pos.data.average_entry(), pos.data.side))
-            } else {
-                None
-            }
-        })
     }
 }
 

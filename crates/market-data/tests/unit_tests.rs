@@ -5,23 +5,6 @@ use market_data::xrpc_state::XrpcState;
 
 #[test]
 fn rpc_types_serde_roundtrip() {
-    // ConnectRequest / ConnectResponse
-    let req = ConnectRequest {
-        client_name: "test".into(),
-    };
-    let json = serde_json::to_string(&req).unwrap();
-    let back: ConnectRequest = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.client_name, "test");
-
-    let resp = ConnectResponse {
-        client_id: 42,
-        slot_name: "slot-42".into(),
-    };
-    let json = serde_json::to_string(&resp).unwrap();
-    let back: ConnectResponse = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.client_id, 42);
-    assert_eq!(back.slot_name, "slot-42");
-
     // GetPriceRequest / GetPriceResponse
     let price_resp = GetPriceResponse {
         symbol: "EURUSD".into(),

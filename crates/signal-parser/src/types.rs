@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use chrono::NaiveDateTime;
-use qs_backtest::RawSignal;
+use qs_core::RawSignal;
 use serde::{Deserialize, Serialize};
 
 thread_local! {

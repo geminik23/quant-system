@@ -13,10 +13,13 @@ ssl = false
 # retry_base_delay_secs = 2    # initial backoff delay in seconds
 # retry_max_delay_secs = 60    # maximum backoff cap in seconds
 
-# Market Data Service settings (xrpc shared memory)
+# Market Data Service endpoint and transport limits
 [market_data]
-shm_name = "market-data"
-shm_buffer_size = 4194304  # 4MB per client
+endpoint = "shm://market-data"
+shm_buffer_size = 4194304
+max_connections = 256
+# Required only for unauthenticated non-loopback TCP on a trusted network.
+allow_insecure_non_loopback = false
 
 # Logging configuration
 [logging]
