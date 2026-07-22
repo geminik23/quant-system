@@ -39,7 +39,7 @@ cargo run -p qs-data-preprocess --bin data-preprocess -- \
   /path/to/ticks.csv
 ```
 
-For bar input, use `input bar --timeframe 1h`. See the [`qs-data-preprocess` guide](crates/data-preprocess/README.md) for supported CSV formats, time-zone handling, queries, and removal commands.
+For bar input, use `input bar --timeframe 1h`. See the [`qs-data-preprocess` guide](https://github.com/geminik23/quant-system/blob/main/crates/data-preprocess/GUIDE.md) for supported CSV formats, time-zone handling, queries, and removal commands.
 
 ### 2. Prepare a raw-signal JSONL file
 
@@ -110,13 +110,13 @@ CTrader FIX ---> Market Data Service ---> real-time bid/ask consumers
 
 | Area | Crates | Responsibility |
 |---|---|---|
-| Trading domain | [`quant-system-core`](crates/core/) (`qs_core` library), [`qs-symbols`](crates/symbols/) | Trade engine, normalized actions, management policies, sizing, currency conversion, and symbol metadata |
-| Historical replay | [`qs-backtest`](crates/backtest/), [`qs-backtest-server`](crates/backtest-server/) | Deterministic replay, accounting, metrics, profiles, retained jobs, and result delivery |
-| Historical data | [`qs-data-preprocess`](crates/data-preprocess/) | CSV import, partitioned storage, bounded queries, and data management |
-| Service contracts | [`qs-service`](crates/service/), [`qs-backtest-api`](crates/backtest-api/), [`qs-market-data-api`](crates/market-data-api/) | Provider-neutral endpoints, failures, DTOs, events, and typed client ports |
-| Internal transport provider | [`qs-service-xrpc`](crates/service-xrpc/) | Channel, SHM, Unix, and TCP runtime behind the logical service APIs |
-| Signal ingestion | [`qs-signal-parser`](crates/signal-parser/) | Telegram-focused offline and online parsing into generic raw-signal actions |
-| Real-time market data | [`qs-market-data`](crates/market-data/) | CTrader FIX quotes, subscriptions, alerts, and reconnection |
+| Trading domain | [`quant-system-core`](https://github.com/geminik23/quant-system/tree/main/crates/core) (`qs_core` library), [`qs-symbols`](https://github.com/geminik23/quant-system/tree/main/crates/symbols) | Trade engine, normalized actions, management policies, sizing, currency conversion, and symbol metadata |
+| Historical replay | [`qs-backtest`](https://github.com/geminik23/quant-system/tree/main/crates/backtest), [`qs-backtest-server`](https://github.com/geminik23/quant-system/tree/main/crates/backtest-server) | Deterministic replay, accounting, metrics, profiles, retained jobs, and result delivery |
+| Historical data | [`qs-data-preprocess`](https://github.com/geminik23/quant-system/tree/main/crates/data-preprocess) | CSV import, partitioned storage, bounded queries, and data management |
+| Service contracts | [`qs-service`](https://github.com/geminik23/quant-system/tree/main/crates/service), [`qs-backtest-api`](https://github.com/geminik23/quant-system/tree/main/crates/backtest-api), [`qs-market-data-api`](https://github.com/geminik23/quant-system/tree/main/crates/market-data-api) | Provider-neutral endpoints, failures, DTOs, events, and typed client ports |
+| Internal transport provider | [`qs-service-xrpc`](https://github.com/geminik23/quant-system/tree/main/crates/service-xrpc) | Channel/SHM/Unix/TCP runtime behind the logical service APIs |
+| Signal ingestion | [`qs-signal-parser`](https://github.com/geminik23/quant-system/tree/main/crates/signal-parser) | Telegram-focused offline and online parsing into generic raw-signal actions |
+| Real-time market data | [`qs-market-data`](https://github.com/geminik23/quant-system/tree/main/crates/market-data) | CTrader FIX quotes, subscriptions, alerts, and reconnection |
 
 ## Operational behavior
 
@@ -147,5 +147,5 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 
 Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/geminik23/quant-system/blob/main/LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](https://github.com/geminik23/quant-system/blob/main/LICENSE-MIT) or <http://opensource.org/licenses/MIT>)

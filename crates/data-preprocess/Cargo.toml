@@ -5,6 +5,7 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Historical market data storage and preprocessing CLI"
 keywords = ["market-data", "parquet", "preprocessing", "ohlcv"]
 categories = ["finance"]

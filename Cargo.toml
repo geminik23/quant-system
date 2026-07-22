@@ -20,6 +20,7 @@ rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/geminik23/quant-system"
+readme = "README.md"
 
 [workspace.dependencies]
 criterion = "0.5"

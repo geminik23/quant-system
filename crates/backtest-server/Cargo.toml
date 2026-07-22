@@ -5,6 +5,7 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Transport-neutral retained-job backtest service and CLI"
 keywords = ["backtest", "server", "ipc", "trading"]
 categories = ["finance"]

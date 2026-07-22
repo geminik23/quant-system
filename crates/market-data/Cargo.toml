@@ -5,6 +5,7 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Real-time CTrader market-data service with configurable local transports"
 keywords = ["market-data", "ipc", "ctrader", "trading"]
 categories = ["finance"]

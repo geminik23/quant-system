@@ -5,6 +5,7 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Shared xrpc transport, connection, and host runtime for quant-system services"
 keywords = ["rpc", "ipc", "shared-memory", "transport"]
 categories = ["network-programming"]
