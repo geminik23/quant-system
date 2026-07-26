@@ -822,7 +822,28 @@ pub fn position_ref_from_msg(msg: &PositionRefMsg, registry: &SymbolRegistry) ->
 ///
 /// `default_symbol` is used when the Entry variant has an empty symbol field.
 /// `registry` normalizes symbol names.
+/// Converts the wire message, then applies the shared `qs-core` signal contract.
+///
+/// Structural decoding (timestamp, side, order-type, symbol normalization) is
+/// owned here because it is wire-specific. Semantic validation is delegated to
+/// `qs_core::validate_raw_signal`, the same function the parser pipeline uses, so
+/// the two entry paths cannot drift. Delegating also makes this path strictly
+/// stronger than before: it previously checked only entry risk, Limit/Stop price,
+/// and the protective stop, and now covers target side, partial-close ratio,
+/// management prices, and ScaleIn geometry as well.
 pub fn raw_signal_from_msg(
+    msg: &RawSignalMsg,
+    default_symbol: &str,
+    registry: &SymbolRegistry,
+) -> crate::error::Result<RawSignal> {
+    let signal = decode_raw_signal_msg(msg, default_symbol, registry)?;
+    qs_core::validate_raw_signal(&signal)
+        .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))?;
+    Ok(signal)
+}
+
+/// Structural wire decoding without semantic validation.
+fn decode_raw_signal_msg(
     msg: &RawSignalMsg,
     default_symbol: &str,
     registry: &SymbolRegistry,
@@ -848,33 +869,6 @@ pub fn raw_signal_from_msg(
             };
             let parsed_side = parse_side_internal(side)?;
             let parsed_order_type = parse_order_type_internal(order_type)?;
-            if !risk.is_finite() || *risk <= 0.0 {
-                return Err(BacktestServerError::InvalidRequest(format!(
-                    "entry risk must be finite and positive, got {risk}"
-                )));
-            }
-            if matches!(parsed_order_type, OrderType::Limit | OrderType::Stop)
-                && !price.is_some_and(|value| value.is_finite() && value > 0.0)
-            {
-                return Err(BacktestServerError::InvalidRequest(format!(
-                    "{parsed_order_type} entry requires a finite positive price"
-                )));
-            }
-            if let Some(entry) = price
-                && let Some(stop) = stoploss
-            {
-                let protective = stop.is_finite()
-                    && *stop > 0.0
-                    && match parsed_side {
-                        Side::Buy => *stop < *entry,
-                        Side::Sell => *stop > *entry,
-                    };
-                if !protective {
-                    return Err(BacktestServerError::InvalidRequest(
-                        "entry stoploss is not protective".into(),
-                    ));
-                }
-            }
             Ok(RawSignal::Entry {
                 ts: parsed_ts,
                 symbol: parsed_symbol,
