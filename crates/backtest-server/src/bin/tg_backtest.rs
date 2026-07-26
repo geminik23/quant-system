@@ -439,7 +439,19 @@ fn load_raw_signals(path: &str) -> Result<Vec<RawSignalMsg>, Box<dyn std::error:
 /// This is a client-side optimisation that reduces request payload size.
 /// The server also applies authoritative filtering, so correctness does not
 /// depend on this function.
+/// Parse a CLI or source timestamp: RFC 3339 first (normalized to UTC), then the
+/// naive ISO forms, then a bare date.
+///
+/// RFC 3339 support is required for `--outcomes-input` date filtering, not merely
+/// convenient: `RawTgMessage.ts` in parser outcome files is RFC 3339 with an offset
+/// (for example `2026-01-01T19:51:04Z`), which is the parser framework's documented
+/// input contract and what `signal_parser::parse_iso_datetime` accepts. Without this
+/// branch, combining `--outcomes-input` with `--from`/`--to` failed on every real
+/// parser output while passing on naive-timestamp test fixtures.
 fn parse_cli_timestamp(value: &str) -> Option<NaiveDateTime> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.naive_utc());
+    }
     let formats = [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S",
@@ -2697,6 +2709,40 @@ mod tests {
         .expect_err("tag filters must fail CLI parsing");
         assert_eq!(filter_error.kind(), clap::error::ErrorKind::ValueValidation);
         assert!(filter_error.to_string().contains("tag filters"));
+    }
+
+    /// RFC 3339 must parse, because parser outcome files carry `Z`-suffixed source
+    /// timestamps per the parser framework's input contract. This failed in the field:
+    /// `--outcomes-input` plus `--from`/`--to` rejected every real parser output while
+    /// naive-timestamp fixtures passed.
+    #[test]
+    fn cli_timestamps_accept_rfc3339_and_normalize_offsets_to_utc() {
+        // The exact shape emitted by the parser framework.
+        assert_eq!(
+            parse_cli_timestamp("2026-01-01T19:51:04Z"),
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(19, 51, 4)
+                    .unwrap()
+            )
+        );
+        // A non-UTC offset must normalize to UTC, matching parse_iso_datetime.
+        assert_eq!(
+            parse_cli_timestamp("2026-01-01T19:51:04+02:00"),
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(17, 51, 4)
+                    .unwrap()
+            )
+        );
+        // The pre-existing naive forms keep working.
+        assert!(parse_cli_timestamp("2026-01-01T19:51:04").is_some());
+        assert!(parse_cli_timestamp("2026-01-01 19:51:04").is_some());
+        assert!(parse_cli_timestamp("2026-01-01").is_some());
+        // Garbage still fails, so the invalid-timestamp error path is intact.
+        assert!(parse_cli_timestamp("not-a-timestamp").is_none());
     }
 
     #[test]
