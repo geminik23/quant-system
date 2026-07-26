@@ -30,6 +30,7 @@ pub mod profile;
 pub mod rules;
 pub mod sizing;
 pub mod types;
+pub mod validation;
 
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
@@ -57,3 +58,4 @@ pub use types::{
     PositionId, PositionRecord, PositionStatus, PreparedPendingFill, PriceQuote, RuleConfig, Side,
     Signal, SlippageModel, StopOrigin, TargetSpec, TradeId,
 };
+pub use validation::{RawSignalValidationError, validate_raw_signal, validate_raw_signals};

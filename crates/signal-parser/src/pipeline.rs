@@ -2,7 +2,6 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, NaiveDateTime};
 use qs_core::RawSignal;
-use qs_core::types::{OrderType, Side};
 
 use crate::error::SignalParserError;
 use crate::registry::ParserRegistry;
@@ -215,116 +214,16 @@ fn parse_messages_impl(
     result
 }
 
+/// Validate emitted signals against the shared `qs-core` contract.
+///
+/// The rules and their exact wording live in `qs_core::validation`, which owns
+/// `RawSignal`. This wrapper only adapts the error into `ParseFailure` so the
+/// outcome JSONL shape is unchanged; the reason strings are reproduced verbatim
+/// and committed goldens stay byte-identical.
 pub(crate) fn validate_signals(signals: &[RawSignal]) -> Result<(), ParseFailure> {
-    for signal in signals {
-        match signal {
-            RawSignal::Entry {
-                side,
-                order_type,
-                price,
-                risk_multiplier,
-                stoploss,
-                targets,
-                ..
-            } => {
-                if !risk_multiplier.is_finite() || *risk_multiplier <= 0.0 {
-                    return Err(ParseFailure::InvalidSignal {
-                        reason: format!(
-                            "entry risk multiplier must be finite and positive, got {risk_multiplier}"
-                        ),
-                    });
-                }
-                if matches!(order_type, OrderType::Limit | OrderType::Stop)
-                    && !price.is_some_and(|value| value.is_finite() && value > 0.0)
-                {
-                    return Err(ParseFailure::InvalidSignal {
-                        reason: format!("{order_type} entry requires a finite positive price"),
-                    });
-                }
-                if let Some(entry) = price {
-                    if !entry.is_finite() || *entry <= 0.0 {
-                        return Err(ParseFailure::InvalidSignal {
-                            reason: format!("entry price must be finite and positive, got {entry}"),
-                        });
-                    }
-                    if let Some(stop) = stoploss {
-                        let protective = stop.is_finite()
-                            && *stop > 0.0
-                            && match side {
-                                Side::Buy => *stop < *entry,
-                                Side::Sell => *stop > *entry,
-                            };
-                        if !protective {
-                            return Err(ParseFailure::InvalidSignal {
-                                reason: "stoploss is not protective for the entry side".into(),
-                            });
-                        }
-                    }
-                    for target in targets {
-                        let valid = target.is_finite()
-                            && *target > 0.0
-                            && match side {
-                                Side::Buy => *target > *entry,
-                                Side::Sell => *target < *entry,
-                            };
-                        if !valid {
-                            return Err(ParseFailure::InvalidSignal {
-                                reason: "target is on the wrong side of entry".into(),
-                            });
-                        }
-                    }
-                }
-            }
-            RawSignal::ClosePartial { ratio, .. } => {
-                if !ratio.is_finite() || *ratio <= 0.0 || *ratio > 1.0 {
-                    return Err(ParseFailure::InvalidSignal {
-                        reason: format!("partial close ratio must be in (0, 1], got {ratio}"),
-                    });
-                }
-            }
-            RawSignal::ModifyStoploss { price, .. }
-            | RawSignal::AddTarget { price, .. }
-            | RawSignal::RemoveTarget { price, .. }
-            | RawSignal::ModifyAllStoploss { price, .. }
-            | RawSignal::ModifyAllStoplossInGroup { price, .. } => {
-                if !price.is_finite() || *price <= 0.0 {
-                    return Err(ParseFailure::InvalidSignal {
-                        reason: format!(
-                            "management price must be finite and positive, got {price}"
-                        ),
-                    });
-                }
-            }
-            RawSignal::ModifyTarget {
-                old_price,
-                new_price,
-                ..
-            } => {
-                if !old_price.is_finite()
-                    || *old_price <= 0.0
-                    || !new_price.is_finite()
-                    || *new_price <= 0.0
-                {
-                    return Err(ParseFailure::InvalidSignal {
-                        reason: format!(
-                            "target prices must be finite and positive, got {old_price} -> {new_price}"
-                        ),
-                    });
-                }
-            }
-            RawSignal::ScaleIn { size, price, .. }
-                if !size.is_finite()
-                    || *size <= 0.0
-                    || price.is_some_and(|value| !value.is_finite() || value <= 0.0) =>
-            {
-                return Err(ParseFailure::InvalidSignal {
-                    reason: "scale-in size/price is invalid".into(),
-                });
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+    qs_core::validate_raw_signals(signals).map_err(|error| ParseFailure::InvalidSignal {
+        reason: error.to_string(),
+    })
 }
 
 fn into_legacy_result(result: ParseBatchResult) -> Result<Vec<RawSignal>, SignalParserError> {
@@ -362,6 +261,7 @@ fn into_legacy_result(result: ParseBatchResult) -> Result<Vec<RawSignal>, Signal
 mod tests {
     use super::*;
     use crate::template::TemplateParser;
+    use qs_core::types::{OrderType, Side};
 
     fn make_registry() -> ParserRegistry {
         let mut reg = ParserRegistry::new();
