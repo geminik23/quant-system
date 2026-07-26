@@ -104,6 +104,18 @@ category = "index"
 pnl_currency = "USD"
 lot_base_units = 1
 lot_step_units = 1
+
+[[symbol]]
+canonical = "xauusd"
+aliases = ["xau/usd", "gold"]
+pip_position = 1
+digits = 2
+category = "metal"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100
+lot_step_units = 1
 "#,
     )
     .unwrap()
@@ -122,7 +134,7 @@ fn test_artifact_store(directory: PathBuf) -> ArtifactStore {
 
 fn empty_state() -> ServerState {
     ServerState {
-        symbol_registry: SymbolRegistry::empty(),
+        symbol_registry: evaluation_symbol_registry(),
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: "/tmp/test-data".into(),
         profiles_path: String::new(),
@@ -1243,6 +1255,22 @@ fn sync_async_and_multi_profile_future_quote_results_are_equivalent() {
     assert_eq!(metadata["tags"]["sizing.identity"], "fixed_lot");
     assert_eq!(metadata["tags"]["symbol.eurusd.pip_position"], "4");
     assert_eq!(metadata["tags"]["symbol.eurusd.lot_base_units"], "100000");
+    assert_eq!(
+        metadata["tags"]["economics.guard"],
+        "legacy-economic-guard-v1"
+    );
+    assert_eq!(
+        metadata["tags"]["economics.symbol.eurusd.status"],
+        "supported"
+    );
+    assert_eq!(
+        metadata["tags"]["economics.symbol.eurusd.model"],
+        "legacy_fx_linear_v1"
+    );
+    assert_eq!(
+        metadata["tags"]["economics.symbol.eurusd.contract_multiplier"],
+        "100000"
+    );
 
     assert_future_quote_results_equal(&sync_result, &async_result, "async");
     assert_future_quote_results_equal(&sync_result, multi_result, "multi-profile");
@@ -1746,6 +1774,62 @@ fn future_scalar_validation_matches_sync_async_and_multi_before_planning() {
     assert!(!multi.success);
     assert_eq!(multi.error.as_deref(), Some(expected.as_str()));
     assert_eq!(multi.results.len(), 1);
+    assert_eq!(multi.results[0].error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn unsupported_crypto_economics_fail_consistently_before_market_data_access() {
+    let mut state = empty_state();
+    state.symbol_registry = SymbolRegistry::from_toml(
+        r#"
+[[symbol]]
+canonical = "btcusd"
+aliases = ["btc/usd"]
+pip_position = 2
+digits = 2
+category = "crypto"
+base_currency = "BTC"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100000000
+lot_step_units = 1
+"#,
+    )
+    .unwrap();
+    state.data_dir = "/path/that/must/not/be/scanned/by/cp00".into();
+
+    let mut request = replay_request();
+    request.request.symbol = "BTC/USD".into();
+    for signal in &mut request.request.raw_signals {
+        if let RawSignalMsg::Entry { symbol, .. } = signal {
+            *symbol = "BTCUSD".into();
+        }
+    }
+    request.evaluation = ProviderEvaluationOptionsMsg::default();
+
+    let sync = handle_run_backtest(&state, &request);
+    assert!(!sync.success);
+    let expected = sync.error.expect("sync economic support error");
+    assert!(expected.contains("unsupported_economic_model"));
+    assert!(expected.contains("instrument btcusd"));
+    assert!(expected.contains("category 'crypto'"));
+    assert!(!expected.contains("market data"));
+
+    let asynchronous = handle_submit_backtest(
+        &state,
+        &SubmitBacktestRequest {
+            request: request.clone(),
+        },
+    );
+    assert!(!asynchronous.success);
+    assert!(asynchronous.job_id.is_none());
+    assert_eq!(asynchronous.error.as_deref(), Some(expected.as_str()));
+    assert!(state.jobs.lock().unwrap().is_empty());
+
+    let multi = handle_run_backtest_multi(&state, &multi_request(&request));
+    assert!(!multi.success);
+    assert_eq!(multi.results.len(), 1);
+    assert!(!multi.results[0].success);
     assert_eq!(multi.results[0].error.as_deref(), Some(expected.as_str()));
 }
 
@@ -2379,7 +2463,7 @@ fn handler_run_backtest_no_data_returns_error() {
     std::fs::create_dir_all(&tmp).ok();
 
     let state = ServerState {
-        symbol_registry: SymbolRegistry::empty(),
+        symbol_registry: evaluation_symbol_registry(),
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: tmp.to_string_lossy().to_string(),
         profiles_path: String::new(),

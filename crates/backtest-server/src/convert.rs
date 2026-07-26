@@ -7,6 +7,7 @@ use qs_backtest::artifacts::{
     FUTURE_ARTIFACT_FORMAT_VERSION, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
 };
 use qs_backtest::currency::RunCurrencyPlan;
+use qs_backtest::economic_support::resolve_legacy_economics;
 use qs_backtest::evaluation::{
     BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationSection,
     GroupFilter, PositionFilter, PositionSide, SourceCoverageCounts,
@@ -63,10 +64,13 @@ pub fn config_from_msg(
     let mut contract_sizes = std::collections::HashMap::new();
     let mut symbol_specs = std::collections::HashMap::new();
     for symbol in symbols {
-        if let Some(spec) = registry.spec(symbol) {
-            contract_sizes.insert(symbol.clone(), spec.lot_base_units as f64);
-            symbol_specs.insert(symbol.clone(), spec.clone());
-        }
+        let spec = registry
+            .spec(symbol)
+            .ok_or_else(|| BacktestServerError::SymbolNotFound(symbol.clone()))?;
+        let economics = resolve_legacy_economics(spec)
+            .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))?;
+        contract_sizes.insert(symbol.clone(), economics.contract_multiplier);
+        symbol_specs.insert(symbol.clone(), spec.clone());
     }
     let sizing = msg.sizing.as_ref().map(sizing_from_msg).transpose()?;
     Ok(BacktestConfig {

@@ -1811,7 +1811,7 @@ fn zero_trade_provider_result(
         identity_routes,
         Vec::new(),
     )?;
-    let config: BacktestConfig = config_from_msg(&config_msg, &registry, &evaluation_symbols)?;
+    let config: BacktestConfig = config_from_msg(&config_msg, &registry, &[])?;
     let future_config = future_config_from_msg(&future_msg, currency_plan)?;
     let runner = BacktestRunner::new_future(config, future_config).with_evaluation_options(options);
     let mut feed = VecFeed::new(Vec::new());

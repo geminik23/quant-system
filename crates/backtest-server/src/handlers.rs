@@ -2916,7 +2916,24 @@ mod tests {
 
     #[allow(dead_code)]
     fn job_test_state() -> ServerState {
-        test_state()
+        let mut state = test_state();
+        state.symbol_registry = SymbolRegistry::from_toml(
+            r#"
+[[symbol]]
+canonical = "xauusd"
+aliases = ["xau/usd"]
+pip_position = 1
+digits = 2
+category = "metal"
+base_currency = "XAU"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100
+lot_step_units = 1
+"#,
+        )
+        .unwrap();
+        state
     }
 
     #[allow(dead_code)]

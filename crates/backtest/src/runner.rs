@@ -30,6 +30,7 @@ use crate::artifacts::{
 };
 use crate::currency::{ConversionQuoteBook, RunCurrencyPlan};
 use crate::data_feed::{DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch};
+use crate::economic_support::{LEGACY_ECONOMIC_GUARD_ID, resolve_legacy_economics};
 use crate::evaluation::EvaluationOptions;
 use crate::executor::BacktestExecutor;
 use crate::future_executor::{FutureExecutor, FutureExecutorError};
@@ -1558,6 +1559,7 @@ impl BacktestRunner {
             }
             .into(),
         );
+        insert_economic_support_metadata(&mut tags, &self.config);
         let (equity_curve, mtm_output_summary) = mtm_curve.into_parts();
         let artifacts = FutureBacktestArtifacts {
             format_version: FUTURE_ARTIFACT_FORMAT_VERSION,
@@ -2423,6 +2425,7 @@ fn validate_replay_config(
 
     for (symbol, spec) in &config.symbol_specs {
         validate_symbol_spec(symbol, spec)?;
+        resolve_legacy_economics(spec).map_err(|error| error.to_string())?;
     }
 
     let entry_symbols: Vec<&str> = raw_signals
@@ -2582,6 +2585,7 @@ fn rejected_future_result(
     ));
     let mut tags = BTreeMap::new();
     tags.insert("configuration_error".into(), error);
+    insert_economic_support_metadata(&mut tags, config);
     let artifacts = FutureBacktestArtifacts {
         execution: ExecutionMetadata {
             execution_model,
@@ -2618,6 +2622,31 @@ fn rejected_future_result(
         ..FutureBacktestArtifacts::default()
     };
     BacktestResult::from_future_artifacts_with_options(artifacts, evaluation_options)
+}
+
+fn insert_economic_support_metadata(tags: &mut BTreeMap<String, String>, config: &BacktestConfig) {
+    tags.insert(
+        "economics.guard".into(),
+        LEGACY_ECONOMIC_GUARD_ID.to_owned(),
+    );
+    for (symbol, spec) in &config.symbol_specs {
+        let prefix = format!("economics.symbol.{symbol}");
+        tags.insert(format!("{prefix}.category"), spec.category.clone());
+        match resolve_legacy_economics(spec) {
+            Ok(economics) => {
+                tags.insert(format!("{prefix}.status"), "supported".into());
+                tags.insert(format!("{prefix}.model"), economics.model.as_str().into());
+                tags.insert(
+                    format!("{prefix}.contract_multiplier"),
+                    economics.contract_multiplier.to_string(),
+                );
+            }
+            Err(error) => {
+                tags.insert(format!("{prefix}.status"), "unsupported".into());
+                tags.insert(format!("{prefix}.reason"), error.to_string());
+            }
+        }
+    }
 }
 
 fn queued_exposure_symbols(

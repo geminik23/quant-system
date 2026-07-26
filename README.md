@@ -15,7 +15,7 @@ The framework currently focuses on normalized signal replay over stored tick or 
 | Telegram parsing | Implemented | Optional Telegram-specific adapter that emits generic raw-signal actions |
 | Real-time market data | Implemented | CTrader FIX bid/ask distribution through the market-data service |
 | Source-neutral strategy runtime | Not implemented | Generic ingestion and live strategy orchestration are planned separately |
-| Live order execution and general crypto economics | Not implemented | Venue adapters and non-FX economic models are not production features yet |
+| Live order execution and general crypto economics | Not implemented | Registry-backed crypto replay fails closed before data loading; venue adapters and crypto economic models are not production features yet |
 
 ## Quick start
 
@@ -131,7 +131,7 @@ TCP endpoints are unauthenticated and restricted to loopback by default. Use SHM
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
 - The current parser is Telegram-specific; generic source events, durable source-neutral ingestion, and non-Telegram adapters are not implemented yet.
 - Live order execution, restart-safe live strategy state, and trading-platform order adapters are not included.
-- Cryptocurrency instruments do not yet have general spot, derivative, fee, funding, margin, or liquidation economics.
+- Registered cryptocurrency symbols are metadata-only and fail closed before monetary replay; general spot, derivative, fee, funding, margin, and liquidation economics are not implemented yet.
 
 ## Development
 

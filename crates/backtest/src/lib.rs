@@ -24,6 +24,7 @@
 pub mod artifacts;
 pub mod currency;
 pub mod data_feed;
+pub mod economic_support;
 pub mod evaluation;
 pub mod executor;
 pub mod future_executor;
@@ -49,6 +50,10 @@ pub use currency::{
     RunCurrencyPlan, RunCurrencyPlanError, resolve_conversion_route, resolve_fx_pair,
 };
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
+pub use economic_support::{
+    EconomicSupportError, LEGACY_ECONOMIC_GUARD_ID, LegacyEconomicModel, SupportedLegacyEconomics,
+    resolve_legacy_economics,
+};
 pub use evaluation::{
     BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationReport,
     EvaluationSection, GroupFilter, PositionFilter, PositionSide,
