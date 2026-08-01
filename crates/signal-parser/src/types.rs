@@ -237,3 +237,94 @@ impl ParseBatchResult {
             .any(|outcome| matches!(outcome, MessageParseOutcome::Failed { .. }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(msg_id: i64, reply_to: Option<i64>) -> RawTgMessage {
+        RawTgMessage {
+            chat_id: 100,
+            msg_id,
+            ts: "2025-01-01T00:00:00Z".into(),
+            message: format!("message-{msg_id}"),
+            reply_to,
+        }
+    }
+
+    #[test]
+    fn raw_tg_message_deserialization_accepts_unknown_fields() {
+        let decoded: RawTgMessage = serde_json::from_str(
+            r#"{"chat_id":100,"msg_id":7,"ts":"2025-01-01T00:00:00Z","message":"message-7","reply_to":null,"source_revision":3}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decoded, message(7, None));
+    }
+
+    #[test]
+    fn message_parse_outcome_deserialization_accepts_unknown_fields() {
+        let decoded: MessageParseOutcome = serde_json::from_str(
+            r#"{"status":"skipped","source":{"chat_id":100,"msg_id":7,"ts":"2025-01-01T00:00:00Z","message":"message-7","reply_to":null},"parser":"test","reason":"parser_returned_skip","diagnostic_version":2}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decoded,
+            MessageParseOutcome::Skipped {
+                source,
+                parser: Some(parser),
+                reason: SkipReason::ParserReturnedSkip,
+            } if source == message(7, None) && parser == "test"
+        ));
+    }
+
+    #[test]
+    fn parse_batch_result_deserialization_accepts_unknown_fields() {
+        let decoded: ParseBatchResult =
+            serde_json::from_str(r#"{"outcomes":[],"signals":[],"batch_version":2}"#).unwrap();
+
+        assert!(decoded.outcomes.is_empty());
+        assert!(decoded.signals.is_empty());
+    }
+
+    #[test]
+    fn ultimate_root_reports_missing_ancestry() {
+        let current = message(3, Some(2));
+        let ctx = ParseContext::empty();
+
+        let result = ctx.with_current_message(&current, || ctx.ultimate_root_message());
+
+        assert_eq!(result, Err(ParseFailure::MissingParent { reply_to: 2 }));
+    }
+
+    #[test]
+    fn ultimate_root_reports_cyclic_ancestry() {
+        let current = message(3, Some(2));
+        let history = vec![message(2, Some(3))];
+        let ctx = ParseContext {
+            market: None,
+            llm: None,
+            history: &history,
+        };
+
+        let result = ctx.with_current_message(&current, || ctx.ultimate_root_message());
+
+        assert!(matches!(
+            result,
+            Err(ParseFailure::AmbiguousIdentity { reason })
+                if reason == "reply cycle detected at message 3"
+        ));
+    }
+
+    #[test]
+    fn ultimate_root_requires_current_message_identity() {
+        let result = ParseContext::empty().ultimate_root_message();
+
+        assert!(matches!(
+            result,
+            Err(ParseFailure::AmbiguousIdentity { reason })
+                if reason == "current message identity is unavailable"
+        ));
+    }
+}

@@ -1,0 +1,76 @@
+{
+  "manifest_schema_version": 1,
+  "root_reexport_inventory": {
+    "role": "root_reexport_inventory",
+    "path": "root_reexport_inventory.json",
+    "records": 27
+  },
+  "fixtures": [
+    {
+      "fixture_id": "structured-v2-basic",
+      "classification": "normative",
+      "execution_path": "offline_structured",
+      "required_features": ["offline"],
+      "inputs": [
+        {
+          "role": "messages",
+          "path": "messages.jsonl",
+          "records": 4
+        },
+        {
+          "role": "parser_config",
+          "path": "parser_config.toml",
+          "records": 1
+        }
+      ],
+      "expectations": [
+        {
+          "role": "signals",
+          "path": "expected_signals.jsonl",
+          "records": 1,
+          "comparison_mode": "exact_bytes",
+          "assertions": []
+        },
+        {
+          "role": "outcomes",
+          "path": "expected_outcomes.jsonl",
+          "records": 4,
+          "comparison_mode": "exact_bytes",
+          "assertions": []
+        }
+      ],
+      "notes": "Outcomes retain input order while processing uses Telegram identity order. The unregistered source is classified before timestamp parsing."
+    },
+    {
+      "fixture_id": "compatibility-batch-stop",
+      "classification": "retained_compatibility",
+      "execution_path": "compatibility_batch",
+      "required_features": ["offline"],
+      "inputs": [
+        {
+          "role": "messages",
+          "path": "messages.jsonl",
+          "records": 4
+        },
+        {
+          "role": "parser_config",
+          "path": "parser_config.toml",
+          "records": 1
+        }
+      ],
+      "expectations": [
+        {
+          "role": "error",
+          "path": null,
+          "records": 1,
+          "comparison_mode": "semantic_assertions",
+          "assertions": [
+            "returns TimestampParse for invalid-registered-source",
+            "does not return partial successful signals"
+          ]
+        }
+      ],
+      "notes": "The compatibility batch stops at the first processed failure and converts it to the legacy overall error."
+    }
+  ]
+}

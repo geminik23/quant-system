@@ -60,12 +60,12 @@ fn run_linear_round_trip(
             stoploss: None,
             targets: Vec::new(),
             group: None,
-            trade_id: Some("cp00-baseline".into()),
+            trade_id: Some("economic-guard-baseline".into()),
         },
         RawSignal::Close {
             ts: ts(1_000),
             position: PositionRef::ByTradeId {
-                trade_id: "cp00-baseline".into(),
+                trade_id: "economic-guard-baseline".into(),
             },
         },
     ];

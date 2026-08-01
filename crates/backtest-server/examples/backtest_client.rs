@@ -297,16 +297,11 @@ fn print_positions(positions: &[PositionSummaryMsg], max: usize) {
     }
 }
 
-// ── Dummy Signal Generators ─────────────────────────────────────────────────
+// Dummy signal generators.
 
-/// Generate F14 raw signals (`RawSignalMsg`) demonstrating the full signal
-/// action vocabulary: entries, management actions (modify SL, partial close,
-/// move SL to breakeven), and bulk operations.
-///
-/// This showcases the key advantage of F14: you can interleave entry and
-/// management signals in the same stream, giving your strategy full control
-/// over position lifecycle without relying on server-side profiles.
-fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
+/// Generate raw signals that demonstrate the complete action vocabulary.
+/// Entries, management actions, and bulk operations can share one stream without relying on server-side profiles.
+fn generate_full_signal_actions(symbol: &str) -> Vec<RawSignalMsg> {
     vec![
         // 1. Open a long position with stoploss and targets. Use a stable
         //    trade_id so later management signals can target this trade.
@@ -319,14 +314,14 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             risk: 1.0,
             stoploss: Some(1.0800),
             targets: vec![1.1050, 1.1100],
-            group: Some("f14-demo".into()),
-            trade_id: Some("f14-demo-buy-1".into()),
+            group: Some("lifecycle-demo".into()),
+            trade_id: Some("lifecycle-demo-buy-1".into()),
         },
         // 2. Tighten the stoploss on the trade by trade_id.
         RawSignalMsg::ModifyStoploss {
             ts: "2024-02-01T12:00:00Z".into(),
             position: PositionRefMsg::ByTradeId {
-                trade_id: "f14-demo-buy-1".into(),
+                trade_id: "lifecycle-demo-buy-1".into(),
             },
             price: 1.0850,
         },
@@ -334,7 +329,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
         RawSignalMsg::ClosePartial {
             ts: "2024-02-02T10:00:00Z".into(),
             position: PositionRefMsg::ByTradeId {
-                trade_id: "f14-demo-buy-1".into(),
+                trade_id: "lifecycle-demo-buy-1".into(),
             },
             ratio: 0.5,
         },
@@ -342,7 +337,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
         RawSignalMsg::MoveStoplossToEntry {
             ts: "2024-02-02T10:01:00Z".into(),
             position: PositionRefMsg::ByTradeId {
-                trade_id: "f14-demo-buy-1".into(),
+                trade_id: "lifecycle-demo-buy-1".into(),
             },
         },
         // 5. Open a second position (short) in a different group.
@@ -355,14 +350,14 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             risk: 1.0,
             stoploss: Some(1.1150),
             targets: vec![1.0900],
-            group: Some("f14-hedge".into()),
-            trade_id: Some("f14-hedge-sell-1".into()),
+            group: Some("lifecycle-hedge".into()),
+            trade_id: Some("lifecycle-hedge-sell-1".into()),
         },
         // 6. Scale into the short trade by trade_id.
         RawSignalMsg::ScaleIn {
             ts: "2024-02-06T09:30:00Z".into(),
             position: PositionRefMsg::ByTradeId {
-                trade_id: "f14-hedge-sell-1".into(),
+                trade_id: "lifecycle-hedge-sell-1".into(),
             },
             price: None,
             size: 0.25,
@@ -371,7 +366,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
         RawSignalMsg::AddRule {
             ts: "2024-02-06T09:31:00Z".into(),
             position: PositionRefMsg::ByTradeId {
-                trade_id: "f14-hedge-sell-1".into(),
+                trade_id: "lifecycle-hedge-sell-1".into(),
             },
             rule: RuleConfigDefMsg::TrailingStop { distance: 0.0050 },
         },
@@ -385,13 +380,13 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
             risk: 1.0,
             stoploss: Some(1.0700),
             targets: vec![1.1000, 1.1050],
-            group: Some("f14-demo".into()),
-            trade_id: Some("f14-demo-buy-2".into()),
+            group: Some("lifecycle-demo".into()),
+            trade_id: Some("lifecycle-demo-buy-2".into()),
         },
         // 9. Close all positions in the hedge group.
         RawSignalMsg::CloseAllInGroup {
             ts: "2024-02-12T16:00:00Z".into(),
-            group_id: "f14-hedge".into(),
+            group_id: "lifecycle-hedge".into(),
         },
         // 10. Modify stoploss for all remaining positions on the symbol.
         RawSignalMsg::ModifyAllStoploss {
@@ -406,7 +401,7 @@ fn generate_f14_signals(symbol: &str) -> Vec<RawSignalMsg> {
     ]
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
+// Example client entry point.
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -497,18 +492,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── 5. Run Backtest — F14 Raw Signals ───────────────────────────────
-        print_header("Run Backtest — F14 Full Signal Actions");
+        // 5. Run a backtest with the complete raw-signal action vocabulary.
+        print_header("Run Backtest - Full Signal Actions");
 
-        let f14_signals = generate_f14_signals(&args.symbol);
+        let raw_signals = generate_full_signal_actions(&args.symbol);
         println!(
-            "  Sending {} F14 raw signals (entries + management) ...",
-            f14_signals.len()
+            "  Sending {} raw signals (entries + management) ...",
+            raw_signals.len()
         );
 
-        // Show what signals we're sending
-        print_section("F14 Signal Stream");
-        for (i, sig) in f14_signals.iter().enumerate() {
+        // Show the signals being submitted.
+        print_section("Raw Signal Stream");
+        for (i, sig) in raw_signals.iter().enumerate() {
             let desc = match sig {
                 RawSignalMsg::Entry { side, risk, .. } => {
                     format!("Entry {} risk={}", side, risk)
@@ -573,7 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let_remainder_run: false,
         };
 
-        let f14_request = BacktestRunSpec {
+        let raw_signal_request = BacktestRunSpec {
             symbol: args.symbol.clone(),
             symbols: Vec::new(),
             all_symbols: false,
@@ -582,7 +577,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeframe: args.timeframe.clone(),
             from: args.from.clone(),
             to: args.to.clone(),
-            raw_signals: f14_signals,
+            raw_signals,
             profile: None,
             profile_def: Some(inline_profile),
             config: BacktestConfigMsg {
@@ -593,11 +588,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
 
-        let f14_resp: RunBacktestResponse = client
+        let raw_signal_response: RunBacktestResponse = client
             .call(
                 "run_backtest",
                 &RunBacktestRequest {
-                    request: f14_request,
+                    request: raw_signal_request,
                     future: FutureQuoteConfigMsg {
                         account_currency: "USD".into(),
                         ..FutureQuoteConfigMsg::default()
@@ -607,10 +602,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
-        println!("  Elapsed: {}ms", f14_resp.elapsed_ms);
+        println!("  Elapsed: {}ms", raw_signal_response.elapsed_ms);
 
-        if f14_resp.success {
-            if let Some(ref result) = f14_resp.result {
+        if raw_signal_response.success {
+            if let Some(ref result) = raw_signal_response.result {
                 print_result_summary(result);
                 print_trade_log(&result.trade_log, 20);
                 print_positions(&result.positions, 10);
@@ -618,7 +613,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!(
                 "  ✗ Backtest failed: {}",
-                f14_resp.error.as_deref().unwrap_or("unknown error")
+                raw_signal_response
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown error")
             );
         }
 

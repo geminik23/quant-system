@@ -318,8 +318,10 @@ fn process_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qs_core::RawSignal;
+    use crate::parser::ChannelParser;
+    use qs_core::{PositionRef, RawSignal};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     //
     // Test handler that captures calls.
@@ -331,8 +333,10 @@ mod tests {
         delete_count: AtomicUsize,
         skip_count: AtomicUsize,
         unregistered_count: AtomicUsize,
-        last_signals: std::sync::Mutex<Vec<RawSignal>>,
-        last_del_ids: std::sync::Mutex<Vec<i64>>,
+        last_signals: Mutex<Vec<RawSignal>>,
+        last_del_ids: Mutex<Vec<i64>>,
+        signal_timestamps: Mutex<Vec<NaiveDateTime>>,
+        signal_message_ids: Mutex<Vec<i64>>,
     }
 
     impl TestHandler {
@@ -343,20 +347,26 @@ mod tests {
                 delete_count: AtomicUsize::new(0),
                 skip_count: AtomicUsize::new(0),
                 unregistered_count: AtomicUsize::new(0),
-                last_signals: std::sync::Mutex::new(Vec::new()),
-                last_del_ids: std::sync::Mutex::new(Vec::new()),
+                last_signals: Mutex::new(Vec::new()),
+                last_del_ids: Mutex::new(Vec::new()),
+                signal_timestamps: Mutex::new(Vec::new()),
+                signal_message_ids: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl SignalHandler for TestHandler {
-        fn on_signals(&self, signals: Vec<RawSignal>, _ctx: &SignalContext) {
+        fn on_signals(&self, signals: Vec<RawSignal>, ctx: &SignalContext) {
             self.new_count.fetch_add(1, Ordering::Relaxed);
             *self.last_signals.lock().unwrap() = signals;
+            self.signal_timestamps.lock().unwrap().push(ctx.ts);
+            self.signal_message_ids.lock().unwrap().push(ctx.msg_id);
         }
-        fn on_signal_edit(&self, signals: Vec<RawSignal>, _ctx: &SignalContext) {
+        fn on_signal_edit(&self, signals: Vec<RawSignal>, ctx: &SignalContext) {
             self.edit_count.fetch_add(1, Ordering::Relaxed);
             *self.last_signals.lock().unwrap() = signals;
+            self.signal_timestamps.lock().unwrap().push(ctx.ts);
+            self.signal_message_ids.lock().unwrap().push(ctx.msg_id);
         }
         fn on_signal_delete(&self, _chat_id: i64, msg_ids: Vec<i64>) {
             self.delete_count.fetch_add(1, Ordering::Relaxed);
@@ -410,6 +420,78 @@ mod tests {
             },
             sender: Some("test".to_string()),
         }
+    }
+
+    type HistorySnapshot = Vec<(i64, String)>;
+    type RecordedCalls = Arc<Mutex<Vec<(i64, HistorySnapshot)>>>;
+
+    struct RecordingParser {
+        channels: Vec<i64>,
+        max_history: usize,
+        calls: RecordedCalls,
+    }
+
+    impl ChannelParser for RecordingParser {
+        fn name(&self) -> &str {
+            "online-recording"
+        }
+
+        fn channel_ids(&self) -> &[i64] {
+            &self.channels
+        }
+
+        fn max_history(&self) -> usize {
+            self.max_history
+        }
+
+        fn parse_root(
+            &self,
+            _message: &str,
+            ts: NaiveDateTime,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            self.record_and_signal(ts, ctx)
+        }
+
+        fn parse_reply(
+            &self,
+            _message: &str,
+            ts: NaiveDateTime,
+            _parent: Option<&RawTgMessage>,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            self.record_and_signal(ts, ctx)
+        }
+    }
+
+    impl RecordingParser {
+        fn record_and_signal(&self, ts: NaiveDateTime, ctx: &ParseContext) -> ParsedAction {
+            let current = ctx.current_message().expect("current source message");
+            self.calls.lock().unwrap().push((
+                current.msg_id,
+                ctx.history
+                    .iter()
+                    .map(|message| (message.msg_id, message.message.clone()))
+                    .collect(),
+            ));
+            ParsedAction::one(RawSignal::Close {
+                ts,
+                position: PositionRef::ByTradeId {
+                    trade_id: format!("online-{}", current.msg_id),
+                },
+            })
+        }
+    }
+
+    fn make_recording_registry(max_history: usize) -> (ParserRegistry, RecordedCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ParserRegistry::new();
+        registry.register(Box::new(RecordingParser {
+            channels: vec![300],
+            max_history,
+            calls: Arc::clone(&calls),
+        }));
+        (registry, calls)
     }
 
     #[test]
@@ -626,5 +708,126 @@ mod tests {
 
         assert_eq!(handler.new_count.load(Ordering::Relaxed), 0);
         assert_eq!(handler.skip_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn missing_or_invalid_relay_timestamp_uses_current_clock() {
+        let registry = make_registry();
+        let handler = TestHandler::new();
+        let mut history = HashMap::new();
+        let before = chrono::Utc::now().naive_utc();
+        let mut missing = make_relay("NEW", 100, 1, "EURUSD BUY NOW SL 1.08 TP 1.09", 0.0);
+        missing.data.date = None;
+        let invalid = make_relay(
+            "NEW",
+            100,
+            2,
+            "GBPUSD BUY NOW SL 1.28 TP 1.29",
+            f64::INFINITY,
+        );
+
+        process_relay(&registry, &handler, &mut history, missing).unwrap();
+        process_relay(&registry, &handler, &mut history, invalid).unwrap();
+        let after = chrono::Utc::now().naive_utc();
+
+        let timestamps = handler.signal_timestamps.lock().unwrap();
+        assert_eq!(timestamps.len(), 2);
+        assert!(timestamps.iter().all(|timestamp| *timestamp >= before));
+        assert!(timestamps.iter().all(|timestamp| *timestamp <= after));
+    }
+
+    #[test]
+    fn edit_appends_a_new_history_revision() {
+        let (registry, calls) = make_recording_registry(3);
+        let handler = TestHandler::new();
+        let mut history = HashMap::new();
+
+        process_relay(
+            &registry,
+            &handler,
+            &mut history,
+            make_relay("NEW", 300, 1, "first", 1706000000.0),
+        )
+        .unwrap();
+        process_relay(
+            &registry,
+            &handler,
+            &mut history,
+            make_relay("EDIT", 300, 1, "edited", 1706000001.0),
+        )
+        .unwrap();
+
+        assert_eq!(handler.new_count.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.edit_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(1, vec![]), (1, vec![(1, "first".into())])]
+        );
+        let retained: Vec<_> = history[&300]
+            .iter()
+            .map(|message| (message.msg_id, message.message.as_str()))
+            .collect();
+        assert_eq!(retained, vec![(1, "first"), (1, "edited")]);
+    }
+
+    #[test]
+    fn delete_leaves_history_and_emits_no_economic_signal() {
+        let (registry, _) = make_recording_registry(3);
+        let handler = TestHandler::new();
+        let mut history = HashMap::new();
+
+        process_relay(
+            &registry,
+            &handler,
+            &mut history,
+            make_relay("NEW", 300, 1, "entry", 1706000000.0),
+        )
+        .unwrap();
+        let retained_before = history.clone();
+        process_relay(
+            &registry,
+            &handler,
+            &mut history,
+            make_del_relay(300, vec![1], None),
+        )
+        .unwrap();
+
+        assert_eq!(history, retained_before);
+        assert_eq!(handler.delete_count.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.new_count.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.edit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(handler.signal_timestamps.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relay_uses_arrival_order_and_retains_bounded_history() {
+        let (registry, calls) = make_recording_registry(2);
+        let handler = TestHandler::new();
+        let mut history = HashMap::new();
+
+        for (msg_id, message) in [(30, "thirty"), (10, "ten"), (20, "twenty")] {
+            process_relay(
+                &registry,
+                &handler,
+                &mut history,
+                make_relay("NEW", 300, msg_id, message, 1706000000.0),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (30, vec![]),
+                (10, vec![(30, "thirty".into())]),
+                (20, vec![(30, "thirty".into()), (10, "ten".into())]),
+            ]
+        );
+        let retained_ids: Vec<_> = history[&300].iter().map(|message| message.msg_id).collect();
+        assert_eq!(retained_ids, vec![10, 20]);
+        assert_eq!(
+            *handler.signal_message_ids.lock().unwrap(),
+            vec![30, 10, 20]
+        );
     }
 }

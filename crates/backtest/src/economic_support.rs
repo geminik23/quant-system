@@ -1,14 +1,12 @@
 //! Fail-closed capability checks for the legacy backtest economic model.
 //!
-//! `SymbolSpec` currently carries both lot-grid metadata and the value historically used as the
-//! per-lot P&L multiplier. Until F22 introduces explicit instrument economics, registry-backed
-//! replay must allow only the categories whose existing contract-multiplier convention is
-//! intentionally supported. Registered crypto symbols remain useful for normalization and
-//! quantity metadata, but they are not economically executable through this model.
+//! `SymbolSpec` currently carries both lot-grid metadata and the value historically used as the per-lot P&L multiplier.
+//! Registry-backed replay allows only categories whose existing contract-multiplier convention is intentionally supported until explicit instrument economics replace this compatibility model.
+//! Registered crypto symbols remain useful for normalization and quantity metadata, but they are not economically executable through this model.
 
 use qs_symbols::SymbolSpec;
 
-/// Stable identity recorded in replay metadata for the transitional CP00 guard.
+/// Stable identity recorded in replay metadata for the transitional economic guard.
 pub const LEGACY_ECONOMIC_GUARD_ID: &str = "legacy-economic-guard-v1";
 
 /// Economic models explicitly supported by the current contract-multiplier replay path.
@@ -165,7 +163,7 @@ mod tests {
         assert_eq!(
             crypto.len(),
             4,
-            "update the CP00 inventory when the catalog changes"
+            "update the crypto economic inventory when the catalog changes"
         );
 
         let mut rejected = crypto

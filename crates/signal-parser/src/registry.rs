@@ -94,8 +94,38 @@ mod tests {
         let mut reg = ParserRegistry::new();
         reg.register(make_parser("alpha", vec![1]));
         reg.register(make_parser("beta", vec![2]));
-        let mut names = reg.names();
-        names.sort();
-        assert_eq!(names, vec!["alpha", "beta"]);
+        let names = reg.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+    }
+
+    #[test]
+    fn same_name_registration_replaces_name_ids_but_keeps_old_channel_mapping() {
+        let mut reg = ParserRegistry::new();
+        reg.register(make_parser("duplicate", vec![10]));
+        reg.register(make_parser("duplicate", vec![20]));
+
+        assert_eq!(reg.ids_for_name("duplicate"), Some([20].as_slice()));
+        assert_eq!(reg.get(10).unwrap().name(), "duplicate");
+        assert_eq!(reg.get(20).unwrap().name(), "duplicate");
+        assert_eq!(reg.names().len(), 1);
+    }
+
+    #[test]
+    fn overlapping_channel_replacement_leaves_stale_name_mapping() {
+        let mut reg = ParserRegistry::new();
+        reg.register(make_parser("alpha", vec![10, 20]));
+        reg.register(make_parser("beta", vec![20, 30]));
+
+        assert_eq!(reg.get(10).unwrap().name(), "alpha");
+        assert_eq!(reg.get(20).unwrap().name(), "beta");
+        assert_eq!(reg.get(30).unwrap().name(), "beta");
+        assert_eq!(reg.ids_for_name("alpha"), Some([10, 20].as_slice()));
+        assert_eq!(reg.ids_for_name("beta"), Some([20, 30].as_slice()));
+        let names = reg.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
     }
 }

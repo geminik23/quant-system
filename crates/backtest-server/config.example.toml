@@ -20,11 +20,11 @@ shm_buffer_size = 16777216
 data_dir = "market_data"
 
 [symbols]
-# Path to the symbol registry TOML (qs-symbols / F06).
+# Path to the qs-symbols registry TOML.
 registry_path = "crates/symbols/symbols.toml"
 
 [profiles]
-# Path to the management profiles TOML (qs-backtest / F09).
+# Path to the qs-backtest management profiles TOML.
 # Profiles should include explicit target_selection. Existing serialized profiles with
 # only use_targets remain readable. Dynamic RPC additions are not persisted.
 profiles_path = "crates/backtest/profiles.toml"

@@ -2192,6 +2192,50 @@ mod tests {
     }
 
     #[test]
+    fn server_conversion_applies_shared_risk_and_scale_in_validation() {
+        let registry = SymbolRegistry::empty();
+        let invalid_entry = RawSignalMsg::Entry {
+            ts: "2026-01-15T10:00:00".into(),
+            symbol: "EURUSD".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            price: None,
+            risk: 0.0,
+            stoploss: None,
+            targets: Vec::new(),
+            group: None,
+            trade_id: None,
+        };
+        let entry_error =
+            backtest_server::convert::raw_signal_from_msg(&invalid_entry, "EURUSD", &registry)
+                .unwrap_err();
+        assert!(
+            entry_error
+                .to_string()
+                .contains("entry risk multiplier must be finite and positive"),
+            "{entry_error}"
+        );
+
+        let invalid_scale_in = RawSignalMsg::ScaleIn {
+            ts: "2026-01-15T10:01:00".into(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "trade-1".into(),
+            },
+            price: None,
+            size: 0.0,
+        };
+        let scale_in_error =
+            backtest_server::convert::raw_signal_from_msg(&invalid_scale_in, "EURUSD", &registry)
+                .unwrap_err();
+        assert!(
+            scale_in_error
+                .to_string()
+                .contains("scale-in size/price is invalid"),
+            "{scale_in_error}"
+        );
+    }
+
+    #[test]
     fn sizing_options_are_mutually_exclusive_and_map_to_current_policies() {
         for (option, value, expected) in [
             ("--base-lot", "0.25", "fixed_lot"),
@@ -2743,6 +2787,93 @@ mod tests {
         assert!(parse_cli_timestamp("2026-01-01").is_some());
         // Garbage still fails, so the invalid-timestamp error path is intact.
         assert!(parse_cli_timestamp("not-a-timestamp").is_none());
+    }
+
+    fn outcome_fixture_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tg_backtest_{label}_{}_{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn load_outcome_error(label: &str, outcomes: &[serde_json::Value]) -> String {
+        let path = outcome_fixture_path(label);
+        let jsonl = outcomes
+            .iter()
+            .map(|outcome| serde_json::to_string(outcome).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, jsonl).unwrap();
+        let error = load_source_coverage(path.to_str().unwrap(), &None, &None).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        error.to_string()
+    }
+
+    fn skipped_outcome(msg_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "status": "skipped",
+            "source": {
+                "chat_id": 42,
+                "msg_id": msg_id,
+                "ts": "2026-01-15T10:00:00Z",
+                "message": "fixture",
+                "reply_to": null
+            },
+            "parser": "fixture",
+            "reason": "parser_returned_skip"
+        })
+    }
+
+    #[test]
+    fn outcomes_jsonl_rejects_unknown_envelope_and_source_fields_and_duplicates() {
+        let mut unknown_envelope = skipped_outcome(1);
+        unknown_envelope["unexpected"] = serde_json::json!(true);
+        let error = load_outcome_error("unknown_envelope", &[unknown_envelope]);
+        assert!(error.contains("unknown field `unexpected`"), "{error}");
+
+        let mut unknown_source = skipped_outcome(1);
+        unknown_source["source"]["unexpected"] = serde_json::json!(true);
+        let error = load_outcome_error("unknown_source", &[unknown_source]);
+        assert!(error.contains("unknown field `unexpected`"), "{error}");
+
+        let duplicate = skipped_outcome(1);
+        let error = load_outcome_error("duplicate_source", &[duplicate.clone(), duplicate]);
+        assert!(
+            error.contains("outcomes line 2: duplicate source outcome"),
+            "{error}"
+        );
+        assert!(error.contains("chat_id=42 msg_id=1"), "{error}");
+    }
+
+    #[test]
+    fn outcomes_jsonl_treats_reason_and_failure_as_opaque_json() {
+        let path = outcome_fixture_path("opaque_details");
+        let mut skipped = skipped_outcome(1);
+        skipped["reason"] = serde_json::json!(["provider", {"code": 7}]);
+        let failed = serde_json::json!({
+            "status": "failed",
+            "source": {
+                "chat_id": 42,
+                "msg_id": 2,
+                "ts": "2026-01-15T10:00:01Z",
+                "message": "fixture",
+                "reply_to": null
+            },
+            "parser": null,
+            "failure": false
+        });
+        std::fs::write(&path, format!("{skipped}\n{failed}\n")).unwrap();
+
+        let coverage = load_source_coverage(path.to_str().unwrap(), &None, &None).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(coverage.raw_messages, 2);
+        assert_eq!(coverage.skipped_messages, 1);
+        assert_eq!(coverage.failed_messages, 1);
     }
 
     #[test]

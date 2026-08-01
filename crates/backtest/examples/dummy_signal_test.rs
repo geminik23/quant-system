@@ -417,9 +417,9 @@ fn estimate_pip(price: f64) -> f64 {
     }
 }
 
-// ── F14 full signal generation ────────────────────────────────────────
+// Generate a complete raw-signal lifecycle.
 
-/// Generates a full F14 signal stream with entry + management signals.
+/// Generates a full signal stream with entry and management signals.
 ///
 /// The stream demonstrates:
 ///   1. Open a BUY position (entry) in group "alpha"
@@ -431,15 +431,13 @@ fn estimate_pip(price: f64) -> f64 {
 ///   7. Add a trailing stop rule to the SELL (AddRule)
 ///   8. Open another BUY in group "alpha"
 ///   9. Close all positions in group "beta" (CloseAllInGroup)
-///  10. Modify stoploss for all on the symbol (ModifyAllStoploss — not available
-///      as a RawSignal; we use CloseAllOf as a close-all-on-symbol fallback,
-///      or just close everything)
+///  10. Modify stoploss for all on the symbol when supported, otherwise close the applicable scope.
 ///  11. Close all remaining positions (CloseAll)
-fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSignal> {
+fn generate_full_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSignal> {
     let n = events.len();
     if n < 100 {
         eprintln!(
-            "Warning: very few data points ({}), F14 signals may not all fire meaningfully",
+            "Warning: very few data points ({}), lifecycle signals may not all fire meaningfully",
             n
         );
     }
@@ -447,16 +445,16 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
     let pip = estimate_pip(events[0].to_quote().ask);
 
     // Pick timestamps at various points through the data
-    let idx_entry1 = n / 20; // ~5% — first BUY entry
-    let idx_modify_sl = n * 3 / 20; // ~15% — tighten SL
-    let idx_partial = n * 5 / 20; // ~25% — partial close
-    let idx_breakeven = idx_partial + 1; // right after partial close
-    let idx_entry2 = n * 7 / 20; // ~35% — SELL entry
-    let idx_scale_in = n * 8 / 20; // ~40% — scale into SELL
-    let idx_add_rule = idx_scale_in + 1; // right after scale-in
-    let idx_entry3 = n * 10 / 20; // ~50% — second BUY
-    let idx_close_group = n * 13 / 20; // ~65% — close group "beta"
-    let idx_close_all = n * 17 / 20; // ~85% — close everything
+    let idx_entry1 = n / 20; // About 5%, first BUY entry.
+    let idx_modify_sl = n * 3 / 20; // About 15%, tighten SL.
+    let idx_partial = n * 5 / 20; // About 25%, partial close.
+    let idx_breakeven = idx_partial + 1; // Immediately after partial close.
+    let idx_entry2 = n * 7 / 20; // About 35%, SELL entry.
+    let idx_scale_in = n * 8 / 20; // About 40%, scale into SELL.
+    let idx_add_rule = idx_scale_in + 1; // Immediately after scale-in.
+    let idx_entry3 = n * 10 / 20; // About 50%, second BUY.
+    let idx_close_group = n * 13 / 20; // About 65%, close group beta.
+    let idx_close_all = n * 17 / 20; // About 85%, close everything.
 
     let ev1 = &events[idx_entry1];
     let ev_mod = &events[idx_modify_sl];
@@ -579,10 +577,7 @@ fn generate_f14_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSign
         },
     ];
 
-    println!(
-        "Generated F14 raw signal stream ({} signals):",
-        signals.len()
-    );
+    println!("Generated raw signal stream ({} signals):", signals.len());
     for (i, sig) in signals.iter().enumerate() {
         let desc = match sig {
             RawSignal::Entry {
@@ -684,7 +679,7 @@ fn main() {
     let result = match args.mode.as_str() {
         "raw-signals" => {
             // RawSignal stream -> run_raw_signals
-            let raw_signals = generate_f14_raw_signals(&events, &data_symbol);
+            let raw_signals = generate_full_raw_signals(&events, &data_symbol);
             let mut feed = VecFeed::new(events);
             let runner = BacktestRunner::new(config);
             println!(
@@ -708,7 +703,7 @@ fn main() {
                 eprintln!("Error: profile '{profile_name}' not found. Available: {available:?}");
                 process::exit(1);
             });
-            let raw_signals = generate_f14_raw_signals(&events, &data_symbol);
+            let raw_signals = generate_full_raw_signals(&events, &data_symbol);
             let mut feed = VecFeed::new(events);
             let runner = BacktestRunner::new(config);
             println!(
@@ -764,7 +759,7 @@ fn main() {
         }
     }
 
-    // 7. Per-group breakdown (relevant for F14 modes with groups)
+    // 7. Per-group breakdown for modes that use groups.
     if !result.per_group.is_empty() {
         println!();
         println!("═══ PER-GROUP BREAKDOWN ════════════════════════════════════════");

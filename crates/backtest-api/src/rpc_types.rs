@@ -564,7 +564,7 @@ pub struct BacktestResultMsg {
     pub max_drawdown: f64,
     pub max_drawdown_pct: f64,
 
-    // F08 enhanced fields
+    // Extended result breakdowns.
     pub summary: SubsetStatsMsg,
     pub per_symbol: HashMap<String, SubsetStatsMsg>,
     pub per_group: HashMap<String, SubsetStatsMsg>,
@@ -785,7 +785,7 @@ pub struct TradeResultMsg {
     pub group: Option<String>,
 }
 
-// ── Dynamic Profiles (F13) ──────────────────────────────────────────────────
+// Dynamic management profile messages.
 
 /// Wire-safe strict target selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,7 +850,7 @@ pub enum ProfileRef {
     Inline(ManagementProfileMsg),
 }
 
-// ── Full Signal Actions (F14) ───────────────────────────────────────────────
+// Full raw-signal action messages.
 
 /// Wire-safe signal that can represent any action, not just entries.
 ///

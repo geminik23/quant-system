@@ -438,7 +438,7 @@ pub fn parse_fill_model(s: Option<&str>) -> FillModel {
     }
 }
 
-// ── Profile Conversions (F13) ───────────────────────────────────────────────
+// Management profile conversions.
 
 fn target_selection_from_msg(msg: &TargetSelectionMsg) -> TargetSelection {
     match msg {
@@ -805,7 +805,7 @@ fn sanitize_f64(v: f64) -> f64 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-// ── F14: RawSignalMsg / PositionRefMsg Conversions ──────────────────────────
+// RawSignalMsg and PositionRefMsg conversions.
 
 /// Convert a wire-safe `PositionRefMsg` into the internal `PositionRef`.
 pub fn position_ref_from_msg(msg: &PositionRefMsg, registry: &SymbolRegistry) -> PositionRef {
@@ -1319,7 +1319,7 @@ mod tests {
         assert_eq!(event.terminal_ts.as_deref(), Some("2026-01-01T10:00:03"));
     }
 
-    // ── Profile conversion tests (F13) ──────────────────────────────────
+    // Management profile conversion tests.
 
     #[test]
     fn profile_from_msg_basic() {
@@ -1534,7 +1534,7 @@ mod tests {
         assert_eq!(back.let_remainder_run, original.let_remainder_run);
     }
 
-    // ── F14: RawSignalMsg / PositionRefMsg conversion tests ─────────────
+    // RawSignalMsg and PositionRefMsg conversion tests.
 
     #[test]
     fn position_ref_from_msg_id() {

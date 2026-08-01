@@ -1,0 +1,6 @@
+[[parser]]
+name = "synthetic-template"
+type = "template"
+channel_ids = [100]
+default_risk_multiplier = 1.0
+group_prefix = "fixture"

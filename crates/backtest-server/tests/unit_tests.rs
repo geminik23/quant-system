@@ -1796,7 +1796,7 @@ lot_step_units = 1
 "#,
     )
     .unwrap();
-    state.data_dir = "/path/that/must/not/be/scanned/by/cp00".into();
+    state.data_dir = "/path/that/must/not/be/scanned/by/crypto-guard".into();
 
     let mut request = replay_request();
     request.request.symbol = "BTC/USD".into();
@@ -2725,7 +2725,7 @@ fn list_symbols_request_none_fields() {
     assert!(decoded.exchange.is_none());
 }
 
-// ── Profile conversion tests (F13) ───────────────────────────────────────────
+// Management profile conversion tests.
 
 #[test]
 fn profile_from_msg_basic() {
@@ -3008,7 +3008,7 @@ fn run_backtest_request_with_profile_def_serde() {
     assert!(decoded.profile.is_none());
 }
 
-// ── F13: Phase 1 Handler Tests ─────────────────────────────────────────────
+// Inline management profile handler tests.
 
 #[test]
 fn inline_profile_validation_error() {
@@ -3104,7 +3104,7 @@ fn backward_compat_multi_string_profiles() {
     assert!(matches!(&decoded.profiles[1], ProfileRef::Named(n) if n == "aggressive"));
 }
 
-// ── F13: Phase 2 Handler Tests ─────────────────────────────────────────────
+// Dynamic management profile handler tests.
 
 #[test]
 fn handler_add_profile_success() {
@@ -3249,7 +3249,7 @@ fn handler_remove_profile_not_found() {
     assert!(resp.error.as_ref().unwrap().contains("not found"));
 }
 
-// ── F14: RawSignalMsg / PositionRefMsg serde tests ──────────────────────────
+// RawSignalMsg and PositionRefMsg serde tests.
 
 #[test]
 fn raw_signal_msg_serde_entry() {

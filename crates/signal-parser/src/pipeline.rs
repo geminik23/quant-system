@@ -260,8 +260,11 @@ fn into_legacy_result(result: ParseBatchResult) -> Result<Vec<RawSignal>, Signal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ChannelParser;
     use crate::template::TemplateParser;
+    use qs_core::PositionRef;
     use qs_core::types::{OrderType, Side};
+    use std::sync::{Arc, Mutex};
 
     fn make_registry() -> ParserRegistry {
         let mut reg = ParserRegistry::new();
@@ -294,6 +297,90 @@ mod tests {
             message: message.to_string(),
             reply_to: Some(reply_to),
         }
+    }
+
+    type RecordedCalls = Arc<Mutex<Vec<(i64, Vec<i64>)>>>;
+
+    struct RecordingParser {
+        channels: Vec<i64>,
+        max_history: usize,
+        signals_per_message: usize,
+        calls: RecordedCalls,
+    }
+
+    impl ChannelParser for RecordingParser {
+        fn name(&self) -> &str {
+            "recording-parser"
+        }
+
+        fn channel_ids(&self) -> &[i64] {
+            &self.channels
+        }
+
+        fn max_history(&self) -> usize {
+            self.max_history
+        }
+
+        fn parse_root(
+            &self,
+            _message: &str,
+            ts: NaiveDateTime,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            let current = ctx.current_message().expect("current source message");
+            self.calls.lock().unwrap().push((
+                current.msg_id,
+                ctx.history.iter().map(|message| message.msg_id).collect(),
+            ));
+            ParsedAction::signals(
+                (0..self.signals_per_message)
+                    .map(|index| RawSignal::Close {
+                        ts,
+                        position: PositionRef::ByTradeId {
+                            trade_id: format!("msg-{}-{index}", current.msg_id),
+                        },
+                    })
+                    .collect(),
+            )
+        }
+
+        fn parse_reply(
+            &self,
+            message: &str,
+            ts: NaiveDateTime,
+            _parent: Option<&RawTgMessage>,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            self.parse_root(message, ts, ctx)
+        }
+    }
+
+    fn make_recording_registry(
+        max_history: usize,
+        signals_per_message: usize,
+    ) -> (ParserRegistry, RecordedCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ParserRegistry::new();
+        registry.register(Box::new(RecordingParser {
+            channels: vec![800],
+            max_history,
+            signals_per_message,
+            calls: Arc::clone(&calls),
+        }));
+        (registry, calls)
+    }
+
+    fn close_trade_ids(signals: &[RawSignal]) -> Vec<&str> {
+        signals
+            .iter()
+            .map(|signal| match signal {
+                RawSignal::Close {
+                    position: PositionRef::ByTradeId { trade_id },
+                    ..
+                } => trade_id.as_str(),
+                _ => panic!("expected close signal"),
+            })
+            .collect()
     }
 
     struct ParentRequiredParser {
@@ -670,9 +757,7 @@ mod tests {
 
     #[test]
     fn parse_messages_can_emit_reply_management_signal() {
-        use crate::parser::ChannelParser;
         use chrono::NaiveDateTime;
-        use qs_core::PositionRef;
 
         struct ReplyParser {
             channels: Vec<i64>,
@@ -744,5 +829,107 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0], RawSignal::Entry { .. }));
         assert!(matches!(result[1], RawSignal::Close { .. }));
+    }
+
+    #[test]
+    fn duplicate_source_messages_are_accepted() {
+        let (registry, calls) = make_recording_registry(2, 1);
+        let messages = vec![
+            make_msg(800, 1, "2025-01-01T10:00:00Z", "first"),
+            make_msg(800, 1, "2025-01-01T10:00:01Z", "duplicate"),
+        ];
+
+        let result = parse_messages_v2(&registry, &messages);
+
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(result.signals.len(), 2);
+        assert_eq!(*calls.lock().unwrap(), vec![(1, vec![]), (1, vec![1])]);
+    }
+
+    #[test]
+    fn compatibility_stops_at_invalid_timestamp_before_later_sorted_messages() {
+        let (registry, calls) = make_recording_registry(4, 1);
+        let messages = vec![
+            make_msg(800, 3, "2025-01-01T10:00:03Z", "later"),
+            make_msg(800, 2, "invalid", "broken"),
+            make_msg(800, 1, "2025-01-01T10:00:01Z", "earlier"),
+        ];
+
+        assert!(matches!(
+            parse_messages(&registry, &messages),
+            Err(SignalParserError::TimestampParse(value, _)) if value == "invalid"
+        ));
+        assert_eq!(*calls.lock().unwrap(), vec![(1, vec![])]);
+    }
+
+    #[test]
+    fn v2_continues_in_input_outcome_order_and_stably_sorts_equal_timestamp_signals() {
+        let (registry, _) = make_recording_registry(4, 1);
+        let messages = vec![
+            make_msg(800, 3, "2025-01-01T10:00:00Z", "third"),
+            make_msg(800, 4, "invalid", "broken"),
+            make_msg(800, 1, "2025-01-01T10:00:00Z", "first"),
+            make_msg(800, 2, "2025-01-01T10:00:00Z", "second"),
+        ];
+
+        let result = parse_messages_v2(&registry, &messages);
+
+        let outcome_ids: Vec<_> = result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.source().msg_id)
+            .collect();
+        assert_eq!(outcome_ids, vec![3, 4, 1, 2]);
+        assert!(matches!(
+            &result.outcomes[1],
+            MessageParseOutcome::Failed {
+                failure: ParseFailure::InvalidTimestamp { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            close_trade_ids(&result.signals),
+            vec!["msg-1-0", "msg-2-0", "msg-3-0"]
+        );
+    }
+
+    #[test]
+    fn v2_retains_bounded_history() {
+        let (registry, calls) = make_recording_registry(2, 1);
+        let messages: Vec<_> = (1..=4)
+            .map(|msg_id| {
+                make_msg(
+                    800,
+                    msg_id,
+                    "2025-01-01T10:00:00Z",
+                    &format!("message-{msg_id}"),
+                )
+            })
+            .collect();
+
+        let result = parse_messages_v2(&registry, &messages);
+
+        assert_eq!(result.signals.len(), 4);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(1, vec![]), (2, vec![1]), (3, vec![1, 2]), (4, vec![2, 3]),]
+        );
+    }
+
+    #[test]
+    fn v2_retains_multiple_signals_from_one_message() {
+        let (registry, _) = make_recording_registry(1, 2);
+
+        let result = parse_messages_v2(
+            &registry,
+            &[make_msg(800, 9, "2025-01-01T10:00:00Z", "two")],
+        );
+
+        assert_eq!(result.signals.len(), 2);
+        assert_eq!(close_trade_ids(&result.signals), vec!["msg-9-0", "msg-9-1"]);
+        assert!(matches!(
+            result.outcomes.as_slice(),
+            [MessageParseOutcome::Parsed { signals, .. }] if signals.len() == 2
+        ));
     }
 }

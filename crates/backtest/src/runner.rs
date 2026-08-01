@@ -3902,9 +3902,8 @@ mod tests {
 
     #[test]
     fn run_raw_signals_with_profile_preserves_trade_id() {
-        // Regression for the F17 trade_id propagation gap: a profile-supplied
-        // raw entry must still expose its trade_id so that a later
-        // PositionRef::ByTradeId signal can resolve and close the position.
+        // Regression for profile-supplied trade ID propagation.
+        // A raw entry must expose its trade ID so a later PositionRef::ByTradeId signal can resolve and close the position.
         let events = vec![
             tick("EURUSD", 1.0848, 1.0850, ts(10, 0, 0)),
             tick("EURUSD", 1.0900, 1.0902, ts(10, 0, 1)),

@@ -323,7 +323,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     tracing_subscriber::fmt::init();
 
-    // 3. Load symbol registry (F06).
+    // 3. Load the symbol registry.
     let symbol_registry = SymbolRegistry::load(&cfg.symbols.registry_path).map_err(|e| {
         format!(
             "Failed to load symbol registry '{}': {}",
@@ -336,7 +336,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         cfg.symbols.registry_path
     );
 
-    // 4. Load profile registry (F09).
+    // 4. Load the management profile registry.
     let profile_registry = ProfileRegistry::load(&cfg.profiles.profiles_path).map_err(|e| {
         format!(
             "Failed to load profiles '{}': {}",

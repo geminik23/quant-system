@@ -70,13 +70,13 @@ pub struct DatabaseSection {
     pub data_dir: String,
 }
 
-/// Path to the symbol registry TOML (F06).
+/// Path to the symbol registry TOML.
 #[derive(Debug, Deserialize)]
 pub struct SymbolsSection {
     pub registry_path: String,
 }
 
-/// Path to the management profiles TOML (F09).
+/// Path to the management profiles TOML.
 #[derive(Debug, Deserialize)]
 pub struct ProfilesSection {
     pub profiles_path: String,

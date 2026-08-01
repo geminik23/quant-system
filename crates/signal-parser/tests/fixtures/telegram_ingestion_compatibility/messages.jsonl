@@ -1,0 +1,4 @@
+{"chat_id":100,"msg_id":2,"ts":"2026-01-01T10:01:00Z","message":"informational update","reply_to":null}
+{"chat_id":200,"msg_id":1,"ts":"invalid-unknown-source","message":"ignored unknown source","reply_to":null}
+{"chat_id":100,"msg_id":1,"ts":"2026-01-01T10:00:00Z","message":"EURUSD BUY NOW SL 1.0800 TP 1.0900","reply_to":null}
+{"chat_id":100,"msg_id":3,"ts":"invalid-registered-source","message":"EURUSD BUY NOW SL 1.0700 TP 1.1000","reply_to":null}

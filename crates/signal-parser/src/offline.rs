@@ -273,8 +273,10 @@ fn write_jsonl_values<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use chrono::NaiveDateTime;
+    use qs_core::PositionRef;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     struct CountingHandler {
         signal_count: Arc<AtomicUsize>,
@@ -313,6 +315,80 @@ mod tests {
             message: message.to_string(),
             reply_to: None,
         }
+    }
+
+    type RecordedCalls = Arc<Mutex<Vec<(i64, Option<i64>, Vec<i64>)>>>;
+
+    struct RecordingParser {
+        channels: Vec<i64>,
+        max_history: usize,
+        calls: RecordedCalls,
+    }
+
+    impl ChannelParser for RecordingParser {
+        fn name(&self) -> &str {
+            "recording-handler"
+        }
+
+        fn channel_ids(&self) -> &[i64] {
+            &self.channels
+        }
+
+        fn max_history(&self) -> usize {
+            self.max_history
+        }
+
+        fn parse_root(
+            &self,
+            _message: &str,
+            ts: NaiveDateTime,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            self.record_and_signal(ts, None, ctx)
+        }
+
+        fn parse_reply(
+            &self,
+            _message: &str,
+            ts: NaiveDateTime,
+            parent: Option<&RawTgMessage>,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            self.record_and_signal(ts, parent.map(|message| message.msg_id), ctx)
+        }
+    }
+
+    impl RecordingParser {
+        fn record_and_signal(
+            &self,
+            ts: NaiveDateTime,
+            parent: Option<i64>,
+            ctx: &ParseContext,
+        ) -> ParsedAction {
+            let current = ctx.current_message().expect("current source message");
+            self.calls.lock().unwrap().push((
+                current.msg_id,
+                parent,
+                ctx.history.iter().map(|message| message.msg_id).collect(),
+            ));
+            ParsedAction::one(RawSignal::Close {
+                ts,
+                position: PositionRef::ByTradeId {
+                    trade_id: format!("offline-{}", current.msg_id),
+                },
+            })
+        }
+    }
+
+    fn make_recording_registry(max_history: usize) -> (ParserRegistry, RecordedCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ParserRegistry::new();
+        registry.register(Box::new(RecordingParser {
+            channels: vec![200],
+            max_history,
+            calls: Arc::clone(&calls),
+        }));
+        (registry, calls)
     }
 
     #[test]
@@ -562,5 +638,82 @@ mod tests {
         assert_eq!(signals.load(Ordering::Relaxed), 2);
         assert_eq!(skips.load(Ordering::Relaxed), 1);
         assert_eq!(unreg.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handler_mode_invokes_parser_with_missing_parent() {
+        let (registry, calls) = make_recording_registry(2);
+        let signals = Arc::new(AtomicUsize::new(0));
+        let handler = CountingHandler {
+            signal_count: Arc::clone(&signals),
+            skip_count: Arc::new(AtomicUsize::new(0)),
+            unregistered_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut reply = make_msg(200, 2, "2025-01-01T10:00:00Z", "close");
+        reply.reply_to = Some(999);
+
+        let count = run_with_handler(&registry, &[reply], &handler);
+
+        assert_eq!(count, 1);
+        assert_eq!(signals.load(Ordering::Relaxed), 1);
+        assert_eq!(*calls.lock().unwrap(), vec![(2, None, vec![])]);
+    }
+
+    #[test]
+    fn handler_mode_continues_after_invalid_timestamp() {
+        let registry = make_registry();
+        let signals = Arc::new(AtomicUsize::new(0));
+        let handler = CountingHandler {
+            signal_count: Arc::clone(&signals),
+            skip_count: Arc::new(AtomicUsize::new(0)),
+            unregistered_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let messages = vec![
+            make_msg(100, 1, "invalid", "broken"),
+            make_msg(
+                100,
+                2,
+                "2025-01-01T10:00:00Z",
+                "EURUSD BUY NOW SL 1.08 TP 1.09",
+            ),
+        ];
+
+        let count = run_with_handler(&registry, &messages, &handler);
+
+        assert_eq!(count, 1);
+        assert_eq!(signals.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handler_mode_retains_bounded_history() {
+        let (registry, calls) = make_recording_registry(2);
+        let handler = CountingHandler {
+            signal_count: Arc::new(AtomicUsize::new(0)),
+            skip_count: Arc::new(AtomicUsize::new(0)),
+            unregistered_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let messages: Vec<_> = (1..=4)
+            .map(|msg_id| {
+                make_msg(
+                    200,
+                    msg_id,
+                    "2025-01-01T10:00:00Z",
+                    &format!("message-{msg_id}"),
+                )
+            })
+            .collect();
+
+        let count = run_with_handler(&registry, &messages, &handler);
+
+        assert_eq!(count, 4);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (1, None, vec![]),
+                (2, None, vec![1]),
+                (3, None, vec![1, 2]),
+                (4, None, vec![2, 3]),
+            ]
+        );
     }
 }
