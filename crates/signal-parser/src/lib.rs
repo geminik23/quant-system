@@ -1,8 +1,12 @@
-//! Per-channel Telegram signal parser for the quant-system workspace.
+//! Source-neutral event contracts and Telegram signal parsing for the quant-system workspace.
+//!
+//! The [`ingestion`] module defines bounded source facts before parsing. Existing Telegram
+//! parsers, runners, artifacts, and direct normalized-signal inputs remain separate.
 
 pub mod config;
 pub mod error;
 pub mod handler;
+pub mod ingestion;
 pub mod offline;
 pub mod parser;
 pub mod pipeline;

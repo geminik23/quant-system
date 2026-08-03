@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that Telegram parser types stay outside domain and logical API crates."""
+"""Check Telegram compatibility and generic ingestion source boundaries."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER_CRATE = (ROOT / "crates/signal-parser").resolve()
+GENERIC_INGESTION = PARSER_CRATE / "src/ingestion"
 TARGETS = (
     ROOT / "crates/core",
     ROOT / "crates/backtest",
@@ -26,6 +27,69 @@ FORBIDDEN_SYMBOLS = (
     "ParserRegistry",
     "SignalHandler",
     "SignalContext",
+)
+GENERIC_FORBIDDEN_SYMBOLS = (
+    "RawTgMessage",
+    "MessageParseOutcome",
+    "ParseBatchResult",
+    "ParseContext",
+    "ParseFailure",
+    "ParsedAction",
+    "SkipReason",
+    "ChannelParser",
+    "TemplateParser",
+    "ParserRegistry",
+    "SignalParserError",
+    "SignalHandler",
+    "SignalContext",
+    "LoggingHandler",
+    "NoopHandler",
+    "LlmClient",
+    "MarketQuote",
+    "OfflineArgs",
+    "OfflineRunner",
+    "OnlineServer",
+    "load_parsers",
+    "parse_messages",
+    "crate::config",
+    "crate::handler",
+    "crate::offline",
+    "crate::online",
+    "crate::parser",
+    "crate::pipeline",
+    "crate::registry",
+    "crate::template",
+    "crate::types",
+    "SourceState",
+    "SourceHistory",
+    "RevisionPolicy",
+    "DuplicatePolicy",
+    "ConflictPolicy",
+    "SourceCheckpoint",
+    "ContentHash",
+    "RawSignal",
+    "TradeIntent",
+    "InstrumentId",
+    "ExecutionVenue",
+    "StrategyRuntime",
+    "qs_core",
+    "qs_symbols",
+    "qs_backtest",
+    "qs_service",
+    "qs_market_data",
+    "tokio",
+    "axum",
+    "tower",
+    "tower_http",
+    "xrpc",
+    "clap",
+    "std::io",
+    "std::net",
+    "std::path",
+    "polars",
+    "duckdb",
+    "ctrader_fix",
+    "std::fs",
 )
 
 
@@ -69,16 +133,38 @@ def check_dependencies(metadata: dict) -> list[str]:
     return errors
 
 
-def check_sources(crate: Path) -> list[str]:
+def check_source_tree(
+    root: Path,
+    symbols: tuple[str, ...],
+    description: str,
+) -> list[str]:
     errors: list[str] = []
-    for source in sorted((crate / "src").rglob("*.rs")):
+    for source in sorted(root.rglob("*.rs")):
         text = source.read_text(encoding="utf-8")
-        for symbol in FORBIDDEN_SYMBOLS:
+        for symbol in symbols:
             if symbol in text:
-                errors.append(
-                    f"{source.relative_to(ROOT)}: forbidden Telegram parser symbol {symbol}"
-                )
+                try:
+                    display_path = source.relative_to(ROOT)
+                except ValueError:
+                    display_path = source
+                errors.append(f"{display_path}: forbidden {description} symbol {symbol}")
     return errors
+
+
+def check_sources(crate: Path) -> list[str]:
+    return check_source_tree(
+        crate / "src",
+        FORBIDDEN_SYMBOLS,
+        "Telegram parser",
+    )
+
+
+def check_generic_ingestion_sources(root: Path = GENERIC_INGESTION) -> list[str]:
+    return check_source_tree(
+        root,
+        GENERIC_FORBIDDEN_SYMBOLS,
+        "generic ingestion",
+    )
 
 
 def main() -> int:
@@ -91,6 +177,7 @@ def main() -> int:
     errors = check_dependencies(metadata)
     for crate in TARGETS:
         errors.extend(check_sources(crate))
+    errors.extend(check_generic_ingestion_sources())
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

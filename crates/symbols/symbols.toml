@@ -975,6 +975,20 @@ lot_min_steps = 1
 lot_max_steps = 0
 
 [[symbol]]
+canonical = "xauaud"
+aliases = ["xau/aud", "xau-aud"]
+pip_position = 2
+digits = 2
+category = "metal"
+base_currency = "XAU"
+quote_currency = "AUD"
+pnl_currency = "AUD"
+lot_base_units = 100
+lot_step_units = 1
+lot_min_steps = 1
+lot_max_steps = 0
+
+[[symbol]]
 canonical = "xagusd"
 aliases = ["silver", "xag/usd", "xag-usd"]
 pip_position = 2

@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-description = "Per-channel Telegram signal parser for the quant-system"
+description = "Source-event contracts and Telegram signal parsing for quant-system"
 keywords = ["telegram", "parser", "signals", "trading"]
 
 [lib]
@@ -26,6 +26,7 @@ qs-core = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }

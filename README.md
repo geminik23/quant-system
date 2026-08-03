@@ -115,7 +115,7 @@ CTrader FIX ---> Market Data Service ---> real-time bid/ask consumers
 | Historical data | [`qs-data-preprocess`](https://github.com/geminik23/quant-system/tree/main/crates/data-preprocess) | CSV import, partitioned storage, bounded queries, and data management |
 | Service contracts | [`qs-service`](https://github.com/geminik23/quant-system/tree/main/crates/service), [`qs-backtest-api`](https://github.com/geminik23/quant-system/tree/main/crates/backtest-api), [`qs-market-data-api`](https://github.com/geminik23/quant-system/tree/main/crates/market-data-api) | Provider-neutral endpoints, failures, DTOs, events, and typed client ports |
 | Internal transport provider | [`qs-service-xrpc`](https://github.com/geminik23/quant-system/tree/main/crates/service-xrpc) | Channel/SHM/Unix/TCP runtime behind the logical service APIs |
-| Signal ingestion | [`qs-signal-parser`](https://github.com/geminik23/quant-system/tree/main/crates/signal-parser) | Telegram-focused offline and online parsing into generic raw-signal actions |
+| Signal ingestion | [`qs-signal-parser`](https://github.com/geminik23/quant-system/tree/main/crates/signal-parser) | Bounded source-neutral event contracts plus Telegram-focused offline and online parsing into generic raw-signal actions |
 | Real-time market data | [`qs-market-data`](https://github.com/geminik23/quant-system/tree/main/crates/market-data) | CTrader FIX quotes, subscriptions, alerts, and reconnection |
 
 ## Operational behavior
@@ -129,7 +129,7 @@ TCP endpoints are unauthenticated and restricted to loopback by default. Use SHM
 ## Current limitations
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
-- The current parser is Telegram-specific; generic source events, durable source-neutral ingestion, and non-Telegram adapters are not implemented yet.
+- Generic bounded source-event contracts are available, but decoder/normalizer stages, durable source-neutral ingestion, non-Telegram adapters, and neutral runners are not implemented yet.
 - Live order execution, restart-safe live strategy state, and trading-platform order adapters are not included.
 - Registered cryptocurrency symbols are metadata-only and fail closed before monetary replay; general spot, derivative, fee, funding, margin, and liquidation economics are not implemented yet.
 

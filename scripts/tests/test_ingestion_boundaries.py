@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "check_ingestion_boundaries.py"
@@ -83,6 +84,55 @@ class IngestionBoundaryTests(unittest.TestCase):
         }
 
         self.assertEqual(BOUNDARIES.check_dependencies(metadata), [])
+
+    def test_rejects_trading_types_in_generic_ingestion(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.rs").write_text("use qs_core::RawSignal;", encoding="utf-8")
+
+            errors = BOUNDARIES.check_generic_ingestion_sources(root)
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any("qs_core" in error for error in errors))
+        self.assertTrue(any("RawSignal" in error for error in errors))
+
+    def test_rejects_storage_and_instrument_types_in_generic_ingestion(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "payload.rs").write_text(
+                "use qs_symbols::InstrumentId; use std::fs;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_generic_ingestion_sources(root)
+
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(any("qs_symbols" in error for error in errors))
+        self.assertTrue(any("InstrumentId" in error for error in errors))
+        self.assertTrue(any("std::fs" in error for error in errors))
+
+    def test_rejects_parser_and_service_runtime_in_generic_ingestion(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.rs").write_text(
+                "use crate::TemplateParser; use tower::Service;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_generic_ingestion_sources(root)
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any("TemplateParser" in error for error in errors))
+        self.assertTrue(any("tower" in error for error in errors))
+
+    def test_accepts_source_only_generic_ingestion(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.rs").write_text("pub struct SourceEvent;", encoding="utf-8")
+
+            errors = BOUNDARIES.check_generic_ingestion_sources(root)
+
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
