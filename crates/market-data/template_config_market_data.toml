@@ -6,6 +6,7 @@ sendercompid = "demo.ctrader.12345"
 server = "demo.ctrader.com"
 username = "12345"
 password = "your_password"
+# Parsed for compatibility; current workspace code does not select connector behavior from this value.
 ssl = false
 
 # Reconnection retry settings (optional — defaults shown below)

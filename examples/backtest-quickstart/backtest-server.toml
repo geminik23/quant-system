@@ -1,0 +1,27 @@
+[server]
+endpoint = "shm://backtest-quickstart"
+shm_buffer_size = 16777216
+
+[database]
+data_dir = "target/quickstart/market_data"
+
+[symbols]
+registry_path = "crates/symbols/symbols.toml"
+
+[profiles]
+profiles_path = "crates/backtest/profiles.toml"
+
+[jobs]
+retention_secs = 3600
+cleanup_interval_secs = 60
+max_retained_jobs = 32
+
+[artifacts]
+directory = "target/quickstart/artifacts"
+inline_limit_bytes = 12582912
+chunk_size = 1048576
+retention_secs = 3600
+max_total_bytes = 134217728
+
+[logging]
+level = "info"

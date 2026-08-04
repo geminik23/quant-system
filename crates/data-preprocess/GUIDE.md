@@ -31,37 +31,40 @@ Each file covers one date for one exchange+symbol (or exchange+symbol+timeframe 
 ## Quick Start
 
 ```bash
-# Build (default: parquet backend)
-cargo build -p qs-data-preprocess
-
 # Import tick data (symbol extracted from filename, UTC+2 default)
-data-preprocess input tick --exchange ctrader BTCUSD_202602161900_202602210954.csv
+cargo run -p qs-data-preprocess -- \
+  input tick --exchange ctrader BTCUSD_202602161900_202602210954.csv
 
 # Import bar data (timeframe required)
-data-preprocess input bar --exchange ctrader --timeframe 1m BTCUSD_M1_202602210045_202602211009.csv
+cargo run -p qs-data-preprocess -- \
+  input bar --exchange ctrader --timeframe 1m BTCUSD_M1_202602210045_202602211009.csv
 
 # View statistics
-data-preprocess stats
+cargo run -p qs-data-preprocess -- stats
 
 # Query ticks
-data-preprocess view tick --exchange ctrader --symbol BTCUSD --limit 20 --tail
+cargo run -p qs-data-preprocess -- \
+  view tick --exchange ctrader --symbol BTCUSD --limit 20 --tail
 
 # Query bars
-data-preprocess view bar --exchange ctrader --symbol BTCUSD --timeframe 1m --limit 20
+cargo run -p qs-data-preprocess -- \
+  view bar --exchange ctrader --symbol BTCUSD --timeframe 1m --limit 20
 
 # Remove data
-data-preprocess remove tick --exchange ctrader --symbol BTCUSD --from 2026-02-16 --to 2026-02-18
-data-preprocess remove symbol --exchange ctrader BTCUSD
-data-preprocess remove exchange binance
+cargo run -p qs-data-preprocess -- \
+  remove tick --exchange ctrader --symbol BTCUSD --from 2026-02-16 --to 2026-02-18
+cargo run -p qs-data-preprocess -- remove symbol --exchange ctrader BTCUSD
+cargo run -p qs-data-preprocess -- remove exchange binance
 
-# Run tests (parquet only, default)
+# Run tests (Parquet only, default)
 cargo test -p qs-data-preprocess
 
 # Run tests (both backends)
 cargo test -p qs-data-preprocess --features duckdb-backend
 
 # Use DuckDB backend at runtime
-data-preprocess --backend duckdb --db market_data.duckdb stats
+cargo run -p qs-data-preprocess --features duckdb-backend -- \
+  --backend duckdb --db market_data.duckdb stats
 ```
 
 ## CLI Reference

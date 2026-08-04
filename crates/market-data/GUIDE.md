@@ -13,9 +13,10 @@ Real-time market-data service that connects to the CTrader FIX API for live fore
 
 ## Quick start
 
+A live run requires valid CTrader FIX credentials and network access to the configured server. Copy the template to a protected local file, replace its placeholders, and do not commit credentials.
+
 ```bash
-cargo build -p qs-market-data
-cargo run -p qs-market-data --bin ctrader_market_data -- --config crates/market-data/template_config_market_data.toml
+cargo run -p qs-market-data --bin ctrader_market_data -- --config /path/to/config_market_data.toml
 cargo test -p qs-market-data
 ```
 
@@ -45,6 +46,8 @@ allow_insecure_non_loopback = false
 [logging]
 level = "info"
 ```
+
+The current configuration schema parses `ssl`, but workspace code does not use that field to select connector behavior. Do not treat the value as proof that the upstream FIX connection is encrypted; verify the provider and `ctrader-fix` transport requirements for the selected endpoint.
 
 Supported endpoints are `shm://NAME`, `unix:///absolute/path.sock`, and `tcp://IP:PORT`. SHM remains the recommended same-host default. Unix sockets provide direct same-host IPC without SHM mappings. TCP is unauthenticated and restricted to loopback unless `allow_insecure_non_loopback = true` explicitly acknowledges a trusted-network boundary; do not expose it directly to the public Internet.
 

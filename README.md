@@ -1,141 +1,107 @@
 # quant-system
 
-A modular Rust workspace for historical market data, deterministic backtesting, structured trading signals, and real-time market-data distribution.
+A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-The framework currently focuses on normalized signal replay over stored tick or bar data. It also provides real-time CTrader market-data distribution and reusable trading-domain libraries, while strategy orchestration and live order execution remain future work.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.2.x` development.
 
-## Capability status
+It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 
-| Capability | Status | Current boundary |
+## Choose a workflow
+
+| Goal | Start here | Readiness |
 |---|---|---|
-| Historical tick and OHLCV storage | Implemented | Partitioned Parquet/Polars by default; DuckDB is optional |
-| Deterministic signal backtesting | Implemented | Stored tick or close-only bar data through streaming FutureQuote replay |
-| Structured signal execution | Implemented | Entry and position-management actions through `RawSignalMsg` |
-| Strategy simulation library | Implemented | In-memory library API; not exposed as the production service path |
-| Telegram parsing | Implemented | Optional Telegram-specific adapter that emits generic raw-signal actions |
-| Real-time market data | Implemented | CTrader FIX bid/ask distribution through the market-data service |
-| Source-neutral strategy runtime | Not implemented | Generic ingestion and live strategy orchestration are planned separately |
-| Live order execution and general crypto economics | Not implemented | Registry-backed crypto replay fails closed before data loading; venue adapters and crypto economic models are not production features yet |
+| Run a deterministic signal backtest | [Five-minute quick start](docs/getting-started.md) | Available; a synthetic fixture is included |
+| Import and manage historical data | [`qs-data-preprocess` guide](crates/data-preprocess/GUIDE.md) | Available for supported tick and bar exports |
+| Embed the pure trade engine | [`quant-system-core`](crates/core) | Library-only |
+| Build an in-process strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
+| Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Provider-specific adapter |
+| Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
 
-## Quick start
+## Five-minute backtest
 
 ### Prerequisites
 
 - Rust 1.88 or newer;
-- Linux shared memory (`/dev/shm`) when using the default `shm://` endpoints;
-- tick or bar CSV data supported by `qs-data-preprocess`;
-- timestamps and symbols in the signal file that match the imported data.
+- Linux shared memory (`/dev/shm`) for the provided `shm://` example;
+- two terminals after the data import finishes.
 
-### 1. Import historical data
-
-The default backend writes partitioned Parquet data under `market_data/`.
+Import the repository-owned EURUSD fixture:
 
 ```bash
 cargo run -p qs-data-preprocess --bin data-preprocess -- \
-  --data-dir market_data \
+  --data-dir target/quickstart/market_data \
   input tick \
-  --exchange icmarkets \
-  --symbol XAUUSD \
-  /path/to/ticks.csv
+  --exchange demo \
+  --symbol EURUSD \
+  --tz-offset +00:00 \
+  examples/backtest-quickstart/EURUSD_ticks.csv
 ```
 
-For bar input, use `input bar --timeframe 1h`. See the [`qs-data-preprocess` guide](https://github.com/geminik23/quant-system/blob/main/crates/data-preprocess/GUIDE.md) for supported CSV formats, time-zone handling, queries, and removal commands.
-
-### 2. Prepare a raw-signal JSONL file
-
-Each line is one tagged `RawSignalMsg`. An Entry requires a finite positive `risk`; `size` is not an Entry field.
-
-```json
-{"action":"Entry","ts":"2026-03-10T10:00:00","symbol":"XAUUSD","side":"Buy","order_type":"Market","price":null,"risk":1.0,"stoploss":2010.0,"targets":[2040.0,2060.0],"group":"example","trade_id":"example-1"}
-```
-
-Entries and later management actions can be mixed in the same JSONL stream. Signal parsing is optional when a manual tool, another service, or an external parser already produces normalized actions.
-
-### 3. Start the backtest server
-
-Copy the example configuration and adjust the data, symbol-registry, profile, and artifact paths if needed.
+Start the backtest server:
 
 ```bash
-cp crates/backtest-server/config.example.toml backtest-server.toml
-
 cargo run -p qs-backtest-server --bin backtest_server -- \
-  --config backtest-server.toml
+  --config examples/backtest-quickstart/backtest-server.toml
 ```
 
-### 4. Run a backtest
-
-In another terminal:
+In another terminal, submit the matching signal stream:
 
 ```bash
 cargo run -p qs-backtest-server --bin tg_backtest -- \
-  --input signals.jsonl \
-  --endpoint shm://backtest \
+  --input examples/backtest-quickstart/signals.jsonl \
+  --endpoint shm://backtest-quickstart \
   --all-symbols \
-  --exchange icmarkets \
+  --exchange demo \
   --data-type tick \
   --balance 10000 \
   --account-currency USD \
   --base-lot 0.02 \
-  --output result.json
+  --output target/quickstart/result.json
 ```
 
-When at least one Entry is present, select exactly one sizing basis: `--base-lot`, `--risk-per-trade`, or `--risk-percent`. `--account-currency` is also required. Run either binary with `--help` for the complete option list.
+The fixture opens a EURUSD long position and closes it one minute later. See the [getting-started guide](docs/getting-started.md) for expected results, endpoint alternatives, and troubleshooting.
 
-## Architecture
+## Architecture at a glance
 
 ```text
-historical CSV
-     |
-     v
-qs-data-preprocess -----> partitioned Parquet tick/bar data
-                                      |
-external producer                     v
-or qs-signal-parser ---> RawSignalMsg ---> Backtest Service
-                                                  |
-                                                  v
-                                      deterministic replay
-                                                  |
-                                                  v
-                                      inline or artifact result
+historical tick/bar export -> qs-data-preprocess -> partitioned Parquet
+                                                        |
+external producer or qs-signal-parser -> RawSignal -----+
+                                                        v
+                                               Backtest Service
+                                                        |
+                                                        v
+                                             deterministic replay
+                                                        |
+                                                        v
+                                            result or artifact
 
-CTrader FIX ---> Market Data Service ---> real-time bid/ask consumers
-                    |
-                    v
-          shm://, unix://, or tcp://127.0.0.1
+CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ```
 
-`RawSignalMsg` is the compatibility boundary between signal producers and the current backtest service. The service APIs are transport-neutral; shared memory is the default local endpoint, while Unix sockets and loopback TCP are available when deployment requirements differ.
+`RawSignal` is the compatibility boundary between signal producers and replay. See [Architecture](docs/architecture.md) for crate ownership and service boundaries.
 
-## Workspace components
-
-| Area | Crates | Responsibility |
-|---|---|---|
-| Trading domain | [`quant-system-core`](https://github.com/geminik23/quant-system/tree/main/crates/core) (`qs_core` library), [`qs-symbols`](https://github.com/geminik23/quant-system/tree/main/crates/symbols) | Trade engine, normalized actions, management policies, sizing, currency conversion, and symbol metadata |
-| Historical replay | [`qs-backtest`](https://github.com/geminik23/quant-system/tree/main/crates/backtest), [`qs-backtest-server`](https://github.com/geminik23/quant-system/tree/main/crates/backtest-server) | Deterministic replay, accounting, metrics, profiles, retained jobs, and result delivery |
-| Historical data | [`qs-data-preprocess`](https://github.com/geminik23/quant-system/tree/main/crates/data-preprocess) | CSV import, partitioned storage, bounded queries, and data management |
-| Service contracts | [`qs-service`](https://github.com/geminik23/quant-system/tree/main/crates/service), [`qs-backtest-api`](https://github.com/geminik23/quant-system/tree/main/crates/backtest-api), [`qs-market-data-api`](https://github.com/geminik23/quant-system/tree/main/crates/market-data-api) | Provider-neutral endpoints, failures, DTOs, events, and typed client ports |
-| Internal transport provider | [`qs-service-xrpc`](https://github.com/geminik23/quant-system/tree/main/crates/service-xrpc) | Channel/SHM/Unix/TCP runtime behind the logical service APIs |
-| Signal ingestion | [`qs-signal-parser`](https://github.com/geminik23/quant-system/tree/main/crates/signal-parser) | Bounded source-neutral event contracts plus Telegram-focused offline and online parsing into generic raw-signal actions |
-| Real-time market data | [`qs-market-data`](https://github.com/geminik23/quant-system/tree/main/crates/market-data) | CTrader FIX quotes, subscriptions, alerts, and reconnection |
-
-## Operational behavior
-
-The backtest CLI uses retained-job streaming by default. Progress and heartbeat events keep long-running work observable without imposing a total job deadline, and reconnecting clients resume the same job instead of submitting it again. Polling and finite synchronous execution remain available as fallbacks.
-
-Results can be returned inline or as verified artifacts. Market-to-market output is bounded by default so large replays do not require returning an unbounded curve.
-
-TCP endpoints are unauthenticated and restricted to loopback by default. Use SHM or Unix sockets for trusted local deployments unless a private-network TCP deployment is explicitly configured.
-
-## Current limitations
+## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
-- Generic bounded source-event contracts are available, but decoder/normalizer stages, durable source-neutral ingestion, non-Telegram adapters, and neutral runners are not implemented yet.
-- Live order execution, restart-safe live strategy state, and trading-platform order adapters are not included.
-- Registered cryptocurrency symbols are metadata-only and fail closed before monetary replay; general spot, derivative, fee, funding, margin, and liquidation economics are not implemented yet.
+- Generic durable ingestion and non-Telegram source adapters are not implemented.
+- Live order execution, restart-safe strategy state, and broker order adapters are not included.
+- Registered cryptocurrency symbols are metadata-only for replay; spot, derivative, fee, funding, margin, and liquidation models are not implemented.
+- Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
+- Historical import accepts the documented MetaTrader-style tab-delimited tick and bar formats, not arbitrary CSV layouts.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Getting started](docs/getting-started.md)
+- [Backtesting](docs/backtesting.md)
+- [Signal ingestion](docs/signal-ingestion.md)
+- [Market data](docs/market-data.md)
+- [Architecture](docs/architecture.md)
+- [Roadmap](docs/roadmap.md)
+- [RawSignal reference](docs/reference/raw-signal.md)
 
 ## Development
-
-Run the full workspace checks before release:
 
 ```bash
 cargo fmt --all -- --check
@@ -147,5 +113,5 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 
 Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/geminik23/quant-system/blob/main/LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](https://github.com/geminik23/quant-system/blob/main/LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)

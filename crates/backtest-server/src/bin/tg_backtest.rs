@@ -153,15 +153,15 @@ fn parse_filter(value: &str) -> Result<CliPositionFilter, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "tg_backtest",
-    about = "Load parsed Telegram signal JSONL and run backtest via SHM server",
+    about = "Load normalized signal JSONL and run a backtest through the service",
     after_help = "Entry JSONL objects require `risk`. When any loaded signal is an Entry, provide exactly one of --base-lot, --risk-per-trade, or --risk-percent plus --account-currency.\n\nExample:\n  tg_backtest --input signals.jsonl --all-symbols --exchange ctrader --risk-per-trade 100 --account-currency USD"
 )]
 struct Args {
-    /// Path to parsed signals JSONL file (use "-" for stdin).
+    /// Path to normalized signal JSONL (use "-" for stdin).
     #[arg(short, long)]
     input: String,
 
-    /// Optional parser outcomes JSONL produced by fx-provider-parser.
+    /// Optional parser outcomes JSONL produced by a compatible parser.
     #[arg(long)]
     outcomes_input: Option<String>,
 
