@@ -134,6 +134,44 @@ class IngestionBoundaryTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_accepts_core_signal_only_in_normalization_allowlist(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "signal.rs").write_text("use qs_core::RawSignal;", encoding="utf-8")
+            (root / "raw_signals_v1.rs").write_text(
+                "use qs_core::RawSignal;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_normalization_sources(root)
+
+        self.assertEqual(errors, [])
+
+    def test_rejects_core_signal_outside_normalization_allowlist(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "graph.rs").write_text("use qs_core::RawSignal;", encoding="utf-8")
+
+            errors = BOUNDARIES.check_normalization_sources(root)
+
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(any("qs_core" in error for error in errors))
+
+    def test_rejects_runtime_and_telegram_in_normalization(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "context.rs").write_text(
+                "use tokio::task; use crate::types::RawTgMessage;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_normalization_sources(root)
+
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(any("tokio" in error for error in errors))
+        self.assertTrue(any("crate::types" in error for error in errors))
+        self.assertTrue(any("RawTgMessage" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

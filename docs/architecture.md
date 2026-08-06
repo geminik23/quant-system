@@ -60,7 +60,7 @@ A future secure remote provider should implement the typed service boundary rath
 
 ### Sources and venues
 
-`qs-signal-parser` owns bounded source facts and Telegram-oriented parsing. Parsing is optional because direct strict `RawSignal` input remains supported.
+`qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization contracts, a strict versioned structured-signal decoder, and Telegram-oriented compatibility parsing. Durable source application and generic runner hosting are not part of the current crate behavior. Parsing remains optional because direct strict `RawSignal` input is still supported.
 
 `qs-market-data` owns the CTrader FIX quote connection and market-data service. It does not own live order execution.
 
@@ -85,8 +85,8 @@ Unsupported economics fail before data access. Output bounds control returned da
 ## Signal flow
 
 ```text
-source message -> optional decoder/parser -> normalized RawSignal
-manual/API -----------------------------------------^
+source event -> stateless route -> optional decoder/parser -> validated candidate RawSignal
+manual/API ----------------------------------------------------------> direct RawSignal
                                                        |
                                                        v
                                             profile and sizing

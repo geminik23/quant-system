@@ -11,6 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PARSER_CRATE = (ROOT / "crates/signal-parser").resolve()
 GENERIC_INGESTION = PARSER_CRATE / "src/ingestion"
+NORMALIZATION = PARSER_CRATE / "src/normalization"
+NORMALIZATION_CORE_ALLOWLIST = {
+    "signal.rs",
+    "raw_signals_v1.rs",
+}
 TARGETS = (
     ROOT / "crates/core",
     ROOT / "crates/backtest",
@@ -91,6 +96,10 @@ GENERIC_FORBIDDEN_SYMBOLS = (
     "ctrader_fix",
     "std::fs",
 )
+NORMALIZATION_FORBIDDEN_SYMBOLS = tuple(
+    symbol for symbol in GENERIC_FORBIDDEN_SYMBOLS if symbol not in {"RawSignal", "qs_core"}
+)
+NORMALIZATION_CORE_SYMBOLS = ("qs_core", "crate::RawSignal", "crate::PositionRef")
 
 
 def load_metadata() -> dict:
@@ -167,6 +176,28 @@ def check_generic_ingestion_sources(root: Path = GENERIC_INGESTION) -> list[str]
     )
 
 
+def check_normalization_sources(root: Path = NORMALIZATION) -> list[str]:
+    errors = check_source_tree(
+        root,
+        NORMALIZATION_FORBIDDEN_SYMBOLS,
+        "normalization",
+    )
+    for source in sorted(root.rglob("*.rs")):
+        if source.name in NORMALIZATION_CORE_ALLOWLIST:
+            continue
+        text = source.read_text(encoding="utf-8")
+        for symbol in NORMALIZATION_CORE_SYMBOLS:
+            if symbol in text:
+                try:
+                    display_path = source.relative_to(ROOT)
+                except ValueError:
+                    display_path = source
+                errors.append(
+                    f"{display_path}: forbidden normalization core symbol {symbol}"
+                )
+    return errors
+
+
 def main() -> int:
     try:
         metadata = load_metadata()
@@ -178,6 +209,7 @@ def main() -> int:
     for crate in TARGETS:
         errors.extend(check_sources(crate))
     errors.extend(check_generic_ingestion_sources())
+    errors.extend(check_normalization_sources())
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

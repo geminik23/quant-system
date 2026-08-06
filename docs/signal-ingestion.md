@@ -6,6 +6,12 @@ The source-neutral compatibility boundary is strict `RawSignal` JSONL. The backt
 
 Use direct JSONL when source decoding and normalization happen elsewhere. Each line must be one supported action with no unknown top-level fields. See the [RawSignal reference](reference/raw-signal.md).
 
+## Stateless normalization library
+
+`signal_parser::normalization` provides bounded source-neutral routing, typed structured-decoder and text-parser pipelines, immutable history/parent context values, semantic reports, and mandatory shared core validation before candidate construction. The built-in strict `quant-system/raw-signals@1` JSON decoder covers every current `RawSignal` action without changing the standalone direct JSONL format.
+
+Routing and selected-pipeline evaluation are separate operations. No-route and cross-pipeline ambiguity complete without requesting pipeline context, while a selected route returns a `PreparedEvaluation` carrying exact context requirements. The current implementation runs inline stateless components only and performs no durable source application, IO, worker scheduling, publication, or venue action.
+
 ## Offline Telegram parser
 
 `qs-signal-parser` includes an offline CLI for configured Telegram channel parsers:
@@ -33,7 +39,7 @@ The optional `online` feature exposes an `OnlineServer` library API. There is no
 
 ## Current limits
 
-- The public CLI is Telegram-oriented; non-Telegram adapters and generic decoder or normalizer runners are not implemented.
-- Source transport connections, durable state, and idempotency storage remain application concerns.
+- The public CLI remains Telegram-oriented; the source-neutral normalization API is currently library-only and has no generic hosted runner.
+- Source transport connections, durable state, idempotency storage, lifecycle commit, and publication remain application concerns.
 - Offline and online parser paths may report failures differently.
 - A source edit or delete is not a trading action unless an upstream policy explicitly normalizes it.

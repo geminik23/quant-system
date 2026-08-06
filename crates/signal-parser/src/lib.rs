@@ -1,12 +1,14 @@
-//! Source-neutral event contracts and Telegram signal parsing for the quant-system workspace.
+//! Source-neutral event and stateless normalization contracts with Telegram compatibility parsing.
 //!
-//! The [`ingestion`] module defines bounded source facts before parsing. Existing Telegram
-//! parsers, runners, artifacts, and direct normalized-signal inputs remain separate.
+//! The [`ingestion`] module defines bounded source facts before parsing, while [`normalization`]
+//! provides deterministic routing and typed stateless pipelines. Existing Telegram runners,
+//! artifacts, and direct normalized-signal inputs remain separate compatibility surfaces.
 
 pub mod config;
 pub mod error;
 pub mod handler;
 pub mod ingestion;
+pub mod normalization;
 pub mod offline;
 pub mod parser;
 pub mod pipeline;

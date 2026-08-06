@@ -84,7 +84,7 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
-- Generic durable ingestion and non-Telegram source adapters are not implemented.
+- Source-neutral event and stateless normalization contracts are available as library APIs; durable ingestion state, hosted generic runners, and non-Telegram online adapters are not implemented.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - Registered cryptocurrency symbols are metadata-only for replay; spot, derivative, fee, funding, margin, and liquidation models are not implemented.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
