@@ -5,6 +5,7 @@ mod context;
 mod diagnostic;
 mod graph;
 mod identity;
+mod projection;
 mod raw_signals_v1;
 mod report;
 mod signal;
@@ -40,6 +41,11 @@ pub use identity::{
     ComponentConfigSchemaRef, ComponentKind, IdentityError, PIPELINE_DOMAIN, PipelineIdentity,
     RESOLVED_GRAPH_DOMAIN, ROUTING_GRAPH_DOMAIN, ResolvedComponentRef, ResolvedGraphIdentity,
     RoutingGraphIdentity, SemanticVersion, hash_domain,
+};
+pub use projection::{
+    EVALUATION_SEMANTIC_DOMAIN, EvaluationSemanticDigest, NORMALIZED_SIGNAL_ID_DOMAIN,
+    NORMALIZED_SIGNAL_SEMANTIC_DOMAIN, NormalizedSignalSemanticDigest, evaluation_semantic_digest,
+    normalized_signal_id_digest, normalized_signal_semantic_digest,
 };
 pub use raw_signals_v1::{
     CanonicalRawSignalsDecoder, RAW_SIGNALS_V1_SCHEMA, StandardSignalFinalizer,

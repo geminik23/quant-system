@@ -60,7 +60,7 @@ A future secure remote provider should implement the typed service boundary rath
 
 ### Sources and venues
 
-`qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization contracts, a strict versioned structured-signal decoder, and Telegram-oriented compatibility parsing. Durable source application and generic runner hosting are not part of the current crate behavior. Parsing remains optional because direct strict `RawSignal` input is still supported.
+`qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization, strict structured-signal decoding, backend-neutral durable source application, committed normalization lifecycle, checkpoints, and transactional committed-batch outbox state. It includes an in-memory conformance store and a single-process SQLite backend while retaining Telegram-oriented compatibility parsing. Generic source adapters, runner hosting, source transports, external sink calls, and committed-batch trading projection remain separate responsibilities. Parsing remains optional because direct strict `RawSignal` input is still supported.
 
 `qs-market-data` owns the CTrader FIX quote connection and market-data service. It does not own live order execution.
 
@@ -85,17 +85,20 @@ Unsupported economics fail before data access. Output bounds control returned da
 ## Signal flow
 
 ```text
-source event -> stateless route -> optional decoder/parser -> validated candidate RawSignal
-manual/API ----------------------------------------------------------> direct RawSignal
-                                                       |
-                                                       v
-                                            profile and sizing
-                                                       |
-                                                       v
-                                            deterministic replay
+source event
+  -> durable preflight and reservation
+  -> stateless route
+  -> selected-pipeline snapshot when required
+  -> optional decoder/parser and validation
+  -> fenced compare-and-commit
+  -> committed normalization batch, lifecycle facts, checkpoint, and outbox state
+
+manual/API RawSignal
+  -> profile and sizing
+  -> deterministic replay
 ```
 
-A source event is not a trade. A parsed signal is not a broker command. Strategy decisions, portfolio supervision, execution planning, venue translation, and execution reports remain explicit downstream responsibilities.
+A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts unless an explicit downstream bridge produces an eligible trading action. A source event is not a trade, and a parsed signal is not a broker command. Strategy decisions, portfolio supervision, execution planning, venue translation, and execution reports remain explicit downstream responsibilities.
 
 ## Market-data flow
 

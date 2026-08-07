@@ -15,6 +15,7 @@ It is not a complete automated trading platform. It does not currently execute l
 | Embed the pure trade engine | [`quant-system-core`](crates/core) | Library-only |
 | Build an in-process strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Provider-specific adapter |
+| Build source-neutral ingestion | [Signal ingestion guide](docs/signal-ingestion.md) | Source-event, normalization, and durable state library APIs |
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
 
 ## Five-minute backtest
@@ -84,7 +85,7 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
-- Source-neutral event and stateless normalization contracts are available as library APIs; durable ingestion state, hosted generic runners, and non-Telegram online adapters are not implemented.
+- Source-neutral event, stateless normalization, and durable source-application contracts are available as library APIs, including restart-safe idempotency, committed lifecycle state, checkpoints, causal replay inputs, and transactional publication outbox state. Generic hosted runners, source adapters, external sink workers, and the committed-batch trading bridge are not implemented.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - Registered cryptocurrency symbols are metadata-only for replay; spot, derivative, fee, funding, margin, and liquidation models are not implemented.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.

@@ -188,6 +188,14 @@ impl InstrumentHint {
     pub fn symbol(&self) -> &SymbolText {
         &self.symbol
     }
+
+    pub fn venue_hint(&self) -> Option<&str> {
+        self.venue_hint.as_ref().map(|value| value.as_str())
+    }
+
+    pub fn market_kind_hint(&self) -> Option<&str> {
+        self.market_kind_hint.as_ref().map(|value| value.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -349,6 +357,18 @@ impl SourceProvenanceDraft {
         &self.source
     }
 
+    pub fn operation(&self) -> SourceOperation {
+        self.operation
+    }
+
+    pub fn occurred_at(&self) -> SourceTimestamp {
+        self.occurred_at
+    }
+
+    pub fn received_at(&self) -> DateTimeUtc {
+        self.received_at
+    }
+
     pub fn source_adapter(&self) -> &SourceAdapterIdentity {
         &self.source_adapter
     }
@@ -373,6 +393,10 @@ impl PipelineCandidateEvidence {
 
     pub fn pipeline(&self) -> &PipelineIdentity {
         &self.pipeline
+    }
+
+    pub fn components(&self) -> &[StageEvidence] {
+        self.components.as_slice()
     }
 }
 

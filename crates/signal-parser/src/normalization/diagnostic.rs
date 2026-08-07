@@ -394,6 +394,14 @@ impl RouteMatchEvidence {
         }
     }
 
+    pub fn route_id(&self) -> &str {
+        self.route_id.as_str()
+    }
+
+    pub fn priority(&self) -> i64 {
+        self.priority
+    }
+
     pub fn target_pipeline(&self) -> &PipelineIdentity {
         &self.target_pipeline
     }

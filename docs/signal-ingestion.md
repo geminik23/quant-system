@@ -10,7 +10,19 @@ Use direct JSONL when source decoding and normalization happen elsewhere. Each l
 
 `signal_parser::normalization` provides bounded source-neutral routing, typed structured-decoder and text-parser pipelines, immutable history/parent context values, semantic reports, and mandatory shared core validation before candidate construction. The built-in strict `quant-system/raw-signals@1` JSON decoder covers every current `RawSignal` action without changing the standalone direct JSONL format.
 
-Routing and selected-pipeline evaluation are separate operations. No-route and cross-pipeline ambiguity complete without requesting pipeline context, while a selected route returns a `PreparedEvaluation` carrying exact context requirements. The current implementation runs inline stateless components only and performs no durable source application, IO, worker scheduling, publication, or venue action.
+Routing and selected-pipeline evaluation are separate operations. No-route and cross-pipeline ambiguity complete without requesting pipeline context, while a selected route returns a `PreparedEvaluation` carrying exact context requirements. The evaluator remains inline and stateless. Durable application is provided by the separate `signal_parser::state` boundary; neither layer performs source transport IO, worker scheduling, external sink calls, or venue action.
+
+## Durable source application
+
+`signal_parser::state` provides backend-neutral contracts for durable intake, monotonic and unversioned duplicate policy, fenced reservations, cutoff-safe selected-pipeline snapshots, evaluation-attempt recording, compare-and-commit, committed batches, immutable lifecycle facts, checkpoints, and committed-batch publication outbox leasing.
+
+`MemorySourceStateStore` is the semantic conformance implementation. `SqliteSourceStateStore` persists the same bounded logical state through one transactionally replaced schema-versioned snapshot. The SQLite backend supports one process, serialized writers, and SQLite-supported local filesystems. It does not claim distributed consensus, coordinated multi-process writers, or network-filesystem safety. Unknown schema versions and malformed persisted state fail closed.
+
+Completed semantic evaluations may commit auditable batches even when they contain no normalized envelopes. Operational failures are recorded separately and do not advance the application checkpoint. The initial delete policy withdraws active normalized outputs as lifecycle facts without running a normalization pipeline or synthesizing a close, cancellation, exit, or broker command.
+
+Application and publication progress are separate. The state layer atomically creates enabled committed-batch outbox records with the application commit, while a future runner performs external sink calls. Lease expiry may redeliver the same stable delivery identity, so external delivery is at least once rather than exactly once.
+
+Recorded receipts, committed batches, source state, and checkpoints are available for separately hosted causal replay and committed redelivery. The state module does not select or retain executable parser graphs.
 
 ## Offline Telegram parser
 
@@ -35,11 +47,11 @@ The configured `channel_ids` select the parser. The included `template` parser r
 
 ## Online feature
 
-The optional `online` feature exposes an `OnlineServer` library API. There is no turnkey online parser binary or durable source supervisor; applications must provide their own handler and process composition.
+The optional `online` feature exposes the existing Telegram-oriented `OnlineServer` library API. There is no turnkey generic online ingestion service, source supervisor, or publication worker; applications must still provide source adaptation and process composition.
 
 ## Current limits
 
-- The public CLI remains Telegram-oriented; the source-neutral normalization API is currently library-only and has no generic hosted runner.
-- Source transport connections, durable state, idempotency storage, lifecycle commit, and publication remain application concerns.
+- The public CLI and optional online server remain Telegram-oriented; source-neutral normalization and durable state are library APIs with no generic hosted runner.
+- Source transports, generic adapters, deployment-manifest compilation, worker scheduling, external sink calls, and the committed-batch trading bridge remain application or future runner concerns.
 - Offline and online parser paths may report failures differently.
 - A source edit or delete is not a trading action unless an upstream policy explicitly normalizes it.

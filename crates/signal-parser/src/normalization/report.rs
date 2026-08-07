@@ -55,6 +55,14 @@ impl AmbiguityAlternativeEvidence {
     pub fn pipeline(&self) -> Option<&PipelineIdentity> {
         self.pipeline.as_ref()
     }
+
+    pub fn alternative_ordinal(&self) -> u32 {
+        self.alternative_ordinal
+    }
+
+    pub fn value_count(&self) -> u32 {
+        self.value_count
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,10 @@ impl AmbiguityEvidence {
 
     pub fn alternatives(&self) -> &[AmbiguityAlternativeEvidence] {
         self.alternatives.as_slice()
+    }
+
+    pub fn total_alternative_values(&self) -> u32 {
+        self.total_alternative_values
     }
 }
 
@@ -200,6 +212,18 @@ impl EvaluationFailure {
 
     pub fn class(&self) -> EvaluationFailureClass {
         self.class
+    }
+
+    pub fn retry_safety(&self) -> EvaluationRetrySafety {
+        self.retry_safety
+    }
+
+    pub fn completion_knowledge(&self) -> CompletionKnowledge {
+        self.completion_knowledge
+    }
+
+    pub fn diagnostics(&self) -> &DiagnosticSet {
+        &self.diagnostics
     }
 }
 

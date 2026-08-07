@@ -469,8 +469,19 @@ pub(crate) fn encode_descriptor_ref(
 ) -> Result<(), IdentityError> {
     resolved.encode(writer)?;
     writer.u16(descriptor.empty_output().tag());
-    writer.u16(descriptor.requirements().parent().tag());
-    writer.u32(descriptor.requirements().maximum_items().get());
-    writer.u64(descriptor.requirements().maximum_bytes().get());
+    let requirements = descriptor.requirements();
+    match requirements.history() {
+        Some(history) => {
+            writer.bool(true);
+            writer.u32(history.maximum_items().get());
+            writer.u64(history.maximum_bytes().get());
+            writer.bool(history.include_payload());
+            writer.bool(history.include_adapter_evidence());
+        }
+        None => writer.bool(false),
+    }
+    writer.u16(requirements.parent().tag());
+    writer.u32(requirements.maximum_items().get());
+    writer.u64(requirements.maximum_bytes().get());
     Ok(())
 }

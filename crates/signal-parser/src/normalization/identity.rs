@@ -15,6 +15,8 @@ pub enum IdentityError {
     LengthOverflow,
     #[error("invalid semantic version text")]
     InvalidSemanticVersion,
+    #[error("canonical floating-point value must be finite")]
+    NonFiniteFloat,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,7 +66,7 @@ impl CanonicalWriter {
 
     pub fn finite_f64(&mut self, value: f64) -> Result<(), IdentityError> {
         if !value.is_finite() {
-            return Err(IdentityError::InvalidSemanticVersion);
+            return Err(IdentityError::NonFiniteFloat);
         }
         let normalized = if value == 0.0 { 0.0 } else { value };
         self.u64(normalized.to_bits());
@@ -140,6 +142,14 @@ impl SemanticVersion {
 
     pub fn patch(&self) -> u64 {
         self.patch
+    }
+
+    pub fn prerelease(&self) -> &str {
+        self.prerelease.as_str()
+    }
+
+    pub fn build(&self) -> &str {
+        self.build.as_str()
     }
 }
 

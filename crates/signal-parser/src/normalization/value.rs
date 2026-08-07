@@ -300,10 +300,6 @@ impl Sha256Digest {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    pub fn to_hex(self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
 }
 
 pub type ComponentId = NonEmptyContractText<128>;

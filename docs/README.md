@@ -8,7 +8,7 @@ Use this index to enter the workspace by goal rather than by crate name.
 |---|---|
 | Complete a repository-owned backtest | [Getting started](getting-started.md) |
 | Import data and understand replay behavior | [Backtesting](backtesting.md) |
-| Produce normalized signals | [Signal ingestion](signal-ingestion.md) |
+| Normalize and durably apply source events | [Signal ingestion](signal-ingestion.md) |
 | Run the CTrader quote service | [Market data](market-data.md) |
 | Understand crate and service ownership | [Architecture](architecture.md) |
 | Review intended project direction | [Roadmap](roadmap.md) |

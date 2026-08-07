@@ -8,7 +8,7 @@
 
 | Today | Next focus | Later |
 |---|---|---|
-| Deterministic replay, reusable Rust libraries, and CTrader live quotes | Neutral inputs, explicit instruments, and shared risk supervision | Live execution, state recovery, and broader market economics |
+| Deterministic replay, reusable Rust libraries, durable ingestion state, and CTrader live quotes | Neutral source adapters and runners, explicit instruments, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
 
 ## Direction
 
@@ -33,7 +33,7 @@ See [Choose a workflow](../README.md#choose-a-workflow) for available entry poin
 
 ### Accept signals from more sources
 
-Move source-specific behavior behind adapters and provide reusable decoding, normalization, provenance, and durable source-state boundaries while preserving direct strict `RawSignal` input.
+Reusable source-event, normalization, provenance, and durable source-state boundaries are available as library APIs while direct strict `RawSignal` input remains supported. The next step is to move source-specific behavior behind adapters and compose neutral offline, online, and replay workflows.
 
 **What this unlocks:** additional message sources and explicit handling of edits, deletes, retries, and duplicate delivery.
 
@@ -67,4 +67,4 @@ Explore richer analysis and model-driven strategy components after neutral strat
 
 ## Not available yet
 
-Live execution, durable generic ingestion, and general cryptocurrency accounting are not available yet. See the root [current boundaries](../README.md#current-boundaries) for complete operational limitations.
+Live execution, hosted generic ingestion adapters and runners, committed-batch trading projection, and general cryptocurrency accounting are not available yet. See the root [current boundaries](../README.md#current-boundaries) for complete operational limitations.

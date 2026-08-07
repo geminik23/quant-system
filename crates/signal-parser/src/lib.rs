@@ -1,8 +1,6 @@
-//! Source-neutral event and stateless normalization contracts with Telegram compatibility parsing.
+//! Source-neutral event, normalization, and durable ingestion-state contracts with Telegram compatibility parsing.
 //!
-//! The [`ingestion`] module defines bounded source facts before parsing, while [`normalization`]
-//! provides deterministic routing and typed stateless pipelines. Existing Telegram runners,
-//! artifacts, and direct normalized-signal inputs remain separate compatibility surfaces.
+//! The [`ingestion`] module defines bounded source facts before parsing, [`normalization`] provides deterministic routing and typed stateless pipelines, and [`state`] owns restart-safe application, committed lifecycle, checkpoints, and publication outbox state. Existing Telegram runners, artifacts, and direct normalized-signal inputs remain separate compatibility surfaces.
 
 pub mod config;
 pub mod error;
@@ -13,6 +11,7 @@ pub mod offline;
 pub mod parser;
 pub mod pipeline;
 pub mod registry;
+pub mod state;
 pub mod template;
 pub mod types;
 

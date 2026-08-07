@@ -12,9 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PARSER_CRATE = (ROOT / "crates/signal-parser").resolve()
 GENERIC_INGESTION = PARSER_CRATE / "src/ingestion"
 NORMALIZATION = PARSER_CRATE / "src/normalization"
+STATE = PARSER_CRATE / "src/state"
 NORMALIZATION_CORE_ALLOWLIST = {
     "signal.rs",
     "raw_signals_v1.rs",
+    "projection.rs",
 }
 TARGETS = (
     ROOT / "crates/core",
@@ -100,6 +102,36 @@ NORMALIZATION_FORBIDDEN_SYMBOLS = tuple(
     symbol for symbol in GENERIC_FORBIDDEN_SYMBOLS if symbol not in {"RawSignal", "qs_core"}
 )
 NORMALIZATION_CORE_SYMBOLS = ("qs_core", "crate::RawSignal", "crate::PositionRef")
+STATE_FORBIDDEN_SYMBOLS = (
+    "RawTgMessage",
+    "MessageParseOutcome",
+    "ParseContext",
+    "ChannelParser",
+    "TemplateParser",
+    "ParserRegistry",
+    "SignalHandler",
+    "OfflineRunner",
+    "OnlineServer",
+    "crate::config",
+    "crate::handler",
+    "crate::offline",
+    "crate::online",
+    "crate::parser",
+    "crate::pipeline",
+    "crate::registry",
+    "crate::template",
+    "crate::types",
+    "StrategyRuntime",
+    "ExecutionVenue",
+    "qs_backtest",
+    "qs_service",
+    "qs_market_data",
+    "axum",
+    "tower",
+    "tower_http",
+    "xrpc",
+    "ctrader_fix",
+)
 
 
 def load_metadata() -> dict:
@@ -198,6 +230,14 @@ def check_normalization_sources(root: Path = NORMALIZATION) -> list[str]:
     return errors
 
 
+def check_state_sources(root: Path = STATE) -> list[str]:
+    return check_source_tree(
+        root,
+        STATE_FORBIDDEN_SYMBOLS,
+        "durable state",
+    )
+
+
 def main() -> int:
     try:
         metadata = load_metadata()
@@ -210,6 +250,7 @@ def main() -> int:
         errors.extend(check_sources(crate))
     errors.extend(check_generic_ingestion_sources())
     errors.extend(check_normalization_sources())
+    errors.extend(check_state_sources())
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

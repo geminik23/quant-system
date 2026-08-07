@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -26,14 +26,14 @@ readme = "README.md"
 criterion = "0.5"
 
 # Workspace crates
-qs-core = { package = "quant-system-core", path = "crates/core", version = "0.2.4" }
-qs-backtest = { path = "crates/backtest", version = "0.2.4" }
-qs-backtest-api = { path = "crates/backtest-api", version = "0.2.4" }
-qs-data-preprocess = { path = "crates/data-preprocess", version = "0.2.4", default-features = false }
-qs-market-data-api = { path = "crates/market-data-api", version = "0.2.4" }
-qs-service = { path = "crates/service", version = "0.2.4" }
-qs-service-xrpc = { path = "crates/service-xrpc", version = "0.2.4" }
-qs-symbols = { path = "crates/symbols", version = "0.2.4" }
+qs-core = { package = "quant-system-core", path = "crates/core", version = "0.2.5" }
+qs-backtest = { path = "crates/backtest", version = "0.2.5" }
+qs-backtest-api = { path = "crates/backtest-api", version = "0.2.5" }
+qs-data-preprocess = { path = "crates/data-preprocess", version = "0.2.5", default-features = false }
+qs-market-data-api = { path = "crates/market-data-api", version = "0.2.5" }
+qs-service = { path = "crates/service", version = "0.2.5" }
+qs-service-xrpc = { path = "crates/service-xrpc", version = "0.2.5" }
+qs-symbols = { path = "crates/symbols", version = "0.2.5" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -67,6 +67,7 @@ xrpc-rs = "0.3.1"
 
 # Data storage & parsing
 duckdb = { version = "1.2", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 csv = "1.3"
 regex = "1"
 polars = { version = "0.46", features = ["parquet", "lazy", "dtype-datetime"] }

@@ -142,6 +142,10 @@ class IngestionBoundaryTests(unittest.TestCase):
                 "use qs_core::RawSignal;",
                 encoding="utf-8",
             )
+            (root / "projection.rs").write_text(
+                "use qs_core::RawSignal;",
+                encoding="utf-8",
+            )
 
             errors = BOUNDARIES.check_normalization_sources(root)
 
@@ -171,6 +175,34 @@ class IngestionBoundaryTests(unittest.TestCase):
         self.assertTrue(any("tokio" in error for error in errors))
         self.assertTrue(any("crate::types" in error for error in errors))
         self.assertTrue(any("RawTgMessage" in error for error in errors))
+
+    def test_state_allows_storage_and_normalization_contracts(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "store.rs").write_text(
+                "use rusqlite::Connection; use crate::normalization::PipelineEvaluationResult;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_state_sources(root)
+
+        self.assertEqual(errors, [])
+
+    def test_state_rejects_parser_runtime_and_provider_symbols(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "store.rs").write_text(
+                "use crate::types::RawTgMessage; use axum::Router; use qs_backtest::BacktestRunner;",
+                encoding="utf-8",
+            )
+
+            errors = BOUNDARIES.check_state_sources(root)
+
+        self.assertEqual(len(errors), 4)
+        self.assertTrue(any("crate::types" in error for error in errors))
+        self.assertTrue(any("RawTgMessage" in error for error in errors))
+        self.assertTrue(any("axum" in error for error in errors))
+        self.assertTrue(any("qs_backtest" in error for error in errors))
 
 
 if __name__ == "__main__":
