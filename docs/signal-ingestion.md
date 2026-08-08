@@ -24,6 +24,22 @@ Application and publication progress are separate. The state layer atomically cr
 
 Recorded receipts, committed batches, source state, and checkpoints are available for separately hosted causal replay and committed redelivery. The state module does not select or retain executable parser graphs.
 
+## Telegram adapter library
+
+`signal_parser::adapters::telegram` is the public provider-specific library boundary before source-neutral routing and durable application. `TelegramBatchSourceAdapter` adapts exported `RawTgMessage` rows as unversioned upserts, while `TelegramRelaySourceAdapter` maps relay new, edit, and delete deliveries to create, update, and delete source operations without flattening their different timestamp and payload rules.
+
+Telegram identity remains exact and opaque in source-event keys after adaptation. Event keys use `tgmsg:v1:{chat_id}:{message_id}`, thread identities use `tgchat:v1:{chat_id}`, and replies reference an event key in the same configured source and Telegram chat. These keys preserve signed 64-bit Telegram identifiers as exact decimal text rather than converting them through a floating-point representation.
+
+Each adaptation produces an accepted, ignored, or rejected outcome with versioned `TelegramSourceEvidenceV1`. Evidence decoding rejects unknown fields, missing required fields, unsupported schema versions, and payloads over 65,536 bytes; timestamp text is limited to 1,024 bytes and ingress delivery identity to 512 bytes. Evidence records the adapter path, opaque identity inputs, source operation, timestamp rule, original timestamp or exact relay epoch bits where applicable, and ingress delivery identity.
+
+Accepted batch rows use stable offline delivery identity derived from artifact identity and row ordinal. Accepted relay outcomes derive stable delivery identity from the supplied ingress delivery ID and output ordinal, and a relay delete expands at most 256 ordered deduplicated message IDs with one stable ordinal per resulting event. The adapters expose deterministic configuration identities so batch and relay policy changes remain distinguishable during durable preflight.
+
+`bind_legacy_telegram_producer` wraps the existing `ChannelParser` registry as a pre-normalized compatibility producer. It reconstructs bounded Telegram history and optional parent context from the selected durable snapshot, preserves parser output order, and sends candidates through the existing shared normalization and core-signal validation before durable compare-and-commit. Deletes remain lifecycle-only durable commits rather than parser calls or synthesized trading actions.
+
+## Compatibility facades
+
+The existing `OfflineRunner`, optional `OnlineServer`, handler callback surfaces, and standalone input and output JSONL contracts remain unchanged compatibility facades. They are not internally hosted through `signal_parser::state`, so using those facades alone does not provide durable reservations, restart-safe lifecycle state, checkpoints, or publication outbox processing.
+
 ## Offline Telegram parser
 
 `qs-signal-parser` includes an offline CLI for configured Telegram channel parsers:
@@ -47,11 +63,11 @@ The configured `channel_ids` select the parser. The included `template` parser r
 
 ## Online feature
 
-The optional `online` feature exposes the existing Telegram-oriented `OnlineServer` library API. There is no turnkey generic online ingestion service, source supervisor, or publication worker; applications must still provide source adaptation and process composition.
+The optional `online` feature exposes the existing Telegram-oriented `OnlineServer` library API. The new adapter library does not rewire this compatibility server or its callbacks through durable state. There is no turnkey neutral online ingestion service, source supervisor, or publication worker; applications must still provide process composition.
 
 ## Current limits
 
-- The public CLI and optional online server remain Telegram-oriented; source-neutral normalization and durable state are library APIs with no generic hosted runner.
-- Source transports, generic adapters, deployment-manifest compilation, worker scheduling, external sink calls, and the committed-batch trading bridge remain application or future runner concerns.
+- The public CLI and optional online server remain Telegram-oriented compatibility facades; source-neutral normalization, durable state, and path-specific Telegram adaptation are library APIs with no neutral hosted runner.
+- A full deployment manifest, neutral offline and online runners, source providers, worker scheduling, publication workers, external sink calls, and the committed-batch trading bridge remain application concerns or future work.
 - Offline and online parser paths may report failures differently.
-- A source edit or delete is not a trading action unless an upstream policy explicitly normalizes it.
+- A source edit or delete is not a trading action unless a separately reviewed downstream policy produces an eligible action.

@@ -60,7 +60,7 @@ A future secure remote provider should implement the typed service boundary rath
 
 ### Sources and venues
 
-`qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization, strict structured-signal decoding, backend-neutral durable source application, committed normalization lifecycle, checkpoints, and transactional committed-batch outbox state. It includes an in-memory conformance store and a single-process SQLite backend while retaining Telegram-oriented compatibility parsing. Generic source adapters, runner hosting, source transports, external sink calls, and committed-batch trading projection remain separate responsibilities. Parsing remains optional because direct strict `RawSignal` input is still supported.
+`qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization, strict structured-signal decoding, backend-neutral durable source application, committed normalization lifecycle, checkpoints, and transactional committed-batch outbox state. `signal_parser::adapters::telegram` owns the public provider-specific boundary for separate batch and relay adaptation, exact opaque Telegram identity, strict bounded evidence, stable delivery identity, and an existing-`ChannelParser` compatibility producer that uses shared validation and durable context snapshots. The crate includes an in-memory conformance store and a single-process SQLite backend. Neutral runner hosting, a full deployment manifest, source providers, publication workers, external sink calls, and committed-batch trading projection remain separate future responsibilities. Parsing remains optional because direct strict `RawSignal` input is still supported.
 
 `qs-market-data` owns the CTrader FIX quote connection and market-data service. It does not own live order execution.
 
@@ -85,11 +85,13 @@ Unsupported economics fail before data access. Output bounds control returned da
 ## Signal flow
 
 ```text
-source event
+Telegram batch row --------> TelegramBatchSourceAdapter ---+
+                                                           |
+Telegram relay delivery ---> TelegramRelaySourceAdapter ---+-> source event
   -> durable preflight and reservation
   -> stateless route
   -> selected-pipeline snapshot when required
-  -> optional decoder/parser and validation
+  -> optional decoder/parser and shared validation
   -> fenced compare-and-commit
   -> committed normalization batch, lifecycle facts, checkpoint, and outbox state
 
@@ -97,6 +99,10 @@ manual/API RawSignal
   -> profile and sizing
   -> deterministic replay
 ```
+
+The Telegram adapters terminate before neutral runner ownership. They preserve exact chat, message, thread, and reply identities in opaque versioned keys, attach strict bounded evidence, and provide stable offline-position or relay-delivery identities for durable duplicate handling. The legacy producer reconstructs bounded `ChannelParser` history and parent context from the selected state snapshot; source deletes bypass it and commit lifecycle withdrawal only.
+
+The existing `OfflineRunner`, optional `OnlineServer`, handler callbacks, and standalone JSONL contracts remain unchanged compatibility facades and are not hosted through durable state.
 
 A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts unless an explicit downstream bridge produces an eligible trading action. A source event is not a trade, and a parsed signal is not a broker command. Strategy decisions, portfolio supervision, execution planning, venue translation, and execution reports remain explicit downstream responsibilities.
 

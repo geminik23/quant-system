@@ -3605,7 +3605,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "criterion",
@@ -3620,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-api"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-server"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "chrono",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "qs-data-preprocess"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "clap",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data-api"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service-xrpc"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "futures",
  "nanoid",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "qs-signal-parser"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum",
  "base64",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "qs-symbols"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3769,7 +3769,7 @@ dependencies = [
 
 [[package]]
 name = "quant-system-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "nanoid",

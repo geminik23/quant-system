@@ -8,7 +8,7 @@
 
 | Today | Next focus | Later |
 |---|---|---|
-| Deterministic replay, reusable Rust libraries, durable ingestion state, and CTrader live quotes | Neutral source adapters and runners, explicit instruments, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
+| Deterministic replay, reusable Rust libraries, durable ingestion state, Telegram batch and relay adapter APIs, and CTrader live quotes | Neutral runners, a full deployment manifest, additional source providers, explicit instruments, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
 
 ## Direction
 
@@ -33,7 +33,7 @@ See [Choose a workflow](../README.md#choose-a-workflow) for available entry poin
 
 ### Accept signals from more sources
 
-Reusable source-event, normalization, provenance, and durable source-state boundaries are available as library APIs while direct strict `RawSignal` input remains supported. The next step is to move source-specific behavior behind adapters and compose neutral offline, online, and replay workflows.
+Reusable source-event, normalization, provenance, and durable source-state boundaries are available as library APIs while direct strict `RawSignal` input remains supported. The public Telegram adapter library now separates batch and relay adaptation, preserves exact opaque Telegram identity with strict bounded evidence and stable delivery identities, and exposes an existing-`ChannelParser` compatibility producer through shared validation and durable context snapshots. The next step is to compose neutral offline, online, and replay runners around a full deployment manifest, add source providers, and host publication workers.
 
 **What this unlocks:** additional message sources and explicit handling of edits, deletes, retries, and duplicate delivery.
 
@@ -67,4 +67,4 @@ Explore richer analysis and model-driven strategy components after neutral strat
 
 ## Not available yet
 
-Live execution, hosted generic ingestion adapters and runners, committed-batch trading projection, and general cryptocurrency accounting are not available yet. See the root [current boundaries](../README.md#current-boundaries) for complete operational limitations.
+Live execution, neutral hosted ingestion runners, a full deployment manifest, additional source providers, publication workers, committed-batch trading projection, and general cryptocurrency accounting are not available yet. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged and are not hosted through durable state. See the root [current boundaries](../README.md#current-boundaries) for complete operational limitations.

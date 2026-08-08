@@ -47,6 +47,15 @@ impl ParserRegistry {
     pub fn has_parser(&self, channel_id: i64) -> bool {
         self.parsers.contains_key(&channel_id)
     }
+
+    /// Return the largest bounded-history requirement declared by a registered parser.
+    pub fn maximum_history(&self) -> usize {
+        self.parsers
+            .values()
+            .map(|parser| parser.max_history())
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl std::fmt::Debug for ParserRegistry {
