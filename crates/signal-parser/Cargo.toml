@@ -15,11 +15,18 @@ name = "signal_parser"
 [[bin]]
 name = "parse_signals"
 path = "src/bin/parse_signals.rs"
+required-features = ["telegram-compat"]
 
 [features]
-default = ["offline"]
-offline = []
-online = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+default = ["offline", "neutral-runner"]
+ingestion-core = []
+adapter-jsonl = ["ingestion-core"]
+neutral-runner = ["adapter-jsonl"]
+telegram-compat = []
+provider-http = ["neutral-runner", "dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+# Compatibility aliases retained for existing parser and server consumers.
+offline = ["telegram-compat"]
+online = ["telegram-compat", "provider-http"]
 
 [dependencies]
 qs-core = { workspace = true }
@@ -27,6 +34,7 @@ qs-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 base64 = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
@@ -42,3 +50,4 @@ tokio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+futures = { workspace = true }

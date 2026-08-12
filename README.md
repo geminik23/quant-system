@@ -15,7 +15,7 @@ It is not a complete automated trading platform. It does not currently execute l
 | Embed the pure trade engine | [`quant-system-core`](crates/core) | Library-only |
 | Build an in-process strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Compatibility CLI and public adapter library |
-| Build source-neutral ingestion | [Signal ingestion guide](docs/signal-ingestion.md) | Source-event, normalization, state, and adapter library APIs |
+
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
 
 ## Five-minute backtest
@@ -80,12 +80,12 @@ external producer or qs-signal-parser -> RawSignal -----+
 CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ```
 
-`RawSignal` is the compatibility boundary between signal producers and replay. Source-neutral ingestion libraries and Telegram adapter APIs are also available; see [Signal ingestion](docs/signal-ingestion.md) and [Architecture](docs/architecture.md).
+`RawSignal` is the compatibility boundary between signal producers and replay. Source-neutral ingestion libraries, strict JSONL codecs, Telegram adapters, and an authenticated webhook provider edge are also available; see [Signal ingestion](docs/signal-ingestion.md) and [Architecture](docs/architecture.md).
 
 ## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
-- Source-event, normalization, durable-state, and Telegram adapter APIs are available as libraries. Existing Telegram runners remain compatibility facades; neutral hosted runners, publication workers, and the committed-batch trading bridge are not implemented.
+- Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - Registered cryptocurrency symbols are metadata-only for replay; spot, derivative, fee, funding, margin, and liquidation models are not implemented.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.

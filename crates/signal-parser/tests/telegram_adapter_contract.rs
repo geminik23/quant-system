@@ -570,6 +570,7 @@ fn preflight(
             delivery_identity: Some(adapted.delivery_identity.clone()),
             source_adapter: fixture.adapter.source_adapter_identity().clone(),
             adapter_evidence: Some(adapted.evidence.encode().unwrap()),
+            execution_identity: None,
             requested_at: adapted.event.received_at(),
             expires_at: timestamp("2026-08-08T00:00:00Z"),
         })

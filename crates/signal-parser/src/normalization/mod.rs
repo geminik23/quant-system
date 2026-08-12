@@ -47,6 +47,7 @@ pub use projection::{
     NORMALIZED_SIGNAL_SEMANTIC_DOMAIN, NormalizedSignalSemanticDigest, evaluation_semantic_digest,
     normalized_signal_id_digest, normalized_signal_semantic_digest,
 };
+pub(crate) use raw_signals_v1::decode_raw_signal_value_v1;
 pub use raw_signals_v1::{
     CanonicalRawSignalsDecoder, RAW_SIGNALS_V1_SCHEMA, StandardSignalFinalizer,
     raw_signals_v1_schema,

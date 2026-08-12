@@ -192,6 +192,7 @@ fn evaluate_and_commit(
             ))),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: source.received_at(),
             expires_at: reservation_expiry(),
         })
@@ -261,6 +262,7 @@ fn run_store_conformance(store: &dyn SourceStateStore) {
             )),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: first.received_at(),
             expires_at: reservation_expiry(),
         })
@@ -287,6 +289,7 @@ fn run_store_conformance(store: &dyn SourceStateStore) {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("delete-3".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: delete.received_at(),
             expires_at: reservation_expiry(),
         })
@@ -328,6 +331,7 @@ fn run_store_conformance(store: &dyn SourceStateStore) {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("stale".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: timestamp("2026-08-06T00:00:02Z"),
             expires_at: reservation_expiry(),
         })
@@ -406,6 +410,7 @@ fn sqlite_store_passes_conformance_and_recovers_after_restart() {
                 )),
                 source_adapter: adapter(),
                 adapter_evidence: None,
+                execution_identity: None,
                 requested_at: timestamp("2026-08-06T00:02:00Z"),
                 expires_at: timestamp("2026-08-06T00:03:00Z"),
             })
@@ -436,6 +441,7 @@ fn operational_failure_is_recorded_without_checkpoint_or_batch() {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("failure-1".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: source.received_at(),
             expires_at: reservation_expiry(),
         })
@@ -506,6 +512,7 @@ fn stale_reservation_fence_cannot_create_a_compare_token() {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("fence-1".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: source.received_at(),
             expires_at: reservation_expiry(),
         })
@@ -526,6 +533,7 @@ fn unversioned_delivery_identity_is_idempotent() {
         delivery_identity: Some(DurableDeliveryIdentity::Stable("unversioned-1".to_string())),
         source_adapter: adapter(),
         adapter_evidence: Some(vec![1, 2, 3]),
+        execution_identity: None,
         requested_at: source.received_at(),
         expires_at: reservation_expiry(),
     };
@@ -556,6 +564,7 @@ fn expired_reservation_is_reclaimed_with_a_new_generation() {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("reclaim-1".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: timestamp("2026-08-06T01:00:01Z"),
             expires_at: timestamp("2026-08-06T01:00:02Z"),
         })
@@ -569,6 +578,7 @@ fn expired_reservation_is_reclaimed_with_a_new_generation() {
             delivery_identity: Some(DurableDeliveryIdentity::Stable("reclaim-1".to_string())),
             source_adapter: adapter(),
             adapter_evidence: None,
+            execution_identity: None,
             requested_at: timestamp("2026-08-06T01:00:03Z"),
             expires_at: timestamp("2026-08-06T01:01:00Z"),
         })

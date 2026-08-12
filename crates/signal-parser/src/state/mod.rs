@@ -33,6 +33,40 @@ const SQLITE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_ACTIVE_OUTPUT_LIMIT: usize = 32;
 pub const MAX_ACTIVE_OUTPUT_LIMIT: usize = 256;
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind} identity")]
+pub struct DigestIdParseError {
+    kind: &'static str,
+}
+
+fn decode_digest_id(value: &str, prefix: &'static str) -> Result<[u8; 32], DigestIdParseError> {
+    let encoded = value
+        .strip_prefix(prefix)
+        .ok_or(DigestIdParseError { kind: prefix })?;
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DigestIdParseError { kind: prefix });
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0]).ok_or(DigestIdParseError { kind: prefix })?;
+        let low = hex_nibble(pair[1]).ok_or(DigestIdParseError { kind: prefix })?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 macro_rules! digest_id {
     ($name:ident, $prefix:literal) => {
         #[derive(
@@ -47,6 +81,10 @@ macro_rules! digest_id {
 
             pub fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
+            }
+
+            pub fn from_string_id(value: &str) -> Result<Self, DigestIdParseError> {
+                decode_digest_id(value, $prefix).map(Self)
             }
 
             pub fn to_string_id(self) -> String {
@@ -117,6 +155,7 @@ pub struct PreflightRequest {
     pub event: SourceEvent,
     pub delivery_identity: Option<DurableDeliveryIdentity>,
     pub source_adapter: SourceAdapterIdentity,
+    pub execution_identity: Option<AdmittedExecutionIdentity>,
     pub adapter_evidence: Option<Vec<u8>>,
     pub requested_at: DateTimeUtc,
     pub expires_at: DateTimeUtc,
@@ -325,6 +364,27 @@ pub struct SourceCheckpoint {
     pub checkpoint_version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedComponentIdentity {
+    pub id: String,
+    pub kind: u16,
+    pub version_major: u64,
+    pub version_minor: u64,
+    pub version_patch: u64,
+    pub version_prerelease: String,
+    pub version_build: String,
+    pub contract_version: u32,
+    pub config_identity: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedExecutionIdentity {
+    pub routing_graph: [u8; 32],
+    pub pipeline: [u8; 32],
+    pub decoder: AdmittedComponentIdentity,
+    pub finalizer: AdmittedComponentIdentity,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedReceipt {
     pub intake_index: u64,
@@ -332,6 +392,7 @@ pub struct RecordedReceipt {
     pub applied_event_id: AppliedEventId,
     pub delivery_identity: DurableDeliveryIdentity,
     pub source_adapter: AdmittedSourceAdapter,
+    pub execution_identity: Option<AdmittedExecutionIdentity>,
     pub adapter_evidence: Option<Vec<u8>>,
     pub event: SourceEvent,
 }
@@ -361,6 +422,9 @@ pub enum PublicationState {
         expires_at: DateTimeUtc,
     },
     RetryPending,
+    RetryScheduled {
+        available_at: DateTimeUtc,
+    },
     Published {
         acknowledged_at: DateTimeUtc,
     },
@@ -374,6 +438,8 @@ pub struct NormalizationOutboxRecord {
     pub sink: String,
     pub state: PublicationState,
     pub attempts: u32,
+    #[serde(default)]
+    pub first_attempt_at: Option<DateTimeUtc>,
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +450,7 @@ pub struct PublicationLease {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationNackDisposition {
-    Retry,
+    Retry { available_at: DateTimeUtc },
     DeadLetter,
 }
 
@@ -544,6 +610,7 @@ impl PersistedState {
             return Err(SourceStateError::AdapterEvidenceTooLarge);
         }
         let source_adapter = AdmittedSourceAdapter::from(&request.source_adapter);
+        let execution_identity = request.execution_identity.clone();
         let adapter_evidence = request.adapter_evidence.clone();
         let event_digest = source_event_digest(&request.event)?;
         let source_key = source_key(&request.event.key().clone());
@@ -651,6 +718,7 @@ impl PersistedState {
             applied_event_id,
             delivery_identity,
             source_adapter,
+            execution_identity,
             adapter_evidence,
             event: request.event.clone(),
         });
@@ -999,6 +1067,7 @@ impl PersistedState {
                     sink,
                     state: PublicationState::Pending,
                     attempts: 0,
+                    first_attempt_at: None,
                 },
             );
         }
@@ -1372,7 +1441,13 @@ macro_rules! impl_store {
                         .filter(|(_, record)| {
                             matches!(
                                 record.state,
-                                PublicationState::Pending | PublicationState::RetryPending
+                                PublicationState::Pending
+                            ) || matches!(
+                                record.state,
+                                PublicationState::RetryPending
+                            ) || matches!(
+                                record.state,
+                                PublicationState::RetryScheduled { available_at } if available_at <= now
                             ) || matches!(
                                 record.state,
                                 PublicationState::Leased { expires_at, .. } if expires_at <= now
@@ -1397,6 +1472,9 @@ macro_rules! impl_store {
                         };
                         state.next_lease = state.next_lease.saturating_add(1);
                         record.attempts = record.attempts.saturating_add(1);
+                        if record.first_attempt_at.is_none() {
+                            record.first_attempt_at = Some(now);
+                        }
                         record.state = PublicationState::Leased { fence, expires_at };
                         leases.push(PublicationLease {
                             record: record.clone(),
@@ -1441,7 +1519,9 @@ macro_rules! impl_store {
                         return Err(SourceStateError::InvalidPublicationLease);
                     }
                     record.state = match disposition {
-                        PublicationNackDisposition::Retry => PublicationState::RetryPending,
+                        PublicationNackDisposition::Retry { available_at } => {
+                            PublicationState::RetryScheduled { available_at }
+                        }
                         PublicationNackDisposition::DeadLetter => PublicationState::DeadLetter,
                     };
                     Ok(record.state.clone())

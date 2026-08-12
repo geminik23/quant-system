@@ -26,6 +26,14 @@ TARGETS = (
     ROOT / "crates/market-data-api",
 )
 FORBIDDEN_PACKAGE = "qs-signal-parser"
+NEUTRAL_RUNNER_FEATURES = ("neutral-runner", "adapter-jsonl")
+NEUTRAL_FORBIDDEN_FEATURES = {
+    "telegram-compat",
+    "offline",
+    "online",
+    "provider-http",
+}
+NEUTRAL_FORBIDDEN_PACKAGES = {"axum", "tower", "tower-http", "tokio", "xrpc-rs"}
 FORBIDDEN_SYMBOLS = (
     "RawTgMessage",
     "MessageParseOutcome",
@@ -148,6 +156,77 @@ def load_metadata() -> dict:
     return json.loads(result.stdout)
 
 
+def check_neutral_runner_dependencies() -> list[str]:
+    feature_selection = ",".join(NEUTRAL_RUNNER_FEATURES)
+    build = subprocess.run(
+        [
+            "cargo",
+            "check",
+            "-p",
+            "qs-signal-parser",
+            "--no-default-features",
+            "--features",
+            feature_selection,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if build.returncode != 0:
+        return [build.stderr.strip() or "neutral runner build failed"]
+
+    command = [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--no-default-features",
+        "--features",
+        feature_selection,
+        "--manifest-path",
+        str(PARSER_CRATE / "Cargo.toml"),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode != 0:
+        return [result.stderr.strip() or "neutral runner metadata failed"]
+
+    metadata = json.loads(result.stdout)
+    package_by_id = {package["id"]: package for package in metadata["packages"]}
+    parser_id = next(
+        package_id
+        for package_id, package in package_by_id.items()
+        if Path(package["manifest_path"]).resolve() == (PARSER_CRATE / "Cargo.toml").resolve()
+    )
+    nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+    parser_features = set(nodes[parser_id]["features"])
+    errors = [
+        f"neutral runner unexpectedly enables feature {feature}"
+        for feature in sorted(parser_features & NEUTRAL_FORBIDDEN_FEATURES)
+    ]
+
+    reachable = set()
+    pending = [parser_id]
+    while pending:
+        package_id = pending.pop()
+        if package_id in reachable:
+            continue
+        reachable.add(package_id)
+        pending.extend(dependency["pkg"] for dependency in nodes[package_id]["deps"])
+    resolved_packages = {package_by_id[package_id]["name"] for package_id in reachable}
+    for package in sorted(resolved_packages & NEUTRAL_FORBIDDEN_PACKAGES):
+        errors.append(f"neutral runner unexpectedly resolves package {package}")
+    return errors
+
+
 def check_dependencies(metadata: dict) -> list[str]:
     target_manifests = {
         (crate / "Cargo.toml").resolve(): crate.relative_to(ROOT) for crate in TARGETS
@@ -245,7 +324,8 @@ def main() -> int:
         print(f"unable to inspect Cargo dependencies: {error}", file=sys.stderr)
         return 1
 
-    errors = check_dependencies(metadata)
+    errors = check_neutral_runner_dependencies()
+    errors.extend(check_dependencies(metadata))
     for crate in TARGETS:
         errors.extend(check_sources(crate))
     errors.extend(check_generic_ingestion_sources())

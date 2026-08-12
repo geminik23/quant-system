@@ -14,27 +14,33 @@ Routing and selected-pipeline evaluation are separate operations. No-route and c
 
 ## Durable source application
 
-`signal_parser::state` provides backend-neutral contracts for durable intake, monotonic and unversioned duplicate policy, fenced reservations, cutoff-safe selected-pipeline snapshots, evaluation-attempt recording, compare-and-commit, committed batches, immutable lifecycle facts, checkpoints, and committed-batch publication outbox leasing.
+`signal_parser::state` durably applies source events, records lifecycle facts and committed batches, and provides checkpoints for replay. `MemorySourceStateStore` is intended for conformance and tests. `SqliteSourceStateStore` supports serialized writers on one process and SQLite-supported local filesystems; it is not a distributed or network-filesystem coordination system.
 
-`MemorySourceStateStore` is the semantic conformance implementation. `SqliteSourceStateStore` persists the same bounded logical state through one transactionally replaced schema-versioned snapshot. The SQLite backend supports one process, serialized writers, and SQLite-supported local filesystems. It does not claim distributed consensus, coordinated multi-process writers, or network-filesystem safety. Unknown schema versions and malformed persisted state fail closed.
+A completed evaluation may commit an auditable batch even when it has no normalized envelopes. A source delete withdraws active outputs as a lifecycle fact. It does not synthesize a close, cancellation, exit, or broker command. Committed-batch publication is separate from source application and is at-least-once.
 
-Completed semantic evaluations may commit auditable batches even when they contain no normalized envelopes. Operational failures are recorded separately and do not advance the application checkpoint. The initial delete policy withdraws active normalized outputs as lifecycle facts without running a normalization pipeline or synthesizing a close, cancellation, exit, or broker command.
+## Reference JSONL codecs
 
-Application and publication progress are separate. The state layer atomically creates enabled committed-batch outbox records with the application commit, while a future runner performs external sink calls. Lease expiry may redeliver the same stable delivery identity, so external delivery is at least once rather than exactly once.
+`signal_parser::adapters::structured_json` provides explicit `source-event-jsonl@1` input and `committed-normalization-jsonl@1` output codecs. These codecs are separate from standalone direct `RawSignal` JSONL and never infer a record kind after decode failure.
 
-Recorded receipts, committed batches, source state, and checkpoints are available for separately hosted causal replay and committed redelivery. The state module does not select or retain executable parser graphs.
+Source-event JSONL uses the exact recursively strict version 1 `SourceEvent` wire. Its artifact identity is SHA-256 over exact input bytes, and each non-empty record receives an offline delivery identity using that artifact identity plus its 1-based physical line number. Blank lines retain physical numbering without producing events. `OfflineIngestionRunner` applies an explicit strict-stop or tolerant-continue policy to bounded record errors.
+
+Committed output uses strict `quant-system/committed-normalization-batch@1` records. Each record represents one authoritative committed batch. Physical JSONL line order is not authoritative under at-least-once publication; consumers use committed batch identity for duplicate detection and commit index for logical order.
+
+## Authenticated webhook provider edge
+
+`signal_parser::adapters::webhook` provides a bounded provider edge for `POST /v1/source-events`. It verifies the version 1 HMAC-SHA256 profile over exact raw body bytes, binds configured key IDs to one source, decodes strict `SourceEvent` only after authentication, and rejects a payload source mismatch before replay reservation.
+
+The webhook edge provides replay protection and requires a configured HMAC secret of at least 32 bytes. The optional HTTP binding returns `202 Accepted` with an admission reference, not a committed batch reference. Consumers must resolve processing results separately. Provider replay protection is durable, but hosted application processing is not restart-safe.
+
+## Neutral structured JSONL composition
+
+`signal_parser::runner` provides library composition for strict manifests, local JSONL ingestion, provider bindings, committed-batch publication, and causal replay. Applications own their executable, deployment configuration, source binding, secrets, and sink policy. Committed-batch JSONL publication is at-least-once, so consumers must deduplicate by committed batch identity.
 
 ## Telegram adapter library
 
-`signal_parser::adapters::telegram` is the public provider-specific library boundary before source-neutral routing and durable application. `TelegramBatchSourceAdapter` adapts exported `RawTgMessage` rows as unversioned upserts, while `TelegramRelaySourceAdapter` maps relay new, edit, and delete deliveries to create, update, and delete source operations without flattening their different timestamp and payload rules.
+`signal_parser::adapters::telegram` adapts exported Telegram rows and relay deliveries into source events before routing and durable application. Batch input is treated as upserts; relay input maps new, edit, and delete deliveries to create, update, and delete source operations. Adapter output preserves the provider delivery identity so retries can be reconciled without treating a source edit or delete as a trading action.
 
-Telegram identity remains exact and opaque in source-event keys after adaptation. Event keys use `tgmsg:v1:{chat_id}:{message_id}`, thread identities use `tgchat:v1:{chat_id}`, and replies reference an event key in the same configured source and Telegram chat. These keys preserve signed 64-bit Telegram identifiers as exact decimal text rather than converting them through a floating-point representation.
-
-Each adaptation produces an accepted, ignored, or rejected outcome with versioned `TelegramSourceEvidenceV1`. Evidence decoding rejects unknown fields, missing required fields, unsupported schema versions, and payloads over 65,536 bytes; timestamp text is limited to 1,024 bytes and ingress delivery identity to 512 bytes. Evidence records the adapter path, opaque identity inputs, source operation, timestamp rule, original timestamp or exact relay epoch bits where applicable, and ingress delivery identity.
-
-Accepted batch rows use stable offline delivery identity derived from artifact identity and row ordinal. Accepted relay outcomes derive stable delivery identity from the supplied ingress delivery ID and output ordinal, and a relay delete expands at most 256 ordered deduplicated message IDs with one stable ordinal per resulting event. The adapters expose deterministic configuration identities so batch and relay policy changes remain distinguishable during durable preflight.
-
-`bind_legacy_telegram_producer` wraps the existing `ChannelParser` registry as a pre-normalized compatibility producer. It reconstructs bounded Telegram history and optional parent context from the selected durable snapshot, preserves parser output order, and sends candidates through the existing shared normalization and core-signal validation before durable compare-and-commit. Deletes remain lifecycle-only durable commits rather than parser calls or synthesized trading actions.
+The existing `ChannelParser` registry remains available as a compatibility producer. It is separate from direct strict `RawSignal` input and source-neutral ingestion composition.
 
 ## Compatibility facades
 
@@ -63,11 +69,11 @@ The configured `channel_ids` select the parser. The included `template` parser r
 
 ## Online feature
 
-The optional `online` feature exposes the existing Telegram-oriented `OnlineServer` library API. The new adapter library does not rewire this compatibility server or its callbacks through durable state. There is no turnkey neutral online ingestion service, source supervisor, or publication worker; applications must still provide process composition.
+The optional `online` feature retains the existing Telegram-oriented `OnlineServer` compatibility API. Webhook hosting is enabled by the optional HTTP provider feature. Both remain library APIs that applications embed in their own process lifecycle.
 
 ## Current limits
 
-- The public CLI and optional online server remain Telegram-oriented compatibility facades; source-neutral normalization, durable state, and path-specific Telegram adaptation are library APIs with no neutral hosted runner.
-- A full deployment manifest, neutral offline and online runners, source providers, worker scheduling, publication workers, external sink calls, and the committed-batch trading bridge remain application concerns or future work.
+- Source-neutral ingestion is library-first. Applications own their executable, configuration, source bindings, and publication policy. Existing Telegram CLI and online server remain compatibility facades.
+- Non-local sinks, additional provider transports, and the committed-batch trading bridge remain future work.
 - Offline and online parser paths may report failures differently.
 - A source edit or delete is not a trading action unless a separately reviewed downstream policy produces an eligible action.

@@ -14,6 +14,13 @@ pub trait ChannelParser: Send + Sync {
         0
     }
 
+    /// Return whether this reply body is self-contained and safe to parse without its parent.
+    ///
+    /// Structured parsing otherwise reports `MissingParent` before invoking the provider parser.
+    fn can_parse_reply_without_parent(&self, _message: &str) -> bool {
+        false
+    }
+
     /// Parse a root message (one without `reply_to`).
     fn parse_root(&self, message: &str, ts: NaiveDateTime, ctx: &ParseContext) -> ParsedAction;
 

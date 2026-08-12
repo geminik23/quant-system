@@ -160,7 +160,10 @@ fn parse_messages_impl(
             let parent = chan_history
                 .iter()
                 .find(|candidate| candidate.msg_id == reply_to_id);
-            if mode == ParseMode::V2 && parent.is_none() {
+            if mode == ParseMode::V2
+                && parent.is_none()
+                && !parser.can_parse_reply_without_parent(&msg.message)
+            {
                 ParsedAction::Rejected(ParseFailure::MissingParent {
                     reply_to: reply_to_id,
                 })
@@ -409,14 +412,22 @@ mod tests {
             ParsedAction::Skip
         }
 
+        fn can_parse_reply_without_parent(&self, message: &str) -> bool {
+            message == "self-contained"
+        }
+
         fn parse_reply(
             &self,
-            _message: &str,
+            message: &str,
             ts: NaiveDateTime,
             parent: Option<&RawTgMessage>,
             _ctx: &ParseContext,
         ) -> ParsedAction {
-            assert_eq!(parent.map(|message| message.msg_id), Some(1));
+            if message == "self-contained" {
+                assert!(parent.is_none());
+            } else {
+                assert_eq!(parent.map(|message| message.msg_id), Some(1));
+            }
             ParsedAction::one(RawSignal::Close {
                 ts,
                 position: qs_core::PositionRef::ByTradeId {
@@ -677,6 +688,29 @@ mod tests {
             }] if source.msg_id == 2 && parser == "parent-required"
         ));
         assert!(result.signals.is_empty());
+    }
+
+    #[test]
+    fn v2_invokes_parser_for_self_contained_reply_without_parent() {
+        let reg = make_parent_required_registry();
+        let messages = vec![make_reply(
+            700,
+            2,
+            "2025-01-01T10:05:00Z",
+            "self-contained",
+            1,
+        )];
+
+        let result = parse_messages_v2(&reg, &messages);
+
+        assert!(matches!(
+            result.outcomes.as_slice(),
+            [MessageParseOutcome::Parsed { source, .. }] if source.msg_id == 2
+        ));
+        assert!(matches!(
+            result.signals.as_slice(),
+            [RawSignal::Close { .. }]
+        ));
     }
 
     #[test]

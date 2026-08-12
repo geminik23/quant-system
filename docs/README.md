@@ -19,6 +19,7 @@ Use this index to enter the workspace by goal rather than by crate name.
 - [`qs-data-preprocess` CLI and storage guide](../crates/data-preprocess/GUIDE.md)
 - [`qs-market-data` operations and client contract](../crates/market-data/GUIDE.md)
 - [`qs-backtest-server` example configuration](../crates/backtest-server/config.example.toml)
-- [`qs-signal-parser` example parser configuration](../crates/signal-parser/parsers.example.toml)
+- [`qs-signal-parser` Telegram parser configuration](../crates/signal-parser/parsers.example.toml)
+
 
 Rust API details remain in each crate's Rustdoc.

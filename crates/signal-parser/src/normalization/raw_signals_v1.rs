@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use qs_core::{OrderType, Side};
+use qs_core::{OrderType, RawSignal, Side, validate_raw_signal};
 
 use crate::ingestion::{
     DateTimeUtc, PayloadEncoding, PayloadSchemaRef, SourceEvent, StructuredPayload,
@@ -510,6 +510,14 @@ fn group_text(value: String) -> Result<GroupText, RawSignalsV1Error> {
 
 fn trade_key(value: String) -> Result<TradeKeyText, RawSignalsV1Error> {
     Ok(TradeKeyText::try_new(value, "trade key")?)
+}
+
+pub(crate) fn decode_raw_signal_value_v1(value: serde_json::Value) -> Result<RawSignal, String> {
+    let dto = serde_json::from_value::<RawSignalDtoV1>(value).map_err(|error| error.to_string())?;
+    let draft = dto.into_draft().map_err(|error| error.to_string())?;
+    let signal = finalize_draft(draft).signal().clone();
+    validate_raw_signal(&signal).map_err(|error| error.to_string())?;
+    Ok(signal)
 }
 
 pub fn raw_signals_v1_schema() -> PayloadSchemaRef {
