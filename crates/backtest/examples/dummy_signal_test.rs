@@ -649,16 +649,20 @@ fn main() {
         eprintln!("Error: symbol '{data_symbol}' not found in '{symbols_path}'");
         process::exit(1);
     });
-    let mut contract_sizes = HashMap::from([(data_symbol.clone(), spec.lot_base_units as f64)]);
+    let economics = qs_backtest::resolve_legacy_economics(&spec).unwrap_or_else(|error| {
+        eprintln!("Error: symbol '{data_symbol}' is not economically supported: {error}");
+        process::exit(1);
+    });
+    let mut contract_sizes = HashMap::from([(data_symbol.clone(), economics.contract_multiplier)]);
     let mut symbol_specs = HashMap::from([(data_symbol.clone(), spec.clone())]);
     if canonical != data_symbol {
-        contract_sizes.insert(canonical.clone(), spec.lot_base_units as f64);
+        contract_sizes.insert(canonical.clone(), economics.contract_multiplier);
         symbol_specs.insert(canonical.clone(), spec.clone());
     }
     println!(
         "Symbol metadata for {}: contract_size={} lot_step={} (from {})",
         data_symbol,
-        spec.lot_base_units,
+        economics.contract_multiplier,
         spec.lot_step_units as f64 / spec.lot_base_units as f64,
         symbols_path
     );

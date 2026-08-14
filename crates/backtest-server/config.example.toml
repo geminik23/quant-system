@@ -23,6 +23,17 @@ data_dir = "market_data"
 # Path to the qs-symbols registry TOML.
 registry_path = "crates/symbols/symbols.toml"
 
+[instruments]
+# Optional strict instrument catalog document. When omitted, supported entries in the
+# qs-symbols registry compile into an immutable compatibility catalog.
+# catalog_path = "instrument-catalog.toml"
+# Optional broker, exchange, or repository-owned alias-resolution default. A trading platform
+# such as CTrader is not a listing venue. Explicit catalogs may omit this when aliases are unique.
+# Compatibility catalogs use repository-default when it is omitted.
+# default_listing_venue = "ic-markets"
+# Identity of the historical data source. This is separate from listing and execution venues.
+market_data_source = "local-parquet"
+
 [profiles]
 # Path to the qs-backtest management profiles TOML.
 # Profiles should include explicit target_selection. Existing serialized profiles with

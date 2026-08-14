@@ -18,15 +18,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 
 use chrono::{Duration, NaiveDateTime};
+use qs_core::sizing::{compute_instrument_native_loss_per_lot, compute_instrument_size_for_spec};
 use qs_core::types::{
     Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, OrderType,
     PositionStatus, PreparedPendingFill, PriceQuote, Side, SlippageModel, position_size_tolerance,
 };
 use qs_core::{ExecutionPricer, FutureApplyError, TradeEngine};
+use qs_instruments::{Decimal, EconomicsModelId, InstrumentSpec, ListingStatus, QuantityUnit};
 
 use crate::artifacts::{
     ExecutionMetadata, FUTURE_ARTIFACT_FORMAT_VERSION, FutureBacktestArtifacts,
-    PendingOrderSnapshot,
+    InstrumentSizingArtifact, PendingOrderSnapshot, ReplayInstrumentManifest,
 };
 use crate::currency::{ConversionQuoteBook, RunCurrencyPlan};
 use crate::data_feed::{DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch};
@@ -241,6 +243,8 @@ pub struct BacktestConfig {
     /// Symbol specs for sizing calculations.  Populated by the server from
     /// the symbol registry.  Empty when no sizing policy is configured.
     pub symbol_specs: HashMap<String, qs_symbols::SymbolSpec>,
+    /// Optional explicit instrument specifications and stored-series bindings pinned for this run.
+    pub instrument_manifest: Option<ReplayInstrumentManifest>,
 }
 
 impl Default for BacktestConfig {
@@ -252,6 +256,7 @@ impl Default for BacktestConfig {
             contract_sizes: HashMap::new(),
             sizing: None,
             symbol_specs: HashMap::new(),
+            instrument_manifest: None,
         }
     }
 }
@@ -263,24 +268,28 @@ pub struct BacktestRunner {
     config: BacktestConfig,
     future_config: Option<FutureQuoteConfig>,
     evaluation_options: EvaluationOptions,
+    instrument_sizing: Vec<InstrumentSizingArtifact>,
 }
 
 impl BacktestRunner {
     /// Create a new runner with the given configuration.
     pub fn new(config: BacktestConfig) -> Self {
-        let executor = BacktestExecutor::new(config.initial_balance, config.contract_sizes.clone());
+        let executor =
+            BacktestExecutor::new(config.initial_balance, effective_contract_sizes(&config));
         Self {
             engine: TradeEngine::with_fill_model(config.fill_model),
             executor,
             config,
             future_config: None,
             evaluation_options: EvaluationOptions::default(),
+            instrument_sizing: Vec::new(),
         }
     }
 
     /// Create a runner using deterministic FutureQuoteV1 scheduling and pricing.
     pub fn new_future(config: BacktestConfig, future_config: FutureQuoteConfig) -> Self {
-        let executor = BacktestExecutor::new(config.initial_balance, config.contract_sizes.clone());
+        let executor =
+            BacktestExecutor::new(config.initial_balance, effective_contract_sizes(&config));
         let engine = TradeEngine::with_fill_model_and_deterministic_ids(config.fill_model);
         Self {
             engine,
@@ -288,6 +297,7 @@ impl BacktestRunner {
             config,
             future_config: Some(future_config),
             evaluation_options: EvaluationOptions::default(),
+            instrument_sizing: Vec::new(),
         }
     }
 
@@ -746,7 +756,7 @@ impl BacktestRunner {
     }
 
     fn finalize_resolved_entry(
-        &self,
+        &mut self,
         mut resolved: ResolvedEntry,
         balance_before: f64,
         operation_ts: NaiveDateTime,
@@ -764,18 +774,36 @@ impl BacktestRunner {
                 "pending entry requires a requested price".to_owned()
             }
         })?;
-        let spec = self
-            .config
-            .symbol_specs
-            .get(&resolved.symbol)
-            .ok_or_else(|| format!("missing symbol spec for {}", resolved.symbol))?;
+        let explicit_spec = explicit_instrument_spec(&self.config, &resolved.symbol);
+        let legacy_spec = self.config.symbol_specs.get(&resolved.symbol);
+        if explicit_spec.is_none() && legacy_spec.is_none() {
+            return Err(format!(
+                "missing instrument or symbol spec for {}",
+                resolved.symbol
+            ));
+        }
 
-        let account_loss_per_lot = if is_monetary_sizing(policy) {
+        let (account_loss_per_lot, native_to_account_rate) = if is_monetary_sizing(policy) {
             let stop = resolved
                 .stoploss
                 .ok_or_else(|| "monetary sizing requires a protective stop".to_owned())?;
-            let native_loss = compute_native_loss_per_lot(resolved.side, entry_price, stop, spec)
-                .map_err(|error| error.to_string())?;
+            let native_loss = match explicit_spec {
+                Some(spec) => compute_instrument_native_loss_per_lot(
+                    resolved.side,
+                    entry_price,
+                    stop,
+                    u16::from(spec.price.display_scale),
+                    &spec.economics,
+                )
+                .map_err(|error| error.to_string())?,
+                None => compute_native_loss_per_lot(
+                    resolved.side,
+                    entry_price,
+                    stop,
+                    legacy_spec.expect("legacy spec presence checked"),
+                )
+                .map_err(|error| error.to_string())?,
+            };
             let plan = self
                 .future_config
                 .as_ref()
@@ -793,22 +821,44 @@ impl BacktestRunner {
                 .ok_or_else(|| "monetary sizing requires conversion quotes".to_owned())?
                 .convert_route(-native_loss, operation_ts, route)
                 .map_err(|error| error.to_string())?;
-            Some(-converted.output_amount)
+            let account_loss = -converted.output_amount;
+            (Some(account_loss), Some(account_loss / native_loss))
         } else {
-            None
+            (None, None)
         };
 
-        let sizing = compute_size(
-            policy,
-            resolved.risk_multiplier,
-            balance_before,
-            resolved.side,
-            entry_price,
-            resolved.stoploss,
-            spec,
-            account_loss_per_lot,
-        )
-        .map_err(|error| error.to_string())?;
+        let sizing = match explicit_spec {
+            Some(spec) => compute_instrument_size_for_spec(
+                policy,
+                resolved.risk_multiplier,
+                balance_before,
+                resolved.side,
+                entry_price,
+                resolved.stoploss,
+                spec,
+                native_to_account_rate,
+            )
+            .map_err(|error| error.to_string())?,
+            None => compute_size(
+                policy,
+                resolved.risk_multiplier,
+                balance_before,
+                resolved.side,
+                entry_price,
+                resolved.stoploss,
+                legacy_spec.expect("legacy spec presence checked"),
+                account_loss_per_lot,
+            )
+            .map_err(|error| error.to_string())?,
+        };
+        if let Some(quantity) = sizing.quantity_adjustment {
+            self.instrument_sizing.push(InstrumentSizingArtifact {
+                symbol: resolved.symbol.clone(),
+                operation_ts,
+                quantity,
+                final_notional: sizing.final_notional.clone(),
+            });
+        }
         let target_steps = allocate_target_steps(
             sizing.final_lot_steps,
             &resolved.target_resolution.weights,
@@ -1044,19 +1094,18 @@ impl BacktestRunner {
         let mut scheduled = VecDeque::from(scheduled);
         let mut queued = VecDeque::<QueuedAction>::new();
         let mut lifecycle = LifecycleLedger::new();
+        let contract_sizes = effective_contract_sizes(&self.config);
         let mut future_executor = FutureExecutor::new(
             self.config.initial_balance,
-            self.config.contract_sizes.clone(),
+            contract_sizes.clone(),
             future.pnl_epsilon,
         )
         .with_currency_plan(future.currency_plan.clone());
-        let mut portfolio = PortfolioRecorder::new(
-            self.config.initial_balance,
-            self.config.contract_sizes.clone(),
-        )
-        .with_fill_model(self.config.fill_model)
-        .with_stale_quote_after_millis(future.stale_quote_after_ms)
-        .with_currency_plan(future.currency_plan.clone());
+        let mut portfolio =
+            PortfolioRecorder::new(self.config.initial_balance, contract_sizes.clone())
+                .with_fill_model(self.config.fill_model)
+                .with_stale_quote_after_millis(future.stale_quote_after_ms)
+                .with_currency_plan(future.currency_plan.clone());
         let mut mtm_curve = MtmCurveCollector::new(future.mtm_output)
             .expect("MTM output policy was validated before replay");
         let mut last_mtm_candidate = None;
@@ -1571,12 +1620,9 @@ impl BacktestRunner {
                     .as_ref()
                     .map(|plan| plan.account_currency().to_owned()),
                 currency_plan: future.currency_plan.clone(),
-                contract_sizes: self
-                    .config
-                    .contract_sizes
-                    .iter()
-                    .map(|(symbol, size)| (symbol.clone(), *size))
-                    .collect(),
+                contract_sizes: contract_sizes.into_iter().collect(),
+                instrument_manifest: self.config.instrument_manifest.clone(),
+                instrument_sizing: std::mem::take(&mut self.instrument_sizing),
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
@@ -1587,7 +1633,7 @@ impl BacktestRunner {
             completed_positions: future_executor.completed_positions.clone(),
             open_positions: portfolio.latest_open_positions().to_vec(),
             pending_orders,
-            pending_order_lifecycle: future_executor.pending_order_lifecycle.clone(),
+            pending_order_lifecycle: future_executor.pending_order_lifecycle,
             lifecycle,
             equity_curve,
             mtm_output_summary,
@@ -2379,6 +2425,131 @@ fn valid_accounting_size(size: f64) -> bool {
     size.is_finite() && size > position_size_tolerance(size)
 }
 
+fn explicit_instrument_spec<'a>(
+    config: &'a BacktestConfig,
+    symbol: &str,
+) -> Option<&'a InstrumentSpec> {
+    config
+        .instrument_manifest
+        .as_ref()?
+        .instruments
+        .get(symbol)
+        .map(|artifact| &artifact.spec)
+}
+
+fn decimal_to_f64(value: Decimal, field: &str) -> Result<f64, String> {
+    let value = value
+        .to_string()
+        .parse::<f64>()
+        .map_err(|error| format!("invalid {field}: {error}"))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("{field} must be finite"))
+    }
+}
+
+fn instrument_multiplier(spec: &InstrumentSpec) -> Result<f64, String> {
+    decimal_to_f64(
+        spec.economics.contract_multiplier.get(),
+        "instrument contract multiplier",
+    )
+    .and_then(|value| {
+        if value > 0.0 {
+            Ok(value)
+        } else {
+            Err("instrument contract multiplier must be positive".into())
+        }
+    })
+}
+
+fn supported_instrument_multiplier(spec: &InstrumentSpec) -> Result<f64, String> {
+    if spec.status != ListingStatus::Trading {
+        return Err(format!(
+            "instrument {} is not in trading status",
+            spec.instrument
+        ));
+    }
+    if spec.economics.quantity_unit != QuantityUnit::StandardLot {
+        return Err(format!(
+            "unsupported quantity unit for instrument {}: {:?}",
+            spec.instrument, spec.economics.quantity_unit
+        ));
+    }
+    let model = spec.economics.pnl_model.as_str();
+    if model != EconomicsModelId::FX_QUOTE_LINEAR_V1
+        && model != EconomicsModelId::CFD_QUOTE_LINEAR_V1
+    {
+        return Err(format!(
+            "unsupported P&L model for instrument {}: {model}",
+            spec.instrument
+        ));
+    }
+    instrument_multiplier(spec)
+}
+
+fn validate_instrument_manifest(config: &BacktestConfig) -> Result<(), String> {
+    let Some(manifest) = &config.instrument_manifest else {
+        return Ok(());
+    };
+    for (symbol, artifact) in &manifest.instruments {
+        if symbol.is_empty() {
+            return Err("instrument manifest symbol must not be empty".into());
+        }
+        artifact
+            .spec
+            .validate()
+            .map_err(|error| format!("invalid instrument spec for {symbol}: {error}"))?;
+        if artifact.resolved.instrument != artifact.spec.instrument {
+            return Err(format!(
+                "resolved instrument and spec identity differ for {symbol}"
+            ));
+        }
+        if artifact.resolved.spec_revision != artifact.spec.revision {
+            return Err(format!(
+                "resolved specification revision does not match the embedded spec for {symbol}"
+            ));
+        }
+        supported_instrument_multiplier(&artifact.spec)?;
+    }
+    for binding in &manifest.stored_series {
+        let known = manifest
+            .instruments
+            .values()
+            .any(|artifact| artifact.resolved == binding.instrument);
+        if !known {
+            return Err(format!(
+                "stored series {}:{} references an instrument outside the manifest",
+                binding.source_partition, binding.source_symbol
+            ));
+        }
+        let artifact = manifest
+            .instruments
+            .values()
+            .find(|artifact| artifact.resolved == binding.instrument)
+            .expect("known binding reference has an instrument artifact");
+        if binding.effective != artifact.spec.effective {
+            return Err(format!(
+                "stored series {}:{} effective interval differs from its instrument spec",
+                binding.source_partition, binding.source_symbol
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn effective_contract_sizes(config: &BacktestConfig) -> HashMap<String, f64> {
+    let mut contract_sizes = config.contract_sizes.clone();
+    if let Some(manifest) = &config.instrument_manifest {
+        for (symbol, artifact) in &manifest.instruments {
+            if let Ok(multiplier) = instrument_multiplier(&artifact.spec) {
+                contract_sizes.insert(symbol.clone(), multiplier);
+            }
+        }
+    }
+    contract_sizes
+}
+
 fn is_monetary_sizing(policy: &SizingPolicy) -> bool {
     matches!(
         policy,
@@ -2423,9 +2594,12 @@ fn validate_replay_config(
         }
     }
 
+    validate_instrument_manifest(config)?;
     for (symbol, spec) in &config.symbol_specs {
         validate_symbol_spec(symbol, spec)?;
-        resolve_legacy_economics(spec).map_err(|error| error.to_string())?;
+        if explicit_instrument_spec(config, symbol).is_none() {
+            resolve_legacy_economics(spec).map_err(|error| error.to_string())?;
+        }
     }
 
     let entry_symbols: Vec<&str> = raw_signals
@@ -2441,8 +2615,10 @@ fn validate_replay_config(
     if let Some(policy) = &config.sizing {
         validate_sizing_policy(policy)?;
         for symbol in &entry_symbols {
-            if !config.symbol_specs.contains_key(*symbol) {
-                return Err(format!("missing symbol spec for {symbol}"));
+            if !config.symbol_specs.contains_key(*symbol)
+                && explicit_instrument_spec(config, symbol).is_none()
+            {
+                return Err(format!("missing instrument or symbol spec for {symbol}"));
             }
         }
         if !entry_symbols.is_empty() && is_monetary_sizing(policy) {
@@ -2599,12 +2775,12 @@ fn rejected_future_result(
                 .as_ref()
                 .map(|plan| plan.account_currency().to_owned()),
             currency_plan: future.currency_plan.clone(),
-            contract_sizes: config
-                .contract_sizes
-                .iter()
-                .filter(|(symbol, size)| !symbol.is_empty() && size.is_finite() && **size > 0.0)
-                .map(|(symbol, size)| (symbol.clone(), *size))
+            contract_sizes: effective_contract_sizes(config)
+                .into_iter()
+                .filter(|(symbol, size)| !symbol.is_empty() && size.is_finite() && *size > 0.0)
                 .collect(),
+            instrument_manifest: config.instrument_manifest.clone(),
+            instrument_sizing: Vec::new(),
             stale_quote_after_millis: future.stale_quote_after_ms,
             pnl_epsilon: if future.pnl_epsilon.is_finite() && future.pnl_epsilon >= 0.0 {
                 future.pnl_epsilon
@@ -2625,11 +2801,15 @@ fn rejected_future_result(
 }
 
 fn insert_economic_support_metadata(tags: &mut BTreeMap<String, String>, config: &BacktestConfig) {
+    let mut compatibility_specs = config.symbol_specs.iter().peekable();
+    if compatibility_specs.peek().is_none() {
+        return;
+    }
     tags.insert(
         "economics.guard".into(),
         LEGACY_ECONOMIC_GUARD_ID.to_owned(),
     );
-    for (symbol, spec) in &config.symbol_specs {
+    for (symbol, spec) in compatibility_specs {
         let prefix = format!("economics.symbol.{symbol}");
         tags.insert(format!("{prefix}.category"), spec.category.clone());
         match resolve_legacy_economics(spec) {

@@ -1,25 +1,22 @@
 [package]
-name = "quant-system-core"
+name = "qs-instruments"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-description = "Core trading domain — execution, normalized intent, management policy, sizing, and currency conversion"
-keywords = ["trading", "engine", "position", "backtest"]
+description = "Exact instrument identities, specifications, grids, and immutable catalogs"
+keywords = ["instruments", "trading", "catalog", "finance"]
 categories = ["finance"]
 
 [lib]
-name = "qs_core"
+name = "qs_instruments"
 
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
-nanoid = { workspace = true }
 thiserror = { workspace = true }
-qs-instruments = { workspace = true }
-qs-symbols = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

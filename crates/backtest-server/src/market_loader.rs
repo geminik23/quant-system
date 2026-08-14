@@ -6,6 +6,7 @@ use std::sync::Arc;
 use chrono::NaiveDateTime;
 use data_preprocess::scanner::{ParquetBarScan, ParquetTickScan};
 use data_preprocess::{Bar, DataError, ParquetScanBounds, Tick, Timeframe};
+use qs_backtest::ReplayInstrumentManifest;
 use qs_backtest::data_feed::{
     EventBatchFeed, EventBatchFeedError, KWayMergeError, KWayMergeFeed, MarketEvent,
     SequencedMarketEvent, SeriesRoles,
@@ -31,22 +32,40 @@ enum MarketSeriesSource {
 pub(crate) struct MarketSeriesDescription {
     canonical_symbol: String,
     roles: SeriesRoles,
+    source_partition: Option<String>,
+    source_symbol: Option<String>,
     source: MarketSeriesSource,
 }
 
 impl MarketSeriesDescription {
-    fn tick(scan: ParquetTickScan, canonical_symbol: String, roles: SeriesRoles) -> Self {
+    fn tick(
+        scan: ParquetTickScan,
+        canonical_symbol: String,
+        roles: SeriesRoles,
+        source_partition: String,
+        source_symbol: String,
+    ) -> Self {
         Self {
             canonical_symbol,
             roles,
+            source_partition: Some(source_partition),
+            source_symbol: Some(source_symbol),
             source: MarketSeriesSource::Tick { scan },
         }
     }
 
-    fn bar(scan: ParquetBarScan, canonical_symbol: String, roles: SeriesRoles) -> Self {
+    fn bar(
+        scan: ParquetBarScan,
+        canonical_symbol: String,
+        roles: SeriesRoles,
+        source_partition: String,
+        source_symbol: String,
+    ) -> Self {
         Self {
             canonical_symbol,
             roles,
+            source_partition: Some(source_partition),
+            source_symbol: Some(source_symbol),
             source: MarketSeriesSource::Bar { scan },
         }
     }
@@ -59,10 +78,18 @@ impl MarketSeriesDescription {
         bounds: ParquetScanBounds,
     ) -> Self {
         match ParquetTickScan::describe(data_dir, &exchange, &symbol, bounds) {
-            Ok(scan) => Self::tick(scan, canonical_symbol, SeriesRoles::CONVERSION),
+            Ok(scan) => Self::tick(
+                scan,
+                canonical_symbol,
+                SeriesRoles::CONVERSION,
+                exchange.clone(),
+                symbol.clone(),
+            ),
             Err(error) => Self {
                 canonical_symbol,
                 roles: SeriesRoles::CONVERSION,
+                source_partition: Some(exchange),
+                source_symbol: Some(symbol),
                 source: MarketSeriesSource::Unavailable {
                     message: error.to_string(),
                 },
@@ -82,6 +109,8 @@ impl MarketSeriesDescription {
         Self {
             canonical_symbol,
             roles,
+            source_partition: None,
+            source_symbol: None,
             source: MarketSeriesSource::Empty,
         }
     }
@@ -187,6 +216,58 @@ impl MarketStreamDescription {
         self.series.len()
     }
 
+    pub(crate) fn stored_series_coordinates(&self) -> Vec<(String, String, String)> {
+        self.series
+            .iter()
+            .filter_map(|series| {
+                Some((
+                    series.canonical_symbol.clone(),
+                    series.source_partition.clone()?,
+                    series.source_symbol.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn validate_stored_series_bindings(
+        &self,
+        manifest: &ReplayInstrumentManifest,
+    ) -> Result<()> {
+        let mut expected = self.stored_series_coordinates();
+        expected.sort();
+        expected.dedup();
+        let mut actual = manifest
+            .stored_series
+            .iter()
+            .map(|binding| {
+                let symbol = manifest
+                    .instruments
+                    .iter()
+                    .find(|(_, artifact)| artifact.resolved == binding.instrument)
+                    .map(|(symbol, _)| symbol.clone())
+                    .ok_or_else(|| {
+                        BacktestServerError::InvalidRequest(format!(
+                            "stored series {}:{} references an unresolved instrument",
+                            binding.source_partition, binding.source_symbol
+                        ))
+                    })?;
+                Ok((
+                    symbol,
+                    binding.source_partition.clone(),
+                    binding.source_symbol.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        actual.sort();
+        actual.dedup();
+        if actual != expected {
+            return Err(BacktestServerError::InvalidRequest(format!(
+                "stored-series bindings do not match the planned market streams: expected {expected:?}, got {actual:?}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_shared_conversion_symbols(
         &mut self,
         shared_symbols: &std::collections::BTreeSet<String>,
@@ -279,7 +360,13 @@ pub(crate) fn describe_primary_market_stream(
             .map_err(map_data_error)?;
             let (first, last) = primary_tick_edges(&scan, canonical_symbol, is_cancelled)?;
             (
-                MarketSeriesDescription::tick(scan, canonical_symbol.clone(), SeriesRoles::PRIMARY),
+                MarketSeriesDescription::tick(
+                    scan,
+                    canonical_symbol.clone(),
+                    SeriesRoles::PRIMARY,
+                    disk_exchange,
+                    disk_symbol,
+                ),
                 first,
                 last,
             )
@@ -319,7 +406,13 @@ pub(crate) fn describe_primary_market_stream(
             .map_err(map_data_error)?;
             let (first, last) = primary_bar_edges(&scan, canonical_symbol, is_cancelled)?;
             (
-                MarketSeriesDescription::bar(scan, canonical_symbol.clone(), SeriesRoles::PRIMARY),
+                MarketSeriesDescription::bar(
+                    scan,
+                    canonical_symbol.clone(),
+                    SeriesRoles::PRIMARY,
+                    disk_exchange,
+                    disk_symbol,
+                ),
                 first,
                 last,
             )
@@ -498,6 +591,9 @@ mod tests {
     use chrono::NaiveDate;
     use data_preprocess::ParquetStore;
     use qs_backtest::data_feed::FallibleBatchFeed;
+    use qs_symbols::SymbolRegistry;
+
+    use crate::InstrumentDomain;
 
     fn ts(second: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 2, 3)
@@ -542,6 +638,25 @@ mod tests {
             }));
         }
         events
+    }
+
+    fn registry() -> SymbolRegistry {
+        SymbolRegistry::from_toml(
+            r#"
+[[symbol]]
+canonical = "eurusd"
+aliases = ["eur/usd"]
+pip_position = 4
+digits = 5
+category = "forex"
+base_currency = "EUR"
+quote_currency = "USD"
+pnl_currency = "USD"
+lot_base_units = 100000
+lot_step_units = 1000
+"#,
+        )
+        .unwrap()
     }
 
     fn collect_ordinals(mut stream: MarketStream) -> Vec<(NaiveDateTime, u64)> {
@@ -624,6 +739,45 @@ mod tests {
             collect_ordinals(description.open(Arc::new(|| false)).unwrap()),
             vec![(ts(1), 1), (ts(2), 2)]
         );
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stored_series_bindings_must_match_planned_stream_coordinates() {
+        let data_dir = temp_data_dir();
+        let store = ParquetStore::open(&data_dir).unwrap();
+        store.insert_ticks(&[tick("EURUSD", 0)]).unwrap();
+        let mut never_cancelled = || false;
+        let description = describe_primary_market_stream(
+            data_dir.to_str().unwrap(),
+            "fixture",
+            &["eurusd".into()],
+            "tick",
+            None,
+            Some(ts(0)),
+            Some(ts(0)),
+            &mut never_cancelled,
+            &mut |_| {},
+        )
+        .unwrap();
+        let registry = registry();
+        let domain = InstrumentDomain::compatibility(&registry).unwrap();
+        let mut manifest = domain
+            .resolve_manifest(&["eurusd".into()], ts(0), Some(ts(0)))
+            .unwrap();
+        domain
+            .attach_stored_series(&mut manifest, description.stored_series_coordinates())
+            .unwrap();
+
+        description
+            .validate_stored_series_bindings(&manifest)
+            .unwrap();
+        manifest.stored_series[0].source_partition = "other".into();
+        let error = description
+            .validate_stored_series_bindings(&manifest)
+            .unwrap_err();
+        assert!(error.to_string().contains("do not match"));
 
         std::fs::remove_dir_all(data_dir).unwrap();
     }

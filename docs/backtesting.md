@@ -6,7 +6,7 @@ The historical path combines data import, strict normalized signals, determinist
 supported tick/bar export
   -> qs-data-preprocess
   -> partitioned Parquet
-  -> backtest server replay plan
+  -> instrument catalog resolution and replay plan
   -> FutureQuote execution and accounting
   -> inline result or verified artifact
 ```
@@ -33,6 +33,16 @@ Every Entry must contain a finite positive `risk` multiplier. It does not contai
 
 See the [RawSignal reference](reference/raw-signal.md) for action shapes.
 
+## Instrument identity and economics
+
+The server can load an optional strict instrument catalog through the `[instruments]` configuration section. A catalog contains exact asset metadata, broker- or exchange-qualified instrument identities, aliases, decimal price and quantity rules, effective intervals, and explicit economics descriptors. Its operator-assigned version identifies the immutable snapshot used for a run.
+
+When `catalog_path` is omitted, the server compiles supported `qs-symbols` FX, metal, commodity, and index rows into a guarded compatibility snapshot. This preserves existing sizing, P&L, and economic-guard metadata. Registry-backed cryptocurrency and unknown categories remain excluded before market-data access.
+
+`default_listing_venue` is an optional alias-resolution hint. Compatibility snapshots use `repository-default` when it is omitted. Explicit catalogs do not receive that implicit default, so one unique alias resolves directly and aliases shared by several venues fail as ambiguous unless the operator supplies the intended broker or exchange listing namespace. A platform such as CTrader is not a listing venue.
+
+Each service replay result can include a typed instrument manifest containing the catalog version, resolved instrument and specification revision, effective specification, and actual Parquet partition and symbol coordinates. Catalog-backed Entry metadata also records exact requested and adjusted quantity, adjustment direction, and post-rounding notional when notional rules are configured. Existing `exchange` request and storage fields remain data coordinates and are not reinterpreted as broker, exchange listing, platform, or execution identity.
+
 ## Replay semantics
 
 The production service uses deterministic FutureQuote replay.
@@ -46,7 +56,7 @@ Close-only bars cannot reconstruct an intrabar price path. Use tick data when ex
 
 ## Service execution
 
-Configure the data root, symbol registry, management profiles, retained jobs, and result artifacts through [`config.example.toml`](../crates/backtest-server/config.example.toml).
+Configure the data root, optional instrument catalog, symbol compatibility registry, management profiles, retained jobs, and result artifacts through [`config.example.toml`](../crates/backtest-server/config.example.toml).
 
 The client streams retained-job progress by default. Polling and finite synchronous execution remain available as explicit alternatives. Results may be returned inline or stored as verified artifacts when they exceed the inline limit.
 
@@ -64,4 +74,6 @@ This library path is separate from the production service contract.
 ## Operational boundaries
 
 - Signal symbols and timestamps must overlap imported data.
-- Symbol metadata controls lot steps, currencies, and supported economics.
+- Explicit instrument specifications control catalog-aware quantity rules, contract multipliers, and supported economics; the symbol registry supplies the guarded compatibility form when no catalog is configured.
+- The current replay implementation supports the existing quote-linear FX/CFD economics with standard-lot quantities. Declaring another model in a catalog does not make it executable.
+- Catalog-backed Entry sizing normalizes prices to the declared display scale, validates the price grid, floors quantity with exact decimal grid arithmetic, validates post-rounding notional bounds, and records the adjustment. Other established engine-facing values remain compatibility-oriented `f64`; this is not a general decimal migration.

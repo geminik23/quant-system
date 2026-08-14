@@ -285,6 +285,18 @@ fn canonical_names_list() {
 }
 
 #[test]
+fn entries_include_currency_metadata_in_canonical_order() {
+    let reg = registry();
+    let entries = reg.entries();
+    let names = entries
+        .iter()
+        .map(|(spec, _)| spec.canonical.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["btcusd", "eurusd", "us100", "usdjpy", "xauusd"]);
+    assert_eq!(entries[1].1.pnl_currency, "USD");
+}
+
+#[test]
 fn symbols_in_category() {
     let reg = registry();
 

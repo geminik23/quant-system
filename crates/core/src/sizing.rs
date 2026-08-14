@@ -3,6 +3,10 @@
 //! Sizing consumes the authoritative entry and protective stop after signal resolution. Currency conversion and target allocation are performed by callers.
 
 use crate::types::Side;
+use qs_instruments::{
+    AdjustmentDirection, Decimal, EconomicsModelId, GridAdjustment, GridRounding,
+    InstrumentEconomics, InstrumentSpec, Money, QuantityRules, QuantityUnit,
+};
 use qs_symbols::SymbolSpec;
 use thiserror::Error;
 
@@ -35,12 +39,12 @@ pub enum LotCapStatus {
     CappedAtMaximum,
 }
 
-/// Auditable output from [`compute_size`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Auditable output from legacy or catalog-backed sizing.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizingResult {
-    /// Authoritative tradable quantity in symbol lot steps.
+    /// Authoritative tradable quantity in legacy lot steps or catalog quantity-grid steps.
     pub final_lot_steps: u64,
-    /// Final lot quantity derived from `final_lot_steps` and `SymbolSpec`.
+    /// Final standard-lot quantity derived from `final_lot_steps` and the active quantity rules.
     pub final_lot: f64,
     /// Raw lot quantity after applying the signal risk multiplier and before lot constraints.
     pub scaled_raw_lot: f64,
@@ -48,10 +52,14 @@ pub struct SizingResult {
     pub requested_account_risk: Option<f64>,
     /// Loss in the symbol's native P&L currency for one lot at the protective stop.
     pub native_loss_per_lot: Option<f64>,
-    /// Caller-supplied account-currency loss for one lot at the protective stop.
+    /// Account-currency loss for one lot at the protective stop.
     pub account_loss_per_lot: Option<f64>,
     /// Maximum-lot cap status.
     pub cap_status: LotCapStatus,
+    /// Exact requested and final quantity for catalog-backed sizing.
+    pub quantity_adjustment: Option<GridAdjustment<Decimal>>,
+    /// Exact notional after quantity adjustment for catalog-backed sizing.
+    pub final_notional: Option<Money>,
 }
 
 /// Stable structured failures from [`compute_size`].
@@ -219,12 +227,122 @@ pub enum SizingError {
     },
 }
 
+/// Catalog-backed sizing failures.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum InstrumentSizingError {
+    /// Existing policy, price, or floating-point sizing validation failed.
+    #[error(transparent)]
+    Sizing(#[from] SizingError),
+    /// The instrument quantity and P&L model combination is not supported by this sizing path.
+    #[error(
+        "unsupported instrument sizing combination: quantity_unit={quantity_unit:?}, pnl_model={pnl_model}"
+    )]
+    UnsupportedInstrumentSizing {
+        /// Instrument quantity unit.
+        quantity_unit: QuantityUnit,
+        /// Instrument P&L model.
+        pnl_model: EconomicsModelId,
+    },
+    /// Catalog-backed monetary sizing did not receive a native-to-account conversion rate.
+    #[error("catalog-backed monetary sizing requires native_to_account_rate")]
+    MissingNativeToAccountRate,
+    /// The supplied native-to-account conversion rate is not usable.
+    #[error("native_to_account_rate must be finite and positive, got {value}")]
+    InvalidNativeToAccountRate {
+        /// Invalid conversion rate.
+        value: f64,
+    },
+    /// The exact instrument decimal cannot be represented as a finite `f64`.
+    #[error("{field} decimal {value} cannot be represented as a finite f64")]
+    ExactDecimalOutOfRange {
+        /// Instrument field being converted.
+        field: &'static str,
+        /// Exact value that could not be converted.
+        value: Decimal,
+    },
+    /// The quantity grid origin is incompatible with the retained zero-based lot-step result.
+    #[error("quantity grid origin must be zero for standard-lot sizing, got {value}")]
+    UnsupportedQuantityGridOrigin {
+        /// Unsupported grid origin.
+        value: Decimal,
+    },
+    /// An exact quantity bound is not on the declared quantity grid.
+    #[error("{field} quantity {value} is not on the declared quantity grid")]
+    QuantityBoundOffGrid {
+        /// Quantity bound field.
+        field: &'static str,
+        /// Off-grid exact quantity.
+        value: Decimal,
+    },
+    /// The exact quantity bounds are inconsistent.
+    #[error("maximum quantity {maximum} is below minimum quantity {minimum}")]
+    InvalidQuantityBounds {
+        /// Minimum standard-lot quantity.
+        minimum: Decimal,
+        /// Maximum standard-lot quantity.
+        maximum: Decimal,
+    },
+    /// An exact quantity bound cannot be represented as a supported lot-step count.
+    #[error("{field} quantity {value} exceeds the supported lot step count")]
+    QuantityStepOverflow {
+        /// Quantity bound field.
+        field: &'static str,
+        /// Exact quantity that overflowed.
+        value: Decimal,
+    },
+    /// Exact quantity-grid arithmetic failed.
+    #[error("invalid quantity grid: {0}")]
+    InvalidQuantityGrid(#[from] qs_instruments::GridError),
+    /// A replay price is outside the declared price grid.
+    #[error("{field} price {value} is outside the declared price grid")]
+    PriceOffGrid {
+        /// Price field being validated.
+        field: &'static str,
+        /// Exact off-grid value.
+        value: Decimal,
+    },
+    /// The notional asset is unsupported by the current quote-linear sizing model.
+    #[error("notional asset {notional_asset} must match settlement asset {settlement_asset}")]
+    UnsupportedNotionalAsset {
+        /// Declared notional asset.
+        notional_asset: qs_instruments::AssetId,
+        /// Instrument settlement asset.
+        settlement_asset: qs_instruments::AssetId,
+    },
+    /// Exact final notional is below the declared minimum.
+    #[error("final notional {notional} is below minimum {minimum}")]
+    BelowMinimumNotional {
+        /// Calculated final notional.
+        notional: Decimal,
+        /// Required minimum.
+        minimum: Decimal,
+    },
+    /// Exact final notional exceeds the declared maximum.
+    #[error("final notional {notional} exceeds maximum {maximum}")]
+    AboveMaximumNotional {
+        /// Calculated final notional.
+        notional: Decimal,
+        /// Allowed maximum.
+        maximum: Decimal,
+    },
+    /// Exact catalog arithmetic failed.
+    #[error("invalid exact instrument arithmetic: {0}")]
+    ExactArithmetic(#[from] qs_instruments::DecimalError),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ValidatedLotSpec {
     lot_base_units: u64,
     lot_step_units: u64,
     lot_min_steps: u64,
     lot_max_steps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedQuantityRules {
+    step: Decimal,
+    minimum_steps: u64,
+    maximum_steps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,7 +372,160 @@ pub fn compute_size(
     let native_loss_per_lot = protective_stop
         .map(|stop_price| compute_native_loss_per_lot(side, entry_price, stop_price, spec))
         .transpose()?;
+    let sizing = compute_raw_size(
+        basis,
+        risk_multiplier,
+        native_loss_per_lot,
+        account_loss_per_lot,
+    )?;
+    let (final_lot_steps, final_lot, cap_status) =
+        apply_lot_constraints(sizing.scaled_raw_lot, lot_spec)?;
 
+    Ok(sizing.into_result(final_lot_steps, final_lot, cap_status, None, None))
+}
+
+/// Compute one account position size from catalog-backed quantity and economics contracts.
+///
+/// This compatibility seam validates exact quantity rules but has no full specification for price-grid or notional validation. New replay consumers should use [`compute_instrument_size_for_spec`].
+#[allow(clippy::too_many_arguments)]
+pub fn compute_instrument_size(
+    policy: &SizingPolicy,
+    risk_multiplier: f64,
+    balance_before: f64,
+    side: Side,
+    entry_price: f64,
+    protective_stop: Option<f64>,
+    price_digits: u16,
+    quantity_rules: &QuantityRules,
+    economics: &InstrumentEconomics,
+    native_to_account_rate: Option<f64>,
+) -> Result<SizingResult, InstrumentSizingError> {
+    validate_risk_multiplier(risk_multiplier)?;
+    validate_entry_price(entry_price)?;
+    validate_instrument_economics(economics)?;
+    let quantity_rules = validate_quantity_rules(quantity_rules)?;
+    let basis = policy_basis(policy, balance_before)?;
+    let native_loss_per_lot = protective_stop
+        .map(|stop_price| {
+            compute_instrument_native_loss_per_lot(
+                side,
+                entry_price,
+                stop_price,
+                price_digits,
+                economics,
+            )
+        })
+        .transpose()?;
+    let account_loss_per_lot =
+        instrument_account_loss(basis, native_loss_per_lot, native_to_account_rate)?;
+    let sizing = compute_raw_size(
+        basis,
+        risk_multiplier,
+        native_loss_per_lot,
+        account_loss_per_lot,
+    )?;
+    let (final_lot_steps, final_lot, cap_status, quantity_adjustment) =
+        apply_quantity_constraints(sizing.scaled_raw_lot, quantity_rules)?;
+    Ok(sizing.into_result(
+        final_lot_steps,
+        final_lot,
+        cap_status,
+        Some(quantity_adjustment),
+        None,
+    ))
+}
+
+/// Compute catalog-backed sizing with complete price, quantity, economics, and notional validation.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_instrument_size_for_spec(
+    policy: &SizingPolicy,
+    risk_multiplier: f64,
+    balance_before: f64,
+    side: Side,
+    entry_price: f64,
+    protective_stop: Option<f64>,
+    spec: &InstrumentSpec,
+    native_to_account_rate: Option<f64>,
+) -> Result<SizingResult, InstrumentSizingError> {
+    validate_risk_multiplier(risk_multiplier)?;
+    validate_entry_price(entry_price)?;
+    validate_instrument_economics(&spec.economics)?;
+    let quantity_rules = validate_quantity_rules(&spec.quantity)?;
+    let entry_decimal = validate_price_grid("entry", entry_price, spec)?;
+    if let Some(stop) = protective_stop {
+        validate_price_grid("protective stop", stop, spec)?;
+    }
+    let basis = policy_basis(policy, balance_before)?;
+    let native_loss_per_lot = protective_stop
+        .map(|stop_price| {
+            compute_instrument_native_loss_per_lot(
+                side,
+                entry_price,
+                stop_price,
+                u16::from(spec.price.display_scale),
+                &spec.economics,
+            )
+        })
+        .transpose()?;
+    let account_loss_per_lot =
+        instrument_account_loss(basis, native_loss_per_lot, native_to_account_rate)?;
+    let sizing = compute_raw_size(
+        basis,
+        risk_multiplier,
+        native_loss_per_lot,
+        account_loss_per_lot,
+    )?;
+    let (final_lot_steps, final_lot, cap_status, quantity_adjustment) =
+        apply_quantity_constraints(sizing.scaled_raw_lot, quantity_rules)?;
+    let final_notional =
+        validate_final_notional(entry_decimal, quantity_adjustment.adjusted, spec)?;
+
+    Ok(sizing.into_result(
+        final_lot_steps,
+        final_lot,
+        cap_status,
+        Some(quantity_adjustment),
+        final_notional,
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawSizingResult {
+    scaled_raw_lot: f64,
+    requested_account_risk: Option<f64>,
+    native_loss_per_lot: Option<f64>,
+    account_loss_per_lot: Option<f64>,
+}
+
+impl RawSizingResult {
+    fn into_result(
+        self,
+        final_lot_steps: u64,
+        final_lot: f64,
+        cap_status: LotCapStatus,
+        quantity_adjustment: Option<GridAdjustment<Decimal>>,
+        final_notional: Option<Money>,
+    ) -> SizingResult {
+        SizingResult {
+            final_lot_steps,
+            final_lot,
+            scaled_raw_lot: self.scaled_raw_lot,
+            requested_account_risk: self.requested_account_risk,
+            native_loss_per_lot: self.native_loss_per_lot,
+            account_loss_per_lot: self.account_loss_per_lot,
+            cap_status,
+            quantity_adjustment,
+            final_notional,
+        }
+    }
+}
+
+fn compute_raw_size(
+    basis: PolicyBasis,
+    risk_multiplier: f64,
+    native_loss_per_lot: Option<f64>,
+    account_loss_per_lot: Option<f64>,
+) -> Result<RawSizingResult, SizingError> {
     let scaled_policy_value = match basis {
         PolicyBasis::FixedLots(base_value) | PolicyBasis::AccountRisk(base_value) => {
             let scaled = base_value * risk_multiplier;
@@ -289,17 +560,31 @@ pub fn compute_size(
         }
     };
 
-    let (final_lot_steps, final_lot, cap_status) = apply_lot_constraints(scaled_raw_lot, lot_spec)?;
-
-    Ok(SizingResult {
-        final_lot_steps,
-        final_lot,
+    Ok(RawSizingResult {
         scaled_raw_lot,
         requested_account_risk,
         native_loss_per_lot,
         account_loss_per_lot: result_account_loss_per_lot,
-        cap_status,
     })
+}
+
+fn instrument_account_loss(
+    basis: PolicyBasis,
+    native_loss_per_lot: Option<f64>,
+    native_to_account_rate: Option<f64>,
+) -> Result<Option<f64>, InstrumentSizingError> {
+    match basis {
+        PolicyBasis::FixedLots(_) => Ok(None),
+        PolicyBasis::AccountRisk(_) => {
+            let native_loss_per_lot =
+                native_loss_per_lot.ok_or(SizingError::MissingProtectiveStop)?;
+            let conversion_rate = native_to_account_rate
+                .ok_or(InstrumentSizingError::MissingNativeToAccountRate)
+                .and_then(validate_native_to_account_rate)?;
+            let account_loss_per_lot = native_loss_per_lot * conversion_rate;
+            Ok(Some(validate_account_loss_per_lot(account_loss_per_lot)?))
+        }
+    }
 }
 
 fn validate_risk_multiplier(value: f64) -> Result<(), SizingError> {
@@ -323,6 +608,14 @@ fn validate_account_loss_per_lot(value: f64) -> Result<f64, SizingError> {
         Ok(value)
     } else {
         Err(SizingError::InvalidAccountLossPerLot { value })
+    }
+}
+
+fn validate_native_to_account_rate(value: f64) -> Result<f64, InstrumentSizingError> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(InstrumentSizingError::InvalidNativeToAccountRate { value })
     }
 }
 
@@ -402,6 +695,173 @@ fn validate_lot_spec(spec: &SymbolSpec) -> Result<ValidatedLotSpec, SizingError>
     })
 }
 
+fn validate_instrument_economics(
+    economics: &InstrumentEconomics,
+) -> Result<(), InstrumentSizingError> {
+    let supported_model = matches!(
+        economics.pnl_model.as_str(),
+        EconomicsModelId::FX_QUOTE_LINEAR_V1 | EconomicsModelId::CFD_QUOTE_LINEAR_V1
+    );
+    if economics.quantity_unit == QuantityUnit::StandardLot && supported_model {
+        Ok(())
+    } else {
+        Err(InstrumentSizingError::UnsupportedInstrumentSizing {
+            quantity_unit: economics.quantity_unit,
+            pnl_model: economics.pnl_model.clone(),
+        })
+    }
+}
+
+fn validate_quantity_rules(
+    rules: &QuantityRules,
+) -> Result<ValidatedQuantityRules, InstrumentSizingError> {
+    if !rules.grid.origin.is_zero() {
+        return Err(InstrumentSizingError::UnsupportedQuantityGridOrigin {
+            value: rules.grid.origin,
+        });
+    }
+
+    let step = rules.grid.step.get();
+    let minimum = rules.minimum.get();
+    if !rules.grid.contains(minimum)? {
+        return Err(InstrumentSizingError::QuantityBoundOffGrid {
+            field: "minimum",
+            value: minimum,
+        });
+    }
+    let minimum_steps = exact_quantity_steps("minimum", minimum, rules.grid.step.get())?;
+
+    let maximum_steps = match rules.maximum {
+        Some(maximum) => {
+            let maximum = maximum.get();
+            if maximum < minimum {
+                return Err(InstrumentSizingError::InvalidQuantityBounds { minimum, maximum });
+            }
+            if !rules.grid.contains(maximum)? {
+                return Err(InstrumentSizingError::QuantityBoundOffGrid {
+                    field: "maximum",
+                    value: maximum,
+                });
+            }
+            Some(exact_quantity_steps(
+                "maximum",
+                maximum,
+                rules.grid.step.get(),
+            )?)
+        }
+        None => None,
+    };
+
+    Ok(ValidatedQuantityRules {
+        step,
+        minimum_steps,
+        maximum_steps,
+    })
+}
+
+fn exact_quantity_steps(
+    field: &'static str,
+    quantity: Decimal,
+    step: Decimal,
+) -> Result<u64, InstrumentSizingError> {
+    let scale = quantity.scale().max(step.scale());
+    let quantity_factor = 10_i128
+        .checked_pow(u32::from(scale - quantity.scale()))
+        .ok_or(InstrumentSizingError::QuantityStepOverflow {
+            field,
+            value: quantity,
+        })?;
+    let step_factor = 10_i128.checked_pow(u32::from(scale - step.scale())).ok_or(
+        InstrumentSizingError::QuantityStepOverflow {
+            field,
+            value: quantity,
+        },
+    )?;
+    let quantity_coefficient = quantity.coefficient().checked_mul(quantity_factor).ok_or(
+        InstrumentSizingError::QuantityStepOverflow {
+            field,
+            value: quantity,
+        },
+    )?;
+    let step_coefficient = step.coefficient().checked_mul(step_factor).ok_or(
+        InstrumentSizingError::QuantityStepOverflow {
+            field,
+            value: quantity,
+        },
+    )?;
+    let steps = quantity_coefficient / step_coefficient;
+    u64::try_from(steps).map_err(|_| InstrumentSizingError::QuantityStepOverflow {
+        field,
+        value: quantity,
+    })
+}
+
+fn exact_decimal_to_f64(field: &'static str, value: Decimal) -> Result<f64, InstrumentSizingError> {
+    let converted = value.coefficient() as f64 / 10_f64.powi(i32::from(value.scale()));
+    if converted.is_finite() {
+        Ok(converted)
+    } else {
+        Err(InstrumentSizingError::ExactDecimalOutOfRange { field, value })
+    }
+}
+
+fn validate_price_grid(
+    field: &'static str,
+    price: f64,
+    spec: &InstrumentSpec,
+) -> Result<Decimal, InstrumentSizingError> {
+    let scale = 10_f64.powi(i32::from(spec.price.display_scale));
+    let normalized = (price * scale).round() / scale;
+    let price = Decimal::checked_from_f64(normalized)?;
+    if spec.price.grid.contains(price)? {
+        Ok(price)
+    } else {
+        Err(InstrumentSizingError::PriceOffGrid {
+            field,
+            value: price,
+        })
+    }
+}
+
+fn validate_final_notional(
+    entry_price: Decimal,
+    quantity: Decimal,
+    spec: &InstrumentSpec,
+) -> Result<Option<Money>, InstrumentSizingError> {
+    let Some(rules) = &spec.notional else {
+        return Ok(None);
+    };
+    if rules.asset != spec.economics.settlement_asset {
+        return Err(InstrumentSizingError::UnsupportedNotionalAsset {
+            notional_asset: rules.asset.clone(),
+            settlement_asset: spec.economics.settlement_asset.clone(),
+        });
+    }
+    let amount = entry_price
+        .checked_mul(quantity)?
+        .checked_mul(spec.economics.contract_multiplier.get())?;
+    if let Some(minimum) = rules.minimum
+        && amount < minimum.get()
+    {
+        return Err(InstrumentSizingError::BelowMinimumNotional {
+            notional: amount,
+            minimum: minimum.get(),
+        });
+    }
+    if let Some(maximum) = rules.maximum
+        && amount > maximum.get()
+    {
+        return Err(InstrumentSizingError::AboveMaximumNotional {
+            notional: amount,
+            maximum: maximum.get(),
+        });
+    }
+    Ok(Some(Money {
+        asset: rules.asset.clone(),
+        amount,
+    }))
+}
+
 /// Compute the positive native P&L currency loss for one standard lot at a protective stop.
 ///
 /// Prices are normalized to `SymbolSpec::digits` before distance is measured. The helper uses the same validation and geometry path as [`compute_size`].
@@ -417,6 +877,50 @@ pub fn compute_native_loss_per_lot(
             value: spec.lot_base_units,
         });
     }
+    compute_native_loss_with_multiplier(
+        side,
+        entry_price,
+        protective_stop,
+        spec.digits,
+        spec.pip_position,
+        spec.lot_base_units as f64,
+    )
+}
+
+/// Compute native stop loss for one catalog-backed standard lot.
+///
+/// The contract multiplier is the economic authority. Quantity storage scale does not participate in this calculation.
+pub fn compute_instrument_native_loss_per_lot(
+    side: Side,
+    entry_price: f64,
+    protective_stop: f64,
+    price_digits: u16,
+    economics: &InstrumentEconomics,
+) -> Result<f64, InstrumentSizingError> {
+    validate_instrument_economics(economics)?;
+    let contract_multiplier = exact_decimal_to_f64(
+        "instrument contract multiplier",
+        economics.contract_multiplier.get(),
+    )?;
+    Ok(compute_native_loss_with_multiplier(
+        side,
+        entry_price,
+        protective_stop,
+        price_digits,
+        price_digits,
+        contract_multiplier,
+    )?)
+}
+
+fn compute_native_loss_with_multiplier(
+    side: Side,
+    entry_price: f64,
+    protective_stop: f64,
+    digits: u16,
+    pip_position: u16,
+    contract_multiplier: f64,
+) -> Result<f64, SizingError> {
+    validate_entry_price(entry_price)?;
     if !protective_stop.is_finite() || protective_stop <= 0.0 {
         return Err(SizingError::InvalidProtectiveStop {
             value: protective_stop,
@@ -433,26 +937,26 @@ pub fn compute_native_loss_per_lot(
             stop_price: protective_stop,
         });
     }
-    if spec.digits > 18 || spec.pip_position > spec.digits {
+    if digits > 18 || pip_position > digits {
         return Err(SizingError::InvalidPricePrecision {
-            digits: spec.digits,
-            pip_position: spec.pip_position,
+            digits,
+            pip_position,
         });
     }
 
-    let scale = 10_i64.pow(spec.digits as u32) as f64;
-    let entry_ticks = price_to_ticks("entry", entry_price, spec.digits, scale)?;
-    let stop_ticks = price_to_ticks("protective stop", protective_stop, spec.digits, scale)?;
+    let scale = 10_i64.pow(digits as u32) as f64;
+    let entry_ticks = price_to_ticks("entry", entry_price, digits, scale)?;
+    let stop_ticks = price_to_ticks("protective stop", protective_stop, digits, scale)?;
     let distance_ticks = entry_ticks.abs_diff(stop_ticks);
     if distance_ticks == 0 {
         return Err(SizingError::StopDistanceBelowTick {
             entry_price,
             stop_price: protective_stop,
-            digits: spec.digits,
+            digits,
         });
     }
 
-    let native_loss_per_lot = distance_ticks as f64 * spec.lot_base_units as f64 / scale;
+    let native_loss_per_lot = distance_ticks as f64 * contract_multiplier / scale;
     if !native_loss_per_lot.is_finite() || native_loss_per_lot <= 0.0 {
         return Err(SizingError::InvalidNativeLossPerLot {
             entry_price,
@@ -513,9 +1017,140 @@ fn apply_lot_constraints(
     Ok((final_lot_steps, final_lot, cap_status))
 }
 
+fn apply_quantity_constraints(
+    scaled_raw_lot: f64,
+    rules: ValidatedQuantityRules,
+) -> Result<(u64, f64, LotCapStatus, GridAdjustment<Decimal>), InstrumentSizingError> {
+    if !scaled_raw_lot.is_finite() || scaled_raw_lot <= 0.0 {
+        return Err(SizingError::InvalidScaledRawLot {
+            value: scaled_raw_lot,
+        }
+        .into());
+    }
+
+    let requested = Decimal::checked_from_f64(scaled_raw_lot)?;
+    let floored = qs_instruments::DecimalGrid::new(Decimal::ZERO, rules.step.try_into()?)
+        .adjust(requested, GridRounding::Floor)?;
+    let floored_lot_steps = exact_quantity_steps("adjusted", floored.adjusted, rules.step)?;
+    if floored_lot_steps < rules.minimum_steps {
+        return Err(SizingError::BelowMinimumLot {
+            scaled_raw_lot,
+            floored_lot_steps,
+            minimum_lot_steps: rules.minimum_steps,
+        }
+        .into());
+    }
+
+    let (final_lot_steps, cap_status) = match rules.maximum_steps {
+        Some(maximum) if floored_lot_steps > maximum => (maximum, LotCapStatus::CappedAtMaximum),
+        _ => (floored_lot_steps, LotCapStatus::NotCapped),
+    };
+    let final_quantity = rules
+        .step
+        .checked_mul(Decimal::new(i128::from(final_lot_steps), 0)?)?;
+    let final_lot = exact_decimal_to_f64("final quantity", final_quantity)?;
+    let direction = match final_quantity.cmp(&requested) {
+        std::cmp::Ordering::Less => AdjustmentDirection::Down,
+        std::cmp::Ordering::Equal => AdjustmentDirection::Unchanged,
+        std::cmp::Ordering::Greater => AdjustmentDirection::Up,
+    };
+
+    Ok((
+        final_lot_steps,
+        final_lot,
+        cap_status,
+        GridAdjustment {
+            requested,
+            adjusted: final_quantity,
+            direction,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use qs_instruments::{
+        AssetId, DecimalGrid, EconomicsModelId, EffectiveInterval, InstrumentAssets, InstrumentId,
+        InstrumentSpec, ListingStatus, NotionalRules, PositiveDecimal, PriceRules, QuantityUnit,
+    };
+
+    fn decimal(value: &str) -> Decimal {
+        value.parse().unwrap()
+    }
+
+    fn positive(value: &str) -> PositiveDecimal {
+        value.parse().unwrap()
+    }
+
+    fn quantity_rules(storage_scale: u8) -> QuantityRules {
+        QuantityRules {
+            grid: DecimalGrid::new(Decimal::ZERO, positive("0.01")),
+            minimum: positive("0.01"),
+            maximum: Some(positive("100")),
+            storage_scale,
+        }
+    }
+
+    fn economics(
+        quantity_unit: QuantityUnit,
+        model: &str,
+        multiplier: &str,
+    ) -> InstrumentEconomics {
+        InstrumentEconomics {
+            pnl_model: EconomicsModelId::new(model).unwrap(),
+            quantity_unit,
+            contract_multiplier: positive(multiplier),
+            settlement_asset: AssetId::new("USD").unwrap(),
+            fee_model: None,
+            funding_model: None,
+            margin_model: None,
+        }
+    }
+
+    fn standard_lot_economics(multiplier: &str) -> InstrumentEconomics {
+        economics(
+            QuantityUnit::StandardLot,
+            EconomicsModelId::FX_QUOTE_LINEAR_V1,
+            multiplier,
+        )
+    }
+
+    fn instrument_spec(step: &str, notional: Option<NotionalRules>) -> InstrumentSpec {
+        let usd = AssetId::new("USD").unwrap();
+        InstrumentSpec {
+            revision: "1.0.0".parse().unwrap(),
+            instrument: InstrumentId::new(
+                "broker-a".parse().unwrap(),
+                qs_instruments::MarketKind::new(qs_instruments::MarketKind::FX_CFD).unwrap(),
+                "EURUSD".parse().unwrap(),
+            ),
+            effective: EffectiveInterval::new("2026-01-01T00:00:00Z".parse().unwrap(), None)
+                .unwrap(),
+            status: ListingStatus::Trading,
+            assets: InstrumentAssets {
+                base: Some("EUR".parse().unwrap()),
+                quote: Some(usd.clone()),
+                settlement: usd,
+                fee_assets: BTreeSet::new(),
+            },
+            price: PriceRules {
+                grid: DecimalGrid::new(Decimal::ZERO, positive("0.00001")),
+                display_scale: 5,
+            },
+            quantity: QuantityRules {
+                grid: DecimalGrid::new(Decimal::ZERO, positive(step)),
+                minimum: positive(step),
+                maximum: Some(positive("100")),
+                storage_scale: 2,
+            },
+            notional,
+            economics: standard_lot_economics("100000"),
+            aliases: BTreeSet::from(["EURUSD".parse().unwrap()]),
+        }
+    }
 
     fn forex_spec() -> SymbolSpec {
         SymbolSpec {
@@ -535,6 +1170,279 @@ mod tests {
             (actual - expected).abs() < 1e-12,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn catalog_sizing_uses_quantity_rules_and_contract_multiplier() {
+        let result = compute_instrument_size(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            Some(1.09500),
+            5,
+            &quantity_rules(2),
+            &standard_lot_economics("100000"),
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(result.native_loss_per_lot, Some(500.0));
+        assert_eq!(result.account_loss_per_lot, Some(500.0));
+        assert_close(result.scaled_raw_lot, 0.2);
+        assert_eq!(result.final_lot_steps, 20);
+        assert_close(result.final_lot, 0.2);
+    }
+
+    #[test]
+    fn storage_scale_does_not_change_native_loss_or_monetary_size() {
+        let economics = standard_lot_economics("100000");
+        let low_scale = compute_instrument_size(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            Some(1.09500),
+            5,
+            &quantity_rules(2),
+            &economics,
+            Some(1.0),
+        )
+        .unwrap();
+        let high_scale = compute_instrument_size(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            Some(1.09500),
+            5,
+            &quantity_rules(8),
+            &economics,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(low_scale, high_scale);
+    }
+
+    #[test]
+    fn contract_multiplier_changes_native_loss_and_monetary_size() {
+        let standard = compute_instrument_size(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            Some(1.09500),
+            5,
+            &quantity_rules(2),
+            &standard_lot_economics("100000"),
+            Some(1.0),
+        )
+        .unwrap();
+        let doubled = compute_instrument_size(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            Some(1.09500),
+            5,
+            &quantity_rules(2),
+            &standard_lot_economics("200000"),
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(standard.native_loss_per_lot, Some(500.0));
+        assert_eq!(doubled.native_loss_per_lot, Some(1_000.0));
+        assert_close(standard.scaled_raw_lot, 0.2);
+        assert_close(doubled.scaled_raw_lot, 0.1);
+        assert_eq!(standard.final_lot_steps, 20);
+        assert_eq!(doubled.final_lot_steps, 10);
+    }
+
+    #[test]
+    fn catalog_fixed_lot_uses_exact_quantity_grid_and_cap() {
+        let mut rules = quantity_rules(4);
+        rules.maximum = Some(positive("0.05"));
+        let result = compute_instrument_size(
+            &SizingPolicy::FixedLot { lots: 0.066 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            None,
+            5,
+            &rules,
+            &standard_lot_economics("100000"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_lot_steps, 5);
+        assert_close(result.final_lot, 0.05);
+        assert_eq!(result.cap_status, LotCapStatus::CappedAtMaximum);
+        assert_eq!(result.native_loss_per_lot, None);
+    }
+
+    #[test]
+    fn full_spec_sizing_uses_exact_grid_and_records_adjustment() {
+        let spec = instrument_spec("0.1", None);
+        let result = compute_instrument_size_for_spec(
+            &SizingPolicy::FixedLot { lots: 0.3 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            None,
+            &spec,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.final_lot_steps, 3);
+        assert_eq!(result.final_lot, 0.3);
+        assert_eq!(
+            result.quantity_adjustment,
+            Some(GridAdjustment {
+                requested: decimal("0.3"),
+                adjusted: decimal("0.3"),
+                direction: AdjustmentDirection::Unchanged,
+            })
+        );
+    }
+
+    #[test]
+    fn full_spec_sizing_validates_price_grid_and_post_rounding_notional() {
+        let usd = AssetId::new("USD").unwrap();
+        let minimum_spec = instrument_spec(
+            "0.01",
+            Some(NotionalRules {
+                asset: usd.clone(),
+                minimum: Some(positive("2200")),
+                maximum: None,
+            }),
+        );
+        let minimum_error = compute_instrument_size_for_spec(
+            &SizingPolicy::FixedLot { lots: 0.019 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            None,
+            &minimum_spec,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            minimum_error,
+            InstrumentSizingError::BelowMinimumNotional { .. }
+        ));
+
+        let maximum_spec = instrument_spec(
+            "0.01",
+            Some(NotionalRules {
+                asset: usd,
+                minimum: None,
+                maximum: Some(positive("1000")),
+            }),
+        );
+        let maximum_error = compute_instrument_size_for_spec(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            None,
+            &maximum_spec,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            maximum_error,
+            InstrumentSizingError::AboveMaximumNotional { .. }
+        ));
+
+        let mut price_spec = instrument_spec("0.01", None);
+        price_spec.price.grid = DecimalGrid::new(Decimal::ZERO, positive("0.00005"));
+        let price_error = compute_instrument_size_for_spec(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10003,
+            None,
+            &price_spec,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            price_error,
+            InstrumentSizingError::PriceOffGrid { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_sizing_rejects_unsupported_quantity_and_model_combinations() {
+        for economics in [
+            economics(
+                QuantityUnit::Contract,
+                EconomicsModelId::FX_QUOTE_LINEAR_V1,
+                "100000",
+            ),
+            economics(
+                QuantityUnit::StandardLot,
+                EconomicsModelId::LINEAR_CONTRACT_V1,
+                "100000",
+            ),
+        ] {
+            let error = compute_instrument_size(
+                &SizingPolicy::FixedLot { lots: 0.01 },
+                1.0,
+                10_000.0,
+                Side::Buy,
+                1.10000,
+                None,
+                5,
+                &quantity_rules(2),
+                &economics,
+                None,
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                InstrumentSizingError::UnsupportedInstrumentSizing { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn catalog_sizing_rejects_nonzero_quantity_grid_origin() {
+        let mut rules = quantity_rules(2);
+        rules.grid = DecimalGrid::new(decimal("0.01"), positive("0.01"));
+        let error = compute_instrument_size(
+            &SizingPolicy::FixedLot { lots: 0.01 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10000,
+            None,
+            5,
+            &rules,
+            &standard_lot_economics("100000"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            InstrumentSizingError::UnsupportedQuantityGridOrigin { .. }
+        ));
     }
 
     #[test]

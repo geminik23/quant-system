@@ -41,6 +41,7 @@ use crate::convert::{
 };
 use crate::error::{BacktestServerError, Result};
 use crate::fx_loader::describe_future_stream;
+use crate::instrument_catalog::InstrumentDomain;
 use crate::market_loader::{
     CancellationCheck, MarketStreamDescription, MarketStreamError, describe_primary_market_stream,
 };
@@ -49,8 +50,10 @@ use crate::rpc_types::*;
 
 /// Shared state accessible by all client handlers.
 pub struct ServerState {
-    /// Symbol registry for normalization and contract size metadata.
+    /// Symbol registry for compatibility normalization and current currency metadata.
     pub symbol_registry: SymbolRegistry,
+    /// Immutable instrument catalog and stored-series identity policy.
+    pub instrument_domain: InstrumentDomain,
     /// Management profile registry (TOML-loaded + dynamically added).
     pub profile_registry: RwLock<ProfileRegistry>,
     /// Root directory for Parquet market data.
@@ -728,7 +731,14 @@ fn execute_backtest_with_future_controlled(
         &state.symbol_registry,
         plan.requested_symbols(),
     )?;
-    let config = config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols())?;
+    let mut config = config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols())?;
+    if let Some(loading_start) = plan.loading_start() {
+        config.instrument_manifest = Some(state.instrument_domain.resolve_manifest(
+            plan.active_symbols(),
+            loading_start,
+            to,
+        )?);
+    }
     let account_currency = account_currency_from_msg(future)?;
     let exchange = req.exchange.to_lowercase();
     tracing::info!(
@@ -798,6 +808,25 @@ fn execute_backtest_with_future_controlled(
             &mut cancelled,
         )?;
         let primary_eod = bundle.description.primary_eod();
+        let mut instrument_symbols = plan.active_symbols().to_vec();
+        instrument_symbols.extend(bundle.currency_plan.conversion_symbols().iter().cloned());
+        instrument_symbols.sort();
+        instrument_symbols.dedup();
+        if let Some(loading_start) = plan.loading_start() {
+            let mut manifest = state.instrument_domain.resolve_manifest(
+                &instrument_symbols,
+                loading_start,
+                primary_eod.or(to),
+            )?;
+            state.instrument_domain.attach_stored_series(
+                &mut manifest,
+                bundle.description.stored_series_coordinates(),
+            )?;
+            bundle
+                .description
+                .validate_stored_series_bindings(&manifest)?;
+            config.instrument_manifest = Some(manifest);
+        }
         let future_config = future_config_from_msg(future, bundle.currency_plan)?;
         let cancellation_token = cancellation.cloned();
         let stream_cancellation: CancellationCheck = Arc::new(move || {
@@ -1113,12 +1142,22 @@ fn execute_backtest_multi_with_future(
                 .collect();
         }
     };
-    let config = match config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols()) {
-        Ok(config) => config,
-        Err(error) => {
-            return profile_error_results(req, error.to_string());
+    let mut config =
+        match config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols()) {
+            Ok(config) => config,
+            Err(error) => {
+                return profile_error_results(req, error.to_string());
+            }
+        };
+    if let Some(loading_start) = plan.loading_start() {
+        match state
+            .instrument_domain
+            .resolve_manifest(plan.active_symbols(), loading_start, to)
+        {
+            Ok(manifest) => config.instrument_manifest = Some(manifest),
+            Err(error) => return profile_error_results(req, error.to_string()),
         }
-    };
+    }
     let account_currency = match account_currency_from_msg(future) {
         Ok(account_currency) => account_currency,
         Err(error) => {
@@ -1157,11 +1196,38 @@ fn execute_backtest_multi_with_future(
             Ok(bundle) => bundle,
             Err(error) => return profile_error_results(req, error.to_string()),
         };
+        let primary_eod = bundle.description.primary_eod();
+        let mut instrument_symbols = plan.active_symbols().to_vec();
+        instrument_symbols.extend(bundle.currency_plan.conversion_symbols().iter().cloned());
+        instrument_symbols.sort();
+        instrument_symbols.dedup();
+        if let Some(loading_start) = plan.loading_start() {
+            let mut manifest = match state.instrument_domain.resolve_manifest(
+                &instrument_symbols,
+                loading_start,
+                primary_eod.or(to),
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => return profile_error_results(req, error.to_string()),
+            };
+            if let Err(error) = state.instrument_domain.attach_stored_series(
+                &mut manifest,
+                bundle.description.stored_series_coordinates(),
+            ) {
+                return profile_error_results(req, error.to_string());
+            }
+            if let Err(error) = bundle
+                .description
+                .validate_stored_series_bindings(&manifest)
+            {
+                return profile_error_results(req, error.to_string());
+            }
+            config.instrument_manifest = Some(manifest);
+        }
         let future_config = match future_config_from_msg(future, bundle.currency_plan) {
             Ok(config) => config,
             Err(error) => return profile_error_results(req, error.to_string()),
         };
-        let primary_eod = bundle.description.primary_eod();
         let metadata_request = single_request_from_multi(req);
 
         req.profiles
@@ -1836,11 +1902,18 @@ pub fn handle_submit_backtest(
         )?;
         validate_replay_sizing(request, &plan)?;
         account_currency_from_msg(&req.request.future)?;
-        config_from_msg(
+        let mut config = config_from_msg(
             &request.config,
             &state.symbol_registry,
             plan.active_symbols(),
         )?;
+        if let Some(loading_start) = plan.loading_start() {
+            config.instrument_manifest = Some(state.instrument_domain.resolve_manifest(
+                plan.active_symbols(),
+                loading_start,
+                to,
+            )?);
+        }
         evaluation_options_from_msg_for_symbols(
             &req.request.evaluation,
             &state.symbol_registry,
@@ -2208,6 +2281,7 @@ mod tests {
         ));
         ServerState {
             symbol_registry: SymbolRegistry::empty(),
+            instrument_domain: InstrumentDomain::compatibility(&SymbolRegistry::empty()).unwrap(),
             profile_registry: RwLock::new(ProfileRegistry::empty()),
             data_dir: "/tmp/test".into(),
             profiles_path: String::new(),
@@ -2933,6 +3007,7 @@ lot_step_units = 1
 "#,
         )
         .unwrap();
+        state.instrument_domain = InstrumentDomain::compatibility(&state.symbol_registry).unwrap();
         state
     }
 

@@ -26,25 +26,34 @@ The workspace separates synchronous trading logic, historical replay, storage, l
                     Channel / SHM / Unix / TCP
 
 Domain and data:
-qs-symbols -> quant-system-core -> qs-backtest -> qs-backtest-server
-                    ^                  ^
-                    |                  |
-             qs-signal-parser   qs-data-preprocess
+qs-symbols -----> qs-instruments -----> quant-system-core
+ compatibility      exact identity,           |
+ facade             specs, catalogs           v
+                                      qs-backtest -> qs-backtest-server
+                                           ^
+                                           |
+                              qs-data-preprocess
+
+qs-signal-parser -> strict RawSignal compatibility boundary
 ```
 
 ## Ownership boundaries
 
 ### Trading domain
 
-`quant-system-core` owns the synchronous engine, normalized signals, position management, pure profile resolution, sizing, and currency conversion. It performs no networking, storage, configuration IO, parsing, or broker calls.
+`qs-instruments` owns source-neutral `AssetId`, broker- or exchange-qualified `InstrumentId`, exact decimal and grid rules, effective-dated instrument specifications, economics descriptors, immutable catalog snapshots, and stored-series or platform bindings. It has no storage, async runtime, parser, strategy, service, or venue SDK dependency.
 
-`qs-symbols` owns the current canonical symbol, alias, precision, lot, and currency metadata used by the compatibility economics path.
+An instrument listing venue, trading platform, execution venue, and market-data source are distinct identities. For example, an IC Markets listing may be exposed through CTrader and executed on a particular broker account or server while historical quotes come from a separate Parquet source. CTrader is therefore a `TradingPlatformId`, not the `ListingVenueId` in the instrument identity.
+
+`quant-system-core` owns the synchronous engine, normalized signals, position management, pure profile resolution, sizing, and currency conversion. Its catalog-aware sizing path uses explicit quantity rules and contract multipliers. It performs no networking, storage, configuration IO, parsing, or broker calls.
+
+`qs-symbols` remains the compatibility facade for current canonical symbols, aliases, precision, lot, and currency metadata. Supported FX, metal, commodity, and index rows can be translated through the guarded compatibility economics result into an immutable instrument snapshot. Registry-backed cryptocurrency and unknown rows are not promoted into executable instruments.
 
 ### Historical replay
 
 `qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, and profile-file loading. It supports in-process strategy and predefined-signal modes.
 
-`qs-backtest-server` composes storage, symbols, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI.
+`qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. It resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
 
 ### Data storage
 
@@ -72,15 +81,16 @@ External source transports, internal service transports, market-data sources, an
 supported tick/bar export
   -> partitioned Parquet
   -> replay request validation
-  -> symbol and economic-capability preflight
+  -> explicit instrument resolution and economic-capability preflight
+  -> catalog, specification, and physical-series binding manifest
   -> bounded chronological cursors
   -> deterministic timestamp batches
-  -> FutureQuote execution
+  -> FutureQuote execution with explicit multiplier and quantity rules
   -> accounting, metrics, and lifecycle artifacts
   -> inline result or verified artifact
 ```
 
-Unsupported economics fail before data access. Output bounds control returned data volume but must not change economic results.
+Unsupported compatibility economics fail before data access. An explicit catalog may declare additional model identifiers, but replay accepts only code-supported FX/CFD model and quantity-unit combinations. Output bounds control returned data volume but must not change economic results.
 
 ## Signal flow
 

@@ -1006,7 +1006,7 @@ lot_max_steps = 0
 
 [[symbol]]
 canonical = "xtiusd"
-aliases = ["oil", "usoil", "wti", "crude", "xti/usd"]
+aliases = ["oil", "usoil", "wti", "crude", "crude oil", "xti/usd"]
 pip_position = 2
 digits = 3
 category = "commodity"

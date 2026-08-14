@@ -9,6 +9,8 @@ pub struct ServerConfig {
     pub server: ServerSection,
     pub database: DatabaseSection,
     pub symbols: SymbolsSection,
+    #[serde(default)]
+    pub instruments: InstrumentsSection,
     pub profiles: ProfilesSection,
     #[serde(default)]
     pub jobs: JobsSection,
@@ -74,6 +76,30 @@ pub struct DatabaseSection {
 #[derive(Debug, Deserialize)]
 pub struct SymbolsSection {
     pub registry_path: String,
+}
+
+/// Instrument catalog and stored-series identity settings.
+#[derive(Debug, Deserialize)]
+pub struct InstrumentsSection {
+    /// Optional strict instrument catalog document. The symbol registry is adapted when omitted.
+    #[serde(default)]
+    pub catalog_path: Option<String>,
+    /// Optional broker-, exchange-, or repository-owned alias-resolution default.
+    #[serde(default)]
+    pub default_listing_venue: Option<String>,
+    /// Identity of the historical market-data source bound to current partitions.
+    #[serde(default = "default_market_data_source")]
+    pub market_data_source: String,
+}
+
+impl Default for InstrumentsSection {
+    fn default() -> Self {
+        Self {
+            catalog_path: None,
+            default_listing_venue: None,
+            market_data_source: default_market_data_source(),
+        }
+    }
 }
 
 /// Path to the management profiles TOML.
@@ -151,6 +177,10 @@ impl Default for LoggingSection {
             level: default_log_level(),
         }
     }
+}
+
+fn default_market_data_source() -> String {
+    "local-parquet".into()
 }
 
 fn default_shm_buffer() -> usize {

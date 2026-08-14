@@ -336,6 +336,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         cfg.symbols.registry_path
     );
 
+    let instrument_domain =
+        backtest_server::instrument_domain_from_config(&cfg.instruments, &symbol_registry)?;
+    tracing::info!(
+        "Loaded instrument catalog {}",
+        instrument_domain.snapshot().id().version
+    );
+
     // 4. Load the management profile registry.
     let profile_registry = ProfileRegistry::load(&cfg.profiles.profiles_path).map_err(|e| {
         format!(
@@ -391,6 +398,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let profiles_path = cfg.profiles.profiles_path.clone();
     let state = Arc::new(ServerState {
         symbol_registry,
+        instrument_domain,
         profile_registry: RwLock::new(profile_registry),
         data_dir: cfg.database.data_dir.clone(),
         profiles_path,
@@ -530,6 +538,10 @@ mod tests {
 
         let state = Arc::new(ServerState {
             symbol_registry: SymbolRegistry::empty(),
+            instrument_domain: backtest_server::InstrumentDomain::compatibility(
+                &SymbolRegistry::empty(),
+            )
+            .unwrap(),
             profile_registry: RwLock::new(ProfileRegistry::empty()),
             data_dir: String::new(),
             profiles_path: String::new(),

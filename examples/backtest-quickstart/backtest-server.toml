@@ -8,6 +8,10 @@ data_dir = "target/quickstart/market_data"
 [symbols]
 registry_path = "crates/symbols/symbols.toml"
 
+[instruments]
+default_listing_venue = "repository-default"
+market_data_source = "quickstart-parquet"
+
 [profiles]
 profiles_path = "crates/backtest/profiles.toml"
 

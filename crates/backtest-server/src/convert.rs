@@ -80,6 +80,7 @@ pub fn config_from_msg(
         contract_sizes,
         sizing,
         symbol_specs,
+        instrument_manifest: None,
     })
 }
 

@@ -41,7 +41,7 @@ cargo run -p qs-backtest-server --bin backtest_server -- \
   --config examples/backtest-quickstart/backtest-server.toml
 ```
 
-Leave the server running. The example uses `shm://backtest-quickstart` and writes retained artifacts under `target/quickstart/artifacts`.
+Leave the server running. The example uses `shm://backtest-quickstart` and writes retained artifacts under `target/quickstart/artifacts`. Its instrument configuration compiles the existing symbol registry into a guarded compatibility catalog under the repository-owned `repository-default` listing namespace and records `quickstart-parquet` as the historical data source. The imported `demo` exchange remains a physical Parquet partition coordinate rather than a broker, listing venue, or trading platform.
 
 ## 3. Submit the signals
 
@@ -62,7 +62,7 @@ cargo run -p qs-backtest-server --bin tg_backtest -- \
 
 The signal stream contains an Entry at `10:00:00` and a Close at `10:01:00`. Under FutureQuote replay, the buy fills at the ask and the close fills at the bid. With the included quotes and a `0.02` lot size, the expected realized P&L is approximately `1.60 USD` before any user-supplied costs.
 
-Inspect the full JSON result at `target/quickstart/result.json`. Stop the server with Ctrl-C when finished.
+Inspect the full JSON result at `target/quickstart/result.json`. Execution metadata includes a typed instrument manifest with the compatibility catalog version, the resolved `repository-default/fx_cfd/EURUSD` identity and specification revision, the effective specification, and the `demo`/`eurusd` stored-series coordinates. Stop the server with Ctrl-C when finished.
 
 ## Troubleshooting
 

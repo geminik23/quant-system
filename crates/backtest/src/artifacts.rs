@@ -10,6 +10,9 @@ use chrono::NaiveDateTime;
 use qs_core::{
     CloseReason, EffectiveStop, ExecutionFill, ExecutionModel, OrderType, PriceQuote, Side,
 };
+use qs_instruments::{
+    Decimal, GridAdjustment, InstrumentSpec, Money, ResolvedInstrumentRef, StoredSeriesBinding,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::currency::{ConversionResult, RunCurrencyPlan};
@@ -31,6 +34,32 @@ fn default_pnl_epsilon() -> f64 {
     DEFAULT_PNL_EPSILON
 }
 
+/// Resolved instrument identity and specification persisted for one replay symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayInstrumentArtifact {
+    pub resolved: ResolvedInstrumentRef,
+    pub spec: InstrumentSpec,
+}
+
+/// Typed instrument and stored-series inputs pinned for a replay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplayInstrumentManifest {
+    pub instruments: BTreeMap<String, ReplayInstrumentArtifact>,
+    pub stored_series: Vec<StoredSeriesBinding>,
+}
+
+/// Exact catalog-backed sizing adjustment recorded before one Entry action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentSizingArtifact {
+    pub symbol: String,
+    pub operation_ts: NaiveDateTime,
+    pub quantity: GridAdjustment<Decimal>,
+    pub final_notional: Option<Money>,
+}
+
 /// Reproducibility metadata for the execution/accounting model used by a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -43,6 +72,10 @@ pub struct ExecutionMetadata {
     pub currency_plan: Option<RunCurrencyPlan>,
     /// Monetary point-value multiplier by symbol.
     pub contract_sizes: BTreeMap<String, f64>,
+    /// Optional typed instrument and stored-series manifest for explicit catalog-backed runs.
+    pub instrument_manifest: Option<ReplayInstrumentManifest>,
+    /// Exact requested and adjusted quantities for catalog-backed Entry sizing.
+    pub instrument_sizing: Vec<InstrumentSizingArtifact>,
     /// Quotes older than this at an equity observation are counted as stale.
     pub stale_quote_after_millis: Option<i64>,
     #[serde(default = "default_pnl_epsilon")]
@@ -60,6 +93,8 @@ impl Default for ExecutionMetadata {
             account_currency: None,
             currency_plan: None,
             contract_sizes: BTreeMap::new(),
+            instrument_manifest: None,
+            instrument_sizing: Vec::new(),
             stale_quote_after_millis: None,
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
@@ -861,6 +896,8 @@ mod tests {
         let decoded: ExecutionMetadata = serde_json::from_str("{}").unwrap();
         assert_eq!(decoded.pnl_epsilon, DEFAULT_PNL_EPSILON);
         assert_eq!(decoded.execution_model, ExecutionModel::default());
+        assert_eq!(decoded.instrument_manifest, None);
+        assert!(decoded.instrument_sizing.is_empty());
 
         let metadata = ExecutionMetadata {
             execution_model: ExecutionModel::new(

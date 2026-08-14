@@ -40,9 +40,10 @@ pub mod strategy;
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
 pub use artifacts::{
-    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts, NetPnlOutcome,
-    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
-    PendingOrderSnapshot, RecordedFill, RiskBasisStatus, RiskTranche,
+    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts,
+    InstrumentSizingArtifact, NetPnlOutcome, OpenPositionSnapshot, PendingOrderLifecycleEvent,
+    PendingOrderLifecycleState, PendingOrderSnapshot, RecordedFill, ReplayInstrumentArtifact,
+    ReplayInstrumentManifest, RiskBasisStatus, RiskTranche,
 };
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
@@ -52,7 +53,7 @@ pub use currency::{
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
 pub use economic_support::{
     EconomicSupportError, LEGACY_ECONOMIC_GUARD_ID, LegacyEconomicModel, SupportedLegacyEconomics,
-    resolve_legacy_economics,
+    guarded_instrument_spec, resolve_legacy_economics,
 };
 pub use evaluation::{
     BootstrapConfig, BreakdownDimension, EvaluationContext, EvaluationOptions, EvaluationReport,

@@ -8,7 +8,7 @@
 
 | Today | Next focus | Later |
 |---|---|---|
-| Deterministic replay, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, explicit instruments, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
+| Deterministic replay, explicit instrument catalogs, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, canonical trading intent, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
 
 ## Direction
 
@@ -39,9 +39,11 @@ Reusable source-event, normalization, provenance, and durable source-state bound
 
 ### Represent instruments and trading intent explicitly
 
-Distinguish data-source symbols, economic instruments, and execution venues. Introduce shared intent and execution-result facts without silently changing the current replay input contract.
+A shared instrument foundation is available: source-neutral assets, broker- or exchange-qualified listings, exact grids, effective-dated specifications, immutable catalogs, guarded compatibility translation, and replay manifests now distinguish data-source coordinates from economic instruments. Trading platforms such as CTrader are also distinct from listing and execution venues.
 
-**What this unlocks:** safer multi-venue identity, economic capability checks, and a common boundary for parser and strategy outputs.
+The next contract is shared source- and strategy-neutral trading intent and execution-result facts without silently changing the current strict replay input.
+
+**What this unlocks:** safer multi-venue identity and economic capability checks today, followed by a common boundary for parser and strategy outputs.
 
 ### Run strategies through shared risk supervision
 
@@ -67,4 +69,4 @@ Explore richer analysis and model-driven strategy components after neutral strat
 
 ## Not available yet
 
-Live execution, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.
+Live execution, canonical intent and execution events, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.

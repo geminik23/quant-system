@@ -133,8 +133,12 @@ fn test_artifact_store(directory: PathBuf) -> ArtifactStore {
 }
 
 fn empty_state() -> ServerState {
+    let symbol_registry = evaluation_symbol_registry();
+    let instrument_domain =
+        backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     ServerState {
-        symbol_registry: evaluation_symbol_registry(),
+        symbol_registry,
+        instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: "/tmp/test-data".into(),
         profiles_path: String::new(),
@@ -235,15 +239,21 @@ fn replay_path_fixture() -> ReplayPathFixture {
     assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
 
     ReplayPathFixture {
-        state: Arc::new(ServerState {
-            symbol_registry: evaluation_symbol_registry(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: data_dir.to_string_lossy().into_owned(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-            max_retained_jobs: 1_000,
-            artifact_store: test_artifact_store(data_dir.join("artifacts")),
+        state: Arc::new({
+            let symbol_registry = evaluation_symbol_registry();
+            let instrument_domain =
+                backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
+            ServerState {
+                symbol_registry,
+                instrument_domain,
+                profile_registry: RwLock::new(ProfileRegistry::empty()),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+                profiles_path: String::new(),
+                start_time: Instant::now(),
+                jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                max_retained_jobs: 1_000,
+                artifact_store: test_artifact_store(data_dir.join("artifacts")),
+            }
         }),
         data_dir,
     }
@@ -442,15 +452,21 @@ fn active_symbol_fixture() -> ReplayPathFixture {
     assert_eq!(store.insert_ticks(&ticks).unwrap(), ticks.len());
 
     ReplayPathFixture {
-        state: Arc::new(ServerState {
-            symbol_registry: active_symbol_registry(),
-            profile_registry: RwLock::new(ProfileRegistry::empty()),
-            data_dir: data_dir.to_string_lossy().into_owned(),
-            profiles_path: String::new(),
-            start_time: Instant::now(),
-            jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
-            max_retained_jobs: 1_000,
-            artifact_store: test_artifact_store(data_dir.join("artifacts")),
+        state: Arc::new({
+            let symbol_registry = active_symbol_registry();
+            let instrument_domain =
+                backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
+            ServerState {
+                symbol_registry,
+                instrument_domain,
+                profile_registry: RwLock::new(ProfileRegistry::empty()),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+                profiles_path: String::new(),
+                start_time: Instant::now(),
+                jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                max_retained_jobs: 1_000,
+                artifact_store: test_artifact_store(data_dir.join("artifacts")),
+            }
         }),
         data_dir,
     }
@@ -1027,8 +1043,12 @@ fn artifact_response_is_compact_and_reconstructs_the_complete_result() {
 #[test]
 fn inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
     let fixture = replay_path_fixture();
+    let symbol_registry = evaluation_symbol_registry();
+    let instrument_domain =
+        backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
-        symbol_registry: evaluation_symbol_registry(),
+        symbol_registry,
+        instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: fixture.data_dir.to_string_lossy().into_owned(),
         profiles_path: String::new(),
@@ -1271,6 +1291,35 @@ fn sync_async_and_multi_profile_future_quote_results_are_equivalent() {
         metadata["tags"]["economics.symbol.eurusd.contract_multiplier"],
         "100000"
     );
+    let instrument_manifest = &metadata["instrument_manifest"];
+    assert_eq!(
+        instrument_manifest["instruments"]["eurusd"]["resolved"]["instrument"]["listing_venue"],
+        "repository-default"
+    );
+    assert_eq!(
+        instrument_manifest["instruments"]["eurusd"]["resolved"]["instrument"]["market_kind"],
+        "fx_cfd"
+    );
+    assert_eq!(
+        instrument_manifest["instruments"]["eurusd"]["spec"]["economics"]["pnl_model"],
+        "fx_quote_linear_v1"
+    );
+    assert_eq!(
+        instrument_manifest["stored_series"][0]["data_source"],
+        "local-parquet"
+    );
+    assert_eq!(
+        instrument_manifest["stored_series"][0]["source_partition"],
+        "fixture"
+    );
+    assert_eq!(
+        instrument_manifest["stored_series"][0]["source_symbol"],
+        "EURUSD"
+    );
+    let sizing = &metadata["instrument_sizing"];
+    assert_eq!(sizing[0]["symbol"], "eurusd");
+    assert_eq!(sizing[0]["quantity"]["requested"], "1");
+    assert_eq!(sizing[0]["quantity"]["adjusted"], "1");
 
     assert_future_quote_results_equal(&sync_result, &async_result, "async");
     assert_future_quote_results_equal(&sync_result, multi_result, "multi-profile");
@@ -1500,8 +1549,12 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
     })
     .collect::<Vec<_>>();
     assert_eq!(store.insert_bars(&bars).unwrap(), bars.len());
+    let symbol_registry = evaluation_symbol_registry();
+    let instrument_domain =
+        backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
-        symbol_registry: evaluation_symbol_registry(),
+        symbol_registry,
+        instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: data_dir.to_string_lossy().into_owned(),
         profiles_path: String::new(),
@@ -2462,8 +2515,12 @@ fn handler_run_backtest_no_data_returns_error() {
     let tmp = std::env::temp_dir().join("qs_bt_test_empty");
     std::fs::create_dir_all(&tmp).ok();
 
+    let symbol_registry = evaluation_symbol_registry();
+    let instrument_domain =
+        backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
-        symbol_registry: evaluation_symbol_registry(),
+        symbol_registry,
+        instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
         data_dir: tmp.to_string_lossy().to_string(),
         profiles_path: String::new(),

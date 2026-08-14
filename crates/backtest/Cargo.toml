@@ -15,6 +15,7 @@ name = "qs_backtest"
 
 [dependencies]
 qs-core = { workspace = true }
+qs-instruments = { workspace = true }
 qs-data-preprocess = { workspace = true }
 qs-symbols = { workspace = true }
 chrono = { workspace = true }

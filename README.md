@@ -2,7 +2,7 @@
 
 A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.2.x` development.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.2.x` development.
 
 It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 
@@ -67,6 +67,8 @@ The fixture opens a EURUSD long position and closes it one minute later. See the
 ```text
 historical tick/bar export -> qs-data-preprocess -> partitioned Parquet
                                                         |
+instrument catalog or symbol compatibility snapshot ----+
+                                                        |
 external producer or qs-signal-parser -> RawSignal -----+
                                                         v
                                                Backtest Service
@@ -75,19 +77,19 @@ external producer or qs-signal-parser -> RawSignal -----+
                                              deterministic replay
                                                         |
                                                         v
-                                            result or artifact
+                               result with pinned instrument manifest
 
 CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ```
 
-`RawSignal` is the compatibility boundary between signal producers and replay. Source-neutral ingestion libraries, strict JSONL codecs, Telegram adapters, and an authenticated webhook provider edge are also available; see [Signal ingestion](docs/signal-ingestion.md) and [Architecture](docs/architecture.md).
+`RawSignal` is the compatibility boundary between signal producers and replay. `qs-instruments` provides source-neutral asset IDs, broker- or exchange-qualified instrument identities, exact decimal grids, effective-dated specifications, and immutable catalog snapshots. CTrader is modeled as a trading platform rather than an instrument listing venue. Source-neutral ingestion libraries, strict JSONL codecs, Telegram adapters, and an authenticated webhook provider edge are also available; see [Signal ingestion](docs/signal-ingestion.md) and [Architecture](docs/architecture.md).
 
 ## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
 - Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
-- Registered cryptocurrency symbols are metadata-only for replay; spot, derivative, fee, funding, margin, and liquidation models are not implemented.
+- The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
 - Historical import accepts the documented MetaTrader-style tab-delimited tick and bar formats, not arbitrary CSV layouts.
 

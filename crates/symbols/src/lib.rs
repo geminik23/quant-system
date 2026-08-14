@@ -356,6 +356,18 @@ impl SymbolRegistry {
         names
     }
 
+    /// List loaded symbol specifications and currency metadata in canonical order.
+    pub fn entries(&self) -> Vec<(&SymbolSpec, &SymbolCurrencyMetadata)> {
+        self.canonical_names()
+            .into_iter()
+            .filter_map(|canonical| {
+                self.symbols
+                    .get(canonical)
+                    .zip(self.currency_metadata.get(canonical))
+            })
+            .collect()
+    }
+
     /// Check if a symbol (canonical or alias) is known.
     pub fn is_known(&self, raw: &str) -> bool {
         self.normalize(raw).is_some()

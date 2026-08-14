@@ -23,6 +23,7 @@ path = "src/bin/tg_backtest.rs"
 
 [dependencies]
 qs-core = { workspace = true }
+qs-instruments = { workspace = true }
 qs-backtest = { workspace = true }
 qs-backtest-api = { workspace = true }
 qs-data-preprocess = { workspace = true, features = ["parquet"] }
