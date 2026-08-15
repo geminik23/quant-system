@@ -1,15 +1,13 @@
 //! Strict authoring and resolved manifests for local structured JSONL ingestion.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::Duration;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::ingestion::{MAX_PAYLOAD_BYTES, SourceEvent, SourceId, SourceRevision};
-use crate::normalization::{ComponentId, SemanticVersion, Sha256Digest, SourceAdapterIdentity};
+use crate::normalization::{ComponentId, SemanticVersion, SourceAdapterIdentity};
 use crate::state::{MAX_ACTIVE_OUTPUT_LIMIT, ReplacementPolicy};
 
 use super::publication::{DeliveryAcknowledgementPolicy, PublicationRetryPolicy};
@@ -24,8 +22,6 @@ pub const BUILTIN_CANONICAL_RAW_SIGNALS_DECODER: &str = "canonical-raw-signals@1
 pub const BUILTIN_STANDARD_SIGNAL_FINALIZER: &str = "standard-signal-finalizer@1.0.0";
 pub const BUILTIN_SQLITE_STATE: &str = "sqlite-source-state@1.0.0";
 pub const BUILTIN_COMMITTED_JSONL_SINK: &str = "committed-normalization-jsonl@1.0.0";
-pub const MANIFEST_DIGEST_ALGORITHM: &str = "sha256";
-pub const MANIFEST_DIGEST_DOMAIN: &str = "quant-system/ingestion-manifest/v1";
 pub const MAX_PUBLICATION_BATCH_SIZE: usize = 256;
 pub const MAX_DURATION_SECONDS: u64 = 86_400;
 pub const MAX_DEADLINE_MILLISECONDS: u64 = MAX_DURATION_SECONDS * 1_000;
@@ -147,7 +143,6 @@ impl RunnerManifest {
             publication: self.publication.clone(),
             malformed_records: self.malformed_records,
             execution_identity,
-            manifest_digest: ManifestDigest::from_canonical_bytes(&self.canonical_projection()),
         };
         resolved.validate_cross_section()?;
         Ok(resolved)
@@ -159,70 +154,6 @@ impl RunnerManifest {
 
     pub fn validate_source_event(&self, event: &SourceEvent) -> Result<(), ManifestError> {
         self.compile()?.validate_source_event(event)
-    }
-
-    fn canonical_projection(&self) -> Vec<u8> {
-        let mut projection = String::new();
-        canonical_field(
-            &mut projection,
-            "schema_version",
-            &self.schema_version.to_string(),
-        );
-        canonical_field(&mut projection, "id", &self.id);
-        canonical_field(&mut projection, "version", &self.version);
-        canonical_field(
-            &mut projection,
-            "malformed_records",
-            self.malformed_records.as_str(),
-        );
-        for source in &self.sources {
-            canonical_field(&mut projection, "source.id", &source.id);
-            canonical_field(&mut projection, "source.adapter", &source.adapter);
-            canonical_field(&mut projection, "source.codec", &source.codec);
-            canonical_field(
-                &mut projection,
-                "source.path",
-                &source.path.to_string_lossy(),
-            );
-            canonical_field(&mut projection, "source.source_id", &source.source_id);
-            canonical_field(&mut projection, "source.pipeline", &source.pipeline);
-            canonical_field(
-                &mut projection,
-                "source.revision_policy",
-                source.revision_policy.as_str(),
-            );
-        }
-        for (id, pipeline) in &self.pipelines {
-            canonical_field(&mut projection, "pipeline.id", id);
-            canonical_field(&mut projection, "pipeline.kind", &pipeline.kind);
-            canonical_field(&mut projection, "pipeline.decoder", &pipeline.decoder);
-            canonical_field(
-                &mut projection,
-                "pipeline.draft_validation",
-                &pipeline.draft_validation,
-            );
-            canonical_field(&mut projection, "pipeline.finalizer", &pipeline.finalizer);
-        }
-        canonical_field(&mut projection, "state.backend", &self.state.backend);
-        canonical_field(
-            &mut projection,
-            "state.path",
-            &self.state.path.to_string_lossy(),
-        );
-        for sink in &self.sinks {
-            canonical_field(&mut projection, "sink.id", &sink.id);
-            canonical_field(&mut projection, "sink.component", &sink.component);
-            canonical_field(&mut projection, "sink.codec", &sink.codec);
-            canonical_field(&mut projection, "sink.path", &sink.path.to_string_lossy());
-            canonical_field(
-                &mut projection,
-                "sink.acknowledgement",
-                sink.acknowledgement.as_str(),
-            );
-        }
-        self.limits.append_canonical(&mut projection);
-        self.publication.append_canonical(&mut projection);
-        projection.into_bytes()
     }
 }
 
@@ -304,12 +235,6 @@ impl StructuredPipeline {
 #[serde(rename_all = "snake_case")]
 pub enum SourceRevisionPolicy {
     Monotonic,
-}
-
-impl SourceRevisionPolicy {
-    fn as_str(self) -> &'static str {
-        "monotonic"
-    }
 }
 
 /// Local SQLite state-store configuration.
@@ -408,53 +333,6 @@ impl RunnerLimits {
             MAX_ACTIVE_OUTPUT_LIMIT,
         )
     }
-
-    fn append_canonical(&self, projection: &mut String) {
-        for (name, value) in [
-            (
-                "limits.admission_queue_depth",
-                self.admission_queue_depth.to_string(),
-            ),
-            (
-                "limits.publication_queue_depth",
-                self.publication_queue_depth.to_string(),
-            ),
-            (
-                "limits.maximum_payload_bytes",
-                self.maximum_payload_bytes.to_string(),
-            ),
-            (
-                "limits.admission_deadline_ms",
-                self.admission_deadline_ms.to_string(),
-            ),
-            (
-                "limits.event_deadline_ms",
-                self.event_deadline_ms.to_string(),
-            ),
-            (
-                "limits.stage_deadline_ms",
-                self.stage_deadline_ms.to_string(),
-            ),
-            (
-                "limits.compare_commit_retries",
-                self.compare_commit_retries.to_string(),
-            ),
-            (
-                "limits.reservation_ttl_seconds",
-                self.reservation_ttl_seconds.to_string(),
-            ),
-            (
-                "limits.maximum_active_outputs",
-                self.maximum_active_outputs.to_string(),
-            ),
-            (
-                "limits.replacement_policy",
-                self.replacement_policy.as_str().to_string(),
-            ),
-        ] {
-            canonical_field(projection, name, &value);
-        }
-    }
 }
 
 /// Publication retry and lease limits for the configured committed-batch sink.
@@ -507,38 +385,6 @@ impl PublicationPolicy {
             "publication.dead_letter_after_ms",
         )
     }
-
-    fn append_canonical(&self, projection: &mut String) {
-        for (name, value) in [
-            (
-                "publication.lease_ttl_seconds",
-                self.lease_ttl_seconds.to_string(),
-            ),
-            ("publication.batch_size", self.batch_size.to_string()),
-            (
-                "publication.attempt_deadline_ms",
-                self.attempt_deadline_ms.to_string(),
-            ),
-            (
-                "publication.initial_backoff_ms",
-                self.initial_backoff_ms.to_string(),
-            ),
-            (
-                "publication.maximum_backoff_ms",
-                self.maximum_backoff_ms.to_string(),
-            ),
-            (
-                "publication.maximum_attempts",
-                self.maximum_attempts.to_string(),
-            ),
-            (
-                "publication.dead_letter_after_ms",
-                self.dead_letter_after_ms.to_string(),
-            ),
-        ] {
-            canonical_field(projection, name, &value);
-        }
-    }
 }
 
 /// Replacement semantics passed to the durable state store.
@@ -547,15 +393,6 @@ impl PublicationPolicy {
 pub enum ManifestReplacementPolicy {
     Patch,
     ReplaceCurrentSourceKey,
-}
-
-impl ManifestReplacementPolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Patch => "patch",
-            Self::ReplaceCurrentSourceKey => "replace_current_source_key",
-        }
-    }
 }
 
 impl From<ManifestReplacementPolicy> for ReplacementPolicy {
@@ -575,15 +412,6 @@ pub enum MalformedRecordPolicy {
     Continue,
 }
 
-impl MalformedRecordPolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Stop => "stop",
-            Self::Continue => "continue",
-        }
-    }
-}
-
 impl From<MalformedRecordPolicy> for OfflineErrorPolicy {
     fn from(value: MalformedRecordPolicy) -> Self {
         match value {
@@ -593,7 +421,7 @@ impl From<MalformedRecordPolicy> for OfflineErrorPolicy {
     }
 }
 
-/// Immutable, fully resolved local manifest with a non-secret canonical digest.
+/// Immutable, fully resolved local runner manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRunnerManifest {
     pub schema_version: u32,
@@ -608,7 +436,6 @@ pub struct ResolvedRunnerManifest {
     pub publication: PublicationPolicy,
     pub malformed_records: MalformedRecordPolicy,
     pub execution_identity: AdmittedExecutionIdentity,
-    pub manifest_digest: ManifestDigest,
 }
 
 impl ResolvedRunnerManifest {
@@ -645,7 +472,6 @@ impl ResolvedRunnerManifest {
                 Duration::milliseconds(self.publication.dead_letter_after_ms as i64),
             )
             .expect("validated publication policy"),
-            manifest_digest: self.manifest_digest.clone(),
             source_adapter: self.source_adapter_identity()?,
             execution_identity: self.execution_identity.clone(),
         })
@@ -653,11 +479,10 @@ impl ResolvedRunnerManifest {
 
     pub fn source_adapter_identity(&self) -> Result<SourceAdapterIdentity, ManifestError> {
         self.validate_cross_section()?;
-        Ok(SourceAdapterIdentity::new(
+        Ok(SourceAdapterIdentity::without_config(
             ComponentId::try_new("source-event-jsonl", "adapter ID")
                 .expect("the built-in adapter ID is valid"),
             SemanticVersion::new(1, 0, 0),
-            Sha256Digest::new([0; 32]),
         ))
     }
 
@@ -767,37 +592,6 @@ pub struct ResolvedSinkBinding {
     pub path: PathBuf,
 }
 
-/// The domain-separated SHA-256 digest of the non-secret resolved configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManifestDigest([u8; 32]);
-
-impl ManifestDigest {
-    fn from_canonical_bytes(bytes: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(MANIFEST_DIGEST_DOMAIN.as_bytes());
-        hasher.update([0]);
-        hasher.update(bytes);
-        Self(hasher.finalize().into())
-    }
-
-    pub fn algorithm(&self) -> &'static str {
-        MANIFEST_DIGEST_ALGORITHM
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManifestDigest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
 /// Validated values that the local composition uses to construct its adapters.
 #[derive(Debug, Clone)]
 pub struct RunnerManifestWiring {
@@ -814,7 +608,6 @@ pub struct RunnerManifestWiring {
     pub event_deadline: std::time::Duration,
     pub publication_batch_size: usize,
     pub publication_retry_policy: PublicationRetryPolicy,
-    pub manifest_digest: ManifestDigest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -876,15 +669,6 @@ pub enum ManifestError {
     },
     #[error("manifest cross-section validation failed: {message}")]
     CrossSection { message: String },
-}
-
-fn canonical_field(projection: &mut String, name: &str, value: &str) {
-    projection.push_str(name);
-    projection.push('=');
-    projection.push_str(&value.len().to_string());
-    projection.push(':');
-    projection.push_str(value);
-    projection.push('\n');
 }
 
 fn validate_exact_component(

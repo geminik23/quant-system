@@ -12,14 +12,14 @@ use signal_parser::normalization::{
     ComponentDescriptor, ComponentId, ComponentKind, ComponentReport, ComponentResult,
     ContractBytes, ContractList, ContractText, DiagnosticSet, DraftValidationStep,
     EmptyOutputPolicy, EvaluationFailureClass, EvaluationInput, EvaluationRetrySafety,
-    GraphCompileError, MeaningBatch, MeaningContract, MeaningEncoding, MeaningNormalizer,
-    MeaningSchemaRef, MessageParser, NoConfig, NormalizationOutcome, ParsedMeaning, PayloadKind,
-    PipelineContextRequirements, PipelineEvaluationResult, PipelineId, PreNormalizedProducer,
-    PreNormalizedSignalBatch, RAW_SIGNALS_V1_SCHEMA, RouteEvaluation, RouteSelector, RouteSpec,
-    SemanticVersion, Sha256Digest, SignalDraft, SignalDraftAction, SourceAdapterIdentity,
-    StageExecutionFailure, StandardSignalFinalizer, StructuredInputCapability, VersionedMeaning,
-    bind_decoder, bind_finalizer, bind_meaning_normalizer, bind_parser,
-    bind_pre_normalized_producer, raw_signals_v1_schema,
+    EvaluationStage, EvidenceFact, GraphCompileError, MAX_CANONICAL_IDENTITY_BYTES, MeaningBatch,
+    MeaningContract, MeaningEncoding, MeaningNormalizer, MeaningSchemaRef, MessageParser, NoConfig,
+    NormalizationOutcome, ParsedMeaning, PayloadKind, PipelineContextRequirements,
+    PipelineEvaluationResult, PipelineId, PreNormalizedProducer, PreNormalizedSignalBatch,
+    RAW_SIGNALS_V1_SCHEMA, RouteEvaluation, RouteSelector, RouteSpec, SemanticVersion, SignalDraft,
+    SignalDraftAction, SourceAdapterIdentity, StageExecutionFailure, StandardSignalFinalizer,
+    StructuredInputCapability, VersionedMeaning, bind_decoder, bind_finalizer,
+    bind_meaning_normalizer, bind_parser, bind_pre_normalized_producer, raw_signals_v1_schema,
 };
 
 fn timestamp(value: &str) -> DateTimeUtc {
@@ -97,10 +97,9 @@ fn pipeline(id: &str) -> CompiledPipeline {
 }
 
 fn source_adapter() -> SourceAdapterIdentity {
-    SourceAdapterIdentity::new(
+    SourceAdapterIdentity::without_config(
         ComponentId::try_new("jsonl-test-adapter", "adapter ID").unwrap(),
         SemanticVersion::new(1, 0, 0),
-        Sha256Digest::new([7; 32]),
     )
 }
 
@@ -262,7 +261,11 @@ impl PreNormalizedProducer for CloseAllProducer {
                 ts: event.occurred_at().value().into_inner().naive_utc(),
             }])
             .unwrap(),
-        ))
+        )
+        .with_facts(vec![
+            EvidenceFact::try_new("compatibility_path", "pre_normalized").unwrap(),
+        ])
+        .unwrap())
     }
 }
 
@@ -326,6 +329,43 @@ fn bounded_values_and_canonical_encoding_are_stable() {
     assert_eq!(
         writer.into_bytes(),
         hex("01010201020304fffffffffffffffe0000000141")
+    );
+    assert!(signal_parser::normalization::CanonicalIdentityBytes::try_new(vec![]).is_err());
+    assert!(
+        signal_parser::normalization::CanonicalIdentityBytes::try_new(vec![
+            0;
+            MAX_CANONICAL_IDENTITY_BYTES
+                + 1
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn component_identity_retains_direct_canonical_configuration_bytes() {
+    let config =
+        NoConfig::new(ComponentConfigSchemaRef::try_new("quant-system/no-config@1").unwrap());
+    let decoder = bind_decoder(
+        descriptor(ComponentKind::Decoder, "direct-config-identity"),
+        &config,
+        |_| Ok(CanonicalRawSignalsDecoder),
+    )
+    .unwrap();
+    let bytes = decoder
+        .resolved()
+        .config_identity()
+        .canonical_bytes()
+        .as_slice();
+
+    assert!(
+        bytes
+            .windows("direct-config-identity".len())
+            .any(|window| window == b"direct-config-identity")
+    );
+    assert!(
+        bytes
+            .windows("quant-system/no-config@1".len())
+            .any(|window| window == b"quant-system/no-config@1")
     );
 }
 
@@ -567,10 +607,14 @@ fn text_and_compatibility_shapes_use_the_same_candidate_boundary() {
     let PipelineEvaluationResult::Completed(report) = result else {
         panic!("compatibility evaluation failed");
     };
-    assert!(matches!(
-        report.outcome(),
-        NormalizationOutcome::Accepted { .. }
-    ));
+    let NormalizationOutcome::Accepted { candidates } = report.outcome() else {
+        panic!("compatibility evaluation was not accepted");
+    };
+    let stage = &candidates.as_slice()[0].evidence().components()[0];
+    assert_eq!(stage.stage(), EvaluationStage::Finalization);
+    assert_eq!(stage.component().id().as_str(), "close-all-producer");
+    assert_eq!(stage.facts()[0].code().as_str(), "compatibility_path");
+    assert_eq!(stage.facts()[0].value().as_str(), "pre_normalized");
 }
 
 #[test]

@@ -24,7 +24,7 @@ impl EvaluationIdentity {
     }
 
     pub fn routing_graph(&self) -> RoutingGraphIdentity {
-        self.routing_graph
+        self.routing_graph.clone()
     }
 
     pub fn selected_pipeline(&self) -> Option<&PipelineIdentity> {

@@ -17,8 +17,7 @@ use crate::normalization::{
     DiagnosticSeverity, EmptyOutputPolicy, EvaluationFailureClass, EvaluationRetrySafety,
     HistoryRequirement, IgnoreReason, ItemLimit, ParentRequirement, PipelineContextRequirements,
     PreNormalizedProducer, PreNormalizedProducerBinding, PreNormalizedSignalBatch, RejectionReason,
-    SemanticVersion, Sha256Digest, SourceAdapterIdentity, StageExecutionFailure,
-    bind_pre_normalized_producer, hash_domain,
+    SemanticVersion, SourceAdapterIdentity, StageExecutionFailure, bind_pre_normalized_producer,
 };
 use crate::registry::ParserRegistry;
 use crate::state::DurableDeliveryIdentity;
@@ -32,7 +31,7 @@ const TELEGRAM_DELETE_MAX_ITEMS: usize = 256;
 const TELEGRAM_HISTORY_MAX_ITEMS: usize = 64;
 const TELEGRAM_HISTORY_FACT_MAX_BYTES: u64 = 1_114_112;
 const TELEGRAM_THREAD_LABEL: &str = "telegram-thread";
-const TELEGRAM_ADAPTER_CONFIG_DOMAIN: &str = "quant-system/telegram-source-adapter-config@1";
+
 const TELEGRAM_LEGACY_CONFIG_SCHEMA: &str = "quant-system/telegram-legacy-producer-config@1";
 
 #[derive(Debug, thiserror::Error)]
@@ -622,15 +621,11 @@ impl TelegramRelaySourceAdapter {
 #[derive(Debug, Clone)]
 pub struct TelegramLegacyProducerConfig {
     schema: ComponentConfigSchemaRef,
-    registry_identity: Sha256Digest,
     maximum_history: u32,
 }
 
 impl TelegramLegacyProducerConfig {
-    pub fn try_new(
-        registry_identity: Sha256Digest,
-        maximum_history: usize,
-    ) -> Result<Self, TelegramAdapterError> {
+    pub fn try_new(maximum_history: usize) -> Result<Self, TelegramAdapterError> {
         if maximum_history > TELEGRAM_HISTORY_MAX_ITEMS {
             return Err(TelegramAdapterError::HistoryLimitExceeded {
                 maximum: TELEGRAM_HISTORY_MAX_ITEMS,
@@ -639,7 +634,6 @@ impl TelegramLegacyProducerConfig {
         }
         Ok(Self {
             schema: ComponentConfigSchemaRef::try_new(TELEGRAM_LEGACY_CONFIG_SCHEMA)?,
-            registry_identity,
             maximum_history: maximum_history as u32,
         })
     }
@@ -654,7 +648,6 @@ impl CanonicalComponentConfig for TelegramLegacyProducerConfig {
         &self,
         writer: &mut CanonicalWriter,
     ) -> Result<(), crate::normalization::IdentityError> {
-        writer.bytes(self.registry_identity.as_bytes())?;
         writer.u32(self.maximum_history);
         Ok(())
     }
@@ -750,10 +743,9 @@ impl PreNormalizedProducer for LegacyTelegramParserAdapter {
 
 pub fn bind_legacy_telegram_producer(
     registry: Arc<ParserRegistry>,
-    registry_identity: Sha256Digest,
 ) -> Result<PreNormalizedProducerBinding, TelegramAdapterError> {
     let maximum_history = registry.maximum_history();
-    let config = TelegramLegacyProducerConfig::try_new(registry_identity, maximum_history)?;
+    let config = TelegramLegacyProducerConfig::try_new(maximum_history)?;
     let history = if maximum_history == 0 {
         None
     } else {
@@ -828,7 +820,9 @@ fn source_adapter_identity(
     Ok(SourceAdapterIdentity::new(
         ComponentId::try_new(id, "adapter ID")?,
         SemanticVersion::new(1, 0, 0),
-        hash_domain(TELEGRAM_ADAPTER_CONFIG_DOMAIN, &writer.into_bytes()),
+        writer
+            .into_identity_bytes()
+            .map_err(|error| TelegramAdapterError::ComponentConfiguration(error.to_string()))?,
     ))
 }
 

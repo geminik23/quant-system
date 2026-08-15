@@ -1,17 +1,20 @@
 //! `quant-system-core` package (`qs_core` library) - Core trade engine for the quant-system workspace.
 //!
-//! This crate provides the **synchronous, side-effect-free** trading domain used by backtesting and future live integrations. It contains the trade engine, normalized signal intent, management-policy resolution, position sizing, and currency-conversion logic, but performs no configuration IO, networking, storage, or broker calls.
+//! This crate provides the **synchronous, side-effect-free** trading domain used by backtesting and future live integrations. It contains the trade engine, strict raw signals, canonical trade intent and execution facts, management-policy resolution, position sizing, and currency-conversion logic, but performs no configuration IO, networking, storage, state lookup, or broker calls.
 //!
 //! # Key types
 //!
 //! | Type | Purpose |
 //! |------|---------|
-//! | [`TradeEngine`] | Main entry point — processes actions and price updates |
-//! | [`Position`] | Atomic unit of market exposure (data + rules) |
-//! | [`Rule`] | Composable management rule (stoploss, trailing, TP, …) |
-//! | [`Action`] | Input vocabulary — what a strategy can request |
-//! | [`Effect`] | Output vocabulary — observable side-effects for the caller |
-//! | [`Signal`] | Timestamped action for replay / backtesting |
+//! | [`TradeEngine`] | Main entry point - processes actions and price updates |
+//! | [`TradeIntent`] | Source-neutral and strategy-neutral desired economic action |
+//! | [`ExecutionCommandEnvelope`] | Immutable identity envelope for a typed gateway command |
+//! | [`ExecutionReport`] | Venue-neutral economic execution fact |
+//! | [`Position`] | Atomic unit of market exposure with data and rules |
+//! | [`Rule`] | Composable management rule such as stoploss, trailing, or take profit |
+//! | [`Action`] | Concrete engine input vocabulary |
+//! | [`Effect`] | Observable engine output for the caller |
+//! | [`Signal`] | Timestamped action for replay or backtesting |
 //!
 //! # Design principle
 //!
@@ -20,10 +23,13 @@
 //! to handle effects (simulate fills for backtest, send broker orders for live).
 
 pub mod alert_register;
+pub mod canonical;
 pub mod currency;
 pub mod engine;
 pub mod error;
 pub mod execution;
+pub mod execution_events;
+pub mod intent;
 pub mod position;
 pub mod position_manager;
 pub mod profile;
@@ -32,9 +38,13 @@ pub mod sizing;
 pub mod types;
 pub mod validation;
 
-// ── Convenience re-exports ──────────────────────────────────────────────────
-
 pub use alert_register::PriceAlertRegister;
+pub use canonical::{
+    CanonicalDomainError, DateTimeUtc, DurationMillis, ExecutionCapability, ExecutionCommandId,
+    FillId, IntentCampaignRef, IntentCorrelationId, IntentIdentityNamespace, IntentPositionRef,
+    IntentProducerId, IntentStateRef, OpaquePayloadRef, OpaqueProvenanceRef, OperatingMode,
+    PositiveFraction, PriceDistance, TradeIntentId, VenueOrderRef, VenuePositionRef,
+};
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
     ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,
@@ -43,6 +53,8 @@ pub use currency::{
 pub use engine::{FutureApplyError, FutureApplyResult, TradeEngine};
 pub use error::{CoreError, Result};
 pub use execution::{ExecutionError, ExecutionPricer, ExecutionResult};
+pub use execution_events::*;
+pub use intent::*;
 pub use position::Position;
 pub use profile::{
     ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError,

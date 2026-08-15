@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ContractValueError {
     #[error("{field} must not be empty")]
@@ -289,16 +291,58 @@ impl ItemLimit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Sha256Digest([u8; 32]);
+pub const MAX_CANONICAL_IDENTITY_BYTES: usize = 2 * 1024 * 1024;
 
-impl Sha256Digest {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalIdentityBytes(Box<[u8]>);
+
+impl CanonicalIdentityBytes {
+    pub fn try_new(value: impl Into<Vec<u8>>) -> Result<Self, ContractValueError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ContractValueError::Empty {
+                field: "canonical identity bytes",
+            });
+        }
+        if value.len() > MAX_CANONICAL_IDENTITY_BYTES {
+            return Err(ContractValueError::LimitExceeded {
+                field: "canonical identity bytes",
+                maximum: MAX_CANONICAL_IDENTITY_BYTES,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value.into_boxed_slice()))
     }
 
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0.into_vec()
+    }
+}
+
+impl Serialize for CanonicalIdentityBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.as_slice())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalIdentityBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Vec::<u8>::deserialize(deserializer)?;
+        Self::try_new(value).map_err(serde::de::Error::custom)
     }
 }
 

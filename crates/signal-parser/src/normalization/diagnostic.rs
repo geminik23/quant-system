@@ -1,6 +1,6 @@
 use super::identity::{PipelineIdentity, ResolvedComponentRef};
 use super::value::{
-    ContractList, ContractText, ContractValueError, DiagnosticCode, DiagnosticText, Sha256Digest,
+    ContractList, ContractText, ContractValueError, DiagnosticCode, DiagnosticText,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,8 +331,6 @@ pub enum EvaluationStage {
 pub struct StageEvidence {
     stage: EvaluationStage,
     component: ResolvedComponentRef,
-    input_digest: Sha256Digest,
-    output_digest: Option<Sha256Digest>,
     facts: ContractList<EvidenceFact, 16>,
 }
 
@@ -340,15 +338,11 @@ impl StageEvidence {
     pub(crate) fn new(
         stage: EvaluationStage,
         component: ResolvedComponentRef,
-        input_digest: Sha256Digest,
-        output_digest: Option<Sha256Digest>,
         facts: ContractList<EvidenceFact, 16>,
     ) -> Self {
         Self {
             stage,
             component,
-            input_digest,
-            output_digest,
             facts,
         }
     }
@@ -359,14 +353,6 @@ impl StageEvidence {
 
     pub fn component(&self) -> &ResolvedComponentRef {
         &self.component
-    }
-
-    pub fn input_digest(&self) -> Sha256Digest {
-        self.input_digest
-    }
-
-    pub fn output_digest(&self) -> Option<Sha256Digest> {
-        self.output_digest
     }
 
     pub fn facts(&self) -> &[EvidenceFact] {

@@ -37,15 +37,13 @@ pub use graph::{
     RouteSelector, RouteSpec,
 };
 pub use identity::{
-    COMPONENT_CONFIG_DOMAIN, CanonicalEncode, CanonicalWriter, ComponentConfigIdentity,
-    ComponentConfigSchemaRef, ComponentKind, IdentityError, PIPELINE_DOMAIN, PipelineIdentity,
-    RESOLVED_GRAPH_DOMAIN, ROUTING_GRAPH_DOMAIN, ResolvedComponentRef, ResolvedGraphIdentity,
-    RoutingGraphIdentity, SemanticVersion, hash_domain,
+    CanonicalEncode, CanonicalWriter, ComponentConfigIdentity, ComponentConfigSchemaRef,
+    ComponentKind, IdentityError, PipelineIdentity, ResolvedComponentRef, ResolvedGraphIdentity,
+    RoutingGraphIdentity, SemanticVersion,
 };
 pub use projection::{
-    EVALUATION_SEMANTIC_DOMAIN, EvaluationSemanticDigest, NORMALIZED_SIGNAL_ID_DOMAIN,
-    NORMALIZED_SIGNAL_SEMANTIC_DOMAIN, NormalizedSignalSemanticDigest, evaluation_semantic_digest,
-    normalized_signal_id_digest, normalized_signal_semantic_digest,
+    NORMALIZED_SIGNAL_SEMANTIC_MAX_BYTES, NormalizedSignalSemanticProjection,
+    normalized_signal_semantic_projection,
 };
 pub(crate) use raw_signals_v1::decode_raw_signal_value_v1;
 pub use raw_signals_v1::{
@@ -63,8 +61,8 @@ pub use signal::{
     SignalDraftAction, SourceAdapterIdentity, SourceProvenanceDraft,
 };
 pub use value::{
-    ByteLimit, ComponentId, ContractBytes, ContractList, ContractMap, ContractText,
-    ContractValueError, DiagnosticCode, DiagnosticText, FiniteF64, GroupText, ItemLimit,
-    NonEmptyContractList, NonEmptyContractText, PipelineId, PositiveFiniteF64, RuleNameText,
-    Sha256Digest, SymbolText, TradeKeyText, UnitInterval,
+    ByteLimit, CanonicalIdentityBytes, ComponentId, ContractBytes, ContractList, ContractMap,
+    ContractText, ContractValueError, DiagnosticCode, DiagnosticText, FiniteF64, GroupText,
+    ItemLimit, MAX_CANONICAL_IDENTITY_BYTES, NonEmptyContractList, NonEmptyContractText,
+    PipelineId, PositiveFiniteF64, RuleNameText, SymbolText, TradeKeyText, UnitInterval,
 };

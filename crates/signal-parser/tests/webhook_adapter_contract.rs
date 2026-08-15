@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use signal_parser::adapters::structured_json::decode_source_event_jsonl;
+use signal_parser::adapters::structured_json::{
+    SourceEventJsonlArtifactIdentity, decode_source_event_jsonl,
+};
 use signal_parser::adapters::webhook::{
     AdmissionError, AdmissionIdentity, AdmissionSubmission, AuthenticatedWebhookAdapter,
     DurableAdmissionAcknowledgement, HttpSourceSubmissionResponseV1, MAX_WEBHOOK_BODY_BYTES,
@@ -709,6 +711,34 @@ fn malformed_and_source_mismatch_do_not_consume_replay_keys() {
 }
 
 #[test]
+fn replay_identities_share_a_direct_length_framed_body_independent_coordinate() {
+    let reservation = replay_reservation("identity:coordinate", NOW, NOW + 10);
+    let first = match MemoryWebhookReplayStore::new().reserve(reservation.clone()) {
+        Ok(WebhookReplayReservationResult::Reserved(record)) => record,
+        result => panic!("expected reservation, got {result:?}"),
+    };
+    let mut changed_body = reservation;
+    changed_body.body_sha256 = [0x7f; 32];
+    let second = match MemoryWebhookReplayStore::new().reserve(changed_body) {
+        Ok(WebhookReplayReservationResult::Reserved(record)) => record,
+        result => panic!("expected reservation, got {result:?}"),
+    };
+    let coordinate = "19:webhook:synthetic-a:19:identity:coordinate:10:1786200000";
+
+    assert_eq!(
+        first.submission_id().as_str(),
+        format!("webhook-submission:v2:{coordinate}")
+    );
+    assert_eq!(
+        first.admission_identity().as_str(),
+        format!("admission:v2:{coordinate}")
+    );
+    assert_eq!(first.submission_id(), second.submission_id());
+    assert_eq!(first.admission_identity(), second.admission_identity());
+    assert_ne!(first.body_sha256(), second.body_sha256());
+}
+
+#[test]
 fn memory_replay_is_stable_conflicting_source_scoped_and_rotation_safe() {
     let admission = Arc::new(ScriptedAdmissionPort::default());
     let replay: Arc<dyn WebhookReplayStore> = Arc::new(MemoryWebhookReplayStore::new());
@@ -974,7 +1004,10 @@ fn jsonl_and_webhook_admit_the_same_strict_source_event() {
     let body = serde_json::to_vec(&source).unwrap();
     let mut artifact = body.clone();
     artifact.push(b'\n');
-    let decoded = decode_source_event_jsonl(&artifact);
+    let decoded = decode_source_event_jsonl(
+        SourceEventJsonlArtifactIdentity::try_new("cross-adapter-source-run").unwrap(),
+        &artifact,
+    );
     let jsonl_record = decoded.records()[0].as_ref().unwrap();
 
     let admission = Arc::new(ScriptedAdmissionPort::default());
@@ -1048,10 +1081,17 @@ fn sqlite_restore_recomputes_deterministic_ids() {
         ));
     }
     let connection = Connection::open(database.path()).unwrap();
+    let wrong_first_seen = (NOW + 1).to_string();
+    let mismatched_submission_id = format!(
+        "webhook-submission:v2:{}:{SOURCE_A}:{}:restore-corrupt:{}:{wrong_first_seen}",
+        SOURCE_A.len(),
+        "restore-corrupt".len(),
+        wrong_first_seen.len(),
+    );
     connection
         .execute(
             "UPDATE webhook_replay_v1 SET submission_id = ?1",
-            ["webhook-submission:v1:0000000000000000000000000000000000000000000000000000000000000000"],
+            [mismatched_submission_id],
         )
         .unwrap();
     drop(connection);

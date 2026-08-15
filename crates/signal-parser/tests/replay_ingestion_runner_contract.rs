@@ -6,7 +6,7 @@ use signal_parser::ingestion::{
     SourceTimestampQuality, StructuredPayload,
 };
 use signal_parser::normalization::{
-    ComponentId, SemanticVersion, Sha256Digest, SourceAdapterIdentity, raw_signals_v1_schema,
+    ComponentId, SemanticVersion, SourceAdapterIdentity, raw_signals_v1_schema,
 };
 use signal_parser::runner::manifest::{
     BUILTIN_CANONICAL_RAW_SIGNALS_DECODER, BUILTIN_COMMITTED_JSONL_SINK,
@@ -125,6 +125,10 @@ fn replay_orders_available_receipts_preserves_delivery_identity_and_leaves_sourc
     let source: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
     let target: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
     let source_service = service(source.clone());
+    assert_eq!(
+        source_service.source_adapter_identity().config_identity(),
+        None
+    );
     let first_delivery = DurableDeliveryIdentity::Stable("source-delivery-1".to_string());
     let second_delivery = DurableDeliveryIdentity::Stable("source-delivery-2".to_string());
 
@@ -140,7 +144,10 @@ fn replay_orders_available_receipts_preserves_delivery_identity_and_leaves_sourc
             second_delivery.clone(),
         )
         .unwrap();
-    assert_eq!(source.recorded_receipts().unwrap().len(), 2);
+    let source_receipts = source.recorded_receipts().unwrap();
+    assert_eq!(source_receipts.len(), 2);
+    assert_eq!(source_receipts[0].source_adapter.config_identity, None);
+    assert_eq!(source_receipts[1].source_adapter.config_identity, None);
 
     let manifest = manifest();
     let report = ReplayIngestionRunner::new(source.clone(), service(target.clone()), &manifest, 1)
@@ -206,7 +213,7 @@ fn replay_rejects_unavailable_recorded_execution_before_target_mutation() {
     let target: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
     let manifest = manifest();
     let mut unavailable_execution: AdmittedExecutionIdentity = manifest.execution_identity.clone();
-    unavailable_execution.routing_graph[0] ^= 1;
+    unavailable_execution.routing_graph.as_mut_slice()[0] ^= 1;
     let source_service = Arc::new(
         structured_jsonl_service(
             SourceId::new("replay:contract-test").unwrap(),
@@ -249,7 +256,10 @@ fn replay_validates_receipts_beyond_the_replay_limit_before_target_mutation() {
         .unwrap();
 
     let mut unavailable_execution: AdmittedExecutionIdentity = manifest.execution_identity.clone();
-    unavailable_execution.finalizer.config_identity[0] ^= 1;
+    unavailable_execution
+        .finalizer
+        .config_identity
+        .as_mut_slice()[0] ^= 1;
     let unavailable_service = Arc::new(
         structured_jsonl_service(
             SourceId::new("replay:contract-test").unwrap(),
@@ -282,10 +292,9 @@ fn replay_validates_receipts_beyond_the_replay_limit_before_target_mutation() {
 fn replay_rejects_unavailable_recorded_adapter_before_target_mutation() {
     let source: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
     let target: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
-    let unavailable_adapter = SourceAdapterIdentity::new(
+    let unavailable_adapter = SourceAdapterIdentity::without_config(
         ComponentId::try_new("unavailable-adapter", "adapter ID").unwrap(),
         SemanticVersion::new(1, 0, 0),
-        Sha256Digest::new([1; 32]),
     );
     let source_service = Arc::new(
         structured_jsonl_service(

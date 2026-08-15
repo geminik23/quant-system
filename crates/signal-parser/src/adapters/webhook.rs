@@ -33,8 +33,8 @@ const MAX_QUERY_BYTES: usize = 256;
 const MAX_CONTENT_TYPE_BYTES: usize = 128;
 const MAX_CONTENT_ENCODING_BYTES: usize = 64;
 const SIGNING_DOMAIN: &str = "quant-system-webhook-v1";
-const SUBMISSION_ID_DOMAIN: &[u8] = b"quant-system/webhook-submission@1";
-const ADMISSION_ID_DOMAIN: &[u8] = b"quant-system/admission-identity@1";
+const SUBMISSION_ID_PREFIX: &str = "webhook-submission:v2:";
+const ADMISSION_ID_PREFIX: &str = "admission:v2:";
 const SQLITE_REPLAY_STATE_PENDING: &str = "pending_admission";
 const SQLITE_REPLAY_STATE_ACCEPTED: &str = "accepted";
 
@@ -300,16 +300,8 @@ impl SubmissionId {
     }
 
     fn from_stored(value: String) -> Result<Self, WebhookReplayStoreError> {
-        if value.starts_with("webhook-submission:v1:")
-            && value.len() == "webhook-submission:v1:".len() + 64
-            && value["webhook-submission:v1:".len()..]
-                .bytes()
-                .all(is_lower_hex)
-        {
-            Ok(Self(value))
-        } else {
-            Err(WebhookReplayStoreError::Corrupt)
-        }
+        validate_direct_identity(&value, SUBMISSION_ID_PREFIX)?;
+        Ok(Self(value))
     }
 }
 
@@ -327,14 +319,8 @@ impl AdmissionIdentity {
     }
 
     fn from_stored(value: String) -> Result<Self, WebhookReplayStoreError> {
-        if value.starts_with("admission:v1:")
-            && value.len() == "admission:v1:".len() + 64
-            && value["admission:v1:".len()..].bytes().all(is_lower_hex)
-        {
-            Ok(Self(value))
-        } else {
-            Err(WebhookReplayStoreError::Corrupt)
-        }
+        validate_direct_identity(&value, ADMISSION_ID_PREFIX)?;
+        Ok(Self(value))
     }
 }
 
@@ -673,7 +659,6 @@ impl WebhookReplayStore for MemoryWebhookReplayStore {
         let (submission_id, admission_identity) = deterministic_identities(
             &reservation.source_id,
             &reservation.idempotency_key,
-            &reservation.body_sha256,
             reservation.now_unix_seconds,
         );
         let record = WebhookReplayRecord {
@@ -862,7 +847,6 @@ impl WebhookReplayStore for SqliteWebhookReplayStore {
             let (submission_id, admission_identity) = deterministic_identities(
                 &reservation.source_id,
                 &reservation.idempotency_key,
-                &reservation.body_sha256,
                 reservation.now_unix_seconds,
             );
             transaction
@@ -1387,12 +1371,8 @@ impl TryFrom<StoredReplayRecord> for WebhookReplayRecord {
         }
         let submission_id = SubmissionId::from_stored(stored.submission_id)?;
         let admission_identity = AdmissionIdentity::from_stored(stored.admission_identity)?;
-        let (expected_submission_id, expected_admission_identity) = deterministic_identities(
-            &source_id,
-            &stored.idempotency_key,
-            &body_sha256,
-            first_seen_unix_seconds,
-        );
+        let (expected_submission_id, expected_admission_identity) =
+            deterministic_identities(&source_id, &stored.idempotency_key, first_seen_unix_seconds);
         if submission_id != expected_submission_id
             || admission_identity != expected_admission_identity
         {
@@ -1416,51 +1396,75 @@ impl TryFrom<StoredReplayRecord> for WebhookReplayRecord {
 fn deterministic_identities(
     source_id: &SourceId,
     idempotency_key: &str,
-    body_sha256: &[u8; 32],
     first_seen_unix_seconds: u64,
 ) -> (SubmissionId, AdmissionIdentity) {
-    let submission_digest = identity_digest(
-        SUBMISSION_ID_DOMAIN,
-        source_id,
+    let first_seen = first_seen_unix_seconds.to_string();
+    let coordinate = format!(
+        "{}:{}:{}:{}:{}:{first_seen}",
+        source_id.as_str().len(),
+        source_id.as_str(),
+        idempotency_key.len(),
         idempotency_key,
-        body_sha256,
-        first_seen_unix_seconds,
-    );
-    let admission_digest = identity_digest(
-        ADMISSION_ID_DOMAIN,
-        source_id,
-        idempotency_key,
-        body_sha256,
-        first_seen_unix_seconds,
+        first_seen.len(),
     );
     (
-        SubmissionId(format!(
-            "webhook-submission:v1:{}",
-            lower_hex(&submission_digest)
-        )),
-        AdmissionIdentity(format!("admission:v1:{}", lower_hex(&admission_digest))),
+        SubmissionId(format!("{SUBMISSION_ID_PREFIX}{coordinate}")),
+        AdmissionIdentity(format!("{ADMISSION_ID_PREFIX}{coordinate}")),
     )
 }
 
-fn identity_digest(
-    domain: &[u8],
-    source_id: &SourceId,
-    idempotency_key: &str,
-    body_sha256: &[u8; 32],
-    first_seen_unix_seconds: u64,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hash_part(&mut hasher, domain);
-    hash_part(&mut hasher, source_id.as_str().as_bytes());
-    hash_part(&mut hasher, idempotency_key.as_bytes());
-    hash_part(&mut hasher, body_sha256);
-    hash_part(&mut hasher, &first_seen_unix_seconds.to_be_bytes());
-    hasher.finalize().into()
+fn validate_direct_identity(value: &str, prefix: &str) -> Result<(), WebhookReplayStoreError> {
+    let coordinate = value
+        .strip_prefix(prefix)
+        .ok_or(WebhookReplayStoreError::Corrupt)?;
+    let (source_id, coordinate) = take_length_framed_identity_part(coordinate)?;
+    let (idempotency_key, coordinate) = take_length_framed_identity_part(coordinate)?;
+    let first_seen = take_final_length_framed_identity_part(coordinate)?;
+    SourceId::new(source_id).map_err(|_| WebhookReplayStoreError::Corrupt)?;
+    validate_ascii(
+        idempotency_key,
+        "idempotency key",
+        MAX_WEBHOOK_IDEMPOTENCY_KEY_BYTES,
+        true,
+    )
+    .map_err(|_| WebhookReplayStoreError::Corrupt)?;
+    parse_canonical_unix_seconds(first_seen).ok_or(WebhookReplayStoreError::Corrupt)?;
+    Ok(())
 }
 
-fn hash_part(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(value);
+fn take_length_framed_identity_part(value: &str) -> Result<(&str, &str), WebhookReplayStoreError> {
+    let (length, framed) = value
+        .split_once(':')
+        .ok_or(WebhookReplayStoreError::Corrupt)?;
+    let length = parse_canonical_usize(length)?;
+    if framed.len() <= length || !framed.is_char_boundary(length) {
+        return Err(WebhookReplayStoreError::Corrupt);
+    }
+    let (part, remainder) = framed.split_at(length);
+    let remainder = remainder
+        .strip_prefix(':')
+        .ok_or(WebhookReplayStoreError::Corrupt)?;
+    Ok((part, remainder))
+}
+
+fn take_final_length_framed_identity_part(value: &str) -> Result<&str, WebhookReplayStoreError> {
+    let (length, part) = value
+        .split_once(':')
+        .ok_or(WebhookReplayStoreError::Corrupt)?;
+    if parse_canonical_usize(length)? != part.len() {
+        return Err(WebhookReplayStoreError::Corrupt);
+    }
+    Ok(part)
+}
+
+fn parse_canonical_usize(value: &str) -> Result<usize, WebhookReplayStoreError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| WebhookReplayStoreError::Corrupt)?;
+    if parsed.to_string() != value {
+        return Err(WebhookReplayStoreError::Corrupt);
+    }
+    Ok(parsed)
 }
 
 fn canonical_material_from_digest(

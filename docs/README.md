@@ -13,6 +13,7 @@ Use this index to enter the workspace by goal rather than by crate name.
 | Understand crate and service ownership | [Architecture](architecture.md) |
 | Review intended project direction | [Roadmap](roadmap.md) |
 | Construct strict signal JSONL | [RawSignal reference](reference/raw-signal.md) |
+| Embed canonical intent and execution-event contracts | [Trade intent and execution events](reference/trade-intent.md) |
 
 ## Component references
 
@@ -20,6 +21,5 @@ Use this index to enter the workspace by goal rather than by crate name.
 - [`qs-market-data` operations and client contract](../crates/market-data/GUIDE.md)
 - [`qs-backtest-server` example configuration](../crates/backtest-server/config.example.toml)
 - [`qs-signal-parser` Telegram parser configuration](../crates/signal-parser/parsers.example.toml)
-
 
 Rust API details remain in each crate's Rustdoc.

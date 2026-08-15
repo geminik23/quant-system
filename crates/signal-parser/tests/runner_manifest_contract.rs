@@ -98,10 +98,12 @@ fn compiles_the_complete_local_jsonl_manifest() {
     let wiring = resolved.wiring().unwrap();
 
     assert_eq!(resolved.id, "local-jsonl");
+    assert_eq!(resolved.version, "1.0.0");
     assert_eq!(resolved.sources[0].pipeline, "strict-json");
     assert_eq!(wiring.source_id.as_str(), "jsonl:manifest-test");
     assert_eq!(wiring.source_adapter.id().as_str(), "source-event-jsonl");
     assert_eq!(wiring.source_adapter.version().major(), 1);
+    assert_eq!(wiring.source_adapter.config_identity(), None);
     assert_eq!(wiring.publication_batch_size, 16);
     assert_eq!(wiring.sink_binding_id, "committed-jsonl");
     assert_eq!(
@@ -118,11 +120,15 @@ fn compiles_the_complete_local_jsonl_manifest() {
         chrono::Duration::seconds(60)
     );
     assert_eq!(wiring.publication_retry_policy.maximum_attempts(), 12);
-    assert_eq!(wiring.manifest_digest.algorithm(), "sha256");
-    assert_eq!(wiring.manifest_digest.to_string().len(), 64);
     assert_eq!(resolved.execution_identity, wiring.execution_identity);
-    assert_ne!(resolved.execution_identity.routing_graph, [0; 32]);
-    assert_ne!(resolved.execution_identity.pipeline, [0; 32]);
+    assert!(
+        !resolved
+            .execution_identity
+            .routing_graph
+            .as_slice()
+            .is_empty()
+    );
+    assert!(!resolved.execution_identity.pipeline.as_slice().is_empty());
     assert_eq!(
         resolved.execution_identity.decoder.id,
         "canonical-raw-signals"
@@ -135,27 +141,6 @@ fn compiles_the_complete_local_jsonl_manifest() {
         resolved.validate_source_event(&source_event(SourceRevision::Monotonic(1))),
         Ok(())
     );
-}
-
-#[test]
-fn digest_is_stable_for_equivalent_input_and_changes_with_non_secret_configuration() {
-    let first = RunnerManifest::from_toml_str(&manifest_toml())
-        .unwrap()
-        .compile()
-        .unwrap();
-    let second = RunnerManifest::from_toml_str(&manifest_toml())
-        .unwrap()
-        .compile()
-        .unwrap();
-    let changed = RunnerManifest::from_toml_str(
-        &manifest_toml().replace("batch_size = 16", "batch_size = 8"),
-    )
-    .unwrap()
-    .compile()
-    .unwrap();
-
-    assert_eq!(first.manifest_digest, second.manifest_digest);
-    assert_ne!(first.manifest_digest, changed.manifest_digest);
 }
 
 #[test]

@@ -92,19 +92,22 @@ impl CommittedBatchSink for ScriptedSink {
                 *self.published.lock().unwrap() += 1;
                 Ok(PublicationDeliveryReceipt {
                     delivery_id: delivery.delivery_id,
-                    batch_id: delivery.batch.batch_id,
+                    batch_id: delivery.batch.batch_id.clone(),
                 })
             }
             SinkResult::SlowSuccess => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 Ok(PublicationDeliveryReceipt {
                     delivery_id: delivery.delivery_id,
-                    batch_id: delivery.batch.batch_id,
+                    batch_id: delivery.batch.batch_id.clone(),
                 })
             }
             SinkResult::InconsistentReceipt => Ok(PublicationDeliveryReceipt {
                 delivery_id: delivery.delivery_id,
-                batch_id: signal_parser::state::CommittedBatchId::from_bytes([0; 32]),
+                batch_id: signal_parser::state::CommittedBatchId::from_applied_event(
+                    delivery.batch.applied_event_id.clone(),
+                    delivery.batch.commit_index.saturating_add(1),
+                ),
             }),
         }
     }

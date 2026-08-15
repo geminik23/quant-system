@@ -1,6 +1,6 @@
 # RawSignal JSONL reference
 
-`RawSignal` is the strict normalized input accepted by the current replay path. A JSONL file contains one action object per line in timestamp order.
+`RawSignal` is the strict normalized input accepted by the current replay path. A JSONL file contains one action object per line in timestamp order. The newer canonical intent contracts are additive and do not change this wire format or the current endpoint default.
 
 Top-level action objects reject unknown fields. Timestamps use naive ISO date-time values such as `2026-01-15T10:00:00`; the producer is responsible for aligning them with imported UTC market-data timestamps.
 
@@ -72,6 +72,14 @@ Examples:
 | `ModifyAllStoploss` | `symbol`, `price` |
 | `CloseAllInGroup` | `group_id` |
 | `ModifyAllStoplossInGroup` | `group_id`, `price` |
+
+## Canonical intent compatibility
+
+`quant-system-core` provides a pure adapter from `RawSignal` to canonical `TradeIntent` values. It is intended for future ingestion, strategy, portfolio, replay, and gateway consumers, not as an implicit replacement for the current JSONL endpoint.
+
+The caller must supply a pinned `ResolvedInstrumentRef`, timestamp policy, provenance and identity namespace, and any already resolved position, pending-entry, campaign, or desired target state needed by the action. The adapter performs no catalog, portfolio, source-state, configuration, or network IO. Bulk actions expand deterministically over the caller-supplied resolved targets. `AddRule` and `RemoveRule` remain compatibility-only because the canonical intent layer does not yet define a neutral management-policy mutation contract.
+
+See [Trade intent and execution events](trade-intent.md) for the canonical contracts and their operational boundaries.
 
 ## Validation notes
 

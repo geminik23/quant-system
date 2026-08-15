@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use crate::adapters::structured_json::{
+    SourceEventJsonlArtifactIdentity, SourceEventJsonlArtifactIdentityError,
+};
 use crate::ingestion::DateTimeUtc;
 use crate::state::{SourceStateError, SourceStateStore, SqliteSourceStateStore};
 
-use crate::runner::manifest::{
-    ManifestDigest, ManifestError, ResolvedRunnerManifest, RunnerManifest,
-};
+use crate::runner::manifest::{ManifestError, ResolvedRunnerManifest, RunnerManifest};
 use crate::runner::publication::{PublicationOrchestrator, PublicationRunReport};
 use crate::runner::runtime::{AdmissionRuntime, RuntimeRunArtifact};
 use crate::runner::service::DurableIngestionService;
@@ -26,6 +27,7 @@ use crate::runner::{
 pub struct LocalIngestionComposition {
     manifest: ResolvedRunnerManifest,
     source_path: PathBuf,
+    source_artifact_identity: SourceEventJsonlArtifactIdentity,
     ingestion_runner: OfflineIngestionRunner,
     execution_service: Arc<crate::runner::IngestionService>,
     admission_runtime: Arc<AdmissionRuntime>,
@@ -84,9 +86,14 @@ impl LocalIngestionComposition {
             Arc::clone(&runner_service),
             Arc::clone(&state),
         )?;
+        let source_artifact_identity = SourceEventJsonlArtifactIdentity::try_new(format!(
+            "source-event-jsonl@1:path:{}",
+            wiring.source_path.display()
+        ))?;
         Ok(Self {
             manifest,
             source_path: wiring.source_path,
+            source_artifact_identity,
             ingestion_runner: OfflineIngestionRunner::new_with_runtime(
                 Arc::clone(&admission_runtime),
                 event_deadline,
@@ -110,7 +117,9 @@ impl LocalIngestionComposition {
         let runtime_before = self.admission_runtime.run_artifact();
         let execution_before = self.execution_service.execution_report();
         let source = fs::read(&self.source_path)?;
-        let ingestion = self.ingestion_runner.run(&source)?;
+        let ingestion = self
+            .ingestion_runner
+            .run(self.source_artifact_identity.clone(), &source)?;
         let publication = self
             .publication_orchestrator
             .run_once(self.publication_batch_size)?;
@@ -121,7 +130,7 @@ impl LocalIngestionComposition {
             .execution_report()
             .saturating_difference(execution_before);
         let artifact = IngestionRunArtifact::from_reports(
-            self.manifest.manifest_digest.clone(),
+            &self.manifest,
             started_at,
             completed_at,
             &ingestion,
@@ -230,7 +239,8 @@ pub struct TimeoutRunCounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestionRunArtifact {
     pub schema_version: u32,
-    pub manifest_digest: ManifestDigest,
+    pub manifest_id: String,
+    pub manifest_version: String,
     pub started_at: DateTimeUtc,
     pub completed_at: DateTimeUtc,
     pub source: SourceRunCounts,
@@ -245,7 +255,7 @@ pub struct IngestionRunArtifact {
 
 impl IngestionRunArtifact {
     fn from_reports(
-        manifest_digest: ManifestDigest,
+        manifest: &ResolvedRunnerManifest,
         started_at: DateTimeUtc,
         completed_at: DateTimeUtc,
         ingestion: &OfflineIngestionReport,
@@ -269,7 +279,8 @@ impl IngestionRunArtifact {
         ];
         Self {
             schema_version: 1,
-            manifest_digest,
+            manifest_id: manifest.id.clone(),
+            manifest_version: manifest.version.clone(),
             started_at,
             completed_at,
             source: SourceRunCounts {
@@ -312,6 +323,8 @@ pub enum LocalIngestionCompositionError {
     State(#[from] SourceStateError),
     #[error(transparent)]
     Build(#[from] IngestionBuildError),
+    #[error(transparent)]
+    SourceArtifactIdentity(#[from] SourceEventJsonlArtifactIdentityError),
     #[error("configured sink acknowledgement policy does not match the manifest")]
     SinkAcknowledgementPolicy,
     #[error(transparent)]

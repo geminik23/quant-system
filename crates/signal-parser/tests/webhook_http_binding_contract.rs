@@ -1,3 +1,5 @@
+#![cfg(feature = "provider-http")]
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -68,6 +70,14 @@ async fn hosted_binding_durably_deduplicates_admission_identity_before_accepting
     ));
     let request_body = serde_json::to_vec(&source_event()).unwrap();
     let timestamp = NOW.to_string();
+    let coordinate = format!(
+        "{}:{SOURCE}:{}:delivery-1:{}:{timestamp}",
+        SOURCE.len(),
+        "delivery-1".len(),
+        timestamp.len(),
+    );
+    let expected_submission_id = format!("webhook-submission:v2:{coordinate}");
+    let expected_admission_identity = format!("admission:v2:{coordinate}");
     let signature =
         sign_webhook_v1(SECRET, KEY_ID, &timestamp, "delivery-1", &request_body).unwrap();
     let mut app = signal_parser::runner::http::webhook_router(
@@ -105,11 +115,7 @@ async fn hosted_binding_durably_deduplicates_admission_identity_before_accepting
             .as_str()
             .is_some_and(|value| value.starts_with("admission:"))
     );
-    assert!(
-        body["submission_id"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-    );
+    assert_eq!(body["submission_id"], expected_submission_id);
 
     let retry = Request::builder()
         .method("POST")
@@ -130,6 +136,6 @@ async fn hosted_binding_durably_deduplicates_admission_identity_before_accepting
     assert!(matches!(
         state.recorded_receipts().unwrap()[0].delivery_identity,
         signal_parser::state::DurableDeliveryIdentity::Stable(ref identity)
-            if identity.starts_with("admission:v1:")
+            if identity == &expected_admission_identity
     ));
 }

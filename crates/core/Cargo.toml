@@ -16,10 +16,8 @@ name = "qs_core"
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 nanoid = { workspace = true }
 thiserror = { workspace = true }
 qs-instruments = { workspace = true }
 qs-symbols = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }

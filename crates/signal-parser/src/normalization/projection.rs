@@ -1,164 +1,36 @@
 use qs_core::{OrderType, PositionRef, RawSignal, RuleConfigDef, Side};
 
-use super::identity::{
-    CanonicalEncode, CanonicalWriter, IdentityError, PipelineIdentity, hash_domain,
-};
-use super::report::{EvaluationIdentity, NormalizationEvaluationReport, NormalizationOutcome};
-use super::signal::{CorrelationHint, InstrumentHint, NormalizationCandidate};
-use super::value::Sha256Digest;
+use super::identity::{CanonicalWriter, IdentityError};
+use super::signal::InstrumentHint;
+use super::value::ContractBytes;
 
-pub const NORMALIZED_SIGNAL_SEMANTIC_DOMAIN: &str = "quant-system/normalized-signal-semantic@1";
-pub const EVALUATION_SEMANTIC_DOMAIN: &str = "quant-system/evaluation-semantic-digest@1";
-pub const NORMALIZED_SIGNAL_ID_DOMAIN: &str = "quant-system/normalized-signal-id@1";
+pub const NORMALIZED_SIGNAL_SEMANTIC_MAX_BYTES: usize = 65_536;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NormalizedSignalSemanticDigest(Sha256Digest);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedSignalSemanticProjection(ContractBytes<NORMALIZED_SIGNAL_SEMANTIC_MAX_BYTES>);
 
-impl NormalizedSignalSemanticDigest {
-    pub fn digest(self) -> Sha256Digest {
-        self.0
+impl NormalizedSignalSemanticProjection {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0.into_inner()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EvaluationSemanticDigest(Sha256Digest);
-
-impl EvaluationSemanticDigest {
-    pub fn digest(self) -> Sha256Digest {
-        self.0
-    }
-}
-
-pub fn normalized_signal_semantic_digest(
+pub fn normalized_signal_semantic_projection(
     signal: &RawSignal,
     instrument_hint: Option<&InstrumentHint>,
-) -> Result<NormalizedSignalSemanticDigest, IdentityError> {
+) -> Result<NormalizedSignalSemanticProjection, IdentityError> {
     let mut writer = CanonicalWriter::new();
+    writer.u16(1);
     encode_raw_signal(signal, &mut writer)?;
     encode_instrument_hint(instrument_hint, &mut writer)?;
-    Ok(NormalizedSignalSemanticDigest(hash_domain(
-        NORMALIZED_SIGNAL_SEMANTIC_DOMAIN,
-        &writer.into_bytes(),
-    )))
-}
-
-pub fn normalized_signal_id_digest(
-    applied_event_id: &[u8; 32],
-    candidate: &NormalizationCandidate,
-) -> Result<Sha256Digest, IdentityError> {
-    let mut writer = CanonicalWriter::new();
-    writer.digest(&Sha256Digest::new(*applied_event_id));
-    encode_pipeline_identity(candidate.evidence().pipeline(), &mut writer)?;
-    writer.u32(candidate.candidate_ordinal());
-    let semantic =
-        normalized_signal_semantic_digest(candidate.signal(), candidate.instrument_hint())?;
-    writer.u16(1);
-    writer.digest(&semantic.digest());
-    Ok(hash_domain(
-        NORMALIZED_SIGNAL_ID_DOMAIN,
-        &writer.into_bytes(),
-    ))
-}
-
-pub fn evaluation_semantic_digest(
-    report: &NormalizationEvaluationReport,
-) -> Result<EvaluationSemanticDigest, IdentityError> {
-    let mut writer = CanonicalWriter::new();
-    encode_evaluation_identity(report.identity(), &mut writer)?;
-    match report.outcome() {
-        NormalizationOutcome::Accepted { candidates } => {
-            writer.u16(1);
-            writer.u32(candidates.as_slice().len() as u32);
-            for candidate in candidates.as_slice() {
-                encode_candidate(candidate, &mut writer)?;
-            }
-        }
-        NormalizationOutcome::Ignored { reason } => {
-            writer.u16(2);
-            writer.text(reason.as_str())?;
-        }
-        NormalizationOutcome::Ambiguous { evidence } => {
-            writer.u16(3);
-            writer.u32(evidence.alternatives().len() as u32);
-            for alternative in evidence.alternatives() {
-                match alternative.pipeline() {
-                    Some(pipeline) => {
-                        writer.bool(true);
-                        encode_pipeline_identity(pipeline, &mut writer)?;
-                    }
-                    None => writer.bool(false),
-                }
-                writer.u32(alternative.alternative_ordinal());
-                writer.u32(alternative.value_count());
-            }
-            writer.u32(evidence.total_alternative_values());
-        }
-        NormalizationOutcome::Rejected { reason } => {
-            writer.u16(4);
-            writer.text(reason.as_str())?;
-        }
-    }
-    Ok(EvaluationSemanticDigest(hash_domain(
-        EVALUATION_SEMANTIC_DOMAIN,
-        &writer.into_bytes(),
-    )))
-}
-
-pub(crate) fn encode_pipeline_identity(
-    pipeline: &PipelineIdentity,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    writer.text(pipeline.id().as_str())?;
-    pipeline.version().encode(writer)?;
-    writer.digest(&pipeline.graph().digest());
-    Ok(())
-}
-
-fn encode_evaluation_identity(
-    identity: &EvaluationIdentity,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    writer.u16(1);
-    writer.digest(&identity.routing_graph().digest());
-    match identity.selected_pipeline() {
-        Some(pipeline) => {
-            writer.bool(true);
-            encode_pipeline_identity(pipeline, writer)?;
-        }
-        None => writer.bool(false),
-    }
-    Ok(())
-}
-
-fn encode_candidate(
-    candidate: &NormalizationCandidate,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    writer.u32(candidate.candidate_ordinal());
-    let semantic =
-        normalized_signal_semantic_digest(candidate.signal(), candidate.instrument_hint())?;
-    writer.u16(1);
-    writer.digest(&semantic.digest());
-    writer.u32(candidate.correlation_hints().len() as u32);
-    for hint in candidate.correlation_hints() {
-        encode_correlation_hint(hint, writer)?;
-    }
-    Ok(())
-}
-
-fn encode_correlation_hint(
-    hint: &CorrelationHint,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    writer.text(hint.key().as_str())?;
-    match hint.confidence() {
-        Some(confidence) => {
-            writer.bool(true);
-            writer.finite_f64(confidence.get())?;
-        }
-        None => writer.bool(false),
-    }
-    Ok(())
+    Ok(NormalizedSignalSemanticProjection(ContractBytes::try_new(
+        writer.into_bytes(),
+        "normalized signal semantic projection",
+    )?))
 }
 
 fn encode_instrument_hint(

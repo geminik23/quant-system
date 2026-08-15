@@ -16,7 +16,7 @@ use signal_parser::ingestion::{
 use signal_parser::normalization::{
     CompiledPipeline, CompiledRoutingGraph, EvaluationInput, NormalizationOutcome,
     PipelineEvaluationResult, PipelineId, RouteEvaluation, RouteSelector, RouteSpec,
-    SemanticVersion, Sha256Digest,
+    SemanticVersion,
 };
 use signal_parser::state::{
     ApplicationCommitInput, CommittedBatchId, CommittedNormalizationOutcome,
@@ -110,6 +110,29 @@ fn canonical_identities_cover_integer_and_configuration_boundaries() {
     assert_eq!(
         relay.source_adapter_identity().id().as_str(),
         "telegram-relay-source-adapter"
+    );
+    let batch_policy = batch
+        .source_adapter_identity()
+        .config_identity()
+        .expect("Telegram adapter configuration is identified");
+    assert!(
+        batch_policy
+            .as_slice()
+            .windows(SOURCE_ID.len())
+            .any(|window| window == SOURCE_ID.as_bytes())
+    );
+    assert!(relay.source_adapter_identity().config_identity().is_some());
+    assert!(
+        permissive_batch
+            .source_adapter_identity()
+            .config_identity()
+            .is_some()
+    );
+    assert!(
+        other_source_batch
+            .source_adapter_identity()
+            .config_identity()
+            .is_some()
     );
     assert_ne!(
         batch.source_adapter_identity().config_identity(),
@@ -401,6 +424,35 @@ impl ChannelParser for SyntheticHistoryParser {
     }
 }
 
+#[test]
+fn legacy_producer_identity_uses_contract_and_history_policy() {
+    let empty = bind_legacy_telegram_producer(Arc::new(ParserRegistry::new())).unwrap();
+
+    let mut first_registry = ParserRegistry::new();
+    first_registry.register(Box::new(SyntheticHistoryParser {
+        channels: [CHAT_ID],
+    }));
+    let first = bind_legacy_telegram_producer(Arc::new(first_registry)).unwrap();
+
+    let mut second_registry = ParserRegistry::new();
+    second_registry.register(Box::new(SyntheticHistoryParser {
+        channels: [CHAT_ID + 1],
+    }));
+    let second = bind_legacy_telegram_producer(Arc::new(second_registry)).unwrap();
+
+    assert_eq!(first.resolved().id().as_str(), "telegram-legacy-producer");
+    assert_eq!(
+        first.resolved().implementation_version(),
+        &SemanticVersion::new(1, 0, 0)
+    );
+    assert_eq!(first.resolved().contract_version(), 1);
+    assert_eq!(first.resolved(), second.resolved());
+    assert_ne!(
+        first.resolved().config_identity(),
+        empty.resolved().config_identity()
+    );
+}
+
 struct LifecycleFixture {
     adapter: TelegramRelaySourceAdapter,
     graph: CompiledRoutingGraph,
@@ -413,9 +465,7 @@ impl LifecycleFixture {
         registry.register(Box::new(SyntheticHistoryParser {
             channels: [CHAT_ID],
         }));
-        let producer =
-            bind_legacy_telegram_producer(Arc::new(registry), Sha256Digest::new([0x42; 32]))
-                .unwrap();
+        let producer = bind_legacy_telegram_producer(Arc::new(registry)).unwrap();
         let pipeline = CompiledPipeline::compile_compatibility(
             PipelineId::try_new("telegram-legacy", "pipeline ID").unwrap(),
             SemanticVersion::new(1, 0, 0),

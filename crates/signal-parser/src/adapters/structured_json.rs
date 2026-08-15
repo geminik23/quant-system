@@ -1,32 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use qs_core::{RawSignal, validate_raw_signal};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use crate::ingestion::{DateTimeUtc, SourceEvent, SourceEventKey, SourceEventRef, SourceRevision};
 use crate::normalization::{
-    ContractText, InstrumentHint, SymbolText, normalized_signal_semantic_digest,
+    CanonicalIdentityBytes, ContractText, InstrumentHint, MAX_CANONICAL_IDENTITY_BYTES, SymbolText,
 };
 use crate::state::{
     AppliedEventId, CommittedBatchId, CommittedEvaluationIdentity, CommittedInstrumentHint,
     CommittedNormalizationBatch, CommittedNormalizationOutcome, CommittedNormalizedSignalEnvelope,
     DurableDeliveryIdentity, NormalizationCommitRef, NormalizedLifecycleEvent, NormalizedSignalId,
+    derive_committed_batch_id,
 };
 
 pub const SOURCE_EVENT_JSONL_CODEC: &str = "source-event-jsonl@1";
 pub const COMMITTED_NORMALIZATION_JSONL_CODEC: &str = "committed-normalization-jsonl@1";
 pub const COMMITTED_NORMALIZATION_BATCH_SCHEMA: &str =
-    "quant-system/committed-normalization-batch@1";
-pub const COMMITTED_NORMALIZATION_BATCH_SCHEMA_VERSION: u32 = 1;
+    "quant-system/committed-normalization-batch@2";
+pub const COMMITTED_NORMALIZATION_BATCH_SCHEMA_VERSION: u32 = 2;
 pub const COMMITTED_NORMALIZATION_BATCH_ARTIFACT_TYPE: &str = COMMITTED_NORMALIZATION_BATCH_SCHEMA;
 pub const MAX_STRUCTURED_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_STRUCTURED_JSON_ERROR_BYTES: usize = 512;
-pub const SOURCE_EVENT_JSONL_ARTIFACT_ID_PREFIX: &str = "source-event-jsonl@1:sha256:";
+pub const MAX_SOURCE_EVENT_JSONL_ARTIFACT_ID_BYTES: usize = 1_024;
 
-const SHA256_WIRE_PREFIX: &str = "sha256:";
+const CANONICAL_IDENTITY_WIRE_PREFIX: &str = "canonical-bytes-base64:";
 const MAX_COMMITTED_ENVELOPES: usize = 32;
 const MAX_COMMITTED_LIFECYCLE_EVENTS: usize = 288;
 const MAX_CORRELATION_HINTS: usize = 32;
@@ -98,6 +98,44 @@ impl JsonlRecordError {
     }
 }
 
+/// A caller-assigned identity for one immutable source-event JSONL artifact or source run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceEventJsonlArtifactIdentity(Box<str>);
+
+impl SourceEventJsonlArtifactIdentity {
+    pub fn try_new(
+        value: impl Into<String>,
+    ) -> Result<Self, SourceEventJsonlArtifactIdentityError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(SourceEventJsonlArtifactIdentityError::Empty);
+        }
+        if value.len() > MAX_SOURCE_EVENT_JSONL_ARTIFACT_ID_BYTES {
+            return Err(SourceEventJsonlArtifactIdentityError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(SourceEventJsonlArtifactIdentityError::ControlCharacter);
+        }
+        Ok(Self(value.into_boxed_str()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SourceEventJsonlArtifactIdentityError {
+    #[error("source-event JSONL artifact identity must not be empty")]
+    Empty,
+    #[error(
+        "source-event JSONL artifact identity exceeds {MAX_SOURCE_EVENT_JSONL_ARTIFACT_ID_BYTES} bytes"
+    )]
+    TooLong,
+    #[error("source-event JSONL artifact identity must not contain control characters")]
+    ControlCharacter,
+}
+
 #[derive(Debug)]
 pub struct SourceEventJsonlRecord {
     physical_line: u64,
@@ -125,12 +163,12 @@ impl SourceEventJsonlRecord {
 
 #[derive(Debug)]
 pub struct SourceEventJsonlArtifact {
-    artifact_identity: String,
+    artifact_identity: SourceEventJsonlArtifactIdentity,
     records: Vec<Result<SourceEventJsonlRecord, JsonlRecordError>>,
 }
 
 impl SourceEventJsonlArtifact {
-    pub fn artifact_identity(&self) -> &str {
+    pub fn artifact_identity(&self) -> &SourceEventJsonlArtifactIdentity {
         &self.artifact_identity
     }
 
@@ -147,12 +185,11 @@ impl SourceEventJsonlArtifact {
 pub struct SourceEventJsonlCodec;
 
 impl SourceEventJsonlCodec {
-    pub fn artifact_identity(artifact_bytes: &[u8]) -> String {
-        source_event_jsonl_artifact_identity(artifact_bytes)
-    }
-
-    pub fn decode(artifact_bytes: &[u8]) -> SourceEventJsonlArtifact {
-        decode_source_event_jsonl(artifact_bytes)
+    pub fn decode(
+        artifact_identity: SourceEventJsonlArtifactIdentity,
+        artifact_bytes: &[u8],
+    ) -> SourceEventJsonlArtifact {
+        decode_source_event_jsonl(artifact_identity, artifact_bytes)
     }
 
     pub fn encode_record(event: &SourceEvent) -> Result<Vec<u8>, StructuredJsonError> {
@@ -160,16 +197,10 @@ impl SourceEventJsonlCodec {
     }
 }
 
-pub fn source_event_jsonl_artifact_identity(artifact_bytes: &[u8]) -> String {
-    let digest = Sha256::digest(artifact_bytes);
-    format!(
-        "{SOURCE_EVENT_JSONL_ARTIFACT_ID_PREFIX}{}",
-        lowercase_hex(digest.as_slice())
-    )
-}
-
-pub fn decode_source_event_jsonl(artifact_bytes: &[u8]) -> SourceEventJsonlArtifact {
-    let artifact_identity = source_event_jsonl_artifact_identity(artifact_bytes);
+pub fn decode_source_event_jsonl(
+    artifact_identity: SourceEventJsonlArtifactIdentity,
+    artifact_bytes: &[u8],
+) -> SourceEventJsonlArtifact {
     let mut records = Vec::new();
 
     for (index, physical_bytes) in artifact_bytes
@@ -185,7 +216,7 @@ pub fn decode_source_event_jsonl(artifact_bytes: &[u8]) -> SourceEventJsonlArtif
             physical_line,
             event,
             delivery_identity: DurableDeliveryIdentity::OfflinePosition {
-                artifact: artifact_identity.clone(),
+                artifact: artifact_identity.as_str().to_string(),
                 ordinal: physical_line,
             },
         });
@@ -343,24 +374,26 @@ pub fn validate_committed_normalization_batch(
         )));
     }
 
+    if !batch.applied_event_id.matches_source_ref(&batch.source) {
+        return Err(invalid_record(
+            "applied_event_id does not match the batch source key and revision",
+        ));
+    }
+
     let lifecycle_only = matches!(
         batch.outcome,
         CommittedNormalizationOutcome::LifecycleOnlyDelete
     );
-    match (
-        lifecycle_only,
-        batch.evaluation_identity.as_ref(),
-        batch.evaluation_semantic_digest.as_ref(),
-    ) {
-        (true, None, None) | (false, Some(_), Some(_)) => {}
-        (true, _, _) => {
+    match (lifecycle_only, batch.evaluation_identity.as_ref()) {
+        (true, None) | (false, Some(_)) => {}
+        (true, Some(_)) => {
             return Err(invalid_record(
-                "lifecycle-only batches must not contain evaluation identity or semantic digest",
+                "lifecycle-only batches must not contain an evaluation identity",
             ));
         }
-        (false, _, _) => {
+        (false, None) => {
             return Err(invalid_record(
-                "completed batches require evaluation identity and semantic digest",
+                "completed batches require an evaluation identity",
             ));
         }
     }
@@ -396,11 +429,20 @@ pub fn validate_committed_normalization_batch(
                 "envelope {index} candidate ordinal must be {index}"
             )));
         }
-        if !unique_envelope_ids.insert(envelope.normalized_id) {
+        let expected_normalized_id = NormalizedSignalId::from_applied_event(
+            batch.applied_event_id.clone(),
+            envelope.candidate_ordinal,
+        );
+        if envelope.normalized_id != expected_normalized_id {
+            return Err(invalid_record(format_args!(
+                "envelope {index} normalized_id does not match its applied event and candidate ordinal"
+            )));
+        }
+        if !unique_envelope_ids.insert(envelope.normalized_id.clone()) {
             return Err(invalid_record("envelope normalized IDs must be unique"));
         }
         validate_envelope(index, envelope)?;
-        envelope_ids.push(envelope.normalized_id);
+        envelope_ids.push(envelope.normalized_id.clone());
     }
 
     match &batch.outcome {
@@ -455,7 +497,18 @@ pub fn validate_committed_normalization_batch(
         }
     }
 
-    validate_lifecycle(batch, &unique_envelope_ids)
+    validate_lifecycle(batch, &unique_envelope_ids)?;
+    let expected_batch_id = derive_committed_batch_id(batch).map_err(|error| {
+        invalid_record(format_args!(
+            "committed batch identity derivation failed: {error}"
+        ))
+    })?;
+    if batch.batch_id != expected_batch_id {
+        return Err(invalid_record(
+            "batch_id does not match its applied event and commit index",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_envelope(
@@ -495,17 +548,6 @@ fn validate_envelope(
     {
         return Err(invalid_record(format_args!(
             "envelope {index} instrument hint symbol does not match its Entry"
-        )));
-    }
-    let semantic =
-        normalized_signal_semantic_digest(&envelope.signal, hint.as_ref()).map_err(|error| {
-            invalid_record(format_args!(
-                "envelope {index} semantic digest calculation failed: {error}"
-            ))
-        })?;
-    if semantic.digest().as_bytes() != &envelope.semantic_digest {
-        return Err(invalid_record(format_args!(
-            "envelope {index} semantic digest does not match its signal and instrument hint"
         )));
     }
     Ok(())
@@ -548,22 +590,22 @@ fn validate_lifecycle(
     for lifecycle in &batch.lifecycle {
         match lifecycle {
             NormalizedLifecycleEvent::Added { output } => {
-                require_current_id(*output, envelope_ids, "added output")?;
-                *current_references.entry(*output).or_default() += 1;
+                require_current_id(output, envelope_ids, "added output")?;
+                *current_references.entry(output.clone()).or_default() += 1;
             }
             NormalizedLifecycleEvent::Superseded { prior, replacement } => {
-                require_prior_id(*prior, envelope_ids, "superseded prior")?;
-                require_current_id(*replacement, envelope_ids, "superseded replacement")?;
-                *current_references.entry(*replacement).or_default() += 1;
+                require_prior_id(prior, envelope_ids, "superseded prior")?;
+                require_current_id(replacement, envelope_ids, "superseded replacement")?;
+                *current_references.entry(replacement.clone()).or_default() += 1;
             }
             NormalizedLifecycleEvent::Equivalent { evaluated, active } => {
-                require_current_id(*evaluated, envelope_ids, "equivalent evaluated")?;
-                require_prior_id(*active, envelope_ids, "equivalent active")?;
-                *current_references.entry(*evaluated).or_default() += 1;
+                require_current_id(evaluated, envelope_ids, "equivalent evaluated")?;
+                require_prior_id(active, envelope_ids, "equivalent active")?;
+                *current_references.entry(evaluated.clone()).or_default() += 1;
             }
             NormalizedLifecycleEvent::Withdrawn { output, cause } => {
-                require_prior_id(*output, envelope_ids, "withdrawn output")?;
-                if *cause != batch.applied_event_id {
+                require_prior_id(output, envelope_ids, "withdrawn output")?;
+                if cause != &batch.applied_event_id {
                     return Err(invalid_record(
                         "withdrawn lifecycle cause does not match batch applied_event_id",
                     ));
@@ -605,11 +647,11 @@ fn validate_lifecycle(
 }
 
 fn require_current_id(
-    id: NormalizedSignalId,
+    id: &NormalizedSignalId,
     envelope_ids: &BTreeSet<NormalizedSignalId>,
     field: &'static str,
 ) -> Result<(), StructuredJsonError> {
-    if !envelope_ids.contains(&id) {
+    if !envelope_ids.contains(id) {
         return Err(invalid_record(format_args!(
             "{field} does not reference a current envelope"
         )));
@@ -618,11 +660,11 @@ fn require_current_id(
 }
 
 fn require_prior_id(
-    id: NormalizedSignalId,
+    id: &NormalizedSignalId,
     envelope_ids: &BTreeSet<NormalizedSignalId>,
     field: &'static str,
 ) -> Result<(), StructuredJsonError> {
-    if envelope_ids.contains(&id) {
+    if envelope_ids.contains(id) {
         return Err(invalid_record(format_args!(
             "{field} incorrectly references a current envelope"
         )));
@@ -640,8 +682,6 @@ struct CommittedBatchWire {
     source: SourceEventRefWire,
     #[serde(deserialize_with = "deserialize_nullable")]
     evaluation_identity: Option<EvaluationIdentityWire>,
-    #[serde(deserialize_with = "deserialize_nullable")]
-    evaluation_semantic_digest: Option<String>,
     semantic_basis: CommitSemanticBasisWire,
     outcome: OutcomeWire,
     envelopes: Vec<EnvelopeWire>,
@@ -662,7 +702,6 @@ impl CommittedBatchWire {
                 .evaluation_identity
                 .as_ref()
                 .map(EvaluationIdentityWire::from_domain),
-            evaluation_semantic_digest: batch.evaluation_semantic_digest.map(encode_sha256),
             semantic_basis: CommitSemanticBasisWire::from_domain(batch),
             outcome: OutcomeWire::from_domain(&batch.outcome),
             envelopes: batch
@@ -699,11 +738,8 @@ impl CommittedBatchWire {
                 ),
             ));
         }
-        self.semantic_basis.validate_wire(
-            self.evaluation_identity.as_ref(),
-            self.evaluation_semantic_digest.as_ref(),
-            &self.outcome,
-        )?;
+        self.semantic_basis
+            .validate_wire(self.evaluation_identity.as_ref(), &self.outcome)?;
         Ok(CommittedNormalizationBatch {
             batch_id: parse_committed_batch_id(&self.batch_id, "batch_id")?,
             applied_event_id: parse_applied_event_id(&self.applied_event_id, "applied_event_id")?,
@@ -711,10 +747,6 @@ impl CommittedBatchWire {
             evaluation_identity: self
                 .evaluation_identity
                 .map(EvaluationIdentityWire::into_domain)
-                .transpose()?,
-            evaluation_semantic_digest: self
-                .evaluation_semantic_digest
-                .map(|value| parse_sha256(&value, "evaluation_semantic_digest"))
                 .transpose()?,
             outcome: self.outcome.into_domain()?,
             envelopes: self
@@ -764,17 +796,20 @@ struct EvaluationIdentityWire {
 impl EvaluationIdentityWire {
     fn from_domain(identity: &CommittedEvaluationIdentity) -> Self {
         Self {
-            routing_graph: encode_sha256(identity.routing_graph),
-            selected_pipeline: identity.selected_pipeline.map(encode_sha256),
+            routing_graph: encode_canonical_identity(&identity.routing_graph),
+            selected_pipeline: identity
+                .selected_pipeline
+                .as_ref()
+                .map(encode_canonical_identity),
         }
     }
 
     fn into_domain(self) -> Result<CommittedEvaluationIdentity, StructuredJsonError> {
         Ok(CommittedEvaluationIdentity {
-            routing_graph: parse_sha256(&self.routing_graph, "routing_graph")?,
+            routing_graph: parse_canonical_identity(&self.routing_graph, "routing_graph")?,
             selected_pipeline: self
                 .selected_pipeline
-                .map(|value| parse_sha256(&value, "selected_pipeline"))
+                .map(|value| parse_canonical_identity(&value, "selected_pipeline"))
                 .transpose()?,
         })
     }
@@ -802,21 +837,16 @@ impl CommitSemanticBasisWire {
     fn validate_wire(
         self,
         identity: Option<&EvaluationIdentityWire>,
-        digest: Option<&String>,
         outcome: &OutcomeWire,
     ) -> Result<(), StructuredJsonError> {
         match self {
             Self::CompletedEvaluation
-                if identity.is_some()
-                    && digest.is_some()
-                    && !matches!(outcome, OutcomeWire::LifecycleOnlyDelete) =>
+                if identity.is_some() && !matches!(outcome, OutcomeWire::LifecycleOnlyDelete) =>
             {
                 Ok(())
             }
             Self::LifecycleOnlyDelete
-                if identity.is_none()
-                    && digest.is_none()
-                    && matches!(outcome, OutcomeWire::LifecycleOnlyDelete) =>
+                if identity.is_none() && matches!(outcome, OutcomeWire::LifecycleOnlyDelete) =>
             {
                 Ok(())
             }
@@ -895,7 +925,6 @@ struct EnvelopeWire {
     #[serde(deserialize_with = "deserialize_nullable")]
     instrument_hint: Option<InstrumentHintWire>,
     candidate_ordinal: u32,
-    semantic_digest: String,
     correlation_hints: Vec<String>,
 }
 
@@ -915,7 +944,6 @@ impl EnvelopeWire {
                 .as_ref()
                 .map(InstrumentHintWire::from_domain),
             candidate_ordinal: envelope.candidate_ordinal,
-            semantic_digest: encode_sha256(envelope.semantic_digest),
             correlation_hints: envelope.correlation_hints.clone(),
         })
     }
@@ -939,7 +967,6 @@ impl EnvelopeWire {
             evaluation_identity: self.evaluation_identity.into_domain()?,
             instrument_hint: self.instrument_hint.map(InstrumentHintWire::into_domain),
             candidate_ordinal: self.candidate_ordinal,
-            semantic_digest: parse_sha256(&self.semantic_digest, "semantic_digest")?,
             correlation_hints: self.correlation_hints,
         })
     }
@@ -1053,7 +1080,7 @@ fn parse_committed_batch_id(
 ) -> Result<CommittedBatchId, StructuredJsonError> {
     CommittedBatchId::from_string_id(value).map_err(|_| {
         invalid_identifier(format_args!(
-            "{field} must use the nb2_ prefix followed by 64 lowercase hexadecimal digits"
+            "{field} must be a canonical length-framed nb3_ identity"
         ))
     })
 }
@@ -1064,7 +1091,7 @@ fn parse_applied_event_id(
 ) -> Result<AppliedEventId, StructuredJsonError> {
     AppliedEventId::from_string_id(value).map_err(|_| {
         invalid_identifier(format_args!(
-            "{field} must use the ae1_ prefix followed by 64 lowercase hexadecimal digits"
+            "{field} must be a canonical length-framed ae2_ identity"
         ))
     })
 }
@@ -1075,7 +1102,7 @@ fn parse_normalized_id(
 ) -> Result<NormalizedSignalId, StructuredJsonError> {
     NormalizedSignalId::from_string_id(value).map_err(|_| {
         invalid_identifier(format_args!(
-            "{field} must use the ns1_ prefix followed by 64 lowercase hexadecimal digits"
+            "{field} must be a canonical length-framed ns1_ identity"
         ))
     })
 }
@@ -1100,54 +1127,41 @@ fn encode_raw_signal_value_v1(signal: &RawSignal) -> Result<Value, StructuredJso
     Ok(value)
 }
 
-fn encode_sha256(bytes: [u8; 32]) -> String {
-    format!("{SHA256_WIRE_PREFIX}{}", lowercase_hex(&bytes))
+fn encode_canonical_identity(bytes: &CanonicalIdentityBytes) -> String {
+    format!(
+        "{CANONICAL_IDENTITY_WIRE_PREFIX}{}",
+        STANDARD.encode(bytes.as_slice())
+    )
 }
 
-fn parse_sha256(value: &str, field: &'static str) -> Result<[u8; 32], StructuredJsonError> {
-    let Some(hex) = value.strip_prefix(SHA256_WIRE_PREFIX) else {
+fn parse_canonical_identity(
+    value: &str,
+    field: &'static str,
+) -> Result<CanonicalIdentityBytes, StructuredJsonError> {
+    let Some(encoded) = value.strip_prefix(CANONICAL_IDENTITY_WIRE_PREFIX) else {
         return Err(invalid_identifier(format_args!(
-            "{field} must use the {SHA256_WIRE_PREFIX} prefix"
+            "{field} must use the {CANONICAL_IDENTITY_WIRE_PREFIX} prefix"
         )));
     };
-    parse_lowercase_hex_digest(hex, field)
-}
-
-fn parse_lowercase_hex_digest(
-    hex: &str,
-    field: &'static str,
-) -> Result<[u8; 32], StructuredJsonError> {
-    if hex.len() != 64
-        || !hex
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    let maximum_encoded_bytes = MAX_CANONICAL_IDENTITY_BYTES.div_ceil(3) * 4;
+    if encoded.len() > maximum_encoded_bytes {
         return Err(invalid_identifier(format_args!(
-            "{field} must contain exactly 64 lowercase hexadecimal digits"
+            "{field} exceeds the canonical identity byte limit"
         )));
     }
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    let bytes = STANDARD.decode(encoded).map_err(|_| {
+        invalid_identifier(format_args!("{field} must contain strict standard base64"))
+    })?;
+    if STANDARD.encode(&bytes) != encoded {
+        return Err(invalid_identifier(format_args!(
+            "{field} must contain canonical padded base64"
+        )));
     }
-    Ok(bytes)
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => unreachable!("hex input was validated"),
-    }
-}
-
-fn lowercase_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    CanonicalIdentityBytes::try_new(bytes).map_err(|_| {
+        invalid_identifier(format_args!(
+            "{field} exceeds the canonical identity byte limit"
+        ))
+    })
 }
 
 fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

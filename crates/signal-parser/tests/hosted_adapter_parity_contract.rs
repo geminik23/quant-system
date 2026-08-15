@@ -17,7 +17,7 @@ use signal_parser::adapters::webhook::{
 use signal_parser::ingestion::{DateTimeUtc, SourceEvent, SourceId, TextFormat};
 use signal_parser::normalization::{
     CompiledPipeline, CompiledRoutingGraph, PayloadKind, PipelineId, RouteSelector, RouteSpec,
-    SemanticVersion, Sha256Digest,
+    SemanticVersion,
 };
 use signal_parser::runner::{
     IngestionService as RunnerIngestionService, IngestionServiceConfig,
@@ -122,8 +122,7 @@ fn runner_service(
     registry.register(Box::new(CloseAllParser {
         channels: [CHAT_ID],
     }));
-    let producer =
-        bind_legacy_telegram_producer(Arc::new(registry), Sha256Digest::new([0x73; 32])).unwrap();
+    let producer = bind_legacy_telegram_producer(Arc::new(registry)).unwrap();
     let pipeline = CompiledPipeline::compile_compatibility(
         PipelineId::try_new("hosted-adapter-parity", "pipeline ID").unwrap(),
         SemanticVersion::new(1, 0, 0),
@@ -262,7 +261,7 @@ async fn hosted_webhook_and_telegram_bindings_commit_identical_semantics_with_di
     assert_eq!(telegram_receipt.event, event);
     assert!(matches!(
         webhook_receipt.delivery_identity,
-        DurableDeliveryIdentity::Stable(ref value) if value.starts_with("admission:v1:")
+        DurableDeliveryIdentity::Stable(ref value) if value.starts_with("admission:v2:")
     ));
     assert!(matches!(
         telegram_receipt.delivery_identity,

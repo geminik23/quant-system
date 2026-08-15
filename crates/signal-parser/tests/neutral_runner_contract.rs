@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use signal_parser::adapters::structured_json::encode_source_event_jsonl_record;
+use signal_parser::adapters::structured_json::{
+    SourceEventJsonlArtifactIdentity, encode_source_event_jsonl_record,
+};
 use signal_parser::ingestion::{
     BoundedBytes, DateTimeUtc, ExternalEventId, PayloadEncoding, SourceEvent, SourceEventKey,
     SourceId, SourceOperation, SourcePayload, SourceRevision, SourceTimestamp,
@@ -11,8 +13,8 @@ use signal_parser::normalization::{
     CanonicalRawSignalsDecoder, CompiledPipeline, CompiledRoutingGraph, ComponentConfigSchemaRef,
     ComponentDescriptor, ComponentId, ComponentKind, DraftValidationStep, EmptyOutputPolicy,
     NoConfig, PayloadKind, PipelineContextRequirements, PipelineId, RouteSelector, RouteSpec,
-    SemanticVersion, Sha256Digest, SourceAdapterIdentity, StandardSignalFinalizer,
-    StructuredInputCapability, bind_decoder, bind_finalizer, raw_signals_v1_schema,
+    SemanticVersion, SourceAdapterIdentity, StandardSignalFinalizer, StructuredInputCapability,
+    bind_decoder, bind_finalizer, raw_signals_v1_schema,
 };
 use signal_parser::runner::{
     CommittedBatchSink, IngestionService, IngestionServiceConfig, OfflineErrorPolicy,
@@ -29,13 +31,17 @@ fn timestamp(value: &str) -> DateTimeUtc {
 }
 
 fn source_event(external_id: &str) -> SourceEvent {
+    source_event_with_revision(external_id, SourceRevision::Monotonic(1))
+}
+
+fn source_event_with_revision(external_id: &str, revision: SourceRevision) -> SourceEvent {
     SourceEvent::new(
         SourceEventKey::new(
             SourceId::new("jsonl:runner-test").unwrap(),
             ExternalEventId::new(external_id).unwrap(),
         ),
         SourceOperation::Create,
-        SourceRevision::Monotonic(1),
+        revision,
         SourceTimestamp::new(
             timestamp("2026-08-09T00:00:00Z"),
             SourceTimestampQuality::SourceProvided,
@@ -126,10 +132,9 @@ fn service(state: Arc<dyn SourceStateStore>) -> Arc<IngestionService> {
     Arc::new(IngestionService::new(
         CompiledRoutingGraph::compile(vec![route], vec![pipeline]).unwrap(),
         state,
-        SourceAdapterIdentity::new(
+        SourceAdapterIdentity::without_config(
             ComponentId::try_new("source-event-jsonl", "adapter ID").unwrap(),
             SemanticVersion::new(1, 0, 0),
-            Sha256Digest::new([9; 32]),
         ),
         IngestionServiceConfig {
             replacement_policy: ReplacementPolicy::Patch,
@@ -159,7 +164,7 @@ impl CommittedBatchSink for RecordingSink {
             .push(delivery.batch.batch_id.to_string_id());
         Ok(PublicationDeliveryReceipt {
             delivery_id: delivery.delivery_id,
-            batch_id: delivery.batch.batch_id,
+            batch_id: delivery.batch.batch_id.clone(),
         })
     }
 }
@@ -171,15 +176,13 @@ fn offline_runner_commits_valid_records_continues_after_malformed_input_and_publ
     let mut artifact = encode_source_event_jsonl_record(&source_event("event-1")).unwrap();
     artifact.extend_from_slice(b"{not-json}\n");
 
-    let report = runner.run(&artifact).unwrap();
+    let artifact_identity =
+        SourceEventJsonlArtifactIdentity::try_new("runner:continue-source-run").unwrap();
+    let report = runner.run(artifact_identity.clone(), &artifact).unwrap();
     assert_eq!(report.admitted_records, 1);
     assert_eq!(report.malformed_records, 1);
     assert_eq!(report.retry_required_records, 0);
-    assert!(
-        report
-            .artifact_identity
-            .starts_with("source-event-jsonl@1:sha256:")
-    );
+    assert_eq!(report.artifact_identity, artifact_identity);
 
     let checkpoint = state.checkpoint("jsonl:runner-test").unwrap().unwrap();
     let sink = Arc::new(RecordingSink::default());
@@ -199,6 +202,33 @@ fn offline_runner_commits_valid_records_continues_after_malformed_input_and_publ
 fn offline_runner_stop_policy_returns_the_physical_line_for_invalid_input() {
     let state: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
     let runner = OfflineIngestionRunner::new(service(state), OfflineErrorPolicy::Stop);
-    let error = runner.run(b"\n{not-json}\n").unwrap_err();
+    let error = runner
+        .run(
+            SourceEventJsonlArtifactIdentity::try_new("runner:stop-source-run").unwrap(),
+            b"\n{not-json}\n",
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("physical line 2"));
+}
+
+#[test]
+fn offline_runner_keeps_unversioned_delivery_stable_under_the_same_caller_identity() {
+    let state: Arc<dyn SourceStateStore> = Arc::new(MemorySourceStateStore::new());
+    let runner = OfflineIngestionRunner::new(service(state), OfflineErrorPolicy::Stop);
+    let event = source_event_with_revision("event-unversioned", SourceRevision::Unversioned);
+    let artifact = encode_source_event_jsonl_record(&event).unwrap();
+    let mut changed_bytes = artifact[..artifact.len() - 1].to_vec();
+    changed_bytes.extend_from_slice(b"\r\n");
+    let artifact_identity =
+        SourceEventJsonlArtifactIdentity::try_new("runner:stable-source-run").unwrap();
+
+    let first = runner.run(artifact_identity.clone(), &artifact).unwrap();
+    let second = runner
+        .run(artifact_identity.clone(), &changed_bytes)
+        .unwrap();
+
+    assert_eq!(first.committed_records, 1);
+    assert_eq!(second.existing_records, 1);
+    assert_eq!(first.artifact_identity, artifact_identity);
+    assert_eq!(second.artifact_identity, artifact_identity);
 }

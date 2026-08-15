@@ -45,7 +45,7 @@ qs-signal-parser -> strict RawSignal compatibility boundary
 
 An instrument listing venue, trading platform, execution venue, and market-data source are distinct identities. For example, an IC Markets listing may be exposed through CTrader and executed on a particular broker account or server while historical quotes come from a separate Parquet source. CTrader is therefore a `TradingPlatformId`, not the `ListingVenueId` in the instrument identity.
 
-`quant-system-core` owns the synchronous engine, normalized signals, position management, pure profile resolution, sizing, and currency conversion. Its catalog-aware sizing path uses explicit quantity rules and contract multipliers. It performs no networking, storage, configuration IO, parsing, or broker calls.
+`quant-system-core` owns the synchronous engine, strict `RawSignal`, position management, pure profile resolution, sizing, currency conversion, and canonical trading-domain contracts. The additive canonical layer includes validated `TradeIntent`, immutable execution commands and dispatch observations, venue `ExecutionReport` facts, deterministic identities, provenance references, and pure compatibility adapters. Its catalog-aware sizing path uses explicit quantity rules and contract multipliers. It performs no networking, storage, configuration IO, parsing, state lookup, or broker calls.
 
 `qs-symbols` remains the compatibility facade for current canonical symbols, aliases, precision, lot, and currency metadata. Supported FX, metal, commodity, and index rows can be translated through the guarded compatibility economics result into an immutable instrument snapshot. Registry-backed cryptocurrency and unknown rows are not promoted into executable instruments.
 
@@ -114,13 +114,19 @@ signed webhook request ----> authenticated provider edge
 manual/API RawSignal
   -> profile and sizing
   -> deterministic replay
+
+caller-resolved RawSignal / future strategy decision / manual API
+  -> TradeIntent
+  -> future portfolio supervision and execution gateway
+  -> immutable command and dispatch observations
+  -> venue ExecutionReport facts
 ```
 
 All source adapters terminate before runner ownership. The webhook edge authenticates and binds requests to one source before admission. A hosted `202 Accepted` response returns before source application completes. The runner owns source application and committed-batch publication; adapters do not own normalization state or sink publication. Source deletes commit lifecycle withdrawal only and do not create trading actions.
 
 The existing `OfflineRunner`, optional `OnlineServer`, handler callbacks, and standalone JSONL contracts remain unchanged compatibility facades and are not hosted through durable state.
 
-A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts unless an explicit downstream bridge produces an eligible trading action. A source event is not a trade, and a parsed signal is not a broker command. Strategy decisions, portfolio supervision, execution planning, venue translation, and execution reports remain explicit downstream responsibilities.
+A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts unless an explicit downstream bridge produces an eligible trading action. The canonical `RawSignal` adapter is pure and requires caller-pinned instrument, position, pending-entry, desired-target-state, timestamp, and provenance context; it does not perform those lookups. A source event is not a trade, a parsed signal is not an approved intent, and an intent is not a broker command. Strategy decisions, portfolio supervision, execution planning, venue translation, dispatch durability, and reconciliation remain explicit downstream responsibilities.
 
 ## Market-data flow
 

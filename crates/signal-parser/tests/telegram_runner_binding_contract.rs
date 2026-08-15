@@ -11,7 +11,7 @@ use signal_parser::runner::service::{
     SourceSubmissionDisposition, SourceSubmissionOutcome, SourceSubmissionResponse,
 };
 use signal_parser::runner::telegram::{TelegramIngestionOutcome, TelegramRelayIngestionBinding};
-use signal_parser::state::CommittedBatchId;
+use signal_parser::state::{AppliedEventId, CommittedBatchId};
 
 #[derive(Default)]
 struct RecordingService {
@@ -30,13 +30,16 @@ impl IngestionService for RecordingService {
         >,
     > {
         let source = SourceEventRef::from(&submission.event);
+        let batch_id = CommittedBatchId::from_applied_event(
+            AppliedEventId::for_unversioned(submission.event.key(), &submission.delivery_identity)
+                .unwrap(),
+            1,
+        );
         let response = SourceSubmissionResponse {
             admission_identity: submission.admission_identity.clone(),
             source,
             disposition: SourceSubmissionDisposition::Committed,
-            outcome_reference: OutcomeReference::from_batch_id(CommittedBatchId::from_bytes(
-                [7; 32],
-            )),
+            outcome_reference: OutcomeReference::from_batch_id(batch_id),
         };
         self.submissions.lock().unwrap().push(submission);
         Box::pin(async move { Ok(response) })

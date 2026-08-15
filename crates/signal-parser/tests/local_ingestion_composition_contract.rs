@@ -145,6 +145,10 @@ dead_letter_after_ms = 86400000
     let composition = LocalIngestionComposition::load(&manifest_path).unwrap();
     let report = composition.run_offline().unwrap();
 
+    assert_eq!(
+        report.ingestion.artifact_identity.as_str(),
+        format!("source-event-jsonl@1:path:{}", source_path.display())
+    );
     assert_eq!(report.ingestion.admitted_records, 1);
     assert_eq!(report.ingestion.malformed_records, 0);
     assert_eq!(report.ingestion.retry_required_records, 0);
@@ -162,7 +166,8 @@ dead_letter_after_ms = 86400000
     assert_eq!(report.artifact.dead_lettered, 0);
     assert_eq!(report.artifact.timeout.expired, 0);
     assert!(report.artifact.completed_at.into_inner() >= report.artifact.started_at.into_inner());
-    assert!(report.artifact.manifest_digest.to_string().len() == 64);
+    assert_eq!(report.artifact.manifest_id, "local-composition");
+    assert_eq!(report.artifact.manifest_version, "1.0.0");
     assert!(report.artifact.outcome_summaries.len() <= 4);
     let published = fs::read(&sink_path).unwrap();
     let batches = decode_committed_normalization_batch_jsonl(&published);

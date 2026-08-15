@@ -9,101 +9,451 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::ingestion::{
-    DateTimeUtc, PayloadEncoding, SourceEvent, SourceEventKey, SourceEventRef, SourceOperation,
-    SourcePayload, SourceRevision, SourceSequence, SourceTimestampQuality, TextFormat,
+    DateTimeUtc, ExternalEventId, SourceEvent, SourceEventKey, SourceEventRef, SourceId,
+    SourceOperation, SourcePayload, SourceRevision,
 };
 use crate::normalization::{
-    BaseContextSnapshot, CanonicalWriter, CompletionKnowledge, ContractBytes, EvaluationClock,
-    EvaluationFailure, EvaluationFailureClass, EvaluationIdentity, EvaluationRetrySafety,
-    HistoricalSourceFact, HistoryView, IdentityError, InstrumentHint,
+    BaseContextSnapshot, CanonicalIdentityBytes, CompletionKnowledge, ContractBytes,
+    EvaluationClock, EvaluationFailure, EvaluationFailureClass, EvaluationIdentity,
+    EvaluationRetrySafety, HistoricalSourceFact, HistoryView, IdentityError, InstrumentHint,
     NormalizationEvaluationReport, NormalizationOutcome, ParentRequirement, ParentView,
-    PipelineContextRequirements, PipelineIdentity, Sha256Digest, SourceAdapterIdentity,
-    evaluation_semantic_digest, hash_domain, normalized_signal_id_digest,
-    normalized_signal_semantic_digest,
+    PipelineContextRequirements, PipelineIdentity, SourceAdapterIdentity,
+    normalized_signal_semantic_projection,
 };
 
-const SOURCE_EVENT_DIGEST_DOMAIN: &str = "quant-system/source-event-digest@1";
-const APPLIED_EVENT_ID_DOMAIN: &str = "quant-system/applied-event-id@1";
-const LIFECYCLE_ONLY_DOMAIN: &str = "quant-system/lifecycle-only-semantic@1";
-const COMMITTED_BATCH_DOMAIN: &str = "quant-system/committed-batch-id@2";
-const PUBLICATION_DELIVERY_DOMAIN: &str = "quant-system/publication-delivery-id@1";
-const APPLICATION_POLICY_DOMAIN: &str = "quant-system/application-policy-identity@1";
-const SINK_BINDING_DOMAIN: &str = "quant-system/sink-binding-identity@1";
-const SQLITE_SCHEMA_VERSION: u32 = 1;
+const APPLIED_EVENT_ID_PREFIX: &str = "ae2_";
+const NORMALIZED_SIGNAL_ID_PREFIX: &str = "ns1_";
+const COMMITTED_BATCH_ID_PREFIX: &str = "nb3_";
+const PUBLICATION_DELIVERY_ID_PREFIX: &str = "pd2_";
+const MAX_DURABLE_DELIVERY_ID_BYTES: usize = 1_024;
+const MAX_APPLIED_EVENT_ID_BYTES: usize = 2_048;
+const PUBLICATION_SINK_MAX_BYTES: usize = 128;
+const SQLITE_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_ACTIVE_OUTPUT_LIMIT: usize = 32;
 pub const MAX_ACTIVE_OUTPUT_LIMIT: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("invalid {kind} identity")]
-pub struct DigestIdParseError {
+pub struct DirectIdParseError {
     kind: &'static str,
 }
 
-fn decode_digest_id(value: &str, prefix: &'static str) -> Result<[u8; 32], DigestIdParseError> {
-    let encoded = value
-        .strip_prefix(prefix)
-        .ok_or(DigestIdParseError { kind: prefix })?;
-    if encoded.len() != 64
-        || !encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(DigestIdParseError { kind: prefix });
-    }
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        let high = hex_nibble(pair[0]).ok_or(DigestIdParseError { kind: prefix })?;
-        let low = hex_nibble(pair[1]).ok_or(DigestIdParseError { kind: prefix })?;
-        bytes[index] = (high << 4) | low;
-    }
-    Ok(bytes)
-}
-
-fn hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
+impl DirectIdParseError {
+    fn new(kind: &'static str) -> Self {
+        Self { kind }
     }
 }
 
-macro_rules! digest_id {
-    ($name:ident, $prefix:literal) => {
-        #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-        )]
-        pub struct $name([u8; 32]);
+fn boxed_direct_id(
+    value: String,
+    maximum: usize,
+    kind: &'static str,
+) -> Result<Box<str>, DirectIdParseError> {
+    validate_direct_component(&value, maximum, false).map_err(|_| DirectIdParseError::new(kind))?;
+    Ok(value.into_boxed_str())
+}
 
-        impl $name {
-            pub fn from_bytes(bytes: [u8; 32]) -> Self {
-                Self(bytes)
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AppliedEventId(Box<str>);
+
+impl AppliedEventId {
+    pub fn for_monotonic(key: &SourceEventKey, revision: u64) -> Result<Self, DirectIdParseError> {
+        let source = key.source().as_str();
+        let external = key.external_id().as_str();
+        Self::from_canonical(format!(
+            "{APPLIED_EVENT_ID_PREFIX}m:{}:{source}:{}:{external}:{revision}",
+            source.len(),
+            external.len()
+        ))
+    }
+
+    pub fn for_unversioned(
+        key: &SourceEventKey,
+        delivery: &DurableDeliveryIdentity,
+    ) -> Result<Self, DirectIdParseError> {
+        let source = key.source().as_str();
+        let external = key.external_id().as_str();
+        let delivery = encode_delivery_identity(delivery)?;
+        Self::from_canonical(format!(
+            "{APPLIED_EVENT_ID_PREFIX}u:{}:{source}:{}:{external}:{delivery}",
+            source.len(),
+            external.len()
+        ))
+    }
+
+    pub fn from_string_id(value: &str) -> Result<Self, DirectIdParseError> {
+        parse_applied_identity(value)?;
+        Self::from_canonical(value.to_string())
+    }
+
+    pub fn to_string_id(&self) -> String {
+        self.0.to_string()
+    }
+
+    pub fn matches_source_ref(&self, source: &SourceEventRef) -> bool {
+        let Ok(parsed) = parse_applied_identity(&self.0) else {
+            return false;
+        };
+        parsed.source == source.key().source().as_str()
+            && parsed.external == source.key().external_id().as_str()
+            && match (parsed.revision, source.revision()) {
+                (ParsedAppliedRevision::Monotonic(left), SourceRevision::Monotonic(right)) => {
+                    left == *right
+                }
+                (ParsedAppliedRevision::Unversioned, SourceRevision::Unversioned) => true,
+                _ => false,
             }
+    }
 
-            pub fn as_bytes(&self) -> &[u8; 32] {
-                &self.0
+    fn from_canonical(value: String) -> Result<Self, DirectIdParseError> {
+        Ok(Self(boxed_direct_id(
+            value,
+            MAX_APPLIED_EVENT_ID_BYTES,
+            "applied event",
+        )?))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NormalizedSignalId {
+    applied_event_id: AppliedEventId,
+    candidate_ordinal: u32,
+}
+
+impl NormalizedSignalId {
+    pub fn from_applied_event(applied_event_id: AppliedEventId, candidate_ordinal: u32) -> Self {
+        Self {
+            applied_event_id,
+            candidate_ordinal,
+        }
+    }
+
+    pub fn from_string_id(value: &str) -> Result<Self, DirectIdParseError> {
+        let encoded = value
+            .strip_prefix(NORMALIZED_SIGNAL_ID_PREFIX)
+            .ok_or_else(|| DirectIdParseError::new("normalized signal"))?;
+        let (applied, ordinal) = take_length_framed(encoded, "normalized signal")?;
+        let ordinal = parse_canonical_u32(ordinal, "normalized signal")?;
+        Ok(Self::from_applied_event(
+            AppliedEventId::from_string_id(applied)?,
+            ordinal,
+        ))
+    }
+
+    pub fn applied_event_id(&self) -> &AppliedEventId {
+        &self.applied_event_id
+    }
+
+    pub fn candidate_ordinal(&self) -> u32 {
+        self.candidate_ordinal
+    }
+
+    pub fn to_string_id(&self) -> String {
+        let applied = self.applied_event_id.to_string_id();
+        format!(
+            "{NORMALIZED_SIGNAL_ID_PREFIX}{}:{applied}:{}",
+            applied.len(),
+            self.candidate_ordinal
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommittedBatchId {
+    applied_event_id: AppliedEventId,
+    commit_index: u64,
+}
+
+impl CommittedBatchId {
+    pub fn from_applied_event(applied_event_id: AppliedEventId, commit_index: u64) -> Self {
+        Self {
+            applied_event_id,
+            commit_index,
+        }
+    }
+
+    pub fn from_string_id(value: &str) -> Result<Self, DirectIdParseError> {
+        let encoded = value
+            .strip_prefix(COMMITTED_BATCH_ID_PREFIX)
+            .ok_or_else(|| DirectIdParseError::new("committed batch"))?;
+        let (applied, commit_index) = take_length_framed(encoded, "committed batch")?;
+        let commit_index = parse_canonical_u64(commit_index, "committed batch")?;
+        Ok(Self::from_applied_event(
+            AppliedEventId::from_string_id(applied)?,
+            commit_index,
+        ))
+    }
+
+    pub fn applied_event_id(&self) -> &AppliedEventId {
+        &self.applied_event_id
+    }
+
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
+    }
+
+    pub fn to_string_id(&self) -> String {
+        let applied = self.applied_event_id.to_string_id();
+        format!(
+            "{COMMITTED_BATCH_ID_PREFIX}{}:{applied}:{}",
+            applied.len(),
+            self.commit_index
+        )
+    }
+}
+
+macro_rules! serialize_string_id {
+    ($type:ty) => {
+        impl Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.to_string_id())
             }
+        }
 
-            pub fn from_string_id(value: &str) -> Result<Self, DigestIdParseError> {
-                decode_digest_id(value, $prefix).map(Self)
-            }
-
-            pub fn to_string_id(self) -> String {
-                let hex = self
-                    .0
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                format!(concat!($prefix, "{}"), hex)
+        impl<'de> Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::from_string_id(&value).map_err(serde::de::Error::custom)
             }
         }
     };
 }
 
-digest_id!(SourceEventDigest, "se1_");
-digest_id!(AppliedEventId, "ae1_");
-digest_id!(NormalizedSignalId, "ns1_");
-digest_id!(CommittedBatchId, "nb2_");
-digest_id!(PublicationDeliveryId, "pd1_");
+serialize_string_id!(AppliedEventId);
+serialize_string_id!(NormalizedSignalId);
+serialize_string_id!(CommittedBatchId);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PublicationDeliveryId {
+    batch_id: CommittedBatchId,
+    sink: Box<str>,
+}
+
+impl PublicationDeliveryId {
+    pub fn try_new(
+        batch_id: CommittedBatchId,
+        sink: &str,
+    ) -> Result<Self, PublicationDeliveryIdParseError> {
+        validate_direct_component(sink, PUBLICATION_SINK_MAX_BYTES, false)
+            .map_err(|_| PublicationDeliveryIdParseError)?;
+        Ok(Self {
+            batch_id,
+            sink: sink.into(),
+        })
+    }
+
+    pub fn from_string_id(value: &str) -> Result<Self, PublicationDeliveryIdParseError> {
+        let encoded = value
+            .strip_prefix(PUBLICATION_DELIVERY_ID_PREFIX)
+            .ok_or(PublicationDeliveryIdParseError)?;
+        let (batch_id, framed_sink) = take_length_framed(encoded, "publication delivery")
+            .map_err(|_| PublicationDeliveryIdParseError)?;
+        let sink = take_final_length_framed(framed_sink, "publication delivery")
+            .map_err(|_| PublicationDeliveryIdParseError)?;
+        Self::try_new(
+            CommittedBatchId::from_string_id(batch_id)
+                .map_err(|_| PublicationDeliveryIdParseError)?,
+            sink,
+        )
+    }
+
+    pub fn batch_id(&self) -> &CommittedBatchId {
+        &self.batch_id
+    }
+
+    pub fn sink(&self) -> &str {
+        &self.sink
+    }
+
+    pub fn to_string_id(&self) -> String {
+        let batch = self.batch_id.to_string_id();
+        format!(
+            "{PUBLICATION_DELIVERY_ID_PREFIX}{}:{batch}:{}:{}",
+            batch.len(),
+            self.sink.len(),
+            self.sink()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid publication delivery identity")]
+pub struct PublicationDeliveryIdParseError;
+
+impl Serialize for PublicationDeliveryId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string_id())
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicationDeliveryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_string_id(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+struct ParsedAppliedIdentity<'a> {
+    source: &'a str,
+    external: &'a str,
+    revision: ParsedAppliedRevision,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParsedAppliedRevision {
+    Monotonic(u64),
+    Unversioned,
+}
+
+fn parse_applied_identity(value: &str) -> Result<ParsedAppliedIdentity<'_>, DirectIdParseError> {
+    let kind = "applied event";
+    let encoded = value
+        .strip_prefix(APPLIED_EVENT_ID_PREFIX)
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    let (revision_kind, framed) = encoded
+        .split_once(':')
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    let (source, framed) = take_length_framed(framed, kind)?;
+    let (external, revision) = take_length_framed(framed, kind)?;
+    SourceId::new(source).map_err(|_| DirectIdParseError::new(kind))?;
+    ExternalEventId::new(external).map_err(|_| DirectIdParseError::new(kind))?;
+    let revision = match revision_kind {
+        "m" => ParsedAppliedRevision::Monotonic(parse_canonical_u64(revision, kind)?),
+        "u" => {
+            validate_delivery_identity(revision, kind)?;
+            ParsedAppliedRevision::Unversioned
+        }
+        _ => return Err(DirectIdParseError::new(kind)),
+    };
+    Ok(ParsedAppliedIdentity {
+        source,
+        external,
+        revision,
+    })
+}
+
+fn encode_delivery_identity(
+    delivery: &DurableDeliveryIdentity,
+) -> Result<String, DirectIdParseError> {
+    Ok(match delivery {
+        DurableDeliveryIdentity::Stable(value) => {
+            validate_direct_component(value, MAX_DURABLE_DELIVERY_ID_BYTES, true)?;
+            format!("s:{}:{value}", value.len())
+        }
+        DurableDeliveryIdentity::OfflinePosition { artifact, ordinal } => {
+            validate_direct_component(artifact, MAX_DURABLE_DELIVERY_ID_BYTES, true)?;
+            format!("o:{}:{artifact}:{ordinal}", artifact.len())
+        }
+        DurableDeliveryIdentity::StoreReceipt(receipt) => format!("r:{receipt}"),
+    })
+}
+
+fn validate_delivery_identity(value: &str, kind: &'static str) -> Result<(), DirectIdParseError> {
+    let (delivery_kind, encoded) = value
+        .split_once(':')
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    match delivery_kind {
+        "s" => {
+            let value = take_final_length_framed(encoded, kind)?;
+            validate_direct_component(value, MAX_DURABLE_DELIVERY_ID_BYTES, true)
+        }
+        "o" => {
+            let (artifact, ordinal) = take_length_framed(encoded, kind)?;
+            validate_direct_component(artifact, MAX_DURABLE_DELIVERY_ID_BYTES, true)?;
+            parse_canonical_u64(ordinal, kind).map(|_| ())
+        }
+        "r" => parse_canonical_u64(encoded, kind).map(|_| ()),
+        _ => Err(DirectIdParseError::new(kind)),
+    }
+}
+
+fn take_length_framed<'a>(
+    value: &'a str,
+    kind: &'static str,
+) -> Result<(&'a str, &'a str), DirectIdParseError> {
+    let (length, framed) = value
+        .split_once(':')
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    let length = parse_canonical_usize(length, kind)?;
+    if framed.len() <= length || !framed.is_char_boundary(length) {
+        return Err(DirectIdParseError::new(kind));
+    }
+    let (field, remainder) = framed.split_at(length);
+    let remainder = remainder
+        .strip_prefix(':')
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    Ok((field, remainder))
+}
+
+fn take_final_length_framed<'a>(
+    value: &'a str,
+    kind: &'static str,
+) -> Result<&'a str, DirectIdParseError> {
+    let (length, field) = value
+        .split_once(':')
+        .ok_or_else(|| DirectIdParseError::new(kind))?;
+    let length = parse_canonical_usize(length, kind)?;
+    if field.len() != length {
+        return Err(DirectIdParseError::new(kind));
+    }
+    Ok(field)
+}
+
+fn parse_canonical_usize(value: &str, kind: &'static str) -> Result<usize, DirectIdParseError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| DirectIdParseError::new(kind))?;
+    if parsed.to_string() != value {
+        return Err(DirectIdParseError::new(kind));
+    }
+    Ok(parsed)
+}
+
+fn parse_canonical_u64(value: &str, kind: &'static str) -> Result<u64, DirectIdParseError> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| DirectIdParseError::new(kind))?;
+    if parsed.to_string() != value {
+        return Err(DirectIdParseError::new(kind));
+    }
+    Ok(parsed)
+}
+
+fn parse_canonical_u32(value: &str, kind: &'static str) -> Result<u32, DirectIdParseError> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| DirectIdParseError::new(kind))?;
+    if parsed.to_string() != value {
+        return Err(DirectIdParseError::new(kind));
+    }
+    Ok(parsed)
+}
+
+fn validate_direct_component(
+    value: &str,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<(), DirectIdParseError> {
+    if (!allow_empty && value.is_empty())
+        || value.len() > maximum
+        || value.chars().any(char::is_control)
+    {
+        return Err(DirectIdParseError::new("direct component"));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DurableDeliveryIdentity {
@@ -133,7 +483,7 @@ pub struct AdmittedSourceAdapter {
     pub version_patch: u64,
     pub version_prerelease: String,
     pub version_build: String,
-    pub config_identity: [u8; 32],
+    pub config_identity: Option<CanonicalIdentityBytes>,
 }
 
 impl From<&SourceAdapterIdentity> for AdmittedSourceAdapter {
@@ -145,7 +495,7 @@ impl From<&SourceAdapterIdentity> for AdmittedSourceAdapter {
             version_patch: value.version().patch(),
             version_prerelease: value.version().prerelease().to_string(),
             version_build: value.version().build().to_string(),
-            config_identity: *value.config_identity().as_bytes(),
+            config_identity: value.config_identity().cloned(),
         }
     }
 }
@@ -164,7 +514,6 @@ pub struct PreflightRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightReservation {
     pub applied_event_id: AppliedEventId,
-    pub event_digest: SourceEventDigest,
     pub delivery_identity: DurableDeliveryIdentity,
     pub fence: ReservationFence,
     pub compare_basis: PreflightCompareBasis,
@@ -177,7 +526,7 @@ pub struct PreflightReservation {
 pub enum PreflightResult {
     Reserved(PreflightReservation),
     ExistingCommitted(CommittedBatchId),
-    Conflict { existing: SourceEventDigest },
+    Conflict { existing: Box<SourceEvent> },
     Stale { latest_revision: u64 },
 }
 
@@ -190,7 +539,7 @@ pub struct SnapshotRequest {
     pub requested_at: DateTimeUtc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationCompareToken {
     pub applied_event_id: AppliedEventId,
     pub fence: ReservationFence,
@@ -252,7 +601,7 @@ pub struct SourceState {
     pub state_version: u64,
     pub latest_applied_event: Option<AppliedEventId>,
     pub latest_revision: Option<SourceRevision>,
-    pub latest_event_digest: Option<SourceEventDigest>,
+    pub latest_event: Option<SourceEvent>,
     pub lifecycle: SourceLifecycleState,
     pub active_outputs: Vec<NormalizedSignalId>,
     pub updated_at: DateTimeUtc,
@@ -260,17 +609,17 @@ pub struct SourceState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedEvaluationIdentity {
-    pub routing_graph: [u8; 32],
-    pub selected_pipeline: Option<[u8; 32]>,
+    pub routing_graph: CanonicalIdentityBytes,
+    pub selected_pipeline: Option<CanonicalIdentityBytes>,
 }
 
 impl From<&EvaluationIdentity> for CommittedEvaluationIdentity {
     fn from(value: &EvaluationIdentity) -> Self {
         Self {
-            routing_graph: *value.routing_graph().digest().as_bytes(),
+            routing_graph: value.routing_graph().canonical_bytes().clone(),
             selected_pipeline: value
                 .selected_pipeline()
-                .map(|pipeline| *pipeline.digest().as_bytes()),
+                .map(PipelineIdentity::canonical_bytes),
         }
     }
 }
@@ -308,7 +657,6 @@ pub struct CommittedNormalizedSignalEnvelope {
     pub evaluation_identity: CommittedEvaluationIdentity,
     pub instrument_hint: Option<CommittedInstrumentHint>,
     pub candidate_ordinal: u32,
-    pub semantic_digest: [u8; 32],
     pub correlation_hints: Vec<String>,
 }
 
@@ -347,7 +695,6 @@ pub struct CommittedNormalizationBatch {
     pub applied_event_id: AppliedEventId,
     pub source: SourceEventRef,
     pub evaluation_identity: Option<CommittedEvaluationIdentity>,
-    pub evaluation_semantic_digest: Option<[u8; 32]>,
     pub outcome: CommittedNormalizationOutcome,
     pub envelopes: Vec<CommittedNormalizedSignalEnvelope>,
     pub lifecycle: Vec<NormalizedLifecycleEvent>,
@@ -374,13 +721,13 @@ pub struct AdmittedComponentIdentity {
     pub version_prerelease: String,
     pub version_build: String,
     pub contract_version: u32,
-    pub config_identity: [u8; 32],
+    pub config_identity: CanonicalIdentityBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmittedExecutionIdentity {
-    pub routing_graph: [u8; 32],
-    pub pipeline: [u8; 32],
+    pub routing_graph: CanonicalIdentityBytes,
+    pub pipeline: CanonicalIdentityBytes,
     pub decoder: AdmittedComponentIdentity,
     pub finalizer: AdmittedComponentIdentity,
 }
@@ -407,7 +754,7 @@ pub struct EvaluationAttemptRecord {
     pub observed_at: DateTimeUtc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationLeaseFence {
     pub delivery_id: PublicationDeliveryId,
     pub generation: u64,
@@ -472,9 +819,15 @@ pub enum SourceStateError {
     InvalidEvaluation,
     #[error("active output limit must be between 1 and {MAX_ACTIVE_OUTPUT_LIMIT}")]
     InvalidActiveOutputLimit,
+    #[error(
+        "publication sink identity must contain 1 through {PUBLICATION_SINK_MAX_BYTES} non-control UTF-8 bytes"
+    )]
+    InvalidPublicationSink,
     #[error("publication lease is stale or foreign")]
     InvalidPublicationLease,
-    #[error("canonical identity projection failed: {0}")]
+    #[error("direct identity construction failed: {0}")]
+    DirectIdentity(#[from] DirectIdParseError),
+    #[error("canonical semantic projection failed: {0}")]
     Identity(#[from] IdentityError),
     #[error("state serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -546,7 +899,7 @@ pub trait SourceStateStore: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveOutputRecord {
     normalized_id: NormalizedSignalId,
-    semantic_digest: [u8; 32],
+    semantic_projection: Vec<u8>,
     correlation_hints: Vec<String>,
 }
 
@@ -612,8 +965,7 @@ impl PersistedState {
         let source_adapter = AdmittedSourceAdapter::from(&request.source_adapter);
         let execution_identity = request.execution_identity.clone();
         let adapter_evidence = request.adapter_evidence.clone();
-        let event_digest = source_event_digest(&request.event)?;
-        let source_key = source_key(&request.event.key().clone());
+        let source_key = source_key(request.event.key());
         let delivery_identity = match (&request.event.revision(), request.delivery_identity) {
             (SourceRevision::Unversioned, Some(delivery)) => delivery,
             (SourceRevision::Unversioned, None) => {
@@ -629,15 +981,17 @@ impl PersistedState {
             }
             (SourceRevision::Opaque(_), _) => return Err(SourceStateError::UnsupportedRevision),
         };
-        let applied_event_id = applied_event_id(&request.event, event_digest, &delivery_identity)?;
+        let applied_event_id = applied_event_id(&request.event, &delivery_identity)?;
         let applied_key = applied_event_id.to_string_id();
 
-        if let Some(batch_id) = self.committed_by_applied.get(&applied_key) {
-            return Ok(PreflightResult::ExistingCommitted(*batch_id));
-        }
         if let Some(existing) = self.reservations.get_mut(&source_key)
             && existing.reservation.applied_event_id == applied_event_id
         {
+            if existing.event != request.event {
+                return Ok(PreflightResult::Conflict {
+                    existing: Box::new(existing.event.clone()),
+                });
+            }
             if existing.reservation.expires_at <= request.requested_at {
                 existing.reservation.fence.generation =
                     existing.reservation.fence.generation.saturating_add(1);
@@ -645,12 +999,21 @@ impl PersistedState {
             }
             return Ok(PreflightResult::Reserved(existing.reservation.clone()));
         }
+
         if self
             .reservations
             .get(&source_key)
             .is_some_and(|existing| existing.reservation.expires_at <= request.requested_at)
         {
             self.reservations.remove(&source_key);
+        }
+
+        if let Some(batch_id) = self.committed_by_applied.get(&applied_key).cloned()
+            && self.receipts.iter().any(|receipt| {
+                receipt.applied_event_id == applied_event_id && receipt.event == request.event
+            })
+        {
+            return Ok(PreflightResult::ExistingCommitted(batch_id));
         }
 
         if let SourceRevision::Monotonic(incoming) = request.event.revision()
@@ -663,24 +1026,38 @@ impl PersistedState {
                 });
             }
             if incoming == latest {
-                if current.latest_event_digest == Some(event_digest)
+                if current.latest_event.as_ref() == Some(&request.event)
                     && let Some(batch_id) = current
                         .latest_applied_event
-                        .and_then(|id| self.committed_by_applied.get(&id.to_string_id()).copied())
+                        .as_ref()
+                        .and_then(|id| self.committed_by_applied.get(&id.to_string_id()).cloned())
                 {
                     return Ok(PreflightResult::ExistingCommitted(batch_id));
                 }
-                return Ok(PreflightResult::Conflict {
-                    existing: current.latest_event_digest.unwrap_or(event_digest),
-                });
+                if let Some(existing) = current.latest_event.as_ref() {
+                    return Ok(PreflightResult::Conflict {
+                        existing: Box::new(existing.clone()),
+                    });
+                }
             }
         }
 
-        if let Some(existing) = self.reservations.get(&source_key)
-            && existing.reservation.event_digest != event_digest
+        if self.committed_by_applied.contains_key(&applied_key)
+            && let Some(existing) = self
+                .receipts
+                .iter()
+                .find(|receipt| receipt.applied_event_id == applied_event_id)
         {
             return Ok(PreflightResult::Conflict {
-                existing: existing.reservation.event_digest,
+                existing: Box::new(existing.event.clone()),
+            });
+        }
+
+        if let Some(existing) = self.reservations.get(&source_key)
+            && existing.event != request.event
+        {
+            return Ok(PreflightResult::Conflict {
+                existing: Box::new(existing.event.clone()),
             });
         }
 
@@ -695,8 +1072,7 @@ impl PersistedState {
             .get(source)
             .map_or(0, |checkpoint| checkpoint.checkpoint_version);
         let reservation = PreflightReservation {
-            applied_event_id,
-            event_digest,
+            applied_event_id: applied_event_id.clone(),
             delivery_identity: delivery_identity.clone(),
             fence: ReservationFence {
                 reservation_id: self.next_reservation,
@@ -734,13 +1110,13 @@ impl PersistedState {
 
     fn reservation(
         &self,
-        applied_event_id: AppliedEventId,
+        applied_event_id: &AppliedEventId,
         fence: ReservationFence,
     ) -> Result<&ReservationRecord, SourceStateError> {
         self.reservations
             .values()
             .find(|record| {
-                record.reservation.applied_event_id == applied_event_id
+                &record.reservation.applied_event_id == applied_event_id
                     && record.reservation.fence == fence
             })
             .ok_or(SourceStateError::FenceLost)
@@ -751,9 +1127,9 @@ impl PersistedState {
         reservation: &PreflightReservation,
         snapshot_id: Option<u64>,
     ) -> Result<ApplicationCompareToken, SourceStateError> {
-        self.reservation(reservation.applied_event_id, reservation.fence)?;
+        self.reservation(&reservation.applied_event_id, reservation.fence)?;
         Ok(ApplicationCompareToken {
-            applied_event_id: reservation.applied_event_id,
+            applied_event_id: reservation.applied_event_id.clone(),
             fence: reservation.fence,
             source_state_version: reservation.compare_basis.source_state_version,
             checkpoint_version: reservation.compare_basis.checkpoint_version,
@@ -764,9 +1140,9 @@ impl PersistedState {
 
     fn validate_compare(
         &self,
-        token: ApplicationCompareToken,
+        token: &ApplicationCompareToken,
     ) -> Result<&ReservationRecord, SourceStateError> {
-        let reservation = self.reservation(token.applied_event_id, token.fence)?;
+        let reservation = self.reservation(&token.applied_event_id, token.fence)?;
         let key = source_key(&reservation.event.key().clone());
         let source_version = self
             .source_states
@@ -791,9 +1167,9 @@ impl PersistedState {
     ) -> Result<CompareAndCommitResult, SourceStateError> {
         let applied_key = request.compare_token.applied_event_id.to_string_id();
         if let Some(existing) = self.committed_by_applied.get(&applied_key) {
-            return Ok(CompareAndCommitResult::AlreadyCommitted(*existing));
+            return Ok(CompareAndCommitResult::AlreadyCommitted(existing.clone()));
         }
-        let reservation = match self.validate_compare(request.compare_token) {
+        let reservation = match self.validate_compare(&request.compare_token) {
             Ok(value) => value.clone(),
             Err(SourceStateError::FenceLost) => return Ok(CompareAndCommitResult::FenceLost),
             Err(SourceStateError::CompareConflict) => {
@@ -806,6 +1182,10 @@ impl PersistedState {
         {
             return Err(SourceStateError::InvalidActiveOutputLimit);
         }
+        if let Some(sink) = request.publication_sink.as_deref() {
+            validate_direct_component(sink, PUBLICATION_SINK_MAX_BYTES, false)
+                .map_err(|_| SourceStateError::InvalidPublicationSink)?;
+        }
 
         let source_key_value = source_key(reservation.event.key());
         let prior_active = self
@@ -817,31 +1197,26 @@ impl PersistedState {
         let mut envelopes = Vec::new();
         let mut lifecycle = Vec::new();
         let mut evaluation_identity = None;
-        let mut evaluation_digest = None;
         let mut application_rejected = false;
 
         let outcome = match request.input {
             ApplicationCommitInput::CompletedEvaluation(report) => {
                 validate_report(report, &reservation.event)?;
-                let digest = evaluation_semantic_digest(report)?.digest();
-                evaluation_digest = Some(*digest.as_bytes());
                 evaluation_identity = Some(CommittedEvaluationIdentity::from(report.identity()));
                 match report.outcome() {
                     NormalizationOutcome::Accepted { candidates } => {
                         let mut evaluated_ids = Vec::with_capacity(candidates.as_slice().len());
                         let mut matched_prior = BTreeSet::new();
                         for candidate in candidates.as_slice() {
-                            let id_digest = normalized_signal_id_digest(
-                                request.compare_token.applied_event_id.as_bytes(),
-                                candidate,
-                            )?;
-                            let normalized_id =
-                                NormalizedSignalId::from_bytes(*id_digest.as_bytes());
-                            let semantic = normalized_signal_semantic_digest(
+                            let normalized_id = NormalizedSignalId::from_applied_event(
+                                request.compare_token.applied_event_id.clone(),
+                                candidate.candidate_ordinal(),
+                            );
+                            let semantic_projection = normalized_signal_semantic_projection(
                                 candidate.signal(),
                                 candidate.instrument_hint(),
-                            )?;
-                            let semantic_bytes = *semantic.digest().as_bytes();
+                            )?
+                            .into_bytes();
                             let correlation_hints = candidate
                                 .correlation_hints()
                                 .iter()
@@ -855,7 +1230,7 @@ impl PersistedState {
                                         && prior.correlation_hints.iter().any(|prior_hint| {
                                             correlation_hints.contains(prior_hint)
                                         }))
-                                        || prior.semantic_digest == semantic_bytes
+                                        || prior.semantic_projection == semantic_projection
                                 })
                                 .map(|(index, _)| index)
                                 .collect::<Vec<_>>();
@@ -865,35 +1240,35 @@ impl PersistedState {
                             if let Some(index) = matches.first().copied() {
                                 matched_prior.insert(index);
                                 let prior = &prior_active[index];
-                                if prior.semantic_digest == semantic_bytes {
+                                if prior.semantic_projection == semantic_projection {
                                     lifecycle.push(NormalizedLifecycleEvent::Equivalent {
-                                        evaluated: normalized_id,
-                                        active: prior.normalized_id,
+                                        evaluated: normalized_id.clone(),
+                                        active: prior.normalized_id.clone(),
                                     });
                                 } else {
                                     lifecycle.push(NormalizedLifecycleEvent::Superseded {
-                                        prior: prior.normalized_id,
-                                        replacement: normalized_id,
+                                        prior: prior.normalized_id.clone(),
+                                        replacement: normalized_id.clone(),
                                     });
                                     next_active
                                         .retain(|value| value.normalized_id != prior.normalized_id);
                                     next_active.push(ActiveOutputRecord {
-                                        normalized_id,
-                                        semantic_digest: semantic_bytes,
+                                        normalized_id: normalized_id.clone(),
+                                        semantic_projection: semantic_projection.clone(),
                                         correlation_hints: correlation_hints.clone(),
                                     });
                                 }
                             } else {
                                 lifecycle.push(NormalizedLifecycleEvent::Added {
-                                    output: normalized_id,
+                                    output: normalized_id.clone(),
                                 });
                                 next_active.push(ActiveOutputRecord {
-                                    normalized_id,
-                                    semantic_digest: semantic_bytes,
+                                    normalized_id: normalized_id.clone(),
+                                    semantic_projection: semantic_projection.clone(),
                                     correlation_hints: correlation_hints.clone(),
                                 });
                             }
-                            evaluated_ids.push(normalized_id);
+                            evaluated_ids.push(normalized_id.clone());
                             envelopes.push(PendingEnvelope {
                                 normalized_id,
                                 signal: candidate.signal().clone(),
@@ -902,7 +1277,6 @@ impl PersistedState {
                                     .instrument_hint()
                                     .map(CommittedInstrumentHint::from),
                                 candidate_ordinal: candidate.candidate_ordinal(),
-                                semantic_digest: semantic_bytes,
                                 correlation_hints,
                             });
                         }
@@ -915,8 +1289,8 @@ impl PersistedState {
                                         .any(|value| value.normalized_id == prior.normalized_id)
                                 {
                                     lifecycle.push(NormalizedLifecycleEvent::Withdrawn {
-                                        output: prior.normalized_id,
-                                        cause: request.compare_token.applied_event_id,
+                                        output: prior.normalized_id.clone(),
+                                        cause: request.compare_token.applied_event_id.clone(),
                                     });
                                     next_active
                                         .retain(|value| value.normalized_id != prior.normalized_id);
@@ -960,8 +1334,8 @@ impl PersistedState {
                 }
                 for prior in &prior_active {
                     lifecycle.push(NormalizedLifecycleEvent::Withdrawn {
-                        output: prior.normalized_id,
-                        cause: request.compare_token.applied_event_id,
+                        output: prior.normalized_id.clone(),
+                        cause: request.compare_token.applied_event_id.clone(),
                     });
                 }
                 next_active.clear();
@@ -969,19 +1343,13 @@ impl PersistedState {
             }
         };
 
-        let semantic_basis = evaluation_digest
-            .unwrap_or_else(|| *hash_domain(LIFECYCLE_ONLY_DOMAIN, &[0, 1, 0, 1, 0, 1]).as_bytes());
-        let batch_id = committed_batch_id(
-            request.compare_token.applied_event_id,
-            semantic_basis,
-            evaluation_digest.is_some(),
-            request.replacement_policy,
-            request.maximum_active_outputs,
-        );
         let commit_index = self.next_commit;
-        self.next_commit = self.next_commit.saturating_add(1);
+        let batch_id = CommittedBatchId::from_applied_event(
+            request.compare_token.applied_event_id.clone(),
+            commit_index,
+        );
         let commit = NormalizationCommitRef {
-            batch_id,
+            batch_id: batch_id.clone(),
             commit_index,
         };
         let identity = evaluation_identity.clone();
@@ -990,7 +1358,7 @@ impl PersistedState {
             .map(|pending| CommittedNormalizedSignalEnvelope {
                 commit: commit.clone(),
                 normalized_id: pending.normalized_id,
-                applied_event_id: request.compare_token.applied_event_id,
+                applied_event_id: request.compare_token.applied_event_id.clone(),
                 signal: pending.signal,
                 source: pending.source,
                 evaluation_identity: identity
@@ -998,24 +1366,27 @@ impl PersistedState {
                     .expect("completed evaluation envelope has identity"),
                 instrument_hint: pending.instrument_hint,
                 candidate_ordinal: pending.candidate_ordinal,
-                semantic_digest: pending.semantic_digest,
                 correlation_hints: pending.correlation_hints,
             })
             .collect::<Vec<_>>();
         let batch = CommittedNormalizationBatch {
-            batch_id,
-            applied_event_id: request.compare_token.applied_event_id,
+            batch_id: batch_id.clone(),
+            applied_event_id: request.compare_token.applied_event_id.clone(),
             source: SourceEventRef::from(&reservation.event),
             evaluation_identity,
-            evaluation_semantic_digest: evaluation_digest,
             outcome,
             envelopes: committed_envelopes,
             lifecycle,
             commit_index,
             committed_at: request.committed_at,
         };
+        if derive_committed_batch_id(&batch)? != batch_id {
+            return Err(SourceStateError::InvalidEvaluation);
+        }
+        self.next_commit = self.next_commit.saturating_add(1);
         self.batches.insert(batch_id.to_string_id(), batch);
-        self.committed_by_applied.insert(applied_key, batch_id);
+        self.committed_by_applied
+            .insert(applied_key, batch_id.clone());
         self.active_outputs
             .insert(source_key_value.clone(), next_active.clone());
         let previous_version = self
@@ -1027,9 +1398,9 @@ impl PersistedState {
             SourceState {
                 key: reservation.event.key().clone(),
                 state_version: previous_version.saturating_add(1),
-                latest_applied_event: Some(request.compare_token.applied_event_id),
+                latest_applied_event: Some(request.compare_token.applied_event_id.clone()),
                 latest_revision: Some(reservation.event.revision().clone()),
-                latest_event_digest: Some(reservation.reservation.event_digest),
+                latest_event: Some(reservation.event.clone()),
                 lifecycle: if matches!(request.input, ApplicationCommitInput::LifecycleOnlyDelete) {
                     SourceLifecycleState::Deleted
                 } else {
@@ -1037,7 +1408,7 @@ impl PersistedState {
                 },
                 active_outputs: next_active
                     .iter()
-                    .map(|value| value.normalized_id)
+                    .map(|value| value.normalized_id.clone())
                     .collect(),
                 updated_at: request.committed_at,
             },
@@ -1050,20 +1421,20 @@ impl PersistedState {
             source.clone(),
             SourceCheckpoint {
                 source,
-                applied_event_id: request.compare_token.applied_event_id,
-                batch_id,
+                applied_event_id: request.compare_token.applied_event_id.clone(),
+                batch_id: batch_id.clone(),
                 commit_index,
                 checkpoint_version,
             },
         );
         self.reservations.remove(&source_key_value);
         if let Some(sink) = request.publication_sink {
-            let delivery_id = publication_delivery_id(batch_id, &sink);
+            let delivery_id = publication_delivery_id(batch_id.clone(), &sink)?;
             self.outbox.insert(
                 delivery_id.to_string_id(),
                 NormalizationOutboxRecord {
                     delivery_id,
-                    batch_id,
+                    batch_id: batch_id.clone(),
                     sink,
                     state: PublicationState::Pending,
                     attempts: 0,
@@ -1086,7 +1457,6 @@ struct PendingEnvelope {
     source: SourceEventRef,
     instrument_hint: Option<CommittedInstrumentHint>,
     candidate_ordinal: u32,
-    semantic_digest: [u8; 32],
     correlation_hints: Vec<String>,
 }
 
@@ -1240,7 +1610,7 @@ macro_rules! impl_store {
             ) -> Result<PipelineStateSnapshot, SourceStateError> {
                 self.write(|state| {
                     let reservation = state
-                        .reservation(request.applied_event_id, request.fence)?
+                        .reservation(&request.applied_event_id, request.fence)?
                         .clone();
                     let prior = state
                         .receipts
@@ -1371,7 +1741,7 @@ macro_rules! impl_store {
                 observed_at: DateTimeUtc,
             ) -> Result<(), SourceStateError> {
                 self.write(|state| {
-                    state.reservation(applied_event_id, fence)?;
+                    state.reservation(&applied_event_id, fence)?;
                     state.attempts.push(EvaluationAttemptRecord {
                         applied_event_id,
                         failure_class: failure_class_name(failure.class()).to_string(),
@@ -1459,14 +1829,14 @@ macro_rules! impl_store {
                     let mut leases = Vec::with_capacity(ids.len());
                     for id in ids {
                         let record = state.outbox.get_mut(&id).expect("outbox ID exists");
-                        let generation = match record.state {
+                        let generation = match &record.state {
                             PublicationState::Leased { fence, .. } => {
                                 fence.generation.saturating_add(1)
                             }
                             _ => record.attempts as u64 + 1,
                         };
                         let fence = PublicationLeaseFence {
-                            delivery_id: record.delivery_id,
+                            delivery_id: record.delivery_id.clone(),
                             generation,
                             lease_id: state.next_lease,
                         };
@@ -1475,7 +1845,10 @@ macro_rules! impl_store {
                         if record.first_attempt_at.is_none() {
                             record.first_attempt_at = Some(now);
                         }
-                        record.state = PublicationState::Leased { fence, expires_at };
+                        record.state = PublicationState::Leased {
+                            fence: fence.clone(),
+                            expires_at,
+                        };
                         leases.push(PublicationLease {
                             record: record.clone(),
                             fence,
@@ -1495,7 +1868,7 @@ macro_rules! impl_store {
                         .outbox
                         .get_mut(&fence.delivery_id.to_string_id())
                         .ok_or(SourceStateError::InvalidPublicationLease)?;
-                    if !matches!(record.state, PublicationState::Leased { fence: current, .. } if current == fence)
+                    if !matches!(&record.state, PublicationState::Leased { fence: current, .. } if current == &fence)
                     {
                         return Err(SourceStateError::InvalidPublicationLease);
                     }
@@ -1514,7 +1887,7 @@ macro_rules! impl_store {
                         .outbox
                         .get_mut(&fence.delivery_id.to_string_id())
                         .ok_or(SourceStateError::InvalidPublicationLease)?;
-                    if !matches!(record.state, PublicationState::Leased { fence: current, .. } if current == fence)
+                    if !matches!(&record.state, PublicationState::Leased { fence: current, .. } if current == &fence)
                     {
                         return Err(SourceStateError::InvalidPublicationLease);
                     }
@@ -1587,208 +1960,37 @@ fn project_history_event(event: &SourceEvent, include_payload: bool) -> SourceEv
     projected.with_metadata(event.metadata().clone())
 }
 
-pub fn source_event_digest(event: &SourceEvent) -> Result<SourceEventDigest, SourceStateError> {
-    let mut writer = CanonicalWriter::new();
-    writer.text(event.key().source().as_str())?;
-    writer.text(event.key().external_id().as_str())?;
-    writer.u16(operation_tag(event.operation()));
-    encode_revision(event.revision(), &mut writer)?;
-    encode_datetime(event.occurred_at().value(), &mut writer);
-    writer.u16(timestamp_quality_tag(event.occurred_at().quality()));
-    encode_option_text(event.thread().map(|value| value.as_str()), &mut writer)?;
-    match event.parent() {
-        Some(parent) => {
-            writer.bool(true);
-            writer.text(parent.source().as_str())?;
-            writer.text(parent.external_id().as_str())?;
-        }
-        None => writer.bool(false),
-    }
-    encode_option_text(event.author().map(|value| value.as_str()), &mut writer)?;
-    encode_option_text(event.correlation().map(|value| value.as_str()), &mut writer)?;
-    match event.sequence() {
-        Some(SourceSequence::Monotonic(value)) => {
-            writer.bool(true);
-            writer.u16(1);
-            writer.u64(*value);
-        }
-        Some(SourceSequence::Opaque(value)) => {
-            writer.bool(true);
-            writer.u16(2);
-            writer.text(value.as_str())?;
-        }
-        None => writer.bool(false),
-    }
-    encode_payload(event.payload(), &mut writer)?;
-    writer.u32(event.metadata().labels().len() as u32);
-    for (key, value) in event.metadata().labels() {
-        writer.text(key.as_str())?;
-        writer.text(value.as_str())?;
-    }
-    let digest = hash_domain(SOURCE_EVENT_DIGEST_DOMAIN, &writer.into_bytes());
-    Ok(SourceEventDigest::from_bytes(*digest.as_bytes()))
-}
-
 fn applied_event_id(
     event: &SourceEvent,
-    event_digest: SourceEventDigest,
     delivery: &DurableDeliveryIdentity,
 ) -> Result<AppliedEventId, SourceStateError> {
-    let mut writer = CanonicalWriter::new();
-    writer.text(event.key().source().as_str())?;
-    writer.text(event.key().external_id().as_str())?;
     match event.revision() {
-        SourceRevision::Monotonic(value) => {
-            writer.u16(1);
-            writer.u64(*value);
+        SourceRevision::Monotonic(revision) => {
+            Ok(AppliedEventId::for_monotonic(event.key(), *revision)?)
         }
-        SourceRevision::Unversioned => writer.u16(4),
-        SourceRevision::Opaque(_) => return Err(SourceStateError::UnsupportedRevision),
+        SourceRevision::Unversioned => Ok(AppliedEventId::for_unversioned(event.key(), delivery)?),
+        SourceRevision::Opaque(_) => Err(SourceStateError::UnsupportedRevision),
     }
-    writer.u16(1);
-    writer.digest(&Sha256Digest::new(*event_digest.as_bytes()));
-    if matches!(event.revision(), SourceRevision::Unversioned) {
-        writer.u16(1);
-        encode_delivery(delivery, &mut writer)?;
-    } else {
-        writer.u16(0);
+}
+
+pub fn derive_committed_batch_id(
+    batch: &CommittedNormalizationBatch,
+) -> Result<CommittedBatchId, DirectIdParseError> {
+    if batch.commit_index == 0 || !batch.applied_event_id.matches_source_ref(&batch.source) {
+        return Err(DirectIdParseError::new("committed batch"));
     }
-    let digest = hash_domain(APPLIED_EVENT_ID_DOMAIN, &writer.into_bytes());
-    Ok(AppliedEventId::from_bytes(*digest.as_bytes()))
+    Ok(CommittedBatchId::from_applied_event(
+        batch.applied_event_id.clone(),
+        batch.commit_index,
+    ))
 }
 
-fn committed_batch_id(
-    applied_event_id: AppliedEventId,
-    semantic_basis: [u8; 32],
-    completed_evaluation: bool,
-    replacement_policy: ReplacementPolicy,
-    maximum_active_outputs: usize,
-) -> CommittedBatchId {
-    let mut writer = CanonicalWriter::new();
-    writer.digest(&Sha256Digest::new(*applied_event_id.as_bytes()));
-    writer.u16(if completed_evaluation { 1 } else { 2 });
-    writer.u16(1);
-    writer.digest(&Sha256Digest::new(semantic_basis));
-    let mut policy_writer = CanonicalWriter::new();
-    policy_writer.u16(match replacement_policy {
-        ReplacementPolicy::Patch => 1,
-        ReplacementPolicy::ReplaceCurrentSourceKey => 2,
-    });
-    policy_writer.u64(maximum_active_outputs as u64);
-    policy_writer.u16(1);
-    let policy = hash_domain(APPLICATION_POLICY_DOMAIN, &policy_writer.into_bytes());
-    writer.u16(1);
-    writer.digest(&policy);
-    writer.u16(match replacement_policy {
-        ReplacementPolicy::Patch => 1,
-        ReplacementPolicy::ReplaceCurrentSourceKey => 2,
-    });
-    let digest = hash_domain(COMMITTED_BATCH_DOMAIN, &writer.into_bytes());
-    CommittedBatchId::from_bytes(*digest.as_bytes())
-}
-
-fn publication_delivery_id(batch_id: CommittedBatchId, sink: &str) -> PublicationDeliveryId {
-    let mut writer = CanonicalWriter::new();
-    writer.digest(&Sha256Digest::new(*batch_id.as_bytes()));
-    let mut sink_writer = CanonicalWriter::new();
-    sink_writer.text(sink).expect("sink binding is valid UTF-8");
-    let sink = hash_domain(SINK_BINDING_DOMAIN, &sink_writer.into_bytes());
-    writer.u16(1);
-    writer.digest(&sink);
-    writer.u16(1);
-    writer.u32(1);
-    let digest = hash_domain(PUBLICATION_DELIVERY_DOMAIN, &writer.into_bytes());
-    PublicationDeliveryId::from_bytes(*digest.as_bytes())
-}
-
-fn encode_revision(
-    revision: &SourceRevision,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    match revision {
-        SourceRevision::Monotonic(value) => {
-            writer.u16(1);
-            writer.u64(*value);
-        }
-        SourceRevision::Opaque(value) => {
-            writer.u16(2);
-            writer.text(value.as_str())?;
-        }
-        SourceRevision::Unversioned => writer.u16(3),
-    }
-    Ok(())
-}
-
-fn encode_payload(
-    payload: &SourcePayload,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    match payload {
-        SourcePayload::Empty => writer.u16(0),
-        SourcePayload::Text(value) => {
-            writer.u16(1);
-            writer.text(value.text().as_str())?;
-            writer.u16(match value.format() {
-                TextFormat::Plain => 1,
-                TextFormat::Markdown => 2,
-                TextFormat::Html => 3,
-            });
-            encode_option_text(value.language().map(|language| language.as_str()), writer)?;
-        }
-        SourcePayload::Structured(value) => {
-            writer.u16(2);
-            writer.text(value.schema().as_str())?;
-            writer.u16(match value.encoding() {
-                PayloadEncoding::Json => 1,
-                PayloadEncoding::Cbor => 2,
-                PayloadEncoding::MessagePack => 3,
-                PayloadEncoding::Binary => 4,
-            });
-            writer.bytes(value.data().as_slice())?;
-        }
-    }
-    Ok(())
-}
-
-fn encode_delivery(
-    delivery: &DurableDeliveryIdentity,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    match delivery {
-        DurableDeliveryIdentity::Stable(value) => {
-            writer.u16(1);
-            writer.text(value)?;
-        }
-        DurableDeliveryIdentity::OfflinePosition { artifact, ordinal } => {
-            writer.u16(2);
-            writer.text(artifact)?;
-            writer.u64(*ordinal);
-        }
-        DurableDeliveryIdentity::StoreReceipt(value) => {
-            writer.u16(3);
-            writer.u64(*value);
-        }
-    }
-    Ok(())
-}
-
-fn encode_datetime(value: DateTimeUtc, writer: &mut CanonicalWriter) {
-    writer.i64(value.as_datetime().timestamp());
-    writer.u32(value.as_datetime().timestamp_subsec_nanos());
-}
-
-fn encode_option_text(
-    value: Option<&str>,
-    writer: &mut CanonicalWriter,
-) -> Result<(), IdentityError> {
-    match value {
-        Some(value) => {
-            writer.bool(true);
-            writer.text(value)?;
-        }
-        None => writer.bool(false),
-    }
-    Ok(())
+fn publication_delivery_id(
+    batch_id: CommittedBatchId,
+    sink: &str,
+) -> Result<PublicationDeliveryId, SourceStateError> {
+    PublicationDeliveryId::try_new(batch_id, sink)
+        .map_err(|_| SourceStateError::InvalidPublicationSink)
 }
 
 fn source_key(key: &SourceEventKey) -> String {
@@ -1797,24 +1999,6 @@ fn source_key(key: &SourceEventKey) -> String {
         key.source().as_str(),
         key.external_id().as_str()
     )
-}
-
-fn operation_tag(value: SourceOperation) -> u16 {
-    match value {
-        SourceOperation::Create => 1,
-        SourceOperation::Update => 2,
-        SourceOperation::Delete => 3,
-        SourceOperation::Upsert => 4,
-        SourceOperation::Snapshot => 5,
-    }
-}
-
-fn timestamp_quality_tag(value: SourceTimestampQuality) -> u16 {
-    match value {
-        SourceTimestampQuality::SourceProvided => 1,
-        SourceTimestampQuality::AdapterDerived => 2,
-        SourceTimestampQuality::ReceptionFallback => 3,
-    }
 }
 
 fn failure_class_name(value: EvaluationFailureClass) -> &'static str {

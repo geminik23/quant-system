@@ -8,7 +8,7 @@
 
 | Today | Next focus | Later |
 |---|---|---|
-| Deterministic replay, explicit instrument catalogs, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, canonical trading intent, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
+| Deterministic replay, explicit instrument catalogs, canonical intent and execution-event contracts, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, committed-batch intent projection, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
 
 ## Direction
 
@@ -41,9 +41,9 @@ Reusable source-event, normalization, provenance, and durable source-state bound
 
 A shared instrument foundation is available: source-neutral assets, broker- or exchange-qualified listings, exact grids, effective-dated specifications, immutable catalogs, guarded compatibility translation, and replay manifests now distinguish data-source coordinates from economic instruments. Trading platforms such as CTrader are also distinct from listing and execution venues.
 
-The next contract is shared source- and strategy-neutral trading intent and execution-result facts without silently changing the current strict replay input.
+Source- and strategy-neutral `TradeIntent`, immutable execution-command and dispatch contracts, and venue `ExecutionReport` facts are also available in the pure trading-domain library. They are additive: current replay input remains strict `RawSignal`, and consumers must provide pinned instrument and state resolution rather than asking the domain types to perform IO.
 
-**What this unlocks:** safer multi-venue identity and economic capability checks today, followed by a common boundary for parser and strategy outputs.
+**What this unlocks:** safer multi-venue identity and economic capability checks plus a common contract for future ingestion, strategy, portfolio, replay, gateway, and venue consumers.
 
 ### Run strategies through shared risk supervision
 
@@ -53,7 +53,7 @@ Connect parsed signals and strategy decisions to common portfolio risk, allocati
 
 ### Connect supervised intent to live venues
 
-Add venue capability checks, execution reports, restart-safe state, uncertain-outcome reconciliation, and provider-specific order adapters behind a venue-neutral boundary.
+Build venue capability enforcement, restart-safe state, uncertain-outcome reconciliation, and provider-specific order adapters on the available venue-neutral command, dispatch, and execution-report contracts.
 
 **What this unlocks:** live order execution without embedding broker behavior in domain, parser, or strategy code.
 
@@ -69,4 +69,4 @@ Explore richer analysis and model-driven strategy components after neutral strat
 
 ## Not available yet
 
-Live execution, canonical intent and execution events, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.
+Live execution, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, portfolio supervision, execution-gateway orchestration, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.

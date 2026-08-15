@@ -20,7 +20,8 @@ use std::sync::Arc;
 use chrono::Duration;
 
 use crate::adapters::structured_json::{
-    decode_source_event_jsonl, encode_committed_normalization_batch_jsonl_record,
+    SourceEventJsonlArtifactIdentity, decode_source_event_jsonl,
+    encode_committed_normalization_batch_jsonl_record,
 };
 
 use crate::ingestion::{DateTimeUtc, PayloadEncoding, SourceEvent, SourceId, SourceOperation};
@@ -29,9 +30,9 @@ use crate::normalization::{
     ComponentBindError, ComponentConfigSchemaRef, ComponentDescriptor, ComponentId, ComponentKind,
     DraftValidationStep, EmptyOutputPolicy, EvaluationInput, NoConfig, PayloadKind,
     PipelineContextRequirements, PipelineEvaluationResult, PipelineId, ResolvedComponentRef,
-    RouteEvaluation, RouteSelector, RouteSpec, SemanticVersion, Sha256Digest,
-    SourceAdapterIdentity, StandardSignalFinalizer, StructuredInputCapability, bind_decoder,
-    bind_finalizer, raw_signals_v1_schema,
+    RouteEvaluation, RouteSelector, RouteSpec, SemanticVersion, SourceAdapterIdentity,
+    StandardSignalFinalizer, StructuredInputCapability, bind_decoder, bind_finalizer,
+    raw_signals_v1_schema,
 };
 use crate::state::{
     AdmittedComponentIdentity, AdmittedExecutionIdentity, ApplicationCommitInput,
@@ -376,7 +377,7 @@ impl IngestionService {
                     .expect("prepared evaluation always selects a pipeline")
                     .clone();
                 let snapshot = self.state.snapshot(SnapshotRequest {
-                    applied_event_id: reservation.applied_event_id,
+                    applied_event_id: reservation.applied_event_id.clone(),
                     fence: reservation.fence,
                     selected_pipeline,
                     requirements: prepared.requirements().clone(),
@@ -456,7 +457,7 @@ pub enum OfflineErrorPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfflineIngestionReport {
-    pub artifact_identity: String,
+    pub artifact_identity: SourceEventJsonlArtifactIdentity,
     pub admitted_records: usize,
     pub malformed_records: usize,
     pub committed_records: usize,
@@ -519,11 +520,12 @@ impl OfflineIngestionRunner {
 
     pub fn run(
         &self,
+        artifact_identity: SourceEventJsonlArtifactIdentity,
         artifact_bytes: &[u8],
     ) -> Result<OfflineIngestionReport, OfflineIngestionError> {
-        let artifact = decode_source_event_jsonl(artifact_bytes);
+        let artifact = decode_source_event_jsonl(artifact_identity, artifact_bytes);
         let mut report = OfflineIngestionReport {
-            artifact_identity: artifact.artifact_identity().to_string(),
+            artifact_identity: artifact.artifact_identity().clone(),
             admitted_records: 0,
             malformed_records: 0,
             committed_records: 0,
@@ -694,15 +696,14 @@ pub fn structured_jsonl_service(
     )?;
     let graph = CompiledRoutingGraph::compile(vec![route], vec![pipeline])?;
     let execution_identity = AdmittedExecutionIdentity {
-        routing_graph: *graph.identity().digest().as_bytes(),
-        pipeline: *pipeline_identity.digest().as_bytes(),
+        routing_graph: graph.identity().canonical_bytes().clone(),
+        pipeline: pipeline_identity.canonical_bytes(),
         decoder: decoder_identity,
         finalizer: finalizer_identity,
     };
-    let source_adapter = SourceAdapterIdentity::new(
+    let source_adapter = SourceAdapterIdentity::without_config(
         ComponentId::try_new("source-event-jsonl", "adapter ID")?,
         SemanticVersion::new(1, 0, 0),
-        Sha256Digest::new([0; 32]),
     );
     Ok(IngestionService::new(graph, state, source_adapter, config)
         .with_execution_identity(execution_identity))
@@ -718,7 +719,7 @@ fn admitted_component_identity(component: &ResolvedComponentRef) -> AdmittedComp
         version_prerelease: component.implementation_version().prerelease().to_string(),
         version_build: component.implementation_version().build().to_string(),
         contract_version: component.contract_version(),
-        config_identity: *component.config_identity().digest().as_bytes(),
+        config_identity: component.config_identity().canonical_bytes().clone(),
     }
 }
 
@@ -819,7 +820,7 @@ impl CommittedBatchSink for CommittedBatchJsonlSink {
         writer.flush()?;
         Ok(publication::PublicationDeliveryReceipt {
             delivery_id: delivery.delivery_id,
-            batch_id: delivery.batch.batch_id,
+            batch_id: delivery.batch.batch_id.clone(),
         })
     }
 }

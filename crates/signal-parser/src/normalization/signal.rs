@@ -10,8 +10,8 @@ use crate::ingestion::{
 use super::diagnostic::{DiagnosticSet, StageEvidence};
 use super::identity::{PipelineIdentity, SemanticVersion};
 use super::value::{
-    ContractList, ContractValueError, FiniteF64, GroupText, PositiveFiniteF64, RuleNameText,
-    Sha256Digest, SymbolText, TradeKeyText, UnitInterval,
+    CanonicalIdentityBytes, ContractList, ContractValueError, FiniteF64, GroupText,
+    PositiveFiniteF64, RuleNameText, SymbolText, TradeKeyText, UnitInterval,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,19 +304,30 @@ impl PreNormalizedSignalBatch {
 pub struct SourceAdapterIdentity {
     id: super::value::NonEmptyContractText<128>,
     version: SemanticVersion,
-    config_identity: Sha256Digest,
+    config_identity: Option<CanonicalIdentityBytes>,
 }
 
 impl SourceAdapterIdentity {
     pub fn new(
         id: super::value::NonEmptyContractText<128>,
         version: SemanticVersion,
-        config_identity: Sha256Digest,
+        config_identity: CanonicalIdentityBytes,
     ) -> Self {
         Self {
             id,
             version,
-            config_identity,
+            config_identity: Some(config_identity),
+        }
+    }
+
+    pub fn without_config(
+        id: super::value::NonEmptyContractText<128>,
+        version: SemanticVersion,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            config_identity: None,
         }
     }
 
@@ -328,8 +339,8 @@ impl SourceAdapterIdentity {
         &self.version
     }
 
-    pub fn config_identity(&self) -> Sha256Digest {
-        self.config_identity
+    pub fn config_identity(&self) -> Option<&CanonicalIdentityBytes> {
+        self.config_identity.as_ref()
     }
 }
 

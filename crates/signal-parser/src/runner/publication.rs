@@ -28,12 +28,12 @@ impl DeliveryAcknowledgementPolicy {
     }
 }
 
-/// Stable runner-owned identity for one sink delivery attempt.
+/// Stable runner-owned identity for one logical sink delivery across attempts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicationDeliveryId(String);
 
 impl PublicationDeliveryId {
-    pub(crate) fn from_state(value: crate::state::PublicationDeliveryId) -> Self {
+    pub(crate) fn from_state(value: &crate::state::PublicationDeliveryId) -> Self {
         Self(value.to_string_id())
     }
 
@@ -245,12 +245,12 @@ impl PublicationOrchestrator {
                 self.dead_letter(lease.fence, &mut report)?;
                 continue;
             }
-            let Some(batch) = self.state.committed_batch(lease.record.batch_id)? else {
+            let Some(batch) = self.state.committed_batch(lease.record.batch_id.clone())? else {
                 self.dead_letter(lease.fence, &mut report)?;
                 continue;
             };
 
-            let delivery_id = PublicationDeliveryId::from_state(lease.record.delivery_id);
+            let delivery_id = PublicationDeliveryId::from_state(&lease.record.delivery_id);
             let started = Instant::now();
             let result = self.sink.publish(CommittedDelivery {
                 delivery_id: delivery_id.clone(),
@@ -267,7 +267,8 @@ impl PublicationOrchestrator {
                         if receipt.delivery_id == delivery_id
                             && receipt.batch_id == lease.record.batch_id =>
                     {
-                        self.state.acknowledge_publication(lease.fence, now)?;
+                        self.state
+                            .acknowledge_publication(lease.fence.clone(), now)?;
                         report.acknowledged += 1;
                         None
                     }

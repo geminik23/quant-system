@@ -18,7 +18,7 @@ use super::diagnostic::{
 };
 use super::identity::{
     CanonicalEncode, CanonicalWriter, IdentityError, PipelineIdentity, ResolvedGraphIdentity,
-    RoutingGraphIdentity, SemanticVersion, hash_domain,
+    RoutingGraphIdentity, SemanticVersion,
 };
 use super::report::{
     AmbiguityAlternativeEvidence, AmbiguityEvidence, EvaluationEvidence, EvaluationFailure,
@@ -32,10 +32,7 @@ use super::signal::{
 };
 use super::value::{
     ContractList, ContractMap, ContractText, ContractValueError, NonEmptyContractList, PipelineId,
-    Sha256Digest,
 };
-
-const STAGE_VALUE_DOMAIN: &str = "quant-system/stage-value/v1";
 
 #[derive(Debug, Clone)]
 pub enum DraftValidationStep {
@@ -155,7 +152,7 @@ impl CompiledPipeline {
         requirements: PipelineContextRequirements,
         kind: CompiledPipelineKind,
     ) -> Result<Self, GraphCompileError> {
-        let graph = ResolvedGraphIdentity::from_payload(&encode_pipeline_kind(&kind)?);
+        let graph = ResolvedGraphIdentity::from_payload(encode_pipeline_kind(&kind)?)?;
         let identity = PipelineIdentity::new(id, version, graph)?;
         Ok(Self {
             identity,
@@ -513,7 +510,7 @@ impl CompiledRoutingGraph {
             }
         }
         routes.sort_by(|left, right| left.id.cmp(&right.id));
-        let identity = RoutingGraphIdentity::from_payload(&encode_routes(&routes)?);
+        let identity = RoutingGraphIdentity::from_payload(encode_routes(&routes)?)?;
         Ok(Self {
             identity,
             routes,
@@ -522,7 +519,7 @@ impl CompiledRoutingGraph {
     }
 
     pub fn identity(&self) -> RoutingGraphIdentity {
-        self.identity
+        self.identity.clone()
     }
 
     pub fn route(&self, input: EvaluationInput) -> RouteEvaluation {
@@ -533,7 +530,7 @@ impl CompiledRoutingGraph {
             .collect::<Vec<_>>();
         if matches.is_empty() {
             return RouteEvaluation::Completed(Box::new(route_terminal_report(
-                EvaluationIdentity::new(self.identity, None),
+                EvaluationIdentity::new(self.identity.clone(), None),
                 NormalizationOutcome::Ignored {
                     reason: ignore_reason("no_route"),
                 },
@@ -564,7 +561,7 @@ impl CompiledRoutingGraph {
                 AmbiguityEvidence::try_new(alternatives.clone(), alternatives.len() as u32)
                     .expect("route and ambiguity bounds share the same ceiling");
             return RouteEvaluation::Completed(Box::new(route_terminal_report(
-                EvaluationIdentity::new(self.identity, None),
+                EvaluationIdentity::new(self.identity.clone(), None),
                 NormalizationOutcome::Ambiguous { evidence },
                 route_evidence,
             )));
@@ -577,7 +574,7 @@ impl CompiledRoutingGraph {
             .clone();
         RouteEvaluation::Prepared(Box::new(PreparedEvaluation {
             input,
-            identity: EvaluationIdentity::new(self.identity, Some(target)),
+            identity: EvaluationIdentity::new(self.identity.clone(), Some(target)),
             route_evidence,
             pipeline,
         }))
@@ -656,7 +653,6 @@ impl PreparedEvaluation {
         {
             return self.rejected("decoder_schema_mismatch", DiagnosticSet::empty(), vec![]);
         }
-        let input_digest = source_payload_digest(self.input.event().payload());
         let mut diagnostics = DiagnosticSet::empty();
         let mut evidence = Vec::new();
         let drafts = match stage_output(
@@ -665,7 +661,6 @@ impl PreparedEvaluation {
                 .decode(self.input.event(), payload, context),
             decoder,
             EvaluationStage::Decoding,
-            input_digest,
             &mut diagnostics,
             &mut evidence,
             decoder.descriptor().empty_output(),
@@ -674,26 +669,16 @@ impl PreparedEvaluation {
             StageFlow::Completed(outcome) => return self.completed(outcome, diagnostics, evidence),
             StageFlow::Failed(failure) => return self.failed(failure),
         };
-        let drafts = match self.run_validation(
-            validation,
-            drafts,
-            context,
-            input_digest,
-            &mut diagnostics,
-            &mut evidence,
-        ) {
-            StageFlow::Accepted(value) => value,
-            StageFlow::Completed(outcome) => return self.completed(outcome, diagnostics, evidence),
-            StageFlow::Failed(failure) => return self.failed(failure),
-        };
-        self.run_finalizer(
-            finalizer,
-            drafts,
-            context,
-            input_digest,
-            diagnostics,
-            evidence,
-        )
+        let drafts =
+            match self.run_validation(validation, drafts, context, &mut diagnostics, &mut evidence)
+            {
+                StageFlow::Accepted(value) => value,
+                StageFlow::Completed(outcome) => {
+                    return self.completed(outcome, diagnostics, evidence);
+                }
+                StageFlow::Failed(failure) => return self.failed(failure),
+            };
+        self.run_finalizer(finalizer, drafts, context, diagnostics, evidence)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,7 +694,6 @@ impl PreparedEvaluation {
         let SourcePayload::Text(payload) = self.input.event().payload() else {
             return self.rejected("route_payload_mismatch", DiagnosticSet::empty(), vec![]);
         };
-        let input_digest = source_payload_digest(self.input.event().payload());
         let mut diagnostics = DiagnosticSet::empty();
         let mut evidence = Vec::new();
         let meanings = match stage_output(
@@ -718,7 +702,6 @@ impl PreparedEvaluation {
                 .parse(self.input.event(), payload, context),
             parser,
             EvaluationStage::Parsing,
-            input_digest,
             &mut diagnostics,
             &mut evidence,
             parser.descriptor().empty_output(),
@@ -740,7 +723,6 @@ impl PreparedEvaluation {
                 .normalize(meanings, self.input.event(), context),
             normalizer,
             EvaluationStage::MeaningNormalization,
-            input_digest,
             &mut diagnostics,
             &mut evidence,
             normalizer.descriptor().empty_output(),
@@ -749,26 +731,16 @@ impl PreparedEvaluation {
             StageFlow::Completed(outcome) => return self.completed(outcome, diagnostics, evidence),
             StageFlow::Failed(failure) => return self.failed(failure),
         };
-        let drafts = match self.run_validation(
-            validation,
-            drafts,
-            context,
-            input_digest,
-            &mut diagnostics,
-            &mut evidence,
-        ) {
-            StageFlow::Accepted(value) => value,
-            StageFlow::Completed(outcome) => return self.completed(outcome, diagnostics, evidence),
-            StageFlow::Failed(failure) => return self.failed(failure),
-        };
-        self.run_finalizer(
-            finalizer,
-            drafts,
-            context,
-            input_digest,
-            diagnostics,
-            evidence,
-        )
+        let drafts =
+            match self.run_validation(validation, drafts, context, &mut diagnostics, &mut evidence)
+            {
+                StageFlow::Accepted(value) => value,
+                StageFlow::Completed(outcome) => {
+                    return self.completed(outcome, diagnostics, evidence);
+                }
+                StageFlow::Failed(failure) => return self.failed(failure),
+            };
+        self.run_finalizer(finalizer, drafts, context, diagnostics, evidence)
     }
 
     fn evaluate_compatibility(
@@ -776,14 +748,12 @@ impl PreparedEvaluation {
         producer: &PreNormalizedProducerBinding,
         context: &BaseContextSnapshot,
     ) -> PipelineEvaluationResult {
-        let input_digest = source_payload_digest(self.input.event().payload());
         let mut diagnostics = DiagnosticSet::empty();
         let mut evidence = Vec::new();
         let signals = match stage_output(
             producer.executable().produce(self.input.event(), context),
             producer,
             EvaluationStage::Finalization,
-            input_digest,
             &mut diagnostics,
             &mut evidence,
             producer.descriptor().empty_output(),
@@ -798,13 +768,11 @@ impl PreparedEvaluation {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_validation(
         &self,
         validation: &DraftValidationStep,
         drafts: super::component::DraftBatch,
         context: &BaseContextSnapshot,
-        input_digest: Sha256Digest,
         diagnostics: &mut DiagnosticSet,
         evidence: &mut Vec<StageEvidence>,
     ) -> StageFlow<super::component::DraftBatch> {
@@ -816,7 +784,6 @@ impl PreparedEvaluation {
                     .validate(drafts, self.input.event(), context),
                 binding.as_ref(),
                 EvaluationStage::DraftValidation,
-                input_digest,
                 diagnostics,
                 evidence,
                 binding.descriptor().empty_output(),
@@ -824,13 +791,11 @@ impl PreparedEvaluation {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_finalizer(
         self,
         finalizer: &FinalizerBinding,
         drafts: super::component::DraftBatch,
         context: &BaseContextSnapshot,
-        input_digest: Sha256Digest,
         mut diagnostics: DiagnosticSet,
         mut evidence: Vec<StageEvidence>,
     ) -> PipelineEvaluationResult {
@@ -840,7 +805,6 @@ impl PreparedEvaluation {
                 .finalize(drafts, self.input.event(), context),
             finalizer,
             EvaluationStage::Finalization,
-            input_digest,
             &mut diagnostics,
             &mut evidence,
             finalizer.descriptor().empty_output(),
@@ -994,12 +958,10 @@ enum StageFlow<T> {
     Failed(StageExecutionFailure),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stage_output<T, B: BindingView>(
     result: Result<ComponentReport<T>, StageExecutionFailure>,
     binding: &B,
     stage: EvaluationStage,
-    input_digest: Sha256Digest,
     diagnostics: &mut DiagnosticSet,
     evidence: &mut Vec<StageEvidence>,
     empty_policy: EmptyOutputPolicy,
@@ -1013,13 +975,7 @@ where
     };
     let (disposition, stage_diagnostics, facts) = report.into_parts();
     diagnostics.append(stage_diagnostics);
-    evidence.push(StageEvidence::new(
-        stage,
-        binding.resolved().clone(),
-        input_digest,
-        None,
-        facts,
-    ));
+    evidence.push(StageEvidence::new(stage, binding.resolved().clone(), facts));
     match disposition {
         StageDisposition::Accepted(output) if output.is_empty() => match empty_policy {
             EmptyOutputPolicy::Ignore => StageFlow::Completed(NormalizationOutcome::Ignored {
@@ -1106,26 +1062,6 @@ fn route_terminal_report(
     )
 }
 
-fn source_payload_digest(payload: &SourcePayload) -> Sha256Digest {
-    let mut writer = CanonicalWriter::new();
-    match payload {
-        SourcePayload::Text(value) => {
-            writer.u16(1);
-            writer.text(value.text().as_str()).unwrap();
-            writer.u16(text_format_tag(value.format()));
-            encode_option_text(value.language().map(LanguageTag::as_str), &mut writer).unwrap();
-        }
-        SourcePayload::Structured(value) => {
-            writer.u16(2);
-            writer.text(value.schema().as_str()).unwrap();
-            writer.u16(encoding_tag(value.encoding()));
-            writer.bytes(value.data().as_slice()).unwrap();
-        }
-        SourcePayload::Empty => writer.u16(3),
-    }
-    hash_domain(STAGE_VALUE_DOMAIN, &writer.into_bytes())
-}
-
 fn route_matches_pipeline(route: &RouteSpec, pipeline: &CompiledPipeline) -> bool {
     match &pipeline.kind {
         CompiledPipelineKind::Structured { decoder, .. } => {
@@ -1163,9 +1099,7 @@ fn encode_routes(routes: &[RouteSpec]) -> Result<Vec<u8>, IdentityError> {
         writer.text(route.id.as_str())?;
         writer.i64(route.priority);
         route.selector.encode(&mut writer)?;
-        writer.text(route.target.id().as_str())?;
-        route.target.version().encode(&mut writer)?;
-        writer.digest(&route.target.graph().digest());
+        route.target.encode(&mut writer)?;
     }
     Ok(writer.into_bytes())
 }

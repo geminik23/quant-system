@@ -1,11 +1,6 @@
-use sha2::{Digest as _, Sha256};
-
-use super::value::{ComponentId, ContractText, ContractValueError, PipelineId, Sha256Digest};
-
-pub const COMPONENT_CONFIG_DOMAIN: &str = "quant-system/component-config-identity/v1";
-pub const RESOLVED_GRAPH_DOMAIN: &str = "quant-system/resolved-graph-identity/v1";
-pub const ROUTING_GRAPH_DOMAIN: &str = "quant-system/routing-graph-identity/v1";
-pub const PIPELINE_DOMAIN: &str = "quant-system/pipeline-identity/v1";
+use super::value::{
+    CanonicalIdentityBytes, ComponentId, ContractText, ContractValueError, PipelineId,
+};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum IdentityError {
@@ -60,10 +55,6 @@ impl CanonicalWriter {
         self.bytes(value.as_bytes())
     }
 
-    pub fn digest(&mut self, value: &Sha256Digest) {
-        self.bytes.extend_from_slice(value.as_bytes());
-    }
-
     pub fn finite_f64(&mut self, value: f64) -> Result<(), IdentityError> {
         if !value.is_finite() {
             return Err(IdentityError::NonFiniteFloat);
@@ -76,18 +67,14 @@ impl CanonicalWriter {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    pub fn into_identity_bytes(self) -> Result<CanonicalIdentityBytes, IdentityError> {
+        Ok(CanonicalIdentityBytes::try_new(self.bytes)?)
+    }
 }
 
 pub trait CanonicalEncode {
     fn encode(&self, writer: &mut CanonicalWriter) -> Result<(), IdentityError>;
-}
-
-pub fn hash_domain(domain: &str, payload: &[u8]) -> Sha256Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update([0]);
-    hasher.update(payload);
-    Sha256Digest::new(hasher.finalize().into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -211,38 +198,38 @@ impl ComponentConfigSchemaRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ComponentConfigIdentity(Sha256Digest);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComponentConfigIdentity(CanonicalIdentityBytes);
 
 impl ComponentConfigIdentity {
-    pub fn digest(self) -> Sha256Digest {
-        self.0
+    pub fn canonical_bytes(&self) -> &CanonicalIdentityBytes {
+        &self.0
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResolvedGraphIdentity(Sha256Digest);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResolvedGraphIdentity(CanonicalIdentityBytes);
 
 impl ResolvedGraphIdentity {
-    pub fn from_payload(payload: &[u8]) -> Self {
-        Self(hash_domain(RESOLVED_GRAPH_DOMAIN, payload))
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self, IdentityError> {
+        Ok(Self(CanonicalIdentityBytes::try_new(payload)?))
     }
 
-    pub fn digest(self) -> Sha256Digest {
-        self.0
+    pub fn canonical_bytes(&self) -> &CanonicalIdentityBytes {
+        &self.0
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RoutingGraphIdentity(Sha256Digest);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutingGraphIdentity(CanonicalIdentityBytes);
 
 impl RoutingGraphIdentity {
-    pub fn from_payload(payload: &[u8]) -> Self {
-        Self(hash_domain(ROUTING_GRAPH_DOMAIN, payload))
+    pub fn from_payload(payload: Vec<u8>) -> Result<Self, IdentityError> {
+        Ok(Self(CanonicalIdentityBytes::try_new(payload)?))
     }
 
-    pub fn digest(self) -> Sha256Digest {
-        self.0
+    pub fn canonical_bytes(&self) -> &CanonicalIdentityBytes {
+        &self.0
     }
 }
 
@@ -288,8 +275,8 @@ impl ResolvedComponentRef {
         self.contract_version
     }
 
-    pub fn config_identity(&self) -> ComponentConfigIdentity {
-        self.config_identity
+    pub fn config_identity(&self) -> &ComponentConfigIdentity {
+        &self.config_identity
     }
 }
 
@@ -299,20 +286,18 @@ impl CanonicalEncode for ResolvedComponentRef {
         writer.u16(self.kind.tag());
         self.implementation_version.encode(writer)?;
         writer.u32(self.contract_version);
-        writer.digest(&self.config_identity.0);
-        Ok(())
+        writer.bytes(self.config_identity.canonical_bytes().as_slice())
     }
 }
 
-impl AsRef<Sha256Digest> for ComponentConfigIdentity {
-    fn as_ref(&self) -> &Sha256Digest {
+impl AsRef<CanonicalIdentityBytes> for ComponentConfigIdentity {
+    fn as_ref(&self) -> &CanonicalIdentityBytes {
         &self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PipelineIdentity {
-    digest: Sha256Digest,
     id: PipelineId,
     version: SemanticVersion,
     graph: ResolvedGraphIdentity,
@@ -324,21 +309,9 @@ impl PipelineIdentity {
         version: SemanticVersion,
         graph: ResolvedGraphIdentity,
     ) -> Result<Self, IdentityError> {
-        let mut writer = CanonicalWriter::new();
-        writer.text(id.as_str())?;
-        version.encode(&mut writer)?;
-        writer.digest(&graph.0);
-        let digest = hash_domain(PIPELINE_DOMAIN, &writer.into_bytes());
-        Ok(Self {
-            digest,
-            id,
-            version,
-            graph,
-        })
-    }
-
-    pub fn digest(&self) -> Sha256Digest {
-        self.digest
+        let identity = Self { id, version, graph };
+        identity.encode_canonical_bytes()?;
+        Ok(identity)
     }
 
     pub fn id(&self) -> &PipelineId {
@@ -349,8 +322,27 @@ impl PipelineIdentity {
         &self.version
     }
 
-    pub fn graph(&self) -> ResolvedGraphIdentity {
-        self.graph
+    pub fn graph(&self) -> &ResolvedGraphIdentity {
+        &self.graph
+    }
+
+    pub fn canonical_bytes(&self) -> CanonicalIdentityBytes {
+        self.encode_canonical_bytes()
+            .expect("validated pipeline identity remains bounded")
+    }
+
+    fn encode_canonical_bytes(&self) -> Result<CanonicalIdentityBytes, IdentityError> {
+        let mut writer = CanonicalWriter::new();
+        self.encode(&mut writer)?;
+        writer.into_identity_bytes()
+    }
+}
+
+impl CanonicalEncode for PipelineIdentity {
+    fn encode(&self, writer: &mut CanonicalWriter) -> Result<(), IdentityError> {
+        writer.text(self.id.as_str())?;
+        self.version.encode(writer)?;
+        writer.bytes(self.graph.canonical_bytes().as_slice())
     }
 }
 
@@ -363,14 +355,12 @@ pub fn component_config_identity(
     config_payload: &[u8],
 ) -> Result<ComponentConfigIdentity, IdentityError> {
     let mut writer = CanonicalWriter::new();
+    writer.u16(1);
     writer.text(id.as_str())?;
     writer.u16(kind.tag());
     version.encode(&mut writer)?;
     writer.u32(contract_version);
     writer.text(schema.as_str())?;
     writer.bytes(config_payload)?;
-    Ok(ComponentConfigIdentity(hash_domain(
-        COMPONENT_CONFIG_DOMAIN,
-        &writer.into_bytes(),
-    )))
+    Ok(ComponentConfigIdentity(writer.into_identity_bytes()?))
 }

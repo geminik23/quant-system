@@ -1,28 +1,31 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use qs_core::{OrderType, Side};
 use signal_parser::ingestion::{
     BoundedBytes, DateTimeUtc, ExternalEventId, PayloadEncoding, SourceEvent, SourceEventKey,
     SourceId, SourceOperation, SourcePayload, SourceRevision, SourceTimestamp,
     SourceTimestampQuality, StructuredPayload,
 };
 use signal_parser::normalization::{
-    BaseContextSnapshot, CanonicalRawSignalsDecoder, CompiledPipeline, CompiledRoutingGraph,
-    CompletionKnowledge, ComponentConfigSchemaRef, ComponentDescriptor, ComponentId, ComponentKind,
-    ComponentResult, DiagnosticSet, DraftValidationStep, EmptyOutputPolicy, EvaluationFailureClass,
+    BaseContextSnapshot, CanonicalIdentityBytes, CanonicalRawSignalsDecoder, CompiledPipeline,
+    CompiledRoutingGraph, CompletionKnowledge, ComponentConfigSchemaRef, ComponentDescriptor,
+    ComponentId, ComponentKind, ComponentReport, ComponentResult, ContractList, CorrelationHint,
+    DiagnosticSet, DraftBatch, DraftValidationStep, EmptyOutputPolicy, EvaluationFailureClass,
     EvaluationInput, EvaluationRetrySafety, NoConfig, NormalizationOutcome,
-    PipelineContextRequirements, PipelineEvaluationResult, PipelineId, PreNormalizedProducer,
-    PreNormalizedSignalBatch, RouteEvaluation, RouteSelector, RouteSpec, SemanticVersion,
-    Sha256Digest, SourceAdapterIdentity, StageExecutionFailure, StandardSignalFinalizer,
-    StructuredInputCapability, bind_decoder, bind_finalizer, bind_pre_normalized_producer,
+    PipelineContextRequirements, PipelineEvaluationResult, PipelineId, PositiveFiniteF64,
+    PreNormalizedProducer, PreNormalizedSignalBatch, RouteEvaluation, RouteSelector, RouteSpec,
+    SemanticVersion, SignalDecoder, SignalDraft, SignalDraftAction, SourceAdapterIdentity,
+    StageExecutionFailure, StandardSignalFinalizer, StructuredInputCapability, SymbolText,
+    TradeKeyText, bind_decoder, bind_finalizer, bind_pre_normalized_producer,
     raw_signals_v1_schema,
 };
 use signal_parser::state::{
-    ApplicationCommitInput, CommittedBatchId, CommittedNormalizationOutcome,
-    CompareAndCommitRequest, CompareAndCommitResult, DurableDeliveryIdentity,
-    MemorySourceStateStore, NormalizedLifecycleEvent, PreflightRequest, PreflightResult,
-    PublicationState, ReplacementPolicy, SnapshotRequest, SourceLifecycleState, SourceStateStore,
-    SqliteSourceStateStore,
+    AdmittedSourceAdapter, ApplicationCommitInput, AppliedEventId, CommittedBatchId,
+    CommittedNormalizationOutcome, CompareAndCommitRequest, CompareAndCommitResult,
+    DurableDeliveryIdentity, MemorySourceStateStore, NormalizedLifecycleEvent, PreflightRequest,
+    PreflightResult, PublicationDeliveryId, PublicationState, ReplacementPolicy, SnapshotRequest,
+    SourceLifecycleState, SourceStateStore, SqliteSourceStateStore,
 };
 
 fn timestamp(value: &str) -> DateTimeUtc {
@@ -66,6 +69,51 @@ fn event(revision: u64, operation: SourceOperation) -> SourceEvent {
         ),
         timestamp("2026-08-06T00:00:01Z"),
         payload,
+    )
+}
+
+fn entry_event(
+    revision: u64,
+    operation: SourceOperation,
+    risk: f64,
+    trade_id: &str,
+) -> SourceEvent {
+    SourceEvent::new(
+        SourceEventKey::new(
+            SourceId::new("jsonl:state-test").unwrap(),
+            ExternalEventId::new("event-1").unwrap(),
+        ),
+        operation,
+        SourceRevision::Monotonic(revision),
+        SourceTimestamp::new(
+            timestamp("2026-08-06T00:00:00Z"),
+            SourceTimestampQuality::SourceProvided,
+        ),
+        timestamp("2026-08-06T00:00:01Z"),
+        SourcePayload::Structured(StructuredPayload::new(
+            raw_signals_v1_schema(),
+            PayloadEncoding::Json,
+            BoundedBytes::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "signals": [{
+                        "action": "Entry",
+                        "ts": "2026-08-06T00:00:00Z",
+                        "symbol": "EURUSD",
+                        "side": "Buy",
+                        "order_type": "Market",
+                        "price": null,
+                        "risk": risk,
+                        "stoploss": null,
+                        "targets": [],
+                        "group": null,
+                        "trade_id": trade_id
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        )),
     )
 }
 
@@ -136,11 +184,93 @@ fn graph() -> CompiledRoutingGraph {
     CompiledRoutingGraph::compile(vec![route], vec![pipeline]).unwrap()
 }
 
+struct CorrelatedEntryDecoder;
+
+impl SignalDecoder for CorrelatedEntryDecoder {
+    fn decode(
+        &self,
+        event: &SourceEvent,
+        payload: &StructuredPayload,
+        _context: &BaseContextSnapshot,
+    ) -> ComponentResult<DraftBatch> {
+        let value: serde_json::Value = serde_json::from_slice(payload.data().as_slice()).unwrap();
+        let signal = &value["signals"][0];
+        let risk = signal["risk"].as_f64().unwrap();
+        let trade_id = signal["trade_id"].as_str().unwrap();
+        let trade_key = TradeKeyText::try_new(trade_id, "trade ID").unwrap();
+        let draft = SignalDraft::try_new(
+            event.occurred_at().value(),
+            None,
+            SignalDraftAction::Entry {
+                symbol: SymbolText::try_new("EURUSD", "symbol").unwrap(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: None,
+                risk: PositiveFiniteF64::try_new(risk, "risk").unwrap(),
+                stoploss: None,
+                targets: ContractList::empty(),
+                group: None,
+                trade_id: Some(trade_key.clone()),
+            },
+            DiagnosticSet::empty(),
+            vec![CorrelationHint::new(trade_key, None)],
+        )
+        .unwrap();
+        Ok(ComponentReport::accepted(
+            ContractList::try_new(vec![draft], "decoded drafts").unwrap(),
+        ))
+    }
+}
+
+fn correlated_graph() -> CompiledRoutingGraph {
+    let config =
+        NoConfig::new(ComponentConfigSchemaRef::try_new("quant-system/no-config@1").unwrap());
+    let decoder = bind_decoder(
+        descriptor(ComponentKind::Decoder, "correlated-state-test-decoder"),
+        &config,
+        |_| Ok(CorrelatedEntryDecoder),
+    )
+    .unwrap();
+    let finalizer = bind_finalizer(
+        descriptor(ComponentKind::Finalizer, "correlated-state-test-finalizer"),
+        &config,
+        |_| Ok(StandardSignalFinalizer),
+    )
+    .unwrap();
+    let pipeline = CompiledPipeline::compile_structured(
+        PipelineId::try_new("correlated-state-test", "pipeline ID").unwrap(),
+        SemanticVersion::new(1, 0, 0),
+        decoder,
+        DraftValidationStep::NoneDeclared,
+        finalizer,
+    )
+    .unwrap();
+    let route = RouteSpec::try_new(
+        "correlated-state-test",
+        1,
+        RouteSelector::try_new(
+            Some(SourceId::new("jsonl:state-test").unwrap()),
+            None,
+            Some(signal_parser::normalization::PayloadKind::Structured),
+            Some(raw_signals_v1_schema()),
+            Some(PayloadEncoding::Json),
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+        )
+        .unwrap(),
+        pipeline.identity().clone(),
+    )
+    .unwrap();
+    CompiledRoutingGraph::compile(vec![route], vec![pipeline]).unwrap()
+}
+
 fn adapter() -> SourceAdapterIdentity {
     SourceAdapterIdentity::new(
         ComponentId::try_new("state-test-adapter", "adapter ID").unwrap(),
         SemanticVersion::new(1, 0, 0),
-        Sha256Digest::new([7; 32]),
+        CanonicalIdentityBytes::try_new(vec![7; 32]).unwrap(),
     )
 }
 
@@ -183,6 +313,26 @@ fn evaluate_and_commit(
     graph: &CompiledRoutingGraph,
     source: SourceEvent,
 ) -> signal_parser::state::CommittedBatchId {
+    let (batch_id, application_rejected) = evaluate_and_commit_with_limit(
+        store,
+        graph,
+        source,
+        ReplacementPolicy::Patch,
+        32,
+        Some("committed-jsonl".to_string()),
+    );
+    assert!(!application_rejected);
+    batch_id
+}
+
+fn evaluate_and_commit_with_limit(
+    store: &dyn SourceStateStore,
+    graph: &CompiledRoutingGraph,
+    source: SourceEvent,
+    replacement_policy: ReplacementPolicy,
+    maximum_active_outputs: usize,
+    publication_sink: Option<String>,
+) -> (CommittedBatchId, bool) {
     let preflight = store
         .preflight(PreflightRequest {
             event: source.clone(),
@@ -227,15 +377,51 @@ fn evaluate_and_commit(
         .compare_and_commit(CompareAndCommitRequest {
             compare_token: snapshot.compare_token,
             input: ApplicationCommitInput::CompletedEvaluation(&report),
+            replacement_policy,
+            maximum_active_outputs,
+            publication_sink,
+            committed_at: source.received_at(),
+        })
+        .unwrap()
+    {
+        CompareAndCommitResult::Committed(batch_id) => (batch_id, false),
+        CompareAndCommitResult::ApplicationRejected(batch_id) => (batch_id, true),
+        other => panic!("unexpected commit result: {other:?}"),
+    }
+}
+
+fn commit_delete(store: &dyn SourceStateStore, source: SourceEvent) -> CommittedBatchId {
+    let preflight = store
+        .preflight(PreflightRequest {
+            event: source.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable(format!(
+                "delete-{:?}",
+                source.revision()
+            ))),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: source.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap();
+    let PreflightResult::Reserved(reservation) = preflight else {
+        panic!("expected delete reservation");
+    };
+    let token = store.route_only_compare_token(&reservation).unwrap();
+    match store
+        .compare_and_commit(CompareAndCommitRequest {
+            compare_token: token,
+            input: ApplicationCommitInput::LifecycleOnlyDelete,
             replacement_policy: ReplacementPolicy::Patch,
             maximum_active_outputs: 32,
-            publication_sink: Some("committed-jsonl".to_string()),
+            publication_sink: None,
             committed_at: source.received_at(),
         })
         .unwrap()
     {
         CompareAndCommitResult::Committed(batch_id) => batch_id,
-        other => panic!("unexpected commit result: {other:?}"),
+        other => panic!("unexpected delete commit result: {other:?}"),
     }
 }
 
@@ -243,7 +429,7 @@ fn run_store_conformance(store: &dyn SourceStateStore) {
     let graph = graph();
     let first = event(1, SourceOperation::Create);
     let first_batch = evaluate_and_commit(store, &graph, first.clone());
-    let committed = store.committed_batch(first_batch).unwrap().unwrap();
+    let committed = store.committed_batch(first_batch.clone()).unwrap().unwrap();
     assert_eq!(committed.envelopes.len(), 1);
     assert!(matches!(
         committed.outcome,
@@ -360,7 +546,7 @@ fn run_store_conformance(store: &dyn SourceStateStore) {
     assert_eq!(leases.len(), 3);
     let first_lease = leases[0].clone();
     let published = store
-        .acknowledge_publication(first_lease.fence, timestamp("2026-08-06T00:00:30Z"))
+        .acknowledge_publication(first_lease.fence.clone(), timestamp("2026-08-06T00:00:30Z"))
         .unwrap();
     assert!(matches!(published, PublicationState::Published { .. }));
     assert!(
@@ -376,6 +562,138 @@ fn in_memory_store_passes_durable_application_conformance() {
 }
 
 #[test]
+fn committed_batch_identity_is_scoped_to_store_commit_order() {
+    let graph = graph();
+
+    let added_store = MemorySourceStateStore::new();
+    let target = event(2, SourceOperation::Update);
+    let added_id = evaluate_and_commit(&added_store, &graph, target.clone());
+    let added = added_store
+        .committed_batch(added_id.clone())
+        .unwrap()
+        .unwrap();
+
+    let equivalent_store = MemorySourceStateStore::new();
+    evaluate_and_commit(&equivalent_store, &graph, event(1, SourceOperation::Create));
+    let equivalent_id = evaluate_and_commit(&equivalent_store, &graph, target);
+    let equivalent = equivalent_store
+        .committed_batch(equivalent_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(added.applied_event_id, equivalent.applied_event_id);
+    assert_eq!(added.evaluation_identity, equivalent.evaluation_identity);
+    assert_ne!(added.commit_index, equivalent.commit_index);
+    assert!(matches!(
+        added.lifecycle.as_slice(),
+        [NormalizedLifecycleEvent::Added { .. }]
+    ));
+    assert!(matches!(
+        equivalent.lifecycle.as_slice(),
+        [NormalizedLifecycleEvent::Equivalent { .. }]
+    ));
+    assert_ne!(added_id, equivalent_id);
+
+    let correlated_graph = correlated_graph();
+    let added_store = MemorySourceStateStore::new();
+    let target = entry_event(2, SourceOperation::Update, 2.0, "stable-trade");
+    let added_id = evaluate_and_commit(&added_store, &correlated_graph, target.clone());
+    let added = added_store
+        .committed_batch(added_id.clone())
+        .unwrap()
+        .unwrap();
+
+    let superseded_store = MemorySourceStateStore::new();
+    evaluate_and_commit(
+        &superseded_store,
+        &correlated_graph,
+        entry_event(1, SourceOperation::Create, 1.0, "stable-trade"),
+    );
+    let superseded_id = evaluate_and_commit(&superseded_store, &correlated_graph, target);
+    let superseded = superseded_store
+        .committed_batch(superseded_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(added.applied_event_id, superseded.applied_event_id);
+    assert_eq!(added.evaluation_identity, superseded.evaluation_identity);
+    assert_ne!(added.commit_index, superseded.commit_index);
+    assert!(matches!(
+        superseded.lifecycle.as_slice(),
+        [NormalizedLifecycleEvent::Superseded { .. }]
+    ));
+    assert_ne!(added_id, superseded_id);
+
+    let accepted_store = MemorySourceStateStore::new();
+    let target = entry_event(2, SourceOperation::Update, 2.0, "target-trade");
+    let (accepted_id, accepted_rejected) = evaluate_and_commit_with_limit(
+        &accepted_store,
+        &graph,
+        target.clone(),
+        ReplacementPolicy::Patch,
+        1,
+        None,
+    );
+    assert!(!accepted_rejected);
+    let accepted = accepted_store
+        .committed_batch(accepted_id.clone())
+        .unwrap()
+        .unwrap();
+
+    let rejected_store = MemorySourceStateStore::new();
+    evaluate_and_commit(
+        &rejected_store,
+        &graph,
+        entry_event(1, SourceOperation::Create, 1.0, "prior-trade"),
+    );
+    let (rejected_id, application_rejected) = evaluate_and_commit_with_limit(
+        &rejected_store,
+        &graph,
+        target,
+        ReplacementPolicy::Patch,
+        1,
+        None,
+    );
+    assert!(application_rejected);
+    let rejected = rejected_store
+        .committed_batch(rejected_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.applied_event_id, rejected.applied_event_id);
+    assert_eq!(accepted.evaluation_identity, rejected.evaluation_identity);
+    assert_ne!(accepted.commit_index, rejected.commit_index);
+    assert!(matches!(
+        rejected.outcome,
+        CommittedNormalizationOutcome::ApplicationRejected { .. }
+    ));
+    assert_ne!(accepted_id, rejected_id);
+
+    let empty_store = MemorySourceStateStore::new();
+    let delete = event(2, SourceOperation::Delete);
+    let empty_delete_id = commit_delete(&empty_store, delete.clone());
+    let empty_delete = empty_store
+        .committed_batch(empty_delete_id.clone())
+        .unwrap()
+        .unwrap();
+
+    let populated_store = MemorySourceStateStore::new();
+    evaluate_and_commit(&populated_store, &graph, event(1, SourceOperation::Create));
+    let populated_delete_id = commit_delete(&populated_store, delete);
+    let populated_delete = populated_store
+        .committed_batch(populated_delete_id.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        empty_delete.applied_event_id,
+        populated_delete.applied_event_id
+    );
+    assert!(empty_delete.lifecycle.is_empty());
+    assert!(matches!(
+        populated_delete.lifecycle.as_slice(),
+        [NormalizedLifecycleEvent::Withdrawn { .. }]
+    ));
+    assert_ne!(empty_delete_id, populated_delete_id);
+}
+
+#[test]
 fn sqlite_store_passes_conformance_and_recovers_after_restart() {
     let path = temporary_database_path();
     let first_batch;
@@ -387,7 +705,7 @@ fn sqlite_store_passes_conformance_and_recovers_after_restart() {
             .recorded_receipts()
             .unwrap()
             .first()
-            .map(|receipt| receipt.applied_event_id)
+            .map(|receipt| receipt.applied_event_id.clone())
             .unwrap();
     }
     {
@@ -424,7 +742,7 @@ fn sqlite_store_passes_conformance_and_recovers_after_restart() {
             )
             .unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_ne!(first_batch.as_bytes(), &[0; 32]);
+        assert!(first_batch.to_string_id().starts_with("ae2_"));
     }
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
@@ -486,7 +804,7 @@ fn operational_failure_is_recorded_without_checkpoint_or_batch() {
     };
     store
         .record_evaluation_failure(
-            reservation.applied_event_id,
+            reservation.applied_event_id.clone(),
             reservation.fence,
             &failure,
             source.received_at(),
@@ -496,7 +814,10 @@ fn operational_failure_is_recorded_without_checkpoint_or_batch() {
     assert!(store.checkpoint("failure:state-test").unwrap().is_none());
     assert!(
         store
-            .committed_batch(CommittedBatchId::from_bytes([0; 32]))
+            .committed_batch(CommittedBatchId::from_applied_event(
+                reservation.applied_event_id,
+                1,
+            ))
             .unwrap()
             .is_none()
     );
@@ -522,6 +843,112 @@ fn stale_reservation_fence_cannot_create_a_compare_token() {
     };
     reservation.fence.generation += 1;
     assert!(store.route_only_compare_token(&reservation).is_err());
+}
+
+#[test]
+fn applied_event_identity_uses_source_revision_and_unversioned_delivery() {
+    let monotonic = event(1, SourceOperation::Create);
+    let first_store = MemorySourceStateStore::new();
+    let PreflightResult::Reserved(first) = first_store
+        .preflight(PreflightRequest {
+            event: monotonic.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable("delivery-a".to_string())),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: monotonic.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap()
+    else {
+        panic!("expected first monotonic reservation");
+    };
+    let second_store = MemorySourceStateStore::new();
+    let PreflightResult::Reserved(second) = second_store
+        .preflight(PreflightRequest {
+            event: monotonic.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable("delivery-b".to_string())),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: monotonic.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap()
+    else {
+        panic!("expected second monotonic reservation");
+    };
+    assert_eq!(first.applied_event_id, second.applied_event_id);
+    assert_eq!(
+        first.applied_event_id.to_string_id(),
+        "ae2_m:16:jsonl:state-test:7:event-1:1"
+    );
+    assert_eq!(
+        AppliedEventId::from_string_id(&first.applied_event_id.to_string_id()).unwrap(),
+        first.applied_event_id
+    );
+    assert!(
+        AppliedEventId::from_string_id(
+            &first
+                .applied_event_id
+                .to_string_id()
+                .replace("m:16:", "m:016:")
+        )
+        .is_err()
+    );
+
+    let mut changed_received = serde_json::to_value(&monotonic).unwrap();
+    changed_received["received_at"] = serde_json::json!("2026-08-06T00:00:02Z");
+    let changed_received: SourceEvent = serde_json::from_value(changed_received).unwrap();
+    let conflict = first_store
+        .preflight(PreflightRequest {
+            event: changed_received.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable("delivery-a".to_string())),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: changed_received.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap();
+    assert!(matches!(conflict, PreflightResult::Conflict { existing } if *existing == monotonic));
+
+    let unversioned = failure_event();
+    let first_store = MemorySourceStateStore::new();
+    let PreflightResult::Reserved(first) = first_store
+        .preflight(PreflightRequest {
+            event: unversioned.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable("delivery-a".to_string())),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: unversioned.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap()
+    else {
+        panic!("expected first unversioned reservation");
+    };
+    let second_store = MemorySourceStateStore::new();
+    let PreflightResult::Reserved(second) = second_store
+        .preflight(PreflightRequest {
+            event: unversioned.clone(),
+            delivery_identity: Some(DurableDeliveryIdentity::Stable("delivery-b".to_string())),
+            source_adapter: adapter(),
+            adapter_evidence: None,
+            execution_identity: None,
+            requested_at: unversioned.received_at(),
+            expires_at: reservation_expiry(),
+        })
+        .unwrap()
+    else {
+        panic!("expected second unversioned reservation");
+    };
+    assert_ne!(first.applied_event_id, second.applied_event_id);
+    assert_eq!(
+        first.applied_event_id.to_string_id(),
+        "ae2_u:18:failure:state-test:7:event-1:s:10:delivery-a"
+    );
 }
 
 #[test]
@@ -552,6 +979,32 @@ fn unversioned_delivery_identity_is_idempotent() {
         Some([1, 2, 3].as_slice())
     );
     assert_eq!(receipts[0].source_adapter.id, "state-test-adapter");
+    assert_eq!(
+        receipts[0]
+            .source_adapter
+            .config_identity
+            .as_ref()
+            .unwrap()
+            .as_slice(),
+        [7; 32]
+    );
+}
+
+#[test]
+fn admitted_source_adapter_persists_absent_config_identity() {
+    let adapter = AdmittedSourceAdapter {
+        id: "no-config-adapter".to_string(),
+        version_major: 1,
+        version_minor: 0,
+        version_patch: 0,
+        version_prerelease: String::new(),
+        version_build: String::new(),
+        config_identity: None,
+    };
+    let encoded = serde_json::to_vec(&adapter).unwrap();
+    let decoded: AdmittedSourceAdapter = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, adapter);
+    assert_eq!(decoded.config_identity, None);
 }
 
 #[test]
@@ -613,6 +1066,10 @@ fn expired_publication_lease_is_recovered_with_the_same_delivery() {
         .unwrap()
         .remove(0);
     assert_eq!(recovered.fence.delivery_id, first.fence.delivery_id);
+    assert_eq!(
+        first.fence.delivery_id.to_string_id(),
+        "pd2_46:nb3_37:ae2_m:16:jsonl:state-test:7:event-1:1:1:15:committed-jsonl"
+    );
     assert!(recovered.fence.generation > first.fence.generation);
     assert!(
         store
@@ -622,7 +1079,98 @@ fn expired_publication_lease_is_recovered_with_the_same_delivery() {
 }
 
 #[test]
-fn sqlite_rejects_future_schema_and_malformed_state() {
+fn publication_delivery_identity_covers_batch_and_sink_once() {
+    let graph = graph();
+    let first_store = MemorySourceStateStore::new();
+    let (first_batch, first_rejected) = evaluate_and_commit_with_limit(
+        &first_store,
+        &graph,
+        event(1, SourceOperation::Create),
+        ReplacementPolicy::Patch,
+        32,
+        Some("sink-a".to_string()),
+    );
+    assert!(!first_rejected);
+    let first = first_store
+        .lease_publications(
+            1,
+            timestamp("2026-08-06T00:00:02Z"),
+            timestamp("2026-08-06T00:01:00Z"),
+        )
+        .unwrap()
+        .remove(0);
+
+    let second_store = MemorySourceStateStore::new();
+    let (second_batch, second_rejected) = evaluate_and_commit_with_limit(
+        &second_store,
+        &graph,
+        event(1, SourceOperation::Create),
+        ReplacementPolicy::Patch,
+        32,
+        Some("sink-b".to_string()),
+    );
+    assert!(!second_rejected);
+    let second = second_store
+        .lease_publications(
+            1,
+            timestamp("2026-08-06T00:00:02Z"),
+            timestamp("2026-08-06T00:01:00Z"),
+        )
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(first_batch, second_batch);
+    assert_ne!(first.fence.delivery_id, second.fence.delivery_id);
+    assert_eq!(first.record.sink, "sink-a");
+    assert_eq!(second.record.sink, "sink-b");
+
+    let encoded = first.fence.delivery_id.to_string_id();
+    assert_eq!(
+        PublicationDeliveryId::from_string_id(&encoded).unwrap(),
+        first.fence.delivery_id
+    );
+    assert_eq!(first.fence.delivery_id.batch_id(), &first_batch);
+    assert_eq!(first.fence.delivery_id.sink(), "sink-a");
+    assert_eq!(
+        serde_json::from_str::<PublicationDeliveryId>(
+            &serde_json::to_string(&first.fence.delivery_id).unwrap()
+        )
+        .unwrap(),
+        first.fence.delivery_id
+    );
+
+    let framed = PublicationDeliveryId::try_new(first_batch.clone(), "sink:with:colons").unwrap();
+    assert_eq!(
+        PublicationDeliveryId::from_string_id(&framed.to_string_id()).unwrap(),
+        framed
+    );
+    assert!(PublicationDeliveryId::from_string_id(&encoded.replace(":6:", ":06:")).is_err());
+    assert!(PublicationDeliveryId::from_string_id(&encoded.replace(":6:", ":5:")).is_err());
+    assert!(PublicationDeliveryId::try_new(first_batch, "bad\nsink").is_err());
+}
+
+#[test]
+fn sqlite_rejects_incompatible_schema_and_malformed_state() {
+    let legacy_path = temporary_database_path();
+    {
+        let store = SqliteSourceStateStore::open(&legacy_path).unwrap();
+        store.quick_check().unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&legacy_path).unwrap();
+        connection
+            .execute(
+                "UPDATE ingestion_state SET schema_version = 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        SqliteSourceStateStore::open(&legacy_path),
+        Err(signal_parser::state::SourceStateError::UnsupportedSchemaVersion(1))
+    ));
+    let _ = std::fs::remove_file(&legacy_path);
+
     let future_path = temporary_database_path();
     {
         let store = SqliteSourceStateStore::open(&future_path).unwrap();
