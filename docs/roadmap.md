@@ -1,72 +1,104 @@
 # Roadmap
 
-`quant-system` is growing from deterministic historical replay and live quote distribution into a source-neutral strategy, risk, and execution framework.
+The current development goal is historical strategy research and backtesting. The framework will support nontrivial multi-timeframe strategies while continuing to use the existing FutureQuote execution and accounting path.
 
-> This roadmap describes direction, not a delivery schedule. An item is available only when it has a public API, command, or documented workflow.
+> This roadmap describes active work only. It does not assume a later live trading platform.
 
-## At a glance
-
-| Today | Next focus | Later |
-|---|---|---|
-| Deterministic replay, explicit instrument catalogs, canonical intent and execution-event contracts, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, committed-batch intent projection, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
-
-## Direction
+## Current focus
 
 ```mermaid
 flowchart TD
-    A[Historical data and deterministic replay]
-    B[Source-neutral inputs and explicit instruments]
-    C[Shared strategy and portfolio supervision]
-    D[Live execution and reconciliation]
-    E[Broader market economics]
+    A[Historical bid ask ticks]
+    B[Multi-timeframe closed bars]
+    C[Causal observations and annotations]
+    D[Stateful strategy]
+    E[Strict RawSignal]
+    F[Existing FutureQuote replay]
+    G[Fills feedback accounting MTM report]
+    H[Journal and experiment comparison]
 
     A --> B
     B --> C
     C --> D
-    B --> E
-    E --> C
+    D --> E
+    E --> F
+    F --> G
+    G --> D
+    D --> H
 ```
 
-See [Choose a workflow](../README.md#choose-a-workflow) for available entry points and [Architecture](architecture.md) for ownership boundaries.
+## Strategy capabilities
 
-## What we are building toward
+The historical strategy runtime will provide:
 
-### Accept signals from more sources
+- explicit strategy requirements and typed caller-owned configuration;
+- D1, H4, H1, M15, and M5 closed bars derived causally from historical data;
+- bid/ask ticks for execution;
+- warmup;
+- common price observations such as zones, swings, rejection, and momentum;
+- custom strategy-owned indicators without a plugin registry;
+- stateful setup, confirmation, entry, management, and exit;
+- FutureQuote fill, rejection, reduction, scale-in, protection, and close feedback;
+- direct strict `RawSignal` output;
+- journal records, causal annotations, hindsight-only labels, ghost decisions, and deterministic baselines.
 
-Reusable source-event, normalization, provenance, and durable source-state boundaries are available as library APIs while direct strict `RawSignal` input remains supported. Public adapters include Telegram, strict source-event and committed-batch JSONL codecs, and an authenticated HMAC webhook edge. Library composition is available for local ingestion, committed-batch publication, causal replay, and provider bindings. The next step is a deployable hosted ingestion product with restart-safe application processing, deployment configuration, and production sink support.
+A strategy-generated fill-bearing action cannot execute on a quote already observed to make that decision.
 
-**What this unlocks:** additional message sources and explicit handling of edits, deletes, retries, and duplicate delivery.
+## Concrete acceptance
 
-### Represent instruments and trading intent explicitly
+The runtime will be tested against:
 
-A shared instrument foundation is available: source-neutral assets, broker- or exchange-qualified listings, exact grids, effective-dated specifications, immutable catalogs, guarded compatibility translation, and replay manifests now distinguish data-source coordinates from economic instruments. Trading platforms such as CTrader are also distinct from listing and execution venues.
+- an easy higher-timeframe support/resistance strategy with a 1:1 target;
+- a lower-timeframe confirmation strategy with early loser exits, break-even, and add-to-winner behavior;
+- a separate asymmetric partial-close and runner experiment;
+- a deterministic random-entry baseline;
+- an unrelated moving-average strategy;
+- a strategy with a custom internal indicator that requires no framework schema change.
 
-Source- and strategy-neutral `TradeIntent`, immutable execution-command and dispatch contracts, and venue `ExecutionReport` facts are also available in the pure trading-domain library. They are additive: current replay input remains strict `RawSignal`, and consumers must provide pinned instrument and state resolution rather than asking the domain types to perform IO.
+This provides enough structure for real strategies without making support/resistance or one trader's terminology mandatory in core.
 
-**What this unlocks:** safer multi-venue identity and economic capability checks plus a common contract for future ingestion, strategy, portfolio, replay, gateway, and venue consumers.
+## Existing code simplification
 
-### Run strategies through shared risk supervision
+The unused canonical intent, command/dispatch, and venue-report scaffolding has been removed. Strict RawSignal, instrument-domain contracts, FutureQuote, sizing, currency conversion, accounting, and reports remain the active foundation.
 
-Connect parsed signals and strategy decisions to common portfolio risk, allocation, and execution planning without treating them as the same kind of producer.
+The original committed-batch execution bridge will not be reintroduced. A separate reduced ingestion tool may export an active committed-signal snapshot as ordinary RawSignal JSONL for the existing `tg_backtest` workflow; it is not part of Strategy execution.
 
-**What this unlocks:** portfolio-level guardrails and comparable replay and live behavior independent of source or strategy implementation.
+## What will be reused
 
-### Connect supervised intent to live venues
+- historical feed abstractions;
+- strict RawSignal validation;
+- replay instrument specifications;
+- ManagementProfile;
+- FutureQuote latency, slippage, pending, stop, target, scale-in, and close behavior;
+- account-currency sizing and conversion;
+- fills, lifecycle, MTM, drawdown, and BacktestResult.
 
-Build venue capability enforcement, restart-safe state, uncertain-outcome reconciliation, and provider-specific order adapters on the available venue-neutral command, dispatch, and execution-report contracts.
+## What is not on the active roadmap
 
-**What this unlocks:** live order execution without embedding broker behavior in domain, parser, or strategy code.
+- global component registries;
+- deployment compilers;
+- content-addressed strategy artifacts;
+- ingestion-to-trading bridges;
+- multi-strategy portfolio allocation;
+- paper or live execution gateways;
+- restart-safe live strategy runtimes;
+- broker and exchange order adapters;
+- cryptocurrency economics beyond the current rejection guard;
+- model training and live inference;
+- strategy RPC services;
+- Discord or screenshot integrations.
 
-## Parallel exploration
+## Completion target
 
-### Broader market economics
+The roadmap is complete when a developer can:
 
-Add explicit cryptocurrency models for exposure, balances, fees, market data, funding, margin, liquidation, and venue behavior without reusing Forex assumptions.
+1. describe required historical series and warmup;
+2. consume causal multi-timeframe context and manual annotations;
+3. run one stateful strategy through setup and position management;
+4. execute generated signals through the existing FutureQuote engine;
+5. react to committed execution feedback;
+6. inspect decisions, generated signals, fills, lifecycle, PnL, MTM, drawdown, and research journal records;
+7. compare explicit strategy variants without hindsight leakage;
+8. implement an unrelated strategy without changing framework contracts.
 
-### Advanced strategy components
-
-Explore richer analysis and model-driven strategy components after neutral strategy, risk, replay, and market-event boundaries are established.
-
-## Not available yet
-
-Live execution, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, portfolio supervision, execution-gateway orchestration, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.
+See [Backtesting](backtesting.md) for current replay behavior and limitations.
