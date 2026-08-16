@@ -29,13 +29,13 @@ flowchart TD
 
 ## Strategy capabilities
 
-The historical strategy foundation now provides validated descriptors and requirements, bounded D1, H4, H1, M15, and M5 closed bars, and complete-boundary causal analysis. It includes explicit bid, ask, or midpoint aggregation, deterministic missing-interval policy, exact warmup readiness, immutable zones, swings, rejection and momentum descriptions, causal annotation scheduling, confirmed pivots, and bounded read-only series and observation history. The remaining runtime work will provide:
+The historical strategy foundation now provides validated descriptors and requirements, bounded D1, H4, H1, M15, and M5 closed bars, complete-boundary causal analysis, and a stateful callback contract. It includes explicit bid, ask, or midpoint aggregation, deterministic missing-interval policy, exact warmup readiness, immutable zones, swings, rejection and momentum descriptions, causal annotation scheduling, confirmed pivots, bounded read-only series and observation history, ordinary caller-owned strategy state, bounded decision drafts, and borrowed effect and terminal-disposition views. The remaining replay and research work will provide:
 
 - typed caller-owned strategy configuration;
 - bid/ask ticks for execution through the existing FutureQuote path;
-- read-only delivery of completed series and observations to stateful strategy callbacks;
+- invocation of complete-boundary stateful callbacks from the FutureQuote replay loop;
 - custom strategy-owned indicators without a plugin registry;
-- stateful setup, confirmation, entry, management, and exit;
+- causal scheduling of generated signals for setup, confirmation, entry, management, and exit;
 - FutureQuote fill, rejection, reduction, scale-in, protection, and close feedback;
 - direct strict `RawSignal` output;
 - journal records, causal annotations, hindsight-only labels, ghost decisions, and deterministic baselines.

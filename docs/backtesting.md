@@ -68,11 +68,12 @@ The client streams retained-job progress by default. Polling and finite synchron
 - describe future historical strategies with validated `StrategyDescriptor`, `StrategyRequirements`, fixed-duration `Timeframe`, per-series warmup, and bounded decision-record contracts;
 - derive bounded causal closed bars from complete primary-tick timestamp batches with explicit bid, ask, or midpoint aggregation;
 - inspect retained history and exact per-series or aggregate warmup readiness through read-only series views;
+- implement a stateful `HistoricalStrategy` that receives one complete timestamp boundary, read-only series, observations, engine state, and borrowed execution facts, then returns an optional bounded decision draft with ordered strict signals;
 - provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy domain, standalone causal multi-timeframe series, and complete-boundary causal analysis layer are available. The analysis layer provides bounded immutable observations, causal annotation scheduling, and confirmed pivots without invoking a strategy or altering execution prices; stateful `HistoricalStrategy` callbacks, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
+The historical strategy domain, standalone causal multi-timeframe series, complete-boundary causal analysis, and stateful `HistoricalStrategy` callback contract are available. Strategies can retain ordinary Rust state, inspect read-only historical and engine state, consume existing effect and terminal-disposition facts supplied by a caller, and return validated decision drafts. The library does not yet invoke these callbacks from the FutureQuote loop, schedule generated signals, enforce warmup actions, or deliver post-commit feedback automatically. This library path is separate from the production service contract.
 
 ## Operational boundaries
 

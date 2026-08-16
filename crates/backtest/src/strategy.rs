@@ -5,7 +5,10 @@
 pub mod analysis;
 pub mod annotation;
 pub mod config;
+pub mod context;
 pub mod domain;
+pub mod feedback;
+pub mod runtime;
 pub mod series;
 
 pub use analysis::{
@@ -26,12 +29,17 @@ pub use config::{
     MAX_WARMUP_BARS, PriceBasis, SeriesId, StrategyConfigError, StrategyRetentionLimits, Timeframe,
     WarmupRequirement,
 };
+pub use context::StrategyContext;
 pub use domain::{
     MAX_DECISION_LATENCY_MS, MAX_INSTRUMENT_BYTES, MAX_STRATEGY_ID_BYTES,
     MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, SeriesRequirement,
     StrategyBacktestResult, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
     StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
     StrategyId, StrategyRequirements,
+};
+pub use feedback::StrategyFeedback;
+pub use runtime::{
+    HistoricalStrategy, StrategyDecisionDraft, StrategyEvent, StrategyOutput, StrategyRuntimeError,
 };
 pub use series::{
     BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_RETAINED_BARS,

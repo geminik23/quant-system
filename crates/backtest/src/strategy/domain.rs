@@ -375,23 +375,12 @@ impl StrategyDecisionRecord {
         limits: StrategyRetentionLimits,
     ) -> Result<Self, StrategyDomainError> {
         let reason = reason.into();
-        if !valid_text(&reason, limits.max_reason_bytes()) {
-            return Err(StrategyDomainError::InvalidDecisionReason {
-                maximum: limits.max_reason_bytes(),
-            });
-        }
-        if related_trade_id
-            .as_deref()
-            .is_some_and(|trade_id| !valid_text(trade_id, MAX_TRADE_ID_BYTES))
-        {
-            return Err(StrategyDomainError::InvalidTradeId);
-        }
-        if emitted_signals.len() > limits.max_signals_per_callback() {
-            return Err(StrategyDomainError::TooManySignals {
-                actual: emitted_signals.len(),
-                maximum: limits.max_signals_per_callback(),
-            });
-        }
+        validate_decision_fields(
+            &reason,
+            related_trade_id.as_deref(),
+            emitted_signals.len(),
+            limits,
+        )?;
         Ok(Self {
             sequence,
             observed_through,
@@ -501,6 +490,29 @@ pub struct StrategyBacktestResult {
     pub replay: BacktestResult,
     pub descriptor: StrategyDescriptor,
     pub decisions: StrategyDecisionOutput,
+}
+
+pub(crate) fn validate_decision_fields(
+    reason: &str,
+    related_trade_id: Option<&str>,
+    signal_count: usize,
+    limits: StrategyRetentionLimits,
+) -> Result<(), StrategyDomainError> {
+    if !valid_text(reason, limits.max_reason_bytes()) {
+        return Err(StrategyDomainError::InvalidDecisionReason {
+            maximum: limits.max_reason_bytes(),
+        });
+    }
+    if related_trade_id.is_some_and(|trade_id| !valid_text(trade_id, MAX_TRADE_ID_BYTES)) {
+        return Err(StrategyDomainError::InvalidTradeId);
+    }
+    if signal_count > limits.max_signals_per_callback() {
+        return Err(StrategyDomainError::TooManySignals {
+            actual: signal_count,
+            maximum: limits.max_signals_per_callback(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_requirements(
