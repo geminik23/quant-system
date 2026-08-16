@@ -51,7 +51,7 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 ### Historical replay
 
-`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, and profile-file loading. It supports in-process strategy and predefined-signal modes.
+`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, and validated historical strategy descriptors, fixed-duration series requirements, warmup requirements, decision records, and bounded decision retention. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available; stateful multi-timeframe strategy execution is not implemented yet.
 
 `qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. It resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
 
@@ -120,7 +120,7 @@ All source adapters terminate before runner ownership. The webhook edge authenti
 
 The existing `OfflineRunner`, optional `OnlineServer`, handler callbacks, and standalone JSONL contracts remain unchanged compatibility facades and are not hosted through durable state.
 
-A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts unless an explicit downstream exporter produces an eligible `RawSignal`. A source event is not a trade, and a parsed signal is not an engine action until the replay boundary validates and resolves it. Strategy decisions, sizing, execution scheduling, and accounting remain explicit downstream responsibilities.
+A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts. A source event is not a trade, and a parsed signal is not an engine action until the replay boundary validates and resolves an explicitly supplied `RawSignal`. Strategy decisions, sizing, execution scheduling, and accounting remain explicit downstream responsibilities.
 
 ## Market-data flow
 

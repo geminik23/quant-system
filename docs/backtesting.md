@@ -64,12 +64,13 @@ The client streams retained-job progress by default. Polling and finite synchron
 
 `qs-backtest` also exposes in-process APIs:
 
-- implement `Strategy` for strategy-driven replay;
-- provide timestamped signals for predefined replay;
+- implement the legacy `Strategy` trait for action-producing replay;
+- describe future historical strategies with validated `StrategyDescriptor`, `StrategyRequirements`, fixed-duration `Timeframe`, per-series warmup, and bounded decision-record contracts;
+- provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-This library path is separate from the production service contract.
+The historical strategy domain is available, but causal multi-timeframe series, stateful `HistoricalStrategy` callbacks, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
 
 ## Operational boundaries
 

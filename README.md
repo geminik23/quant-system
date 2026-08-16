@@ -88,6 +88,7 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
 - Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
+- `qs-backtest` provides validated historical strategy descriptors, fixed-duration series requirements, per-series warmup, and bounded decision-record contracts. Causal multi-timeframe series, stateful historical strategy callbacks, and dynamic FutureQuote strategy integration are not implemented yet.
 - Current backtest endpoints accept strict `RawSignal`. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.

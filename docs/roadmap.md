@@ -29,9 +29,9 @@ flowchart TD
 
 ## Strategy capabilities
 
-The historical strategy runtime will provide:
+The historical strategy foundation now provides validated descriptors, fixed-duration series requirements, per-series warmup, explicit latency and capability requirements, bounded decision records, and exact retained/omitted counts. The remaining runtime work will provide:
 
-- explicit strategy requirements and typed caller-owned configuration;
+- typed caller-owned strategy configuration;
 - D1, H4, H1, M15, and M5 closed bars derived causally from historical data;
 - bid/ask ticks for execution;
 - warmup;
@@ -61,7 +61,7 @@ This provides enough structure for real strategies without making support/resist
 
 The unused canonical intent, command/dispatch, and venue-report scaffolding has been removed. Strict RawSignal, instrument-domain contracts, FutureQuote, sizing, currency conversion, accounting, and reports remain the active foundation.
 
-The original committed-batch execution bridge will not be reintroduced. A separate reduced ingestion tool may export an active committed-signal snapshot as ordinary RawSignal JSONL for the existing `tg_backtest` workflow; it is not part of Strategy execution.
+The original committed-batch execution bridge will not be reintroduced. Committed batches remain ingestion publication and audit artifacts, while historical strategies and manual/API producers use explicit strict RawSignal values.
 
 ## What will be reused
 

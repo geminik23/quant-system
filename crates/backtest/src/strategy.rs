@@ -1,7 +1,22 @@
-//! Strategy trait for strategy-driven backtests.
+//! Historical strategy contracts and the legacy action-producing strategy trait.
 //!
-//! Implement [`Strategy`] to define custom trading logic that reacts to
-//! market events and produces [`Action`]s for the engine to process.
+//! The validated descriptor, series requirements, decision records, and retention values are additive foundations for FutureQuote historical strategies. The existing [`Strategy`] trait remains the legacy action-producing API.
+
+pub mod config;
+pub mod domain;
+
+pub use config::{
+    MAX_DECISION_RECORDS, MAX_REASON_BYTES, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
+    MAX_WARMUP_BARS, PriceBasis, SeriesId, StrategyConfigError, StrategyRetentionLimits, Timeframe,
+    WarmupRequirement,
+};
+pub use domain::{
+    MAX_DECISION_LATENCY_MS, MAX_INSTRUMENT_BYTES, MAX_STRATEGY_ID_BYTES,
+    MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, SeriesRequirement,
+    StrategyBacktestResult, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
+    StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
+    StrategyId, StrategyRequirements,
+};
 
 use qs_core::types::Action;
 
@@ -36,6 +51,7 @@ use crate::data_feed::MarketEvent;
 ///                 targets: vec![],
 ///                 rules: vec![],
 ///                 group: None,
+///                 trade_id: None,
 ///             }];
 ///         }
 ///         vec![]
