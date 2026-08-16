@@ -72,7 +72,7 @@ The client streams retained-job progress by default. Polling and finite synchron
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy domain and standalone causal multi-timeframe series are available. The series component does not invoke a strategy or alter execution prices; stateful `HistoricalStrategy` callbacks, analysis, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
+The historical strategy domain, standalone causal multi-timeframe series, and complete-boundary causal analysis layer are available. The analysis layer provides bounded immutable observations, causal annotation scheduling, and confirmed pivots without invoking a strategy or altering execution prices; stateful `HistoricalStrategy` callbacks, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
 
 ## Operational boundaries
 
