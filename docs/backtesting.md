@@ -66,11 +66,13 @@ The client streams retained-job progress by default. Polling and finite synchron
 
 - implement the legacy `Strategy` trait for action-producing replay;
 - describe future historical strategies with validated `StrategyDescriptor`, `StrategyRequirements`, fixed-duration `Timeframe`, per-series warmup, and bounded decision-record contracts;
+- derive bounded causal closed bars from complete primary-tick timestamp batches with explicit bid, ask, or midpoint aggregation;
+- inspect retained history and exact per-series or aggregate warmup readiness through read-only series views;
 - provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy domain is available, but causal multi-timeframe series, stateful `HistoricalStrategy` callbacks, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
+The historical strategy domain and standalone causal multi-timeframe series are available. The series component does not invoke a strategy or alter execution prices; stateful `HistoricalStrategy` callbacks, analysis, execution feedback, and dynamic FutureQuote signal integration are not implemented yet. This library path is separate from the production service contract.
 
 ## Operational boundaries
 

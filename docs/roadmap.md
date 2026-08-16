@@ -29,12 +29,10 @@ flowchart TD
 
 ## Strategy capabilities
 
-The historical strategy foundation now provides validated descriptors, fixed-duration series requirements, per-series warmup, explicit latency and capability requirements, bounded decision records, and exact retained/omitted counts. The remaining runtime work will provide:
+The historical strategy foundation now provides validated descriptors and requirements plus bounded D1, H4, H1, M15, and M5 closed bars derived causally from complete historical primary-tick batches. It includes explicit bid, ask, or midpoint aggregation, deterministic missing-interval policy, read-only retained history, and exact warmup readiness. The remaining runtime work will provide:
 
 - typed caller-owned strategy configuration;
-- D1, H4, H1, M15, and M5 closed bars derived causally from historical data;
-- bid/ask ticks for execution;
-- warmup;
+- bid/ask ticks for execution through the existing FutureQuote path;
 - common price observations such as zones, swings, rejection, and momentum;
 - custom strategy-owned indicators without a plugin registry;
 - stateful setup, confirmation, entry, management, and exit;

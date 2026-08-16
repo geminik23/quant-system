@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod domain;
+pub mod series;
 
 pub use config::{
     MAX_DECISION_RECORDS, MAX_REASON_BYTES, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
@@ -16,6 +17,10 @@ pub use domain::{
     StrategyBacktestResult, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
     StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
     StrategyId, StrategyRequirements,
+};
+pub use series::{
+    BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_RETAINED_BARS,
+    MissingIntervalPolicy, MultiTimeframeSeries, SeriesError, SeriesViewError, SeriesWarmupState,
 };
 
 use qs_core::types::Action;

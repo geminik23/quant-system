@@ -78,11 +78,13 @@ pub use runner::{
     BacktestRunner, FutureQuoteConfig, ReplayCancelled, ReplayProgress, StreamingReplayError,
 };
 pub use strategy::{
-    MAX_DECISION_LATENCY_MS, MAX_DECISION_RECORDS, MAX_INSTRUMENT_BYTES, MAX_REASON_BYTES,
+    BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_DECISION_LATENCY_MS,
+    MAX_DECISION_RECORDS, MAX_INSTRUMENT_BYTES, MAX_REASON_BYTES, MAX_RETAINED_BARS,
     MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK, MAX_STRATEGY_ID_BYTES,
     MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, MAX_WARMUP_BARS,
-    PriceBasis, SeriesId, SeriesRequirement, Strategy, StrategyBacktestResult, StrategyConfigError,
-    StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord, StrategyDecisionRecorder,
-    StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError, StrategyId,
-    StrategyRequirements, StrategyRetentionLimits, Timeframe, WarmupRequirement,
+    MissingIntervalPolicy, MultiTimeframeSeries, PriceBasis, SeriesError, SeriesId,
+    SeriesRequirement, SeriesViewError, SeriesWarmupState, Strategy, StrategyBacktestResult,
+    StrategyConfigError, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
+    StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
+    StrategyId, StrategyRequirements, StrategyRetentionLimits, Timeframe, WarmupRequirement,
 };
