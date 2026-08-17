@@ -95,7 +95,7 @@ pub use strategy::{
     StrategyDecisionDraft, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
     StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
     StrategyEvent, StrategyFeedback, StrategyId, StrategyObservation, StrategyObservationDraft,
-    StrategyObservationValue, StrategyOutput, StrategyRequirements, StrategyRetentionLimits,
-    StrategyRuntimeError, SwingKind, SwingPoint, Timeframe, WarmupRequirement, ZoneId, ZoneSide,
-    ZoneSource, ZoneState,
+    StrategyObservationValue, StrategyOutput, StrategyReplayError, StrategyReplayInputError,
+    StrategyRequirements, StrategyRetentionLimits, StrategyRuntimeError, SwingKind, SwingPoint,
+    Timeframe, WarmupRequirement, ZoneId, ZoneSide, ZoneSource, ZoneState,
 };

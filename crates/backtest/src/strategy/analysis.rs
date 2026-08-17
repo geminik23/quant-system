@@ -780,6 +780,20 @@ impl AnalysisPipeline {
         }
         self.validate_boundary(&boundary)?;
 
+        let activates_annotation = self
+            .annotations
+            .pending_causal()
+            .first()
+            .and_then(|annotation| annotation.valid_from())
+            .is_some_and(|valid_from| valid_from <= boundary.observed_through);
+        if boundary.closed_bars.is_empty() && !activates_annotation {
+            self.last_boundary = Some(boundary.observed_through);
+            return Ok(AnalysisBoundaryOutput {
+                observed_through: boundary.observed_through,
+                observations: Vec::new(),
+            });
+        }
+
         let mut staged_store = self.observations.clone();
         let mut staged_annotations = self.annotations.clone();
         let mut staged_sequence = self.next_sequence;

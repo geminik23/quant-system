@@ -68,12 +68,13 @@ The client streams retained-job progress by default. Polling and finite synchron
 - describe future historical strategies with validated `StrategyDescriptor`, `StrategyRequirements`, fixed-duration `Timeframe`, per-series warmup, and bounded decision-record contracts;
 - derive bounded causal closed bars from complete primary-tick timestamp batches with explicit bid, ask, or midpoint aggregation;
 - inspect retained history and exact per-series or aggregate warmup readiness through read-only series views;
-- implement a stateful `HistoricalStrategy` that receives one complete timestamp boundary, read-only series, observations, engine state, and borrowed execution facts, then returns an optional bounded decision draft with ordered strict signals;
+- implement a stateful `HistoricalStrategy` that receives one complete timestamp boundary, read-only series, observations, engine state, and committed execution facts, then returns an optional bounded decision draft with ordered strict signals;
+- run that strategy from a materialized `DataFeed` or complete `FallibleBatchFeed` timestamp stream through the existing FutureQuote scheduler and accounting path;
 - provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy domain, standalone causal multi-timeframe series, complete-boundary causal analysis, and stateful `HistoricalStrategy` callback contract are available. Strategies can retain ordinary Rust state, inspect read-only historical and engine state, consume existing effect and terminal-disposition facts supplied by a caller, and return validated decision drafts. The library does not yet invoke these callbacks from the FutureQuote loop, schedule generated signals, enforce warmup actions, or deliver post-commit feedback automatically. This library path is separate from the production service contract.
+The historical strategy path invokes `HistoricalStrategy` once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances strategy state but rejects economic signals, and only committed effects plus newly terminal dispositions are delivered as feedback. Decision retention does not suppress execution. This library path is separate from the production service contract; journal, label, experiment, and concrete strategy acceptance features remain later work.
 
 ## Operational boundaries
 

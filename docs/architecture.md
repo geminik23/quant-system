@@ -51,7 +51,7 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 ### Historical replay
 
-`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal observations and annotations, and a stateful callback contract with read-only context and borrowed execution facts. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available; dynamic strategy execution through FutureQuote is not implemented yet.
+`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal observations and annotations, and stateful callback replay with read-only context, causal generated-signal scheduling, warmup enforcement, and committed execution feedback. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available and use their established behavior.
 
 `qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. It resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
 

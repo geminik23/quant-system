@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod domain;
 pub mod feedback;
+pub mod replay;
 pub mod runtime;
 pub mod series;
 
@@ -38,6 +39,7 @@ pub use domain::{
     StrategyId, StrategyRequirements,
 };
 pub use feedback::StrategyFeedback;
+pub use replay::{StrategyReplayError, StrategyReplayInputError};
 pub use runtime::{
     HistoricalStrategy, StrategyDecisionDraft, StrategyEvent, StrategyOutput, StrategyRuntimeError,
 };

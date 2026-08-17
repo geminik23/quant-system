@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use chrono::{Duration, NaiveDateTime};
 use qs_core::sizing::{compute_instrument_native_loss_per_lot, compute_instrument_size_for_spec};
 use qs_core::types::{
-    Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, OrderType,
+    Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, FutureEffect, OrderType,
     PositionStatus, PreparedPendingFill, PriceQuote, Side, SlippageModel, position_size_tolerance,
 };
 use qs_core::{ExecutionPricer, FutureApplyError, TradeEngine};
@@ -45,7 +45,11 @@ use crate::profile::{
 };
 use crate::report::BacktestResult;
 use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
-use crate::strategy::Strategy;
+use crate::strategy::{
+    AnalysisBoundary, AnalysisPipeline, BarSeriesSpec, HistoricalStrategy, MultiTimeframeSeries,
+    Strategy, StrategyBacktestResult, StrategyContext, StrategyDecisionRecorder, StrategyEvent,
+    StrategyFeedback, StrategyReplayError, StrategyReplayInputError, StrategyRetentionLimits,
+};
 
 /// Future-quote execution settings. Existing runners remain on legacy semantics
 /// unless [`BacktestRunner::run_raw_signals_future`] is used.
@@ -116,6 +120,7 @@ struct ScheduledSignal {
     signal_ts: NaiveDateTime,
     effective_ts: NaiveDateTime,
     signal: RawSignal,
+    requires_later_quote: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +134,7 @@ struct QueuedAction {
     effective_ts: NaiveDateTime,
     entry_signal: Option<RawSignal>,
     entry_profile: Option<ManagementProfile>,
+    requires_later_quote: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +143,278 @@ enum FutureTransactionError {
     Core(#[from] FutureApplyError),
     #[error(transparent)]
     Accounting(#[from] FutureExecutorError),
+}
+
+#[derive(Debug)]
+enum StrategyDriverError<E> {
+    Series(crate::strategy::SeriesError),
+    SeriesView(crate::strategy::SeriesViewError),
+    Analysis(crate::strategy::AnalysisError),
+    Strategy(E),
+    Runtime(crate::strategy::StrategyRuntimeError),
+    WarmupSignals {
+        timestamp: NaiveDateTime,
+    },
+    InvalidGeneratedSignal {
+        signal_index: usize,
+        reason: String,
+    },
+    TickExecutionRequired {
+        symbol: String,
+        timestamp: NaiveDateTime,
+    },
+}
+
+enum FutureBatchReplayError<E> {
+    Feed(E),
+    Cancelled,
+    Dynamic,
+}
+
+trait FutureReplayHook {
+    fn is_active(&self) -> bool;
+    fn output_ready(&self) -> bool;
+    fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool;
+    fn reject_generated_configuration(&mut self, reason: String);
+    fn on_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        pending_effects: &mut Vec<FutureEffect>,
+    ) -> Option<Vec<ScheduledSignal>>;
+}
+
+struct StaticReplayHook;
+
+impl FutureReplayHook for StaticReplayHook {
+    fn is_active(&self) -> bool {
+        false
+    }
+
+    fn output_ready(&self) -> bool {
+        true
+    }
+
+    fn preflight_primary_events(&mut self, _events: &[FeedEvent]) -> bool {
+        true
+    }
+
+    fn reject_generated_configuration(&mut self, _reason: String) {
+        unreachable!("static replay does not generate strategy signals");
+    }
+
+    fn on_boundary(
+        &mut self,
+        _batch: &TimestampBatch,
+        _engine: &TradeEngine,
+        _lifecycle: &LifecycleLedger,
+        pending_effects: &mut Vec<FutureEffect>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        pending_effects.clear();
+        Some(Vec::new())
+    }
+}
+
+struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
+    strategy: &'a mut S,
+    requirements: crate::strategy::StrategyRequirements,
+    series: MultiTimeframeSeries,
+    analysis: AnalysisPipeline,
+    limits: StrategyRetentionLimits,
+    decisions: StrategyDecisionRecorder,
+    next_decision_sequence: u64,
+    next_signal_sequence: u64,
+    delivered_dispositions: usize,
+    warmup_complete: bool,
+    failure: Option<StrategyDriverError<S::Error>>,
+}
+
+impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
+    fn new(
+        strategy: &'a mut S,
+        series: MultiTimeframeSeries,
+        analysis: AnalysisPipeline,
+        limits: StrategyRetentionLimits,
+    ) -> Self {
+        Self {
+            requirements: strategy.requirements().clone(),
+            strategy,
+            series,
+            analysis,
+            limits,
+            decisions: StrategyDecisionRecorder::new(limits),
+            next_decision_sequence: 0,
+            next_signal_sequence: 0,
+            delivered_dispositions: 0,
+            warmup_complete: false,
+            failure: None,
+        }
+    }
+
+    fn finish(
+        self,
+    ) -> Result<crate::strategy::StrategyDecisionOutput, StrategyDriverError<S::Error>> {
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok(self.decisions.finish()),
+        }
+    }
+
+    fn fail(&mut self, error: StrategyDriverError<S::Error>) -> Option<Vec<ScheduledSignal>> {
+        self.failure = Some(error);
+        None
+    }
+}
+
+impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn output_ready(&self) -> bool {
+        self.warmup_complete
+    }
+
+    fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool {
+        if self.requirements.needs_tick_execution()
+            && let Some(event) = events
+                .iter()
+                .find(|event| matches!(event.event, MarketEvent::Bar { .. }))
+        {
+            self.failure = Some(StrategyDriverError::TickExecutionRequired {
+                symbol: event.event.symbol().to_owned(),
+                timestamp: event.event.ts(),
+            });
+            return false;
+        }
+        true
+    }
+
+    fn reject_generated_configuration(&mut self, reason: String) {
+        self.failure = Some(StrategyDriverError::InvalidGeneratedSignal {
+            signal_index: 0,
+            reason,
+        });
+    }
+
+    fn on_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        pending_effects: &mut Vec<FutureEffect>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        let closed_bars = match self.series.on_batch(batch) {
+            Ok(bars) => bars,
+            Err(error) => return self.fail(StrategyDriverError::Series(error)),
+        };
+        let boundary = AnalysisBoundary::new(batch.ts, &closed_bars, &self.series);
+        let observations = match self.analysis.on_boundary(boundary) {
+            Ok(output) => output.observations().to_vec(),
+            Err(error) => return self.fail(StrategyDriverError::Analysis(error)),
+        };
+        self.warmup_complete = match self.series.warmup_complete(&self.requirements) {
+            Ok(complete) => complete,
+            Err(error) => return self.fail(StrategyDriverError::SeriesView(error)),
+        };
+        let disposition_end = lifecycle.len();
+        let feedback = StrategyFeedback::new(
+            pending_effects,
+            &lifecycle.as_slice()[self.delivered_dispositions..disposition_end],
+        );
+        let event = StrategyEvent::new(&batch.events, &closed_bars, &observations, feedback);
+        let context = StrategyContext::new(
+            batch.ts,
+            &self.series,
+            self.analysis.observations(),
+            engine,
+            self.warmup_complete,
+        );
+        let output = match self.strategy.on_event(event, context) {
+            Ok(output) => output,
+            Err(error) => return self.fail(StrategyDriverError::Strategy(error)),
+        };
+        pending_effects.clear();
+        self.delivered_dispositions = disposition_end;
+
+        let Some(draft) = output.into_decision() else {
+            return Some(Vec::new());
+        };
+        let record = match draft.into_record(self.next_decision_sequence, batch.ts, self.limits) {
+            Ok(record) => record,
+            Err(error) => return self.fail(StrategyDriverError::Runtime(error)),
+        };
+        if !self.warmup_complete && !record.emitted_signals().is_empty() {
+            return self.fail(StrategyDriverError::WarmupSignals {
+                timestamp: batch.ts,
+            });
+        }
+        if let Some((signal_index, error)) =
+            record
+                .emitted_signals()
+                .iter()
+                .enumerate()
+                .find_map(|(index, signal)| {
+                    qs_core::validation::validate_raw_signal(signal)
+                        .err()
+                        .map(|error| (index, error))
+                })
+        {
+            return self.fail(StrategyDriverError::InvalidGeneratedSignal {
+                signal_index,
+                reason: error.to_string(),
+            });
+        }
+        let effective_ts = match self.requirements.effective_timestamp(batch.ts) {
+            Ok(timestamp) => timestamp,
+            Err(error) => {
+                return self.fail(StrategyDriverError::Runtime(
+                    crate::strategy::StrategyRuntimeError::Domain(error),
+                ));
+            }
+        };
+        let signals = match self.decisions.push(record) {
+            Ok(signals) => signals,
+            Err(error) => {
+                return self.fail(StrategyDriverError::Runtime(
+                    crate::strategy::StrategyRuntimeError::Domain(error),
+                ));
+            }
+        };
+        self.next_decision_sequence = match self.next_decision_sequence.checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                return self.fail(StrategyDriverError::Runtime(
+                    crate::strategy::StrategyRuntimeError::Domain(
+                        crate::strategy::StrategyDomainError::OmittedCounterOverflow,
+                    ),
+                ));
+            }
+        };
+        let mut scheduled = Vec::with_capacity(signals.len());
+        for signal in signals {
+            let sequence = self.next_signal_sequence;
+            self.next_signal_sequence = match self.next_signal_sequence.checked_add(1) {
+                Some(sequence) => sequence,
+                None => {
+                    return self.fail(StrategyDriverError::Runtime(
+                        crate::strategy::StrategyRuntimeError::Domain(
+                            crate::strategy::StrategyDomainError::OmittedCounterOverflow,
+                        ),
+                    ));
+                }
+            };
+            scheduled.push(ScheduledSignal {
+                sequence,
+                signal_ts: batch.ts,
+                effective_ts,
+                signal,
+                requires_later_quote: true,
+            });
+        }
+        Some(scheduled)
+    }
 }
 
 /// Stage at which an exact FutureQuote equity observation was made.
@@ -269,6 +547,7 @@ pub struct BacktestRunner {
     future_config: Option<FutureQuoteConfig>,
     evaluation_options: EvaluationOptions,
     instrument_sizing: Vec<InstrumentSizingArtifact>,
+    committed_feedback: Vec<FutureEffect>,
 }
 
 impl BacktestRunner {
@@ -283,6 +562,7 @@ impl BacktestRunner {
             future_config: None,
             evaluation_options: EvaluationOptions::default(),
             instrument_sizing: Vec::new(),
+            committed_feedback: Vec::new(),
         }
     }
 
@@ -298,6 +578,7 @@ impl BacktestRunner {
             future_config: Some(future_config),
             evaluation_options: EvaluationOptions::default(),
             instrument_sizing: Vec::new(),
+            committed_feedback: Vec::new(),
         }
     }
 
@@ -645,7 +926,8 @@ impl BacktestRunner {
             ));
         }
 
-        self.run_raw_signals_future_batches(
+        let mut hook = StaticReplayHook;
+        match self.run_raw_signals_future_batches(
             feed,
             primary_eod,
             raw_signals,
@@ -656,7 +938,17 @@ impl BacktestRunner {
             0,
             &mut is_cancelled,
             &mut on_progress,
-        )
+            &mut hook,
+        ) {
+            Ok(result) => Ok(result),
+            Err(FutureBatchReplayError::Feed(error)) => Err(StreamingReplayError::Feed(error)),
+            Err(FutureBatchReplayError::Cancelled) => {
+                Err(StreamingReplayError::Cancelled(ReplayCancelled))
+            }
+            Err(FutureBatchReplayError::Dynamic) => {
+                unreachable!("static replay has no dynamic hook")
+            }
+        }
     }
 
     /// Consume a fallible stream of complete timestamp batches and run FutureQuoteV1.
@@ -710,6 +1002,133 @@ impl BacktestRunner {
             profile,
             future,
         ))
+    }
+
+    /// Run a historical strategy from a materialized data feed through FutureQuote.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_historical_strategy_future<F, S>(
+        self,
+        source_feed: &mut F,
+        strategy: &mut S,
+        series_specs: Vec<BarSeriesSpec>,
+        analysis: AnalysisPipeline,
+        retention: StrategyRetentionLimits,
+        profile: Option<&ManagementProfile>,
+    ) -> Result<StrategyBacktestResult, StrategyReplayError<Infallible, S::Error>>
+    where
+        F: DataFeed,
+        S: HistoricalStrategy,
+    {
+        crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
+        MultiTimeframeSeries::new(series_specs.clone())?;
+        let future = self.future_config.clone().unwrap_or_default();
+        validate_replay_config(&self.config, Some(&future), &[])
+            .map_err(StrategyReplayInputError::FutureQuote)?;
+        if let Some(profile) = profile {
+            profile
+                .validate()
+                .map_err(|error| StrategyReplayInputError::ManagementProfile(error.to_string()))?;
+        }
+        let mut ordered_events = Vec::new();
+        let mut source_last_ts = BTreeMap::<String, NaiveDateTime>::new();
+        while let Some(batch) = source_feed.next_batch() {
+            for event in batch.events {
+                let symbol = event.event.symbol().to_owned();
+                let timestamp = event.event.ts();
+                if source_last_ts
+                    .get(&symbol)
+                    .is_some_and(|previous| *previous > timestamp)
+                {
+                    continue;
+                }
+                source_last_ts.insert(symbol, timestamp);
+                ordered_events.push(event);
+            }
+        }
+        ordered_events.sort_by_key(FeedEvent::ordering_key);
+        let primary_eod = ordered_events
+            .iter()
+            .filter(|event| event.metadata.roles.primary)
+            .filter_map(|event| event.event.to_valid_quote())
+            .map(|quote| quote.ts)
+            .max();
+        let mut ordered_feed = crate::data_feed::VecFeed::from_feed_events(ordered_events);
+        let mut feed = DataFeedBatchAdapter {
+            feed: &mut ordered_feed,
+        };
+        self.run_historical_strategy_future_streaming(
+            &mut feed,
+            primary_eod,
+            strategy,
+            series_specs,
+            analysis,
+            retention,
+            profile,
+        )
+    }
+
+    /// Run a historical strategy from complete ordered timestamp batches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_historical_strategy_future_streaming<F, S>(
+        mut self,
+        feed: &mut F,
+        primary_eod: Option<NaiveDateTime>,
+        strategy: &mut S,
+        series_specs: Vec<BarSeriesSpec>,
+        analysis: AnalysisPipeline,
+        retention: StrategyRetentionLimits,
+        profile: Option<&ManagementProfile>,
+    ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, S::Error>>
+    where
+        F: FallibleBatchFeed,
+        S: HistoricalStrategy,
+    {
+        crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
+        let future = self.future_config.clone().unwrap_or_default();
+        self.future_config = Some(future.clone());
+        validate_replay_config(&self.config, Some(&future), &[])
+            .map_err(StrategyReplayInputError::FutureQuote)?;
+        if let Some(profile) = profile {
+            profile
+                .validate()
+                .map_err(|error| StrategyReplayInputError::ManagementProfile(error.to_string()))?;
+        }
+        let descriptor = strategy.descriptor().clone();
+        let series = MultiTimeframeSeries::new(series_specs)?;
+        let mut hook = StrategyReplayDriver::new(strategy, series, analysis, retention);
+        let mut is_cancelled = || false;
+        let mut on_progress = |_| {};
+        let replay = match self.run_raw_signals_future_batches(
+            feed,
+            primary_eod,
+            Vec::new(),
+            profile,
+            future,
+            None,
+            0,
+            0,
+            &mut is_cancelled,
+            &mut on_progress,
+            &mut hook,
+        ) {
+            Ok(replay) => replay,
+            Err(FutureBatchReplayError::Feed(error)) => {
+                return Err(StrategyReplayError::Feed(error));
+            }
+            Err(FutureBatchReplayError::Cancelled) => {
+                unreachable!("strategy replay is not cancellable")
+            }
+            Err(FutureBatchReplayError::Dynamic) => {
+                let error = hook.finish().expect_err("dynamic failure stores its cause");
+                return Err(map_strategy_driver_error(error));
+            }
+        };
+        let decisions = hook.finish().map_err(map_strategy_driver_error)?;
+        Ok(StrategyBacktestResult {
+            replay,
+            descriptor,
+            decisions,
+        })
     }
 
     /// Process a single raw signal: entry signals go through profile transform,
@@ -1016,6 +1435,7 @@ impl BacktestRunner {
         let mut feed = DataFeedBatchAdapter {
             feed: &mut ordered_feed,
         };
+        let mut hook = StaticReplayHook;
         match self.run_raw_signals_future_batches(
             &mut feed,
             primary_eod,
@@ -1027,15 +1447,19 @@ impl BacktestRunner {
             invalid_quotes,
             is_cancelled,
             on_progress,
+            &mut hook,
         ) {
             Ok(result) => Ok(result),
-            Err(StreamingReplayError::Cancelled(error)) => Err(error),
-            Err(StreamingReplayError::Feed(error)) => match error {},
+            Err(FutureBatchReplayError::Cancelled) => Err(ReplayCancelled),
+            Err(FutureBatchReplayError::Feed(error)) => match error {},
+            Err(FutureBatchReplayError::Dynamic) => {
+                unreachable!("static replay has no dynamic hook")
+            }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_raw_signals_future_batches<F, C, P>(
+    fn run_raw_signals_future_batches<F, C, P, H>(
         mut self,
         feed: &mut F,
         primary_eod: Option<NaiveDateTime>,
@@ -1047,11 +1471,13 @@ impl BacktestRunner {
         mut invalid_quotes: u64,
         is_cancelled: &mut C,
         on_progress: &mut P,
-    ) -> std::result::Result<BacktestResult, StreamingReplayError<F::Error>>
+        hook: &mut H,
+    ) -> std::result::Result<BacktestResult, FutureBatchReplayError<F::Error>>
     where
         F: FallibleBatchFeed,
         C: FnMut() -> bool,
         P: FnMut(ReplayProgress),
+        H: FutureReplayHook,
     {
         let total_events = known_total_events.unwrap_or(0);
         let total_signals = raw_signals.len();
@@ -1087,6 +1513,7 @@ impl BacktestRunner {
                         .checked_add_signed(Duration::milliseconds(future.signal_latency_ms))
                         .expect("signal latency overflow was validated before scheduling"),
                     signal,
+                    requires_later_quote: false,
                 }
             })
             .collect();
@@ -1125,11 +1552,11 @@ impl BacktestRunner {
         let mut terminated_quiescently = false;
 
         while let Some(mut batch) =
-            FallibleBatchFeed::next_batch(feed).map_err(StreamingReplayError::Feed)?
+            FallibleBatchFeed::next_batch(feed).map_err(FutureBatchReplayError::Feed)?
         {
             let batch_ts = batch.ts;
             if is_cancelled() {
-                return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                return Err(FutureBatchReplayError::Cancelled);
             }
             batch
                 .events
@@ -1137,7 +1564,7 @@ impl BacktestRunner {
             let mut accepted = Vec::new();
             for feed_event in batch.events {
                 if is_cancelled() {
-                    return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                    return Err(FutureBatchReplayError::Cancelled);
                 }
                 let quote = feed_event.event.to_quote();
                 if ExecutionPricer::validate_quote(&quote).is_err()
@@ -1160,10 +1587,18 @@ impl BacktestRunner {
                 last_quote_ts.insert(quote.symbol.clone(), quote.ts);
                 accepted.push((feed_event, quote));
             }
+            let accepted_primary_events = accepted
+                .iter()
+                .filter(|(event, _)| event.metadata.roles.primary)
+                .map(|(event, _)| event.clone())
+                .collect::<Vec<_>>();
+            if !hook.preflight_primary_events(&accepted_primary_events) {
+                return Err(FutureBatchReplayError::Dynamic);
+            }
 
             for (feed_event, quote) in &accepted {
                 if is_cancelled() {
-                    return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                    return Err(FutureBatchReplayError::Cancelled);
                 }
                 if feed_event.metadata.roles.conversion
                     && matches!(feed_event.event, MarketEvent::Tick { .. })
@@ -1181,10 +1616,11 @@ impl BacktestRunner {
                 && primary_eod.is_some_and(|eod| batch_ts <= eod);
 
             let mut primary_quotes = Vec::new();
+            let mut primary_events = Vec::new();
             let mut batch_quotes = BTreeMap::new();
             for (feed_event, quote) in accepted {
                 if is_cancelled() {
-                    return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                    return Err(FutureBatchReplayError::Cancelled);
                 }
                 if !feed_event.metadata.roles.primary {
                     processed_events += 1;
@@ -1200,17 +1636,20 @@ impl BacktestRunner {
                 }
 
                 last_processed_primary_ts = Some(quote.ts);
+                primary_events.push(feed_event);
                 portfolio.record_quote(quote.clone());
-                observe_future_equity(
-                    &mut portfolio,
-                    &future_executor,
-                    quote.ts,
-                    &conversion_quotes,
-                    EquityObservationKind::PreSettlement,
-                    &mut mtm_curve,
-                    &mut last_mtm_candidate,
-                    false,
-                );
+                if hook.output_ready() {
+                    observe_future_equity(
+                        &mut portfolio,
+                        &future_executor,
+                        quote.ts,
+                        &conversion_quotes,
+                        EquityObservationKind::PreSettlement,
+                        &mut mtm_curve,
+                        &mut last_mtm_candidate,
+                        false,
+                    );
+                }
                 batch_quotes.insert(quote.symbol.clone(), quote.clone());
                 primary_quotes.push(quote);
             }
@@ -1257,7 +1696,7 @@ impl BacktestRunner {
                     .is_some_and(|signal| signal.effective_ts < representative_quote.ts)
                 {
                     if is_cancelled() {
-                        return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                        return Err(FutureBatchReplayError::Cancelled);
                     }
                     let signal = scheduled.pop_front().expect("front checked");
                     self.schedule_future_signal(
@@ -1333,7 +1772,7 @@ impl BacktestRunner {
                     .is_some_and(|signal| signal.effective_ts == representative_quote.ts)
                 {
                     if is_cancelled() {
-                        return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                        return Err(FutureBatchReplayError::Cancelled);
                     }
                     let signal = scheduled.pop_front().expect("front checked");
                     self.schedule_future_signal(
@@ -1380,7 +1819,56 @@ impl BacktestRunner {
                 }
             }
 
+            let strategy_batch = TimestampBatch {
+                ts: batch_ts,
+                events: primary_events,
+            };
+            let generated = hook
+                .on_boundary(
+                    &strategy_batch,
+                    &self.engine,
+                    &lifecycle,
+                    &mut self.committed_feedback,
+                )
+                .ok_or(FutureBatchReplayError::Dynamic)?;
+            if !generated.is_empty() {
+                let generated_signals = generated
+                    .iter()
+                    .map(|scheduled| scheduled.signal.clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) =
+                    validate_replay_config(&self.config, Some(&future), &generated_signals)
+                {
+                    hook.reject_generated_configuration(error);
+                    return Err(FutureBatchReplayError::Dynamic);
+                }
+            }
+            for generated_signal in generated {
+                if generated_signal.effective_ts <= batch_ts
+                    && let Some(representative_quote) = primary_quotes.first()
+                {
+                    self.schedule_future_signal(
+                        generated_signal,
+                        profile,
+                        representative_quote,
+                        &batch_quotes,
+                        &mut queued,
+                        &mut lifecycle,
+                        &mut future_executor,
+                        &mut portfolio,
+                        &pricer,
+                        &conversion_quotes,
+                    );
+                } else {
+                    scheduled.push_back(generated_signal);
+                }
+            }
+
             for quote in &primary_quotes {
+                if !hook.output_ready() {
+                    processed_events += 1;
+                    continue;
+                }
                 observe_future_equity(
                     &mut portfolio,
                     &future_executor,
@@ -1401,7 +1889,7 @@ impl BacktestRunner {
                     });
                 }
             }
-            if valuation_only {
+            if valuation_only && hook.output_ready() {
                 observe_future_equity(
                     &mut portfolio,
                     &future_executor,
@@ -1421,7 +1909,8 @@ impl BacktestRunner {
                     .chain(primary_eod),
             );
 
-            if last_processed_primary_ts.is_some()
+            if !hook.is_active()
+                && last_processed_primary_ts.is_some()
                 && scheduled.is_empty()
                 && queued.is_empty()
                 && self.engine.open_positions().is_empty()
@@ -1435,7 +1924,7 @@ impl BacktestRunner {
 
         for action in queued {
             if is_cancelled() {
-                return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                return Err(FutureBatchReplayError::Cancelled);
             }
             let mut disposition =
                 ActionDisposition::rejected(action.action_id, "no_eligible_quote");
@@ -1446,7 +1935,7 @@ impl BacktestRunner {
         }
         for signal in scheduled {
             if is_cancelled() {
-                return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                return Err(FutureBatchReplayError::Cancelled);
             }
             let mut disposition = ActionDisposition::rejected(
                 format!("signal:{:08}", signal.sequence),
@@ -1468,7 +1957,7 @@ impl BacktestRunner {
         }
 
         if is_cancelled() {
-            return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+            return Err(FutureBatchReplayError::Cancelled);
         }
 
         if self.config.close_on_finish {
@@ -1480,7 +1969,7 @@ impl BacktestRunner {
                 .collect();
             for (sequence, id) in ids.into_iter().enumerate() {
                 if is_cancelled() {
-                    return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+                    return Err(FutureBatchReplayError::Cancelled);
                 }
                 let Some(symbol) = self
                     .engine
@@ -1553,10 +2042,12 @@ impl BacktestRunner {
         }
 
         if is_cancelled() {
-            return Err(StreamingReplayError::Cancelled(ReplayCancelled));
+            return Err(FutureBatchReplayError::Cancelled);
         }
 
-        if let Some(ts) = effective_terminal_ts {
+        if let Some(ts) = effective_terminal_ts
+            && hook.output_ready()
+        {
             let observation_kind = if terminated_quiescently {
                 EquityObservationKind::QuiescentTermination
             } else {
@@ -1713,6 +2204,7 @@ impl BacktestRunner {
                 },
                 quote.ts,
             ) {
+                let committed_effects = engine_transaction.effects().to_vec();
                 if FutureExecutor::requires_processing(engine_transaction.effects())
                     && let Err(error) = future_executor.process_future_effects_with_currency(
                         engine_transaction.effects(),
@@ -1729,6 +2221,7 @@ impl BacktestRunner {
                     return Err(error.into());
                 }
                 let _ = engine_transaction.commit();
+                self.committed_feedback.extend(committed_effects);
             }
         }
 
@@ -1736,6 +2229,7 @@ impl BacktestRunner {
         let engine_transaction = self
             .engine
             .begin_on_price_future_effects_priced(quote, &prepared, pricer, pip_size)?;
+        let committed_effects = engine_transaction.effects().to_vec();
         if FutureExecutor::requires_processing(engine_transaction.effects())
             && let Err(error) = future_executor.process_future_effects_with_currency(
                 engine_transaction.effects(),
@@ -1752,6 +2246,7 @@ impl BacktestRunner {
             return Err(error.into());
         }
         let _ = engine_transaction.commit();
+        self.committed_feedback.extend(committed_effects);
         Ok(())
     }
 
@@ -1798,6 +2293,7 @@ impl BacktestRunner {
                 effective_ts: scheduled.effective_ts,
                 entry_signal: Some(scheduled.signal),
                 entry_profile: profile.cloned(),
+                requires_later_quote: scheduled.requires_later_quote,
             });
             return;
         }
@@ -1878,6 +2374,7 @@ impl BacktestRunner {
                     effective_ts: scheduled.effective_ts,
                     entry_signal: None,
                     entry_profile: None,
+                    requires_later_quote: scheduled.requires_later_quote,
                 });
             } else {
                 let action_quote = batch_quotes.get(&symbol).unwrap_or(quote);
@@ -1961,7 +2458,10 @@ impl BacktestRunner {
                 remaining.push_back(action);
                 continue;
             };
-            if action.effective_ts > quote.ts || increases != exposure_increasing {
+            if action.effective_ts > quote.ts
+                || (action.requires_later_quote && quote.ts <= action.signal_ts)
+                || increases != exposure_increasing
+            {
                 remaining.push_back(action);
                 continue;
             }
@@ -2119,6 +2619,7 @@ impl BacktestRunner {
             }
         };
 
+        let committed_effects = engine_transaction.effects().to_vec();
         let mut affected = if FutureExecutor::requires_processing(engine_transaction.effects()) {
             match future_executor.process_future_effects_with_currency(
                 engine_transaction.effects(),
@@ -2155,6 +2656,7 @@ impl BacktestRunner {
         affected.sort();
         affected.dedup();
         let _ = engine_transaction.commit();
+        self.committed_feedback.extend(committed_effects);
 
         let mut disposition = ActionDisposition::applied(action_id);
         disposition.action_kind = Some(action_kind);
@@ -2378,6 +2880,31 @@ impl BacktestRunner {
                 .map(|position_id| Action::CancelPending { position_id })
                 .collect(),
             _ => resolve_signal(signal, &self.engine),
+        }
+    }
+}
+
+fn map_strategy_driver_error<FeedError, StrategyError>(
+    error: StrategyDriverError<StrategyError>,
+) -> StrategyReplayError<FeedError, StrategyError> {
+    match error {
+        StrategyDriverError::Series(error) => StrategyReplayError::Series(error),
+        StrategyDriverError::SeriesView(error) => StrategyReplayError::SeriesView(error),
+        StrategyDriverError::Analysis(error) => StrategyReplayError::Analysis(error),
+        StrategyDriverError::Strategy(error) => StrategyReplayError::Strategy(error),
+        StrategyDriverError::Runtime(error) => StrategyReplayError::Runtime(error),
+        StrategyDriverError::WarmupSignals { timestamp } => {
+            StrategyReplayError::WarmupSignals { timestamp }
+        }
+        StrategyDriverError::InvalidGeneratedSignal {
+            signal_index,
+            reason,
+        } => StrategyReplayError::InvalidGeneratedSignal {
+            signal_index,
+            reason,
+        },
+        StrategyDriverError::TickExecutionRequired { symbol, timestamp } => {
+            StrategyReplayError::TickExecutionRequired { symbol, timestamp }
         }
     }
 }
