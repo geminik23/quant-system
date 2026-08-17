@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use chrono::NaiveDateTime;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::SeriesId;
 use super::analysis::{
@@ -16,7 +17,8 @@ pub const MAX_ANNOTATIONS: usize = 1_000_000;
 pub const MAX_ANNOTATION_NOTE_BYTES: usize = 4096;
 
 /// Stable caller-supplied identity for one annotation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct AnnotationId(String);
 
 impl AnnotationId {
@@ -40,8 +42,19 @@ impl fmt::Display for AnnotationId {
     }
 }
 
+impl<'de> Deserialize<'de> for AnnotationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Eligibility classification shared with later research output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnnotationUse {
     CausalDecisionInput,
     HindsightLabel,
@@ -100,7 +113,7 @@ impl Default for AnnotationLimits {
 }
 
 /// One validated manual causal input or research-only record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StrategyAnnotation {
     annotation_id: AnnotationId,
     input_sequence: u64,
@@ -226,6 +239,49 @@ impl StrategyAnnotation {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrategyAnnotationDef {
+    annotation_id: AnnotationId,
+    input_sequence: u64,
+    created_at: NaiveDateTime,
+    observed_through: NaiveDateTime,
+    valid_from: Option<NaiveDateTime>,
+    use_kind: AnnotationUse,
+    symbol: String,
+    source_series: Vec<SeriesId>,
+    value: StrategyObservationValue,
+    note: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for StrategyAnnotation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = StrategyAnnotationDef::deserialize(deserializer)?;
+        Self::new(
+            value.annotation_id,
+            value.input_sequence,
+            value.created_at,
+            value.observed_through,
+            value.valid_from,
+            value.use_kind,
+            value.symbol,
+            value.source_series,
+            value.value,
+            value.note,
+            AnnotationLimits::new(
+                MAX_ANNOTATIONS,
+                MAX_ANNOTATION_NOTE_BYTES,
+                MAX_OBSERVATION_SOURCE_SERIES,
+            )
+            .expect("hard annotation limits are valid"),
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Deterministic annotation schedule and research-only retention.
 #[derive(Debug, Clone)]
 pub struct AnnotationTimeline {
@@ -329,6 +385,10 @@ impl AnnotationTimeline {
 
     pub fn research_only(&self) -> &[StrategyAnnotation] {
         &self.research_only
+    }
+
+    pub(crate) fn into_research_only(self) -> Vec<StrategyAnnotation> {
+        self.research_only
     }
 
     pub fn total_count(&self) -> usize {

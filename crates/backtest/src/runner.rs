@@ -48,7 +48,8 @@ use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
 use crate::strategy::{
     AnalysisBoundary, AnalysisPipeline, BarSeriesSpec, HistoricalStrategy, MultiTimeframeSeries,
     Strategy, StrategyBacktestResult, StrategyContext, StrategyDecisionRecorder, StrategyEvent,
-    StrategyFeedback, StrategyReplayError, StrategyReplayInputError, StrategyRetentionLimits,
+    StrategyFeedback, StrategyJournalRecorder, StrategyReplayError, StrategyReplayInputError,
+    StrategyResearchLimits, StrategyResearchOutput, StrategyRetentionLimits,
 };
 
 /// Future-quote execution settings. Existing runners remain on legacy semantics
@@ -223,6 +224,7 @@ struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
     analysis: AnalysisPipeline,
     limits: StrategyRetentionLimits,
     decisions: StrategyDecisionRecorder,
+    journal: StrategyJournalRecorder,
     next_decision_sequence: u64,
     next_signal_sequence: u64,
     delivered_dispositions: usize,
@@ -236,6 +238,7 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
         series: MultiTimeframeSeries,
         analysis: AnalysisPipeline,
         limits: StrategyRetentionLimits,
+        research_limits: StrategyResearchLimits,
     ) -> Self {
         Self {
             requirements: strategy.requirements().clone(),
@@ -244,6 +247,7 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
             analysis,
             limits,
             decisions: StrategyDecisionRecorder::new(limits),
+            journal: StrategyJournalRecorder::new(research_limits),
             next_decision_sequence: 0,
             next_signal_sequence: 0,
             delivered_dispositions: 0,
@@ -254,10 +258,22 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
 
     fn finish(
         self,
-    ) -> Result<crate::strategy::StrategyDecisionOutput, StrategyDriverError<S::Error>> {
+    ) -> Result<
+        (
+            crate::strategy::StrategyDecisionOutput,
+            StrategyResearchOutput,
+        ),
+        StrategyDriverError<S::Error>,
+    > {
         match self.failure {
             Some(error) => Err(error),
-            None => Ok(self.decisions.finish()),
+            None => Ok((
+                self.decisions.finish(),
+                StrategyResearchOutput {
+                    journal: self.journal.finish(),
+                    research_annotations: self.analysis.into_research_annotations(),
+                },
+            )),
         }
     }
 
@@ -338,7 +354,13 @@ impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
         pending_effects.clear();
         self.delivered_dispositions = disposition_end;
 
-        let Some(draft) = output.into_decision() else {
+        let (decision, journal) = output.into_parts();
+        if let Err(error) = self.journal.push_callback(batch.ts, journal) {
+            return self.fail(StrategyDriverError::Runtime(
+                crate::strategy::StrategyRuntimeError::Journal(error),
+            ));
+        }
+        let Some(draft) = decision else {
             return Some(Vec::new());
         };
         let record = match draft.into_record(self.next_decision_sequence, batch.ts, self.limits) {
@@ -546,6 +568,7 @@ pub struct BacktestRunner {
     config: BacktestConfig,
     future_config: Option<FutureQuoteConfig>,
     evaluation_options: EvaluationOptions,
+    strategy_research_limits: StrategyResearchLimits,
     instrument_sizing: Vec<InstrumentSizingArtifact>,
     committed_feedback: Vec<FutureEffect>,
 }
@@ -561,6 +584,7 @@ impl BacktestRunner {
             config,
             future_config: None,
             evaluation_options: EvaluationOptions::default(),
+            strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
             committed_feedback: Vec::new(),
         }
@@ -577,6 +601,7 @@ impl BacktestRunner {
             config,
             future_config: Some(future_config),
             evaluation_options: EvaluationOptions::default(),
+            strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
             committed_feedback: Vec::new(),
         }
@@ -591,6 +616,12 @@ impl BacktestRunner {
     /// Legacy execution ignores these options and preserves its existing report.
     pub fn with_evaluation_options(mut self, options: EvaluationOptions) -> Self {
         self.evaluation_options = options;
+        self
+    }
+
+    /// Apply journal bounds to historical strategy replay.
+    pub fn with_strategy_research_limits(mut self, limits: StrategyResearchLimits) -> Self {
+        self.strategy_research_limits = limits;
         self
     }
 
@@ -1095,7 +1126,13 @@ impl BacktestRunner {
         }
         let descriptor = strategy.descriptor().clone();
         let series = MultiTimeframeSeries::new(series_specs)?;
-        let mut hook = StrategyReplayDriver::new(strategy, series, analysis, retention);
+        let mut hook = StrategyReplayDriver::new(
+            strategy,
+            series,
+            analysis,
+            retention,
+            self.strategy_research_limits,
+        );
         let mut is_cancelled = || false;
         let mut on_progress = |_| {};
         let replay = match self.run_raw_signals_future_batches(
@@ -1123,11 +1160,12 @@ impl BacktestRunner {
                 return Err(map_strategy_driver_error(error));
             }
         };
-        let decisions = hook.finish().map_err(map_strategy_driver_error)?;
+        let (decisions, research) = hook.finish().map_err(map_strategy_driver_error)?;
         Ok(StrategyBacktestResult {
             replay,
             descriptor,
             decisions,
+            research,
         })
     }
 

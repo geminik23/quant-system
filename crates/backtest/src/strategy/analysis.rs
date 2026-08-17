@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use chrono::NaiveDateTime;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::annotation::{AnnotationId, AnnotationLimits, AnnotationTimeline, StrategyAnnotation};
 use super::{ClosedBar, HistoricalSeriesView, SeriesId, SeriesViewError};
@@ -16,7 +17,8 @@ pub const MAX_ZONE_ID_BYTES: usize = 64;
 pub const MAX_PIVOT_SIDE_BARS: usize = 1_000_000;
 
 /// Stable caller-supplied identity for one price zone.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct ZoneId(String);
 
 impl ZoneId {
@@ -40,22 +42,35 @@ impl fmt::Display for ZoneId {
     }
 }
 
+impl<'de> Deserialize<'de> for ZoneId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Provenance category for a descriptive price zone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ZoneSource {
     CausalAnnotation,
     DeterministicAnalyzer,
 }
 
 /// Descriptive side of a price zone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ZoneSide {
     Support,
     Resistance,
 }
 
 /// Descriptive lifecycle state of an immutable zone snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ZoneState {
     Active,
     Broken,
@@ -67,7 +82,7 @@ pub enum ZoneState {
 }
 
 /// One validated immutable price-zone snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PriceZone {
     zone_id: ZoneId,
     side: ZoneSide,
@@ -141,15 +156,49 @@ impl PriceZone {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriceZoneDef {
+    zone_id: ZoneId,
+    side: ZoneSide,
+    lower: f64,
+    upper: f64,
+    created_at: NaiveDateTime,
+    touch_count: u32,
+    state: ZoneState,
+    source: ZoneSource,
+}
+
+impl<'de> Deserialize<'de> for PriceZone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = PriceZoneDef::deserialize(deserializer)?;
+        Self::new(
+            value.zone_id,
+            value.side,
+            value.lower,
+            value.upper,
+            value.created_at,
+            value.touch_count,
+            value.state,
+            value.source,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// High or low classification for a confirmed swing point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SwingKind {
     High,
     Low,
 }
 
 /// One immutable swing point with explicit anchor and confirmation times.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SwingPoint {
     kind: SwingKind,
     price: f64,
@@ -209,8 +258,36 @@ impl SwingPoint {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwingPointDef {
+    kind: SwingKind,
+    price: f64,
+    anchor_open_time: NaiveDateTime,
+    anchor_close_time: NaiveDateTime,
+    confirmed_at: NaiveDateTime,
+}
+
+impl<'de> Deserialize<'de> for SwingPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = SwingPointDef::deserialize(deserializer)?;
+        Self::new(
+            value.kind,
+            value.price,
+            value.anchor_open_time,
+            value.anchor_close_time,
+            value.confirmed_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Common descriptive rejection patterns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RejectionPattern {
     LongWick,
     Engulfing,
@@ -219,7 +296,8 @@ pub enum RejectionPattern {
 }
 
 /// Common descriptive momentum states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MomentumState {
     Advancing,
     Stalling,
@@ -228,7 +306,8 @@ pub enum MomentumState {
 }
 
 /// Small common observation vocabulary shared by historical strategies.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StrategyObservationValue {
     Zone(PriceZone),
     Swing(SwingPoint),
@@ -289,6 +368,43 @@ impl StrategyObservationValue {
         match self {
             Self::Zone(zone) => Some(zone),
             _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum StrategyObservationValueDef {
+    Zone(PriceZone),
+    Swing(SwingPoint),
+    Rejection {
+        pattern: RejectionPattern,
+        anchor_open_time: NaiveDateTime,
+        anchor_close_time: NaiveDateTime,
+    },
+    Momentum(MomentumState),
+}
+
+impl<'de> Deserialize<'de> for StrategyObservationValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match StrategyObservationValueDef::deserialize(deserializer)? {
+            StrategyObservationValueDef::Zone(value) => Ok(Self::Zone(value)),
+            StrategyObservationValueDef::Swing(value) => Ok(Self::Swing(value)),
+            StrategyObservationValueDef::Rejection {
+                pattern,
+                anchor_open_time,
+                anchor_close_time,
+            } => Self::rejection(pattern, anchor_open_time, anchor_close_time)
+                .map_err(serde::de::Error::custom),
+            StrategyObservationValueDef::Momentum(value) => Ok(Self::Momentum(value)),
         }
     }
 }
@@ -765,6 +881,10 @@ impl AnalysisPipeline {
 
     pub fn annotations(&self) -> &AnnotationTimeline {
         &self.annotations
+    }
+
+    pub(crate) fn into_research_annotations(self) -> Vec<StrategyAnnotation> {
+        self.annotations.into_research_only()
     }
 
     pub fn is_failed(&self) -> bool {

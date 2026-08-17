@@ -8,8 +8,8 @@ use crate::profile::RawSignal;
 use super::domain::validate_decision_fields;
 use super::{
     ClosedBar, StrategyContext, StrategyDecisionKind, StrategyDecisionRecord, StrategyDescriptor,
-    StrategyDomainError, StrategyFeedback, StrategyObservation, StrategyRequirements,
-    StrategyRetentionLimits,
+    StrategyDomainError, StrategyFeedback, StrategyJournalDraft, StrategyJournalError,
+    StrategyObservation, StrategyRequirements, StrategyRetentionLimits,
 };
 
 /// One complete replay timestamp presented in already committed order.
@@ -126,31 +126,55 @@ impl StrategyDecisionDraft {
     }
 }
 
-/// Optional retained decision output from one strategy callback.
+/// Optional economic decision and ordered non-economic journal drafts from one callback.
 #[derive(Debug, Clone, Default)]
 pub struct StrategyOutput {
     decision: Option<StrategyDecisionDraft>,
+    journal: Vec<StrategyJournalDraft>,
 }
 
 impl StrategyOutput {
     pub const fn new(decision: Option<StrategyDecisionDraft>) -> Self {
-        Self { decision }
+        Self {
+            decision,
+            journal: Vec::new(),
+        }
     }
 
     pub const fn none() -> Self {
-        Self { decision: None }
+        Self::new(None)
     }
 
     pub fn from_decision(decision: StrategyDecisionDraft) -> Self {
         Self::new(Some(decision))
     }
 
+    pub fn from_journal(journal: Vec<StrategyJournalDraft>) -> Self {
+        Self {
+            decision: None,
+            journal,
+        }
+    }
+
+    pub fn with_journal(mut self, journal: Vec<StrategyJournalDraft>) -> Self {
+        self.journal = journal;
+        self
+    }
+
     pub fn decision(&self) -> Option<&StrategyDecisionDraft> {
         self.decision.as_ref()
     }
 
+    pub fn journal(&self) -> &[StrategyJournalDraft] {
+        &self.journal
+    }
+
     pub fn into_decision(self) -> Option<StrategyDecisionDraft> {
         self.decision
+    }
+
+    pub fn into_parts(self) -> (Option<StrategyDecisionDraft>, Vec<StrategyJournalDraft>) {
+        (self.decision, self.journal)
     }
 }
 
@@ -159,6 +183,8 @@ impl StrategyOutput {
 pub enum StrategyRuntimeError {
     #[error(transparent)]
     Domain(#[from] StrategyDomainError),
+    #[error(transparent)]
+    Journal(#[from] StrategyJournalError),
     #[error(
         "signal {signal_index} timestamp {signal_ts} does not match strategy boundary {observed_through}"
     )]

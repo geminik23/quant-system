@@ -10,6 +10,7 @@ use crate::profile::RawSignal;
 use crate::report::BacktestResult;
 
 use super::config::{PriceBasis, SeriesId, StrategyRetentionLimits, Timeframe, WarmupRequirement};
+use super::{AnnotationUse, StrategyAnnotation, StrategyJournalOutput};
 
 pub const MAX_STRATEGY_ID_BYTES: usize = 64;
 pub const MAX_STRATEGY_REVISION_BYTES: usize = 64;
@@ -484,12 +485,49 @@ impl StrategyDecisionRecorder {
     }
 }
 
+/// Non-economic journal and research-only annotations returned beside replay.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct StrategyResearchOutput {
+    pub journal: StrategyJournalOutput,
+    pub research_annotations: Vec<StrategyAnnotation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrategyResearchOutputDef {
+    journal: StrategyJournalOutput,
+    research_annotations: Vec<StrategyAnnotation>,
+}
+
+impl<'de> Deserialize<'de> for StrategyResearchOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = StrategyResearchOutputDef::deserialize(deserializer)?;
+        if value
+            .research_annotations
+            .iter()
+            .any(|annotation| annotation.use_kind() == AnnotationUse::CausalDecisionInput)
+        {
+            return Err(serde::de::Error::custom(
+                "causal decision annotations cannot enter research-only output",
+            ));
+        }
+        Ok(Self {
+            journal: value.journal,
+            research_annotations: value.research_annotations,
+        })
+    }
+}
+
 /// Strategy-specific wrapper around an existing economic replay result.
 #[derive(Debug, Clone, Serialize)]
 pub struct StrategyBacktestResult {
     pub replay: BacktestResult,
     pub descriptor: StrategyDescriptor,
     pub decisions: StrategyDecisionOutput,
+    pub research: StrategyResearchOutput,
 }
 
 pub(crate) fn validate_decision_fields(
@@ -503,8 +541,8 @@ pub(crate) fn validate_decision_fields(
             maximum: limits.max_reason_bytes(),
         });
     }
-    if related_trade_id.is_some_and(|trade_id| !valid_text(trade_id, MAX_TRADE_ID_BYTES)) {
-        return Err(StrategyDomainError::InvalidTradeId);
+    if let Some(trade_id) = related_trade_id {
+        validate_trade_id(trade_id)?;
     }
     if signal_count > limits.max_signals_per_callback() {
         return Err(StrategyDomainError::TooManySignals {
@@ -513,6 +551,14 @@ pub(crate) fn validate_decision_fields(
         });
     }
     Ok(())
+}
+
+pub(crate) fn validate_trade_id(trade_id: &str) -> Result<(), StrategyDomainError> {
+    if valid_text(trade_id, MAX_TRADE_ID_BYTES) {
+        Ok(())
+    } else {
+        Err(StrategyDomainError::InvalidTradeId)
+    }
 }
 
 fn validate_requirements(

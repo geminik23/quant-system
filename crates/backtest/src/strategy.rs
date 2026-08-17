@@ -7,7 +7,9 @@ pub mod annotation;
 pub mod config;
 pub mod context;
 pub mod domain;
+pub mod experiment;
 pub mod feedback;
+pub mod journal;
 pub mod replay;
 pub mod runtime;
 pub mod series;
@@ -36,9 +38,19 @@ pub use domain::{
     MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, SeriesRequirement,
     StrategyBacktestResult, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
     StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
-    StrategyId, StrategyRequirements,
+    StrategyId, StrategyRequirements, StrategyResearchOutput,
+};
+pub use experiment::{
+    StrategyComparisonMetrics, StrategyComparisonSnapshot, StrategyExperimentComparison,
+    StrategyExperimentError,
 };
 pub use feedback::StrategyFeedback;
+pub use journal::{
+    JournalKind, MAX_CHART_REF_BYTES, MAX_EXPERIMENT_LABEL_BYTES, MAX_JOURNAL_PER_CALLBACK,
+    MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,
+    StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput, StrategyJournalRecord,
+    StrategyJournalRecorder, StrategyJournalRetention, StrategyResearchLimits,
+};
 pub use replay::{StrategyReplayError, StrategyReplayInputError};
 pub use runtime::{
     HistoricalStrategy, StrategyDecisionDraft, StrategyEvent, StrategyOutput, StrategyRuntimeError,

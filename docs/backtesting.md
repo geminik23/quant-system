@@ -70,11 +70,13 @@ The client streams retained-job progress by default. Polling and finite synchron
 - inspect retained history and exact per-series or aggregate warmup readiness through read-only series views;
 - implement a stateful `HistoricalStrategy` that receives one complete timestamp boundary, read-only series, observations, engine state, and committed execution facts, then returns an optional bounded decision draft with ordered strict signals;
 - run that strategy from a materialized `DataFeed` or complete `FallibleBatchFeed` timestamp stream through the existing FutureQuote scheduler and accounting path;
+- emit bounded ordered non-economic journal drafts during ordinary callbacks, including warmup, without changing executable scheduling or decision retention;
+- retain hindsight and journal-only annotations outside decision context and compare two completed strategy results through existing position-level metrics;
 - provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy path invokes `HistoricalStrategy` once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances strategy state but rejects economic signals, and only committed effects plus newly terminal dispositions are delivered as feedback. Decision retention does not suppress execution. This library path is separate from the production service contract; journal, label, experiment, and concrete strategy acceptance features remain later work.
+The historical strategy path invokes `HistoricalStrategy` once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances strategy state but rejects economic signals, and only committed effects plus newly terminal dispositions are delivered as feedback. Decision and journal retention do not suppress execution. Journal timestamps and sequence are runtime-owned, hypothetical records remain non-economic, and hindsight or journal-only annotations are returned only as research output. This library path is separate from the production service contract. A future configured-strategy path is under design but not implemented; current callers still provide a Rust `HistoricalStrategy` implementation directly.
 
 ## Operational boundaries
 
