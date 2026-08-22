@@ -1,0 +1,20 @@
+[package]
+name = "qs-strategy"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synchronous reusable configured strategy core"
+
+[lib]
+name = "qs_strategy"
+
+[dependencies]
+qs-core = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

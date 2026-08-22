@@ -28,7 +28,9 @@ The workspace separates synchronous trading logic, historical replay, storage, l
 Domain and data:
 qs-symbols -----> qs-instruments -----> quant-system-core
  compatibility      exact identity,           |
- facade             specs, catalogs           v
+ facade             specs, catalogs           +----> qs-strategy
+                                              |      configured core only
+                                              v
                                       qs-backtest -> qs-backtest-server
                                            ^
                                            |
@@ -47,11 +49,13 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 `quant-system-core` owns the synchronous engine, strict `RawSignal`, position management, pure profile resolution, sizing, and currency conversion. Its catalog-aware sizing path uses explicit quantity rules and contract multipliers. It performs no networking, storage, configuration IO, parsing, state lookup, or broker calls.
 
+`qs-strategy` owns the reusable synchronous configured strategy core. It compiles recursively strict unversioned configuration against bounded logical source IDs and an explicit immutable material library, derives source-specific lookback and named-input requirements, evaluates ordered source updates, total trade-slot facts, bounded typed expressions, and causal materials, commits deterministic finite-state transitions atomically, and emits generic decisions and notes plus ordered commands carrying strict `RawSignal` values with deterministic correlation IDs. Command feedback rejects unknown, mismatched, duplicate, or replayed events and retains successful correlations until the action-specific committed fact and terminal disposition are both observed. The crate is library-only and does not own logical-source binding, historical history or feeds, FutureQuote adaptation, service or RPC execution, live runtime orchestration, persistence, or management-profile composition.
+
 `qs-symbols` remains the compatibility facade for current canonical symbols, aliases, precision, lot, and currency metadata. Supported FX, metal, commodity, and index rows can be translated through the guarded compatibility economics result into an immutable instrument snapshot. Registry-backed cryptocurrency and unknown rows are not promoted into executable instruments.
 
 ### Historical replay
 
-`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal observations and annotations, and stateful callback replay with read-only context, causal generated-signal scheduling, warmup enforcement, committed execution feedback, bounded non-economic journal output, research-only annotation results, and explicit completed-result comparison. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available and use their established behavior.
+`qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal observations and annotations, and stateful callback replay with read-only context, causal generated-signal scheduling, warmup enforcement, committed execution feedback, bounded non-economic journal output, research-only annotation results, and explicit completed-result comparison. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available and use their established behavior. It does not yet adapt `qs-strategy` configured instances into historical replay.
 
 `qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. It resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
 

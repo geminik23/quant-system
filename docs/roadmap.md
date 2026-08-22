@@ -1,6 +1,6 @@
 # Roadmap
 
-The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path. The intended next direction is reusable configured strategy behavior plus a historical adapter.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, plus a reusable synchronous configured strategy core. The intended next direction is a historical adapter that connects configured behavior to that replay path.
 
 > This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
 
@@ -33,9 +33,7 @@ Current callers implement `HistoricalStrategy` directly in Rust. A generated fil
 
 ## Configured strategy direction
 
-A future configured-strategy path is under design but is not implemented yet. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials.
-
-Reusable configured behavior will live in a dependency-light synchronous strategy core outside `qs-backtest`. Historical backtesting will be one adapter to that core rather than the owner of the configuration compiler, materials, expressions, or state machine.
+The dependency-light synchronous `qs-strategy` core now implements reusable configured behavior outside `qs-backtest`. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials. Historical backtesting remains a future adapter to that core rather than the owner of the configuration compiler, materials, expressions, or state machine.
 
 The intended flow is:
 
@@ -69,18 +67,19 @@ flowchart TD
     K --> L
 ```
 
-The configured path is expected to provide:
+The configured core now provides:
 
 - recursively strict configuration without a schema-version field;
 - an explicit immutable library of reusable causal materials;
-- compile-time reference, type, dependency, lookback, warmup, and bound validation;
+- compile-time source, named-input schema, reference, type, dependency, per-source lookback, trigger, state, expression, and bound validation;
 - bounded typed condition expressions rather than free-form strings;
-- deterministic finite-state transitions with atomic state and output;
-- typed strict `RawSignal` action templates carried by commands with deterministic correlation IDs, plus generic decision and note templates;
+- ordered independent logical-source updates, total vacant/pending/open trade-slot facts, and deterministic finite-state transitions with atomic state and output;
+- typed strict `RawSignal` action templates carried by commands with deterministic correlation IDs, validated action-specific feedback lifecycles, plus generic decision and note templates;
 - one reusable configured strategy core independent from historical and real-time runtime ownership;
-- a historical adapter that reuses the existing callback and FutureQuote execution path;
-- neutral conformance examples and a custom material extension seam;
+- neutral conformance coverage and a custom material extension seam;
 - no content hash, digest, fingerprint, or content-derived strategy identity.
+
+The historical adapter that binds logical sources to historical series and reuses the existing callback and FutureQuote execution path is not implemented. It must preserve command IDs through effect-before-disposition feedback, map generic notes into historical journals, and prove direct-signal and feed parity without duplicating economics. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles also remain unavailable.
 
 Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
 

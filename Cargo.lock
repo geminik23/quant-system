@@ -3782,6 +3782,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-strategy"
+version = "0.2.9"
+dependencies = [
+ "chrono",
+ "quant-system-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "qs-symbols"
 version = "0.2.9"
 dependencies = [

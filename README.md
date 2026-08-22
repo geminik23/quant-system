@@ -13,7 +13,8 @@ It is not a complete automated trading platform. It does not currently execute l
 | Run a deterministic signal backtest | [Five-minute quick start](docs/getting-started.md) | Available; a synthetic fixture is included |
 | Import and manage historical data | [`qs-data-preprocess` guide](crates/data-preprocess/GUIDE.md) | Available for supported tick and bar exports |
 | Embed the pure trade engine or strict raw-signal contracts | [`quant-system-core`](crates/core) | Library-only |
-| Build an in-process strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
+| Compile and evaluate reusable configured strategy behavior | [`qs-strategy`](crates/strategy) | Library-only; synchronous core |
+| Build an in-process historical strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Compatibility CLI and public adapter library |
 
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
@@ -88,8 +89,9 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
 - Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
-- `qs-backtest` provides validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal analysis, and stateful callbacks integrated with the existing FutureQuote scheduler, accounting, committed execution feedback, warmup enforcement, bounded decision output, non-economic research journals, research-only annotations, and explicit completed-result comparison. This remains an in-process library path rather than a service endpoint.
-- Current backtest endpoints accept strict `RawSignal`. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
+- `qs-strategy` provides a reusable synchronous configured strategy core with recursively strict unversioned configuration, bounded logical bar sources, source-specific input requirements, an explicit immutable material library, typed bounded expressions, deterministic material and finite-state evaluation, total vacant/pending/open trade-slot facts, generic decisions and notes, and validated command-correlated strict `RawSignal` values. It is library-only: it does not load strategy files, bind logical sources to historical series, consume historical feeds, expose server or RPC execution, run live strategies, persist configured state, or compose configured strategies with management profiles.
+- `qs-backtest` provides validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal analysis, and stateful callbacks integrated with the existing FutureQuote scheduler, accounting, committed execution feedback, warmup enforcement, bounded decision output, non-economic research journals, research-only annotations, and explicit completed-result comparison. This remains an in-process library path rather than a service endpoint, and no configured-strategy historical adapter is available yet.
+- Current backtest endpoints accept strict `RawSignal`. No configured-strategy server execution, portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
