@@ -1,8 +1,8 @@
 # Roadmap
 
-The current development goal is reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path. The intended next direction is reusable configured strategy behavior plus a historical adapter.
 
-> This roadmap describes intended direction. It does not assume a later live trading platform.
+> This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
 
 ## Current foundation
 
@@ -35,6 +35,8 @@ Current callers implement `HistoricalStrategy` directly in Rust. A generated fil
 
 A future configured-strategy path is under design but is not implemented yet. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials.
 
+Reusable configured behavior will live in a dependency-light synchronous strategy core outside `qs-backtest`. Historical backtesting will be one adapter to that core rather than the owner of the configuration compiler, materials, expressions, or state machine.
+
 The intended flow is:
 
 ```mermaid
@@ -42,54 +44,72 @@ flowchart TD
     A[Strict strategy configuration]
     B[Explicit immutable material library]
     C[Configured strategy compiler]
-    D[ConfiguredStrategy]
-    E[Existing HistoricalStrategy replay]
-    F[Strict RawSignal]
-    G[Existing FutureQuote execution]
+    D[Reusable ConfiguredStrategy]
+    E[Completed historical facts]
+    F[Historical adapter]
+    G[Reusable StrategyInput]
+    H[Reusable strategy output]
+    I[Existing HistoricalStrategy and FutureQuote path]
+    J[Future live causal facts]
+    K[Future real-time adapter]
+    L[Future risk and execution runtime]
 
     A --> C
     B --> C
     C --> D
-    D --> E
     E --> F
     F --> G
+    G --> D
+    D --> H
+    H --> F
+    F --> I
+    J --> K
+    K --> G
+    H --> K
+    K --> L
 ```
 
 The configured path is expected to provide:
 
-- a strict versioned configuration schema;
-- reusable versioned causal materials;
+- recursively strict configuration without a schema-version field;
+- an explicit immutable library of reusable causal materials;
 - compile-time reference, type, dependency, lookback, warmup, and bound validation;
 - bounded typed condition expressions rather than free-form strings;
-- deterministic finite-state transitions;
-- typed `RawSignal` action templates and journal templates;
-- one reusable configured strategy implementation over the existing callback;
-- neutral conformance examples and a custom material extension seam.
+- deterministic finite-state transitions with atomic state and output;
+- typed strict `RawSignal` action templates carried by commands with deterministic correlation IDs, plus generic decision and note templates;
+- one reusable configured strategy core independent from historical and real-time runtime ownership;
+- a historical adapter that reuses the existing callback and FutureQuote execution path;
+- neutral conformance examples and a custom material extension seam;
+- no content hash, digest, fingerprint, or content-derived strategy identity.
 
-Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration.
+Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
 
 ## Design constraints
 
 Configured strategy execution must preserve the current causal order:
 
 1. settle existing FutureQuote work and commit feedback;
-2. update completed historical series;
-3. evaluate causal materials and analysis in stable order;
-4. evaluate at most one configured transition from one immutable boundary snapshot;
+2. update completed historical series and causal analysis;
+3. project one immutable reusable strategy input from completed facts;
+4. evaluate reusable materials in stable dependency order and select at most one configured transition;
 5. atomically commit configured state and output;
-6. lower actions to strict `RawSignal`;
+6. return ordered correlated commands containing strict `RawSignal` payloads plus generic decisions and notes to the historical adapter;
 7. wait for a later eligible quote for fill-bearing work.
 
 Emitting an Entry is not equivalent to a fill. Configured state must use committed execution feedback to distinguish requested, open, rejected, and closed lifecycle states.
 
+Before adapter readiness, causal materials advance but configured transitions, state assignments, decisions, notes, and signals do not. The first ready input evaluates the accumulated material state from unchanged configured state. EMA and ATR update only from new completed bars, crossing is a one-boundary pulse, and command feedback retains its originating correlation ID. Initial execution is limited to one configured instance, one primary symbol, and one active campaign. Missing arithmetic remains missing, comparisons with missing are false, required output cannot be missing, and every declared configured state must be reachable from the initial state or compilation fails.
+
 ## What will be reused
+
+The historical adapter will reuse:
 
 - historical feed and complete timestamp-batch abstractions;
 - `HistoricalStrategy`, `StrategyContext`, and `StrategyFeedback`;
 - causal series, observations, annotations, and analyzers;
 - strict `RawSignal` validation;
 - replay instrument specifications;
-- `ManagementProfile`;
+- unprofiled Entry resolution for the initial configured path;
 - FutureQuote slippage, pending, stop, target, scale-in, and close behavior;
 - account-currency sizing and conversion;
 - fills, lifecycle, MTM, drawdown, and `BacktestResult`;
@@ -132,12 +152,13 @@ An explicit immutable run-local material library and an in-process configured-st
 The configured-strategy objective is complete when a developer can:
 
 1. define a nontrivial causal strategy through strict configuration and reusable materials;
-2. compile and reject invalid graphs, types, references, bounds, and transitions before replay;
-3. consume causal multi-timeframe context and committed execution feedback;
-4. emit validated ordered `RawSignal` actions and bounded journals;
-5. execute through the existing FutureQuote engine without another economic path;
+2. compile it in a reusable strategy core outside `qs-backtest` and reject invalid graphs, types, references, bounds, and transitions before execution;
+3. consume adapter-supplied causal context and committed execution feedback without importing historical runtime types;
+4. emit validated ordered commands with deterministic correlation IDs, strict `RawSignal` payloads, and bounded generic decisions and notes;
+5. adapt the same configured behavior to historical replay through the existing FutureQuote engine without another economic path;
 6. reproduce equivalent direct-signal economic results;
 7. reuse one custom material across several configurations;
-8. continue implementing direct Rust strategies without framework regression.
+8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
+9. continue implementing direct Rust strategies without framework regression.
 
 See [Backtesting](backtesting.md) for current replay behavior and limitations.

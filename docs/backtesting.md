@@ -76,7 +76,17 @@ The client streams retained-job progress by default. Polling and finite synchron
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-The historical strategy path invokes `HistoricalStrategy` once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances strategy state but rejects economic signals, and only committed effects plus newly terminal dispositions are delivered as feedback. Decision and journal retention do not suppress execution. Journal timestamps and sequence are runtime-owned, hypothetical records remain non-economic, and hindsight or journal-only annotations are returned only as research output. This library path is separate from the production service contract. A future configured-strategy path is under design but not implemented; current callers still provide a Rust `HistoricalStrategy` implementation directly.
+The historical strategy path invokes `HistoricalStrategy` once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances strategy state but rejects economic signals, and only committed effects plus newly terminal dispositions are delivered as feedback. Decision and journal retention do not suppress execution. Journal timestamps and sequence are runtime-owned, hypothetical records remain non-economic, and hindsight or journal-only annotations are returned only as research output. This library path is separate from the production service contract. Current callers still provide a Rust `HistoricalStrategy` implementation directly.
+
+## Configured strategy direction
+
+A future configured-strategy path is under design but is not implemented. Reusable configured behavior will live in a separate synchronous strategy core rather than in `qs-backtest`, because the same material, expression, state, and action logic should also be usable by a future real-time adapter.
+
+The reusable core will compile recursively strict configuration without a schema-version field against an explicit immutable material library. It will consume adapter-supplied causal inputs and command-correlated committed execution feedback, then return ordered commands containing deterministic correlation IDs and strict `RawSignal` payloads plus generic decisions and notes. Unreachable configured states will reject during compilation. While adapter readiness is false, causal materials will advance but configured state and output will remain unchanged; evaluation begins on the first ready input.
+
+`qs-backtest` will own only the historical adapter. That adapter will project completed bars, selected observations, readiness, immutable position facts, and command-correlated committed FutureQuote feedback into the reusable input, then map configured commands back into the existing `HistoricalStrategy`, FutureQuote, journal, accounting, MTM, and report path. Historical series definitions, warmup, sizing, account currency, and result retention remain backtest bindings rather than reusable strategy behavior. Initial configured runs reject a supplied `ManagementProfile` and use existing unprofiled Entry resolution; profile composition is deferred.
+
+No configured compiler, strategy file loader, historical adapter, or real-time runtime exists in the current workspace yet.
 
 ## Operational boundaries
 
