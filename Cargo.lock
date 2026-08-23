@@ -3621,6 +3621,7 @@ dependencies = [
  "criterion",
  "qs-data-preprocess",
  "qs-instruments",
+ "qs-strategy",
  "qs-symbols",
  "quant-system-core",
  "serde",

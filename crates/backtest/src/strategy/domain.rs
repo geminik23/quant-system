@@ -9,14 +9,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::profile::RawSignal;
 use crate::report::BacktestResult;
 
+use super::annotation::deserialize_research_annotations;
 use super::config::{PriceBasis, SeriesId, StrategyRetentionLimits, Timeframe, WarmupRequirement};
-use super::{AnnotationUse, StrategyAnnotation, StrategyJournalOutput};
+use super::{StrategyAnnotation, StrategyJournalOutput};
 
 pub const MAX_STRATEGY_ID_BYTES: usize = 64;
 pub const MAX_STRATEGY_REVISION_BYTES: usize = 64;
 pub const MAX_STRATEGY_TITLE_BYTES: usize = 256;
 pub const MAX_INSTRUMENT_BYTES: usize = 64;
-pub const MAX_TRADE_ID_BYTES: usize = 128;
+pub const MAX_TRADE_ID_BYTES: usize = qs_strategy::MAX_GENERATED_ID_BYTES;
 pub const MAX_DECISION_LATENCY_MS: u64 = 86_400_000;
 
 /// Errors returned while validating historical strategy domain values.
@@ -496,6 +497,7 @@ pub struct StrategyResearchOutput {
 #[serde(deny_unknown_fields)]
 struct StrategyResearchOutputDef {
     journal: StrategyJournalOutput,
+    #[serde(deserialize_with = "deserialize_research_annotations")]
     research_annotations: Vec<StrategyAnnotation>,
 }
 
@@ -505,15 +507,6 @@ impl<'de> Deserialize<'de> for StrategyResearchOutput {
         D: Deserializer<'de>,
     {
         let value = StrategyResearchOutputDef::deserialize(deserializer)?;
-        if value
-            .research_annotations
-            .iter()
-            .any(|annotation| annotation.use_kind() == AnnotationUse::CausalDecisionInput)
-        {
-            return Err(serde::de::Error::custom(
-                "causal decision annotations cannot enter research-only output",
-            ));
-        }
         Ok(Self {
             journal: value.journal,
             research_annotations: value.research_annotations,

@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use chrono::NaiveDateTime;
+use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::SeriesId;
@@ -443,6 +444,8 @@ pub enum AnnotationError {
     DuplicateAnnotationId { annotation_id: AnnotationId },
     #[error("annotation input sequence {input_sequence} is already present")]
     DuplicateInputSequence { input_sequence: u64 },
+    #[error("causal decision annotation cannot enter research-only output")]
+    CausalAnnotationInResearchOutput,
     #[error("annotation count overflowed")]
     AnnotationCountOverflow,
     #[error("annotation count {actual} exceeds maximum {maximum}")]
@@ -454,6 +457,80 @@ pub enum AnnotationError {
         valid_from: NaiveDateTime,
         advanced_through: NaiveDateTime,
     },
+}
+
+pub(crate) fn deserialize_research_annotations<'de, D>(
+    deserializer: D,
+) -> Result<Vec<StrategyAnnotation>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ResearchAnnotationsVisitor;
+
+    impl<'de> Visitor<'de> for ResearchAnnotationsVisitor {
+        type Value = Vec<StrategyAnnotation>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded sequence of unique research-only annotations")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if let Some(actual) = sequence.size_hint()
+                && actual > MAX_ANNOTATIONS
+            {
+                return Err(serde::de::Error::custom(
+                    AnnotationError::TooManyAnnotations {
+                        actual,
+                        maximum: MAX_ANNOTATIONS,
+                    },
+                ));
+            }
+
+            let capacity = sequence.size_hint().unwrap_or(0).min(MAX_ANNOTATIONS);
+            let mut annotations = Vec::with_capacity(capacity);
+            let mut ids = BTreeSet::new();
+            let mut input_sequences = BTreeSet::new();
+            while let Some(annotation) = sequence.next_element::<StrategyAnnotation>()? {
+                let count = annotations.len().checked_add(1).ok_or_else(|| {
+                    serde::de::Error::custom(AnnotationError::AnnotationCountOverflow)
+                })?;
+                if count > MAX_ANNOTATIONS {
+                    return Err(serde::de::Error::custom(
+                        AnnotationError::TooManyAnnotations {
+                            actual: count,
+                            maximum: MAX_ANNOTATIONS,
+                        },
+                    ));
+                }
+                if annotation.use_kind() == AnnotationUse::CausalDecisionInput {
+                    return Err(serde::de::Error::custom(
+                        AnnotationError::CausalAnnotationInResearchOutput,
+                    ));
+                }
+                if !ids.insert(annotation.annotation_id().clone()) {
+                    return Err(serde::de::Error::custom(
+                        AnnotationError::DuplicateAnnotationId {
+                            annotation_id: annotation.annotation_id().clone(),
+                        },
+                    ));
+                }
+                if !input_sequences.insert(annotation.input_sequence()) {
+                    return Err(serde::de::Error::custom(
+                        AnnotationError::DuplicateInputSequence {
+                            input_sequence: annotation.input_sequence(),
+                        },
+                    ));
+                }
+                annotations.push(annotation);
+            }
+            Ok(annotations)
+        }
+    }
+
+    deserializer.deserialize_seq(ResearchAnnotationsVisitor)
 }
 
 fn validate_limit(

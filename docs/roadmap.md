@@ -1,6 +1,6 @@
 # Roadmap
 
-The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, plus a reusable synchronous configured strategy core. The intended next direction is a historical adapter that connects configured behavior to that replay path.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and an in-process historical adapter that connects configured behavior to that replay path.
 
 > This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
 
@@ -31,11 +31,11 @@ The historical strategy foundation currently provides validated descriptors and 
 
 Current callers implement `HistoricalStrategy` directly in Rust. A generated fill-bearing action cannot execute on a quote already observed to make that decision.
 
-## Configured strategy direction
+## Configured strategy implementation
 
-The dependency-light synchronous `qs-strategy` core now implements reusable configured behavior outside `qs-backtest`. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials. Historical backtesting remains a future adapter to that core rather than the owner of the configuration compiler, materials, expressions, or state machine.
+The dependency-light synchronous `qs-strategy` core implements reusable configured behavior outside `qs-backtest`. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials. Historical backtesting adapts that core rather than owning the configuration compiler, materials, expressions, or state machine.
 
-The intended flow is:
+The implemented historical flow and future live boundary are:
 
 ```mermaid
 flowchart TD
@@ -79,7 +79,7 @@ The configured core now provides:
 - neutral conformance coverage and a custom material extension seam;
 - no content hash, digest, fingerprint, or content-derived strategy identity.
 
-The historical adapter that binds logical sources to historical series and reuses the existing callback and FutureQuote execution path is not implemented. It must preserve command IDs through effect-before-disposition feedback, map generic notes into historical journals, and prove direct-signal and feed parity without duplicating economics. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles also remain unavailable.
+The historical adapter binds complete logical source specifications to historical series, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, rejects supplied management profiles, and reuses unprofiled Entry plus the existing FutureQuote economic path. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles remain unavailable.
 
 Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
 
@@ -101,7 +101,7 @@ Before adapter readiness, causal materials advance but configured transitions, s
 
 ## What will be reused
 
-The historical adapter will reuse:
+The historical adapter reuses:
 
 - historical feed and complete timestamp-batch abstractions;
 - `HistoricalStrategy`, `StrategyContext`, and `StrategyFeedback`;
@@ -146,9 +146,9 @@ Concrete private strategy configurations may be added later when there is a real
 
 An explicit immutable run-local material library and an in-process configured-strategy compiler are compatible with these boundaries. They must not grow into a global plugin or deployment platform.
 
-## Completion target
+## Completion status
 
-The configured-strategy objective is complete when a developer can:
+The implementation now allows a developer to:
 
 1. define a nontrivial causal strategy through strict configuration and reusable materials;
 2. compile it in a reusable strategy core outside `qs-backtest` and reject invalid graphs, types, references, bounds, and transitions before execution;
@@ -160,4 +160,4 @@ The configured-strategy objective is complete when a developer can:
 8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
 9. continue implementing direct Rust strategies without framework regression.
 
-See [Backtesting](backtesting.md) for current replay behavior and limitations.
+The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. See [Backtesting](backtesting.md) for current replay behavior and limitations.

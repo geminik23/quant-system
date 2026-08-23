@@ -10,16 +10,19 @@ use qs_backtest::runner::BacktestConfig;
 use qs_backtest::sizing::SizingPolicy;
 use qs_backtest::{
     AnalysisPipeline, AnnotationId, AnnotationLimits, AnnotationUse, BacktestRunner, BarSeriesSpec,
-    FutureQuoteConfig, HistoricalStrategy, JournalKind, MissingIntervalPolicy,
+    FutureQuoteConfig, HistoricalStrategy, JournalKind, MAX_ANNOTATIONS, MissingIntervalPolicy,
     ObservationStoreLimits, PriceBasis, RawSignal, SeriesId, SeriesRequirement, StrategyAnnotation,
     StrategyBacktestResult, StrategyContext, StrategyDecisionDraft, StrategyDecisionKind,
     StrategyDecisionRecorder, StrategyDescriptor, StrategyEvent, StrategyExperimentComparison,
-    StrategyId, StrategyJournalDraft, StrategyJournalError, StrategyJournalRecorder,
-    StrategyObservationValue, StrategyOutput, StrategyRequirements, StrategyResearchLimits,
-    StrategyResearchOutput, StrategyRetentionLimits, Timeframe, WarmupRequirement,
+    StrategyId, StrategyJournalDraft, StrategyJournalError, StrategyJournalRecord,
+    StrategyJournalRecorder, StrategyObservationValue, StrategyOutput, StrategyRequirements,
+    StrategyResearchLimits, StrategyResearchOutput, StrategyRetentionLimits, Timeframe,
+    WarmupRequirement,
 };
 use qs_core::types::{CloseReason, OrderType, PositionId, Side};
 use qs_symbols::SymbolSpec;
+use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 const SYMBOL: &str = "EURUSD";
 
@@ -603,6 +606,106 @@ fn comparison_uses_position_metrics_and_preserves_caller_order() {
     );
 }
 
+struct OversizedResearchOutput;
+
+impl<'de> Deserializer<'de> for OversizedResearchOutput {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_map(ResearchOutputMap { next_field: 0 })
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier
+        ignored_any
+    }
+}
+
+struct ResearchOutputMap {
+    next_field: u8,
+}
+
+impl<'de> MapAccess<'de> for ResearchOutputMap {
+    type Error = de::value::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        let key = match self.next_field {
+            0 => "journal",
+            1 => "research_annotations",
+            _ => return Ok(None),
+        };
+        self.next_field += 1;
+        seed.deserialize(key.into_deserializer()).map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        match self.next_field - 1 {
+            0 => {
+                let mut deserializer = serde_json::Deserializer::from_str(
+                    r#"{"records":[],"retention":{"retained":0,"omitted":0}}"#,
+                );
+                seed.deserialize(&mut deserializer)
+                    .map_err(de::Error::custom)
+            }
+            1 => seed.deserialize(OversizedAnnotations),
+            _ => unreachable!("research output map yields only known fields"),
+        }
+    }
+}
+
+struct OversizedAnnotations;
+
+impl<'de> Deserializer<'de> for OversizedAnnotations {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_seq(OversizedAnnotationSequence)
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_seq(OversizedAnnotationSequence)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct tuple tuple_struct map struct enum identifier
+        ignored_any
+    }
+}
+
+struct OversizedAnnotationSequence;
+
+impl<'de> SeqAccess<'de> for OversizedAnnotationSequence {
+    type Error = de::value::Error;
+
+    fn next_element_seed<T>(&mut self, _seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        Ok(None)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(MAX_ANNOTATIONS + 1)
+    }
+}
+
 #[test]
 fn research_values_round_trip_strictly_and_reject_unknown_fields() {
     let draft = journal(JournalKind::OutcomeReview, "review", Some("trade-1"));
@@ -615,6 +718,10 @@ fn research_values_round_trip_strictly_and_reject_unknown_fields() {
         )
         .is_err()
     );
+
+    let record_json = r#"{"sequence":0,"observed_through":"2026-02-02T12:00:00","kind":"outcome_review","symbol":"EURUSD","related_trade_id":"trade-1","reason":"review","chart_ref":"chart://review","values":{"reference_price":1.101}}"#;
+    let record: StrategyJournalRecord = serde_json::from_str(record_json).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), record_json);
 
     let research = StrategyResearchOutput {
         journal: StrategyJournalRecorder::new(StrategyResearchLimits::default()).finish(),
@@ -661,6 +768,70 @@ fn research_values_round_trip_strictly_and_reject_unknown_fields() {
     let comparison_json = serde_json::to_string(&comparison).unwrap();
     let decoded: StrategyExperimentComparison = serde_json::from_str(&comparison_json).unwrap();
     assert_eq!(decoded, comparison);
+}
+
+#[test]
+fn journal_values_reject_duplicate_wire_keys() {
+    let duplicate_draft = r#"{"kind":"no_action","symbol":"EURUSD","related_trade_id":null,"reason":"ok","chart_ref":null,"values":{"price":1.0,"price":2.0}}"#;
+    let error = serde_json::from_str::<StrategyJournalDraft>(duplicate_draft).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("journal value key 'price' is duplicated")
+    );
+
+    let duplicate_record = r#"{"sequence":0,"observed_through":"2026-02-02T12:00:00","kind":"no_action","symbol":"EURUSD","related_trade_id":null,"reason":"ok","chart_ref":null,"values":{"price":1.0,"price":2.0}}"#;
+    let error = serde_json::from_str::<StrategyJournalRecord>(duplicate_record).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("journal value key 'price' is duplicated")
+    );
+}
+
+#[test]
+fn research_output_revalidates_annotation_collection_invariants() {
+    let empty_journal = StrategyJournalRecorder::new(StrategyResearchLimits::default()).finish();
+    let duplicate_id = StrategyResearchOutput {
+        journal: empty_journal.clone(),
+        research_annotations: vec![
+            annotation("duplicate", 1, AnnotationUse::HindsightLabel, None),
+            annotation("duplicate", 2, AnnotationUse::JournalOnly, None),
+        ],
+    };
+    let error = serde_json::from_str::<StrategyResearchOutput>(
+        &serde_json::to_string(&duplicate_id).unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("annotation ID 'duplicate' is already present")
+    );
+
+    let duplicate_sequence = StrategyResearchOutput {
+        journal: empty_journal,
+        research_annotations: vec![
+            annotation("first", 7, AnnotationUse::HindsightLabel, None),
+            annotation("second", 7, AnnotationUse::JournalOnly, None),
+        ],
+    };
+    let error = serde_json::from_str::<StrategyResearchOutput>(
+        &serde_json::to_string(&duplicate_sequence).unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("annotation input sequence 7 is already present")
+    );
+
+    let error = StrategyResearchOutput::deserialize(OversizedResearchOutput).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("annotation count 1000001 exceeds maximum 1000000")
+    );
 }
 
 struct BatchFeed {

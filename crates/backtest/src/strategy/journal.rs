@@ -1,8 +1,10 @@
 //! Bounded non-economic research journal output.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use chrono::NaiveDateTime;
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::analysis::validate_symbol;
@@ -286,6 +288,7 @@ struct StrategyJournalDraftDef {
     related_trade_id: Option<String>,
     reason: String,
     chart_ref: Option<String>,
+    #[serde(deserialize_with = "deserialize_journal_values")]
     values: BTreeMap<String, f64>,
 }
 
@@ -382,6 +385,7 @@ struct StrategyJournalRecordDef {
     related_trade_id: Option<String>,
     reason: String,
     chart_ref: Option<String>,
+    #[serde(deserialize_with = "deserialize_journal_values")]
     values: BTreeMap<String, f64>,
 }
 
@@ -562,6 +566,8 @@ pub enum StrategyJournalError {
     TooManyValues { actual: usize, maximum: usize },
     #[error("journal value key '{key}' must contain 1 to {maximum} ASCII identifier bytes")]
     InvalidValueKey { key: String, maximum: usize },
+    #[error("journal value key '{key}' is duplicated")]
+    DuplicateValueKey { key: String },
     #[error("journal value '{key}' must be finite")]
     NonFiniteValue { key: String },
     #[error("callback returned {actual} journal drafts, exceeding maximum {maximum}")]
@@ -589,6 +595,38 @@ pub(crate) fn validate_experiment_label(
             maximum: limits.max_experiment_label_bytes,
         })
     }
+}
+
+fn deserialize_journal_values<'de, D>(deserializer: D) -> Result<BTreeMap<String, f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct JournalValuesVisitor;
+
+    impl<'de> Visitor<'de> for JournalValuesVisitor {
+        type Value = BTreeMap<String, f64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of unique journal scalar values")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, f64>()? {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        StrategyJournalError::DuplicateValueKey { key },
+                    ));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(JournalValuesVisitor)
 }
 
 fn validate_limit(

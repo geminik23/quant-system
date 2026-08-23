@@ -10,14 +10,18 @@ use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestRunner, BarSeriesSpec, FutureQuoteConfig,
     HistoricalStrategy, MissingIntervalPolicy, ObservationStoreLimits, PositionRef, PriceBasis,
     RawSignal, SeriesId, SeriesRequirement, StrategyContext, StrategyDecisionDraft,
-    StrategyDecisionKind, StrategyDescriptor, StrategyEvent, StrategyId, StrategyOutput,
-    StrategyReplayError, StrategyRequirements, StrategyRetentionLimits, Timeframe, VecFeed,
-    WarmupRequirement,
+    StrategyDecisionKind, StrategyDescriptor, StrategyEvent, StrategyFeedback, StrategyId,
+    StrategyOutput, StrategyReplayError, StrategyRequirements, StrategyRetentionLimits, Timeframe,
+    VecFeed, WarmupRequirement,
 };
 use qs_core::types::{Effect, FutureEffect, OrderType, Side};
 use qs_symbols::SymbolSpec;
 
 const SYMBOL: &str = "EURUSD";
+
+type FeedbackEventSummary = (&'static str, Option<String>);
+type BoundaryFeedback = (NaiveDateTime, Vec<FeedbackEventSummary>);
+type PendingBoundaryFeedback = (NaiveDateTime, usize, usize, Vec<FeedbackEventSummary>);
 
 fn ts(minute: i64) -> NaiveDateTime {
     NaiveDate::from_ymd_opt(2026, 1, 2)
@@ -101,6 +105,21 @@ fn descriptor(id: &str) -> StrategyDescriptor {
     StrategyDescriptor::new(StrategyId::new(id).unwrap(), "r1", id).unwrap()
 }
 
+fn feedback_events(feedback: StrategyFeedback<'_>) -> Vec<FeedbackEventSummary> {
+    feedback
+        .events()
+        .iter()
+        .map(|event| {
+            let kind = if event.effect().is_some() {
+                "effect"
+            } else {
+                "disposition"
+            };
+            (kind, event.action_id().map(str::to_owned))
+        })
+        .collect()
+}
+
 fn entry(timestamp: NaiveDateTime) -> RawSignal {
     RawSignal::Entry {
         ts: timestamp,
@@ -122,6 +141,7 @@ struct RecordingStrategy {
     callbacks: Vec<(NaiveDateTime, Vec<u64>, bool)>,
     emit_entry_at: Option<NaiveDateTime>,
     feedback: Vec<(NaiveDateTime, usize, usize)>,
+    ordered_feedback: Vec<BoundaryFeedback>,
 }
 
 impl RecordingStrategy {
@@ -132,6 +152,7 @@ impl RecordingStrategy {
             callbacks: Vec::new(),
             emit_entry_at,
             feedback: Vec::new(),
+            ordered_feedback: Vec::new(),
         }
     }
 }
@@ -165,6 +186,10 @@ impl HistoricalStrategy for RecordingStrategy {
             context.observed_through(),
             event.feedback().effects().len(),
             event.feedback().dispositions().len(),
+        ));
+        self.ordered_feedback.push((
+            context.observed_through(),
+            feedback_events(event.feedback()),
         ));
         if self.emit_entry_at == Some(context.observed_through()) {
             let draft = StrategyDecisionDraft::new(
@@ -266,6 +291,111 @@ fn generated_entry_uses_a_later_quote_and_feedback_is_delivered_once() {
     assert_eq!(result.replay.recorded_fills[0].quote_ts, ts(2));
     assert_eq!(strategy.feedback[2], (ts(2), 1, 1));
     assert_eq!(strategy.feedback[3], (ts(3), 0, 0));
+    assert_eq!(
+        strategy.ordered_feedback[2].1,
+        vec![
+            ("effect", Some("signal:00000000".into())),
+            ("disposition", Some("signal:00000000".into())),
+        ]
+    );
+}
+
+struct PendingEntryStrategy {
+    descriptor: StrategyDescriptor,
+    requirements: StrategyRequirements,
+    feedback: Vec<PendingBoundaryFeedback>,
+}
+
+impl HistoricalStrategy for PendingEntryStrategy {
+    type Error = Infallible;
+
+    fn descriptor(&self) -> &StrategyDescriptor {
+        &self.descriptor
+    }
+
+    fn requirements(&self) -> &StrategyRequirements {
+        &self.requirements
+    }
+
+    fn on_event(
+        &mut self,
+        event: StrategyEvent<'_>,
+        context: StrategyContext<'_>,
+    ) -> Result<StrategyOutput, Self::Error> {
+        self.feedback.push((
+            context.observed_through(),
+            event.feedback().effects().len(),
+            event.feedback().dispositions().len(),
+            feedback_events(event.feedback()),
+        ));
+        if context.observed_through() != ts(1) {
+            return Ok(StrategyOutput::none());
+        }
+        let signal = RawSignal::Entry {
+            ts: ts(1),
+            symbol: SYMBOL.into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: Some(1.1000),
+            risk_multiplier: 1.0,
+            stoploss: Some(0.9),
+            targets: vec![],
+            group: Some("pending-campaign".into()),
+            trade_id: Some("pending-trade".into()),
+        };
+        Ok(StrategyOutput::from_decision(
+            StrategyDecisionDraft::new(
+                StrategyDecisionKind::Entry,
+                "place pending entry",
+                Some("pending-trade".into()),
+                vec![signal],
+                StrategyRetentionLimits::default(),
+            )
+            .unwrap(),
+        ))
+    }
+}
+
+#[test]
+fn pending_fill_feedback_uses_the_placement_action_id() {
+    let mut strategy = PendingEntryStrategy {
+        descriptor: descriptor("pending-entry"),
+        requirements: requirements(1, 0),
+        feedback: Vec::new(),
+    };
+    let mut feed = VecFeed::from_feed_events(vec![
+        event(0, 0, 1.1010),
+        event(1, 1, 1.1010),
+        event(2, 2, 1.0990),
+        event(3, 3, 1.1020),
+    ]);
+
+    let result = BacktestRunner::new_future(config(false), FutureQuoteConfig::default())
+        .run_historical_strategy_future(
+            &mut feed,
+            &mut strategy,
+            vec![spec(1)],
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(strategy.feedback[2].1, 2);
+    assert_eq!(strategy.feedback[2].2, 1);
+    assert_eq!(
+        strategy.feedback[2].3,
+        vec![
+            ("effect", Some("signal:00000000".into())),
+            ("disposition", Some("signal:00000000".into())),
+            ("effect", Some("signal:00000000".into())),
+        ]
+    );
+    assert_eq!(result.replay.recorded_fills.len(), 1);
+    assert_eq!(
+        result.replay.action_dispositions[0].action_id,
+        "signal:00000000"
+    );
 }
 
 struct WarmupEmitter(RecordingStrategy);

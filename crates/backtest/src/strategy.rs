@@ -5,6 +5,7 @@
 pub mod analysis;
 pub mod annotation;
 pub mod config;
+pub mod configured;
 pub mod context;
 pub mod domain;
 pub mod experiment;
@@ -32,6 +33,13 @@ pub use config::{
     MAX_WARMUP_BARS, PriceBasis, SeriesId, StrategyConfigError, StrategyRetentionLimits, Timeframe,
     WarmupRequirement,
 };
+pub use configured::{
+    BacktestConfiguredStrategyAdapter, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
+    ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
+    ConfiguredStrategyAdapterPreflightError, HistoricalNamedInputProjector,
+    HistoricalVolumeProjection, NamedInputProjectionContext, NamedInputProjectionError,
+    ProjectedNamedInput,
+};
 pub use context::StrategyContext;
 pub use domain::{
     MAX_DECISION_LATENCY_MS, MAX_INSTRUMENT_BYTES, MAX_STRATEGY_ID_BYTES,
@@ -44,7 +52,7 @@ pub use experiment::{
     StrategyComparisonMetrics, StrategyComparisonSnapshot, StrategyExperimentComparison,
     StrategyExperimentError,
 };
-pub use feedback::StrategyFeedback;
+pub use feedback::{StrategyFeedback, StrategyFeedbackEvent};
 pub use journal::{
     JournalKind, MAX_CHART_REF_BYTES, MAX_EXPERIMENT_LABEL_BYTES, MAX_JOURNAL_PER_CALLBACK,
     MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,

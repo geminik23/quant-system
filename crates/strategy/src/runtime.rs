@@ -263,6 +263,7 @@ pub struct ConfiguredStrategy {
     strategy_id: String,
     instance_id: String,
     primary_symbol: String,
+    declared_sources: Vec<SourceId>,
     source_set: BTreeSet<SourceId>,
     materials: Vec<CompiledMaterial>,
     material_values: Vec<Value>,
@@ -364,6 +365,7 @@ impl ConfiguredStrategy {
             strategy_id: config.strategy_id,
             instance_id,
             primary_symbol,
+            declared_sources: config.sources,
             source_set,
             materials,
             material_values,
@@ -386,6 +388,14 @@ impl ConfiguredStrategy {
 
     pub fn state_id(&self) -> &str {
         &self.states[self.current_state].id
+    }
+
+    pub fn declared_sources(&self) -> &[SourceId] {
+        &self.declared_sources
+    }
+
+    pub fn primary_symbol(&self) -> &str {
+        &self.primary_symbol
     }
 
     pub fn input_requirements(&self) -> &ConfiguredStrategyRequirements {
@@ -411,6 +421,25 @@ impl ConfiguredStrategy {
         result
     }
 
+    /// Commit feedback at an adapter-owned final boundary without evaluating market inputs or transitions.
+    pub fn finalize_command_feedback(
+        &mut self,
+        feedback: &[CommandFeedback],
+    ) -> Result<(), EvaluationError> {
+        if self.terminal {
+            return Err(EvaluationError::Terminal);
+        }
+        let mut identity = self.identity.clone();
+        if let Err(error) = process_feedback(&mut identity, feedback) {
+            self.terminal = true;
+            return Err(error);
+        }
+        identity.commands.clear();
+        self.identity = identity;
+        self.pending_feedback.clear();
+        Ok(())
+    }
+
     fn evaluate_staged(
         &mut self,
         input: &StrategyInput,
@@ -420,6 +449,7 @@ impl ConfiguredStrategy {
         let retained_observations = pending.clone();
         let had_pending = !pending.is_empty();
         let mut identity = self.identity.clone();
+        let prior_slots = identity.slots.clone();
         let current_observations = process_feedback(&mut identity, &input.feedback)?;
         let mut observations = pending.clone();
         observations.extend(current_observations.iter().cloned());
@@ -583,12 +613,12 @@ impl ConfiguredStrategy {
         let decision = transition
             .decision
             .as_ref()
-            .map(|template| evaluate_decision(template, &output_scope, &identity))
+            .map(|template| evaluate_decision(template, &output_scope, &identity, &prior_slots))
             .transpose()?;
         let notes = transition
             .notes
             .iter()
-            .map(|template| evaluate_note(template, &output_scope, &identity))
+            .map(|template| evaluate_note(template, &output_scope, &identity, &prior_slots))
             .collect::<Result<Vec<_>, _>>()?;
         for (material, evaluator) in self.materials.iter_mut().zip(evaluators) {
             material.evaluator = evaluator;
@@ -1763,11 +1793,16 @@ fn evaluate_decision(
     template: &CompiledDecision,
     scope: &EvalScope<'_>,
     identity: &IdentityState,
+    prior_slots: &[SlotBinding],
 ) -> Result<Decision, EvaluationError> {
     Ok(Decision {
         kind: template.kind,
         reason: template.reason.clone(),
-        related_trade: resolve_related_trade(template.trade_slot.as_deref(), identity)?,
+        related_trade: resolve_related_trade(
+            template.trade_slot.as_deref(),
+            identity,
+            prior_slots,
+        )?,
         values: evaluate_outputs(&template.values, scope)?,
     })
 }
@@ -1776,11 +1811,16 @@ fn evaluate_note(
     template: &CompiledNote,
     scope: &EvalScope<'_>,
     identity: &IdentityState,
+    prior_slots: &[SlotBinding],
 ) -> Result<Note, EvaluationError> {
     Ok(Note {
         kind: template.kind,
         reason: template.reason.clone(),
-        related_trade: resolve_related_trade(template.trade_slot.as_deref(), identity)?,
+        related_trade: resolve_related_trade(
+            template.trade_slot.as_deref(),
+            identity,
+            prior_slots,
+        )?,
         values: evaluate_outputs(&template.values, scope)?,
     })
 }
@@ -1788,11 +1828,13 @@ fn evaluate_note(
 fn resolve_related_trade(
     slot: Option<&str>,
     identity: &IdentityState,
+    prior_slots: &[SlotBinding],
 ) -> Result<Option<RelatedTrade>, EvaluationError> {
     slot.map(|slot| {
         identity
             .slots
             .iter()
+            .chain(prior_slots)
             .find(|item| item.slot == slot)
             .map(|item| RelatedTrade {
                 slot: slot.into(),

@@ -108,6 +108,20 @@ fn compile(config: StrategyConfig) -> Result<ConfiguredStrategy, CompileError> {
     ConfiguredStrategy::compile(config, &MaterialLibrary::builtins(), "instance_a", "EURUSD")
 }
 
+#[test]
+fn configured_strategy_exposes_declared_sources_and_primary_symbol() {
+    let strategy = compile(base(vec![state("idle", vec![])])).unwrap();
+    assert_eq!(
+        strategy
+            .declared_sources()
+            .iter()
+            .map(SourceId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["fast", "slow"]
+    );
+    assert_eq!(strategy.primary_symbol(), "EURUSD");
+}
+
 fn entry_action(slot: &str) -> ActionTemplate {
     ActionTemplate::Entry {
         slot: slot.into(),
