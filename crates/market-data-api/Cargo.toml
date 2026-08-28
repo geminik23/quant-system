@@ -21,3 +21,6 @@ qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -4,14 +4,15 @@ use chrono::Utc;
 use clap::Parser;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, broadcast, watch};
 
 use market_data::Result;
 use market_data::core::AlertSet;
 use market_data::core::ctrader_type::CTraderFixConfig;
 use market_data::market_data::{
-    ConnectionState, MarketManagerHandles, market_handler::MarketHandler,
-    market_manager::MarketManager,
+    MarketManagerHandles,
+    market_handler::{MarketHandler, ObservedQuote},
+    market_manager::{MarketManager, PriceTickEvent, SourceStateSnapshot},
 };
 use market_data::rpc_types::*;
 use market_data::utils::load_config;
@@ -107,7 +108,126 @@ impl Drop for ClientCleanup {
     }
 }
 
-// ── Per-Client RPC Registration ──
+enum CombinedStreamItem {
+    Event(StreamEvent),
+    Skip,
+    Closed,
+}
+
+fn get_price_response(symbol: String, quote: Option<ObservedQuote>) -> GetPriceResponse {
+    match quote {
+        Some(quote) => GetPriceResponse {
+            symbol,
+            bid: quote.bid,
+            ask: quote.ask,
+            ts_ms: quote.observed_at_ms,
+            found: true,
+        },
+        None => GetPriceResponse {
+            symbol,
+            bid: 0.0,
+            ask: 0.0,
+            ts_ms: 0,
+            found: false,
+        },
+    }
+}
+
+fn price_snapshot(symbol: String, quote: Option<ObservedQuote>) -> PriceSnapshot {
+    match quote {
+        Some(quote) => PriceSnapshot {
+            symbol,
+            bid: quote.bid,
+            ask: quote.ask,
+            ts_ms: quote.observed_at_ms,
+            found: true,
+        },
+        None => PriceSnapshot {
+            symbol,
+            bid: 0.0,
+            ask: 0.0,
+            ts_ms: 0,
+            found: false,
+        },
+    }
+}
+
+fn price_tick(event: PriceTickEvent) -> PriceTick {
+    PriceTick {
+        symbol: event.symbol,
+        bid: event.bid,
+        ask: event.ask,
+        ts_ms: event.ts_ms,
+    }
+}
+
+fn get_state_response(snapshot: SourceStateSnapshot) -> GetStateResponse {
+    GetStateResponse {
+        state: snapshot.state.as_str().to_string(),
+        ts_ms: snapshot.changed_at_ms,
+    }
+}
+
+fn source_state_event(snapshot: SourceStateSnapshot) -> StreamEvent {
+    StreamEvent::source_state(snapshot.state.as_str(), snapshot.changed_at_ms)
+}
+
+fn lagged_stream_event(receiver: &str, dropped: u64) -> StreamEvent {
+    StreamEvent::data_quality(DataQualityEvent::new(
+        format!("{receiver} receiver lagged"),
+        Some(dropped),
+        Utc::now().timestamp_millis(),
+    ))
+}
+
+async fn next_price_stream_item(
+    receiver: &mut broadcast::Receiver<PriceTickEvent>,
+    filter: &RwLock<Option<HashSet<String>>>,
+) -> CombinedStreamItem {
+    match receiver.recv().await {
+        Ok(tick) => {
+            let filter = filter.read().await;
+            let should_send = match &*filter {
+                None => false,
+                Some(set) if set.is_empty() => true,
+                Some(set) => set.contains(&tick.symbol),
+            };
+            if should_send {
+                CombinedStreamItem::Event(StreamEvent::price(price_tick(tick)))
+            } else {
+                CombinedStreamItem::Skip
+            }
+        }
+        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+            CombinedStreamItem::Event(lagged_stream_event("price", dropped))
+        }
+        Err(broadcast::error::RecvError::Closed) => CombinedStreamItem::Closed,
+    }
+}
+
+async fn next_state_stream_item(
+    receiver: &mut broadcast::Receiver<SourceStateSnapshot>,
+) -> CombinedStreamItem {
+    match receiver.recv().await {
+        Ok(snapshot) => CombinedStreamItem::Event(source_state_event(snapshot)),
+        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+            CombinedStreamItem::Event(lagged_stream_event("state", dropped))
+        }
+        Err(broadcast::error::RecvError::Closed) => CombinedStreamItem::Closed,
+    }
+}
+
+async fn next_quality_stream_item(
+    receiver: &mut broadcast::Receiver<DataQualityEvent>,
+) -> CombinedStreamItem {
+    match receiver.recv().await {
+        Ok(event) => CombinedStreamItem::Event(StreamEvent::data_quality(event)),
+        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+            CombinedStreamItem::Event(lagged_stream_event("quality", dropped))
+        }
+        Err(broadcast::error::RecvError::Closed) => CombinedStreamItem::Closed,
+    }
+}
 
 fn register_client_handlers(
     server: &RpcServer<BincodeCodec>,
@@ -133,17 +253,8 @@ fn register_client_handlers(
         server.register_typed("get_price", move |req: GetPriceRequest| {
             let handler = handler.clone();
             async move {
-                let (bid, ask, found) = match handler.get_last_bid_ask(&req.symbol).await {
-                    Some((b, a)) => (b, a, true),
-                    None => (0.0, 0.0, false),
-                };
-                Ok(GetPriceResponse {
-                    symbol: req.symbol,
-                    bid,
-                    ask,
-                    ts_ms: Utc::now().timestamp_millis(),
-                    found,
-                })
+                let quote = handler.get_observed_quote(&req.symbol).await;
+                Ok(get_price_response(req.symbol, quote))
             }
         });
     }
@@ -155,18 +266,9 @@ fn register_client_handlers(
             let handler = handler.clone();
             async move {
                 let mut prices = Vec::with_capacity(req.symbols.len());
-                for sym in req.symbols {
-                    let (bid, ask, found) = match handler.get_last_bid_ask(&sym).await {
-                        Some((b, a)) => (b, a, true),
-                        None => (0.0, 0.0, false),
-                    };
-                    prices.push(PriceSnapshot {
-                        symbol: sym,
-                        bid,
-                        ask,
-                        ts_ms: Utc::now().timestamp_millis(),
-                        found,
-                    });
+                for symbol in req.symbols {
+                    let quote = handler.get_observed_quote(&symbol).await;
+                    prices.push(price_snapshot(symbol, quote));
                 }
                 Ok(GetPricesResponse { prices })
             }
@@ -191,17 +293,8 @@ fn register_client_handlers(
         server.register_typed("get_state", move |_req: ()| {
             let handles = handles.clone();
             async move {
-                let state_val = handles.get_connection_state().await;
-                let state_str = match state_val {
-                    ConnectionState::Connected => "CONNECTED",
-                    ConnectionState::Disconnected => "DISCONNECTED",
-                    ConnectionState::Connecting => "CONNECTING",
-                    ConnectionState::Logon => "LOGON",
-                };
-                Ok(GetStateResponse {
-                    state: state_str.to_string(),
-                    ts_ms: Utc::now().timestamp_millis(),
-                })
+                let snapshot = handles.get_source_state().await;
+                Ok(get_state_response(snapshot))
             }
         });
     }
@@ -364,7 +457,19 @@ fn register_client_handlers(
                 let filter = filter.clone();
                 async move {
                     let mut price_rx = handles.subscribe_price_ticks();
-                    while let Ok(tick) = price_rx.recv().await {
+                    loop {
+                        let tick = match price_rx.recv().await {
+                            Ok(tick) => tick,
+                            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                                tracing::warn!(
+                                    client_id,
+                                    dropped,
+                                    "direct price stream receiver lagged"
+                                );
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
                         let f = filter.read().await;
                         let should_send = match &*f {
                             None => false,
@@ -372,16 +477,7 @@ fn register_client_handlers(
                             Some(set) => set.contains(&tick.symbol),
                         };
                         drop(f);
-                        if should_send
-                            && sender
-                                .send(PriceTick {
-                                    symbol: tick.symbol,
-                                    bid: tick.bid,
-                                    ask: tick.ask,
-                                    ts_ms: tick.ts_ms,
-                                })
-                                .is_err()
-                        {
+                        if should_send && sender.send(price_tick(tick)).is_err() {
                             break;
                         }
                     }
@@ -403,7 +499,15 @@ fn register_client_handlers(
                 let state = state.clone();
                 async move {
                     let mut alert_rx = handles.subscribe_alerts();
-                    while let Ok(event) = alert_rx.recv().await {
+                    loop {
+                        let event = match alert_rx.recv().await {
+                            Ok(event) => event,
+                            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                                tracing::warn!(client_id, dropped, "alert stream receiver lagged");
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        };
                         if state.owner_of(&event.alert_id).await == Some(client_id) {
                             let (symbol, ref_price, _kind) = state
                                 .take_alert_meta(&event.alert_id)
@@ -442,47 +546,41 @@ fn register_client_handlers(
                 async move {
                     let mut price_rx = handles.subscribe_price_ticks();
                     let mut state_rx = handles.subscribe_state_changes();
+                    let mut quality_rx = handles.subscribe_quality_events();
+                    let initial_state = handles.get_source_state().await;
+                    if sender.send(source_state_event(initial_state)).is_err()
+                    {
+                        let _ = sender.end();
+                        return Ok(());
+                    }
 
-                    loop {
-                        tokio::select! {
-                            result = price_rx.recv() => {
-                                let Ok(tick) = result else { break };
-                                let f = filter.read().await;
-                                let should_send = match &*f {
-                                    None => false,
-                                    Some(set) if set.is_empty() => true,
-                                    Some(set) => set.contains(&tick.symbol),
-                                };
-                                drop(f);
-                                if should_send {
-                                    let event = StreamEvent {
-                                        event_type: "PRICE".into(),
-                                        symbol: Some(tick.symbol),
-                                        bid: Some(tick.bid),
-                                        ask: Some(tick.ask),
-                                        state: None,
-                                        ts_ms: tick.ts_ms,
-                                    };
-                                    if sender.send(event).is_err() { break; }
+                    let mut price_open = true;
+                    let mut state_open = true;
+                    let mut quality_open = true;
+                    while price_open || state_open || quality_open {
+                        let item = tokio::select! {
+                            item = next_price_stream_item(&mut price_rx, &filter), if price_open => item,
+                            item = next_state_stream_item(&mut state_rx), if state_open => item,
+                            item = next_quality_stream_item(&mut quality_rx), if quality_open => item,
+                        };
+
+                        match item {
+                            CombinedStreamItem::Event(event) => {
+                                if sender.send(event).is_err() {
+                                    break;
                                 }
                             }
-                            result = state_rx.recv() => {
-                                let Ok(new_state) = result else { break };
-                                let state_str = match new_state {
-                                    ConnectionState::Connected => "CONNECTED",
-                                    ConnectionState::Disconnected => "DISCONNECTED",
-                                    ConnectionState::Connecting => "CONNECTING",
-                                    ConnectionState::Logon => "LOGON",
-                                };
-                                let event = StreamEvent {
-                                    event_type: "STATE".into(),
-                                    symbol: None,
-                                    bid: None,
-                                    ask: None,
-                                    state: Some(state_str.to_string()),
-                                    ts_ms: Utc::now().timestamp_millis(),
-                                };
-                                if sender.send(event).is_err() { break; }
+                            CombinedStreamItem::Skip => {}
+                            CombinedStreamItem::Closed => {
+                                if price_open && price_rx.is_closed() {
+                                    price_open = false;
+                                }
+                                if state_open && state_rx.is_closed() {
+                                    state_open = false;
+                                }
+                                if quality_open && quality_rx.is_closed() {
+                                    quality_open = false;
+                                }
                             }
                         }
                     }
@@ -603,6 +701,133 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_and_stream_preserve_quote_observation_timestamp() {
+        let quote = ObservedQuote {
+            bid: 1.1234,
+            ask: 1.1236,
+            observed_at_ms: 1_700_000_000_123,
+        };
+        let snapshot = get_price_response("EURUSD".into(), Some(quote));
+        let stream_tick = price_tick(PriceTickEvent {
+            symbol: "EURUSD".into(),
+            bid: quote.bid,
+            ask: quote.ask,
+            ts_ms: quote.observed_at_ms,
+        });
+
+        assert_eq!(snapshot.ts_ms, quote.observed_at_ms);
+        assert_eq!(stream_tick.ts_ms, quote.observed_at_ms);
+    }
+
+    #[test]
+    fn state_response_and_initial_stream_event_use_transition_timestamp() {
+        use market_data::market_data::ConnectionState;
+
+        let snapshot = SourceStateSnapshot {
+            state: ConnectionState::Connecting,
+            changed_at_ms: 1_700_000_000_456,
+        };
+        let response = get_state_response(snapshot);
+        let initial_event = source_state_event(snapshot);
+
+        assert_eq!(response.state, "CONNECTING");
+        assert_eq!(response.ts_ms, snapshot.changed_at_ms);
+        assert_eq!(initial_event.event_type, StreamEvent::STATE);
+        assert_eq!(initial_event.state.as_deref(), Some("CONNECTING"));
+        assert_eq!(initial_event.ts_ms, snapshot.changed_at_ms);
+    }
+
+    #[tokio::test]
+    async fn combined_stream_receivers_report_lag_and_continue() {
+        use market_data::market_data::ConnectionState;
+
+        let filter = RwLock::new(Some(HashSet::new()));
+        let (price_tx, mut price_rx) = broadcast::channel(1);
+        price_tx
+            .send(PriceTickEvent {
+                symbol: "EURUSD".into(),
+                bid: 1.1,
+                ask: 1.2,
+                ts_ms: 10,
+            })
+            .unwrap();
+        price_tx
+            .send(PriceTickEvent {
+                symbol: "EURUSD".into(),
+                bid: 1.2,
+                ask: 1.3,
+                ts_ms: 11,
+            })
+            .unwrap();
+        assert_quality_lag(
+            next_price_stream_item(&mut price_rx, &filter).await,
+            "price",
+            1,
+        );
+        assert_price_event(next_price_stream_item(&mut price_rx, &filter).await, 11);
+
+        let (state_tx, mut state_rx) = broadcast::channel(1);
+        state_tx
+            .send(SourceStateSnapshot {
+                state: ConnectionState::Connecting,
+                changed_at_ms: 20,
+            })
+            .unwrap();
+        state_tx
+            .send(SourceStateSnapshot {
+                state: ConnectionState::Connected,
+                changed_at_ms: 21,
+            })
+            .unwrap();
+        assert_quality_lag(next_state_stream_item(&mut state_rx).await, "state", 1);
+        let CombinedStreamItem::Event(state_event) = next_state_stream_item(&mut state_rx).await
+        else {
+            panic!("expected state event after lag");
+        };
+        assert_eq!(state_event.state.as_deref(), Some("CONNECTED"));
+        assert_eq!(state_event.ts_ms, 21);
+
+        let (quality_tx, mut quality_rx) = broadcast::channel(1);
+        quality_tx
+            .send(DataQualityEvent::new("first", None, 30))
+            .unwrap();
+        quality_tx
+            .send(DataQualityEvent::new("second", None, 31))
+            .unwrap();
+        assert_quality_lag(
+            next_quality_stream_item(&mut quality_rx).await,
+            "quality",
+            1,
+        );
+        let CombinedStreamItem::Event(quality_event) =
+            next_quality_stream_item(&mut quality_rx).await
+        else {
+            panic!("expected quality event after lag");
+        };
+        assert_eq!(quality_event.event_type, StreamEvent::DATA_QUALITY);
+        assert_eq!(quality_event.quality.unwrap().reason, "second");
+    }
+
+    fn assert_quality_lag(item: CombinedStreamItem, receiver: &str, dropped: u64) {
+        let CombinedStreamItem::Event(event) = item else {
+            panic!("expected data-quality event");
+        };
+        assert_eq!(event.event_type, StreamEvent::DATA_QUALITY);
+        let quality = event.quality.unwrap();
+        assert_eq!(quality.reason, format!("{receiver} receiver lagged"));
+        assert_eq!(quality.dropped, Some(dropped));
+        assert_eq!(event.ts_ms, quality.ts_ms);
+    }
+
+    fn assert_price_event(item: CombinedStreamItem, ts_ms: i64) {
+        let CombinedStreamItem::Event(event) = item else {
+            panic!("expected price event");
+        };
+        assert_eq!(event.event_type, StreamEvent::PRICE);
+        assert_eq!(event.ts_ms, ts_ms);
+    }
 
     #[test]
     fn endpoint_resolution_supports_current_legacy_and_conflict_diagnostics() {

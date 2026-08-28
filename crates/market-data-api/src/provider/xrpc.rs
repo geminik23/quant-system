@@ -11,7 +11,7 @@ use crate::{
     SetAlertRequest, StreamEvent, SubscribePricesRequest, UnsubscribePricesRequest,
 };
 
-/// Market-data xrpc connection façade. Provider types are not exposed by its API.
+/// Market-data xrpc connection facade. Provider types are not exposed by its API.
 pub struct MarketDataXrpcClient {
     session: XrpcClientSession<BincodeCodec>,
 }

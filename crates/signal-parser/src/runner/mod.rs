@@ -177,7 +177,7 @@ pub enum IngestionServiceError {
     InvalidOutcomeReference,
 }
 
-/// Composes the IP03 transaction protocol around a compiled IP02 routing graph.
+/// Composes durable source application around a compiled routing graph.
 pub struct IngestionService {
     graph: CompiledRoutingGraph,
     state: Arc<dyn SourceStateStore>,

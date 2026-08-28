@@ -2,7 +2,7 @@
 
 A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.2.x` development.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.3.x` development.
 
 It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 
@@ -12,8 +12,9 @@ It is not a complete automated trading platform. It does not currently execute l
 |---|---|---|
 | Run a deterministic signal backtest | [Five-minute quick start](docs/getting-started.md) | Available; a synthetic fixture is included |
 | Import and manage historical data | [`qs-data-preprocess` guide](crates/data-preprocess/GUIDE.md) | Available for supported tick and bar exports |
-| Embed the pure trade engine or canonical trading contracts | [`quant-system-core`](crates/core) | Library-only |
-| Build an in-process strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
+| Embed the pure trade engine or strict raw-signal contracts | [`quant-system-core`](crates/core) | Library-only |
+| Compile and evaluate reusable configured strategy behavior | [`qs-strategy`](crates/strategy) | Library-only; synchronous core |
+| Build an in-process historical strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Compatibility CLI and public adapter library |
 
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
@@ -82,15 +83,20 @@ external producer or qs-signal-parser -> RawSignal -----+
 CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 ```
 
-`RawSignal` remains the compatibility boundary accepted by current replay endpoints. `quant-system-core` also provides additive source- and strategy-neutral `TradeIntent`, immutable execution-command, dispatch-report, and venue `ExecutionReport` contracts for future supervisors, gateways, replay adapters, and venue adapters. `qs-instruments` provides source-neutral asset IDs, broker- or exchange-qualified instrument identities, exact decimal grids, effective-dated specifications, and immutable catalog snapshots. CTrader is modeled as a trading platform rather than an instrument listing venue. Source-neutral ingestion libraries, strict JSONL codecs, Telegram adapters, and an authenticated webhook provider edge are also available; see [Signal ingestion](docs/signal-ingestion.md), [Trading intent](docs/reference/trade-intent.md), and [Architecture](docs/architecture.md).
+`RawSignal` remains the compatibility boundary accepted by current replay endpoints. `qs-instruments` provides source-neutral asset IDs, broker- or exchange-qualified instrument identities, exact decimal grids, effective-dated specifications, and immutable catalog snapshots. CTrader is modeled as a trading platform rather than an instrument listing venue. Source-neutral ingestion libraries, strict JSONL codecs, Telegram adapters, and an authenticated webhook provider edge are also available; see [Signal ingestion](docs/signal-ingestion.md) and [Architecture](docs/architecture.md).
 
 ## Current boundaries
 
 - Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
 - Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
-- Canonical intent and execution-event types are available as pure library contracts, but current backtest endpoints still accept strict `RawSignal`. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch-to-intent bridge is included.
+- `qs-strategy` provides a reusable synchronous configured strategy core with recursively strict unversioned configuration, bounded logical bar sources, source-specific input requirements, an explicit immutable material library, typed bounded expressions, deterministic material and finite-state evaluation, total vacant/pending/open trade-slot facts, generic decisions and notes, and validated command-correlated strict `RawSignal` values. It remains library-only and owns no historical feeds, services, live runtime, persistence, or management-profile composition.
+- `qs-backtest` provides validated historical strategy contracts and a configured-strategy adapter over the existing FutureQuote scheduler. The adapter performs complete logical-source binding, exact tick-count volume projection, named-input projection, total trade-slot projection, ordered command provenance and committed feedback, final feedback processing, decision and note mapping, and unprofiled Entry reuse while rejecting supplied management profiles before feed consumption.
+- Configured historical execution is available through materialized and streaming in-process library APIs. Current conformance verifies neutral no-op, EMA crossover, EMA/ATR lifecycle, pending cancellation, custom material reuse, direct-signal economic parity, aligned-EOD materialized/streaming parity, final feedback handling, and strict research-output deserialization.
+- Current backtest service endpoints accept strict `RawSignal`; configured-strategy server or RPC execution is not included. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.
+- Shipped backtest clients use provider-neutral retained-job, artifact, synchronous-execution, and discovery capabilities through the typed xrpc facade; RPC method names and provider error mapping remain inside the API provider module.
+- Market-data snapshots and streams use service quote-observation timestamps rather than unavailable CTrader source timestamps. Reconnect invalidates prior-session quote cache entries, source-state events carry transition timestamps, and the combined event stream exposes detected receiver lag or subscription rejection without claiming replay or exactly-once delivery.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
 - Historical import accepts the documented MetaTrader-style tab-delimited tick and bar formats, not arbitrary CSV layouts.
 
@@ -104,7 +110,6 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
 - [RawSignal reference](docs/reference/raw-signal.md)
-- [Trade intent and execution events](docs/reference/trade-intent.md)
 
 ## Development
 

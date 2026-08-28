@@ -13,7 +13,6 @@ Use this index to enter the workspace by goal rather than by crate name.
 | Understand crate and service ownership | [Architecture](architecture.md) |
 | Review intended project direction | [Roadmap](roadmap.md) |
 | Construct strict signal JSONL | [RawSignal reference](reference/raw-signal.md) |
-| Embed canonical intent and execution-event contracts | [Trade intent and execution events](reference/trade-intent.md) |
 
 ## Component references
 

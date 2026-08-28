@@ -89,7 +89,7 @@ enum InputType {
         /// Exchange / broker name
         #[arg(long, short)]
         exchange: String,
-        /// Bar timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M)
+        /// Bar timeframe (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M)
         #[arg(long, short)]
         timeframe: String,
         /// Override symbol (default: extracted from filename)

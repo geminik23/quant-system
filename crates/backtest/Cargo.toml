@@ -18,6 +18,7 @@ qs-core = { workspace = true }
 qs-instruments = { workspace = true }
 qs-data-preprocess = { workspace = true }
 qs-symbols = { workspace = true }
+qs-strategy = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

@@ -448,6 +448,18 @@ impl App {
                     self.update_conn_status(state_str);
                 }
             }
+            "DATA_QUALITY" => {
+                if let Some(quality) = event.quality {
+                    let dropped = quality
+                        .dropped
+                        .map(|count| format!(", dropped={count}"))
+                        .unwrap_or_default();
+                    self.push_log(
+                        "DATA_QUALITY".into(),
+                        format!("{}{}", quality.reason, dropped),
+                    );
+                }
+            }
             _ => {}
         }
     }

@@ -48,17 +48,14 @@ TCP has no built-in authentication or TLS. Non-loopback binding is rejected unle
 
 ## Health model
 
-Local transport connectivity and upstream CTrader freshness are separate states. A client can connect to the local service while the FIX source is reconnecting or stale. Consumers must observe source-state events and handle reconnect or resubscribe as potentially data-loss-visible behavior.
+Local transport connectivity, CTrader source state, and quote freshness are separate facts. A client can connect to the local service while the FIX source is reconnecting. Entering `CONNECTING` or `DISCONNECTED` clears cached quotes, so snapshot requests return `found = false` until the replacement session produces a new observation.
+
+`GetPriceResponse.ts_ms`, `PriceSnapshot.ts_ms`, and streamed `PriceTick.ts_ms` record when this service observed the CTrader callback. They are not exchange event time or FIX `SendingTime`. `GetStateResponse.ts_ms` and `STATE` events record when this service committed the source-state transition.
+
+The combined event stream sends the current source state first and then emits `PRICE`, `STATE`, and `DATA_QUALITY` events. A data-quality event reports service-observed loss such as broadcast receiver lag or a rejected spot subscription, including a dropped count when known. It does not provide replay, exactly-once delivery, an upstream sequence, or market-hours-aware staleness. The direct price stream remains price-only and best-effort; consumers that need gap visibility should use the combined event stream.
 
 ## Supported operations
 
-The provider-neutral `MarketDataClient` supports:
-
-- ping and source-state queries;
-- symbol discovery;
-- one or multiple snapshots;
-- filtered price subscriptions;
-- one-shot above/below alerts;
-- price, alert, and combined source-state streams.
+The provider-neutral `MarketDataClient` supports one or multiple snapshots, source-state queries, local subscription filters, one-shot above/below alerts, owned-alert queries, combined price/state/quality events, and alert streams. The current service also registers provider-edge ping, symbol-discovery, and direct price-stream RPCs used by the bundled operational clients; those operations are not methods on the provider-neutral trait.
 
 See the full [`qs-market-data` guide](../crates/market-data/GUIDE.md) for configuration and the typed client contract.

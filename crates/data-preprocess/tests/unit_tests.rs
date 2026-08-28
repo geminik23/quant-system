@@ -128,6 +128,7 @@ fn timeframe_parse_and_display() {
     assert_eq!(Timeframe::parse("4h").unwrap(), Timeframe::H4);
     assert_eq!(Timeframe::parse("1d").unwrap(), Timeframe::D1);
     assert_eq!(Timeframe::parse("1w").unwrap(), Timeframe::W1);
+    assert_eq!(Timeframe::parse("1M").unwrap(), Timeframe::MN1);
     assert_eq!(Timeframe::parse("MN1").unwrap(), Timeframe::MN1);
 
     // Invalid
@@ -135,9 +136,20 @@ fn timeframe_parse_and_display() {
     assert!(Timeframe::parse("").is_err());
 
     // as_str round-trip
-    assert_eq!(Timeframe::M1.as_str(), "1m");
-    assert_eq!(Timeframe::H4.as_str(), "4h");
-    assert_eq!(Timeframe::MN1.as_str(), "1M");
+    for timeframe in [
+        Timeframe::M1,
+        Timeframe::M3,
+        Timeframe::M5,
+        Timeframe::M15,
+        Timeframe::M30,
+        Timeframe::H1,
+        Timeframe::H4,
+        Timeframe::D1,
+        Timeframe::W1,
+        Timeframe::MN1,
+    ] {
+        assert_eq!(Timeframe::parse(timeframe.as_str()).unwrap(), timeframe);
+    }
 
     // Display
     assert_eq!(format!("{}", Timeframe::D1), "1d");
@@ -1433,7 +1445,7 @@ mod parquet_tests {
         let bar = Bar {
             exchange: "ctrader".into(),
             symbol: "EURUSD".into(),
-            timeframe: Timeframe::H4,
+            timeframe: Timeframe::MN1,
             ts,
             open: 1.0850,
             high: 1.0900,
@@ -1449,7 +1461,7 @@ mod parquet_tests {
             .query_bars(&BarQueryOpts {
                 exchange: "ctrader".into(),
                 symbol: "EURUSD".into(),
-                timeframe: "4h".into(),
+                timeframe: "1M".into(),
                 from: None,
                 to: None,
                 limit: 10,
@@ -1461,7 +1473,7 @@ mod parquet_tests {
         let b = &rows[0];
         assert_eq!(b.exchange, "ctrader");
         assert_eq!(b.symbol, "EURUSD");
-        assert_eq!(b.timeframe, Timeframe::H4);
+        assert_eq!(b.timeframe, Timeframe::MN1);
         assert_eq!(b.ts, ts);
         assert!((b.open - 1.0850).abs() < 0.0001);
         assert!((b.high - 1.0900).abs() < 0.0001);

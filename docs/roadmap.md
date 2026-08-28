@@ -1,72 +1,163 @@
 # Roadmap
 
-`quant-system` is growing from deterministic historical replay and live quote distribution into a source-neutral strategy, risk, and execution framework.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and an in-process historical adapter that connects configured behavior to that replay path.
 
-> This roadmap describes direction, not a delivery schedule. An item is available only when it has a public API, command, or documented workflow.
+> This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
 
-## At a glance
-
-| Today | Next focus | Later |
-|---|---|---|
-| Deterministic replay, explicit instrument catalogs, canonical intent and execution-event contracts, reusable Rust libraries, durable ingestion state, Telegram and webhook adapters, strict ingestion JSONL codecs, causal replay APIs, and CTrader live quotes | Deployable hosted ingestion, committed-batch intent projection, and shared risk supervision | Live execution, venue-state recovery, and broader market economics |
-
-## Direction
+## Current foundation
 
 ```mermaid
 flowchart TD
-    A[Historical data and deterministic replay]
-    B[Source-neutral inputs and explicit instruments]
-    C[Shared strategy and portfolio supervision]
-    D[Live execution and reconciliation]
-    E[Broader market economics]
+    A[Historical bid ask ticks]
+    B[Multi-timeframe closed bars]
+    C[Causal observations and annotations]
+    D[HistoricalStrategy]
+    E[Strict RawSignal]
+    F[Existing FutureQuote replay]
+    G[Fills feedback accounting MTM report]
+    H[Journal and experiment comparison]
 
     A --> B
     B --> C
     C --> D
-    B --> E
-    E --> C
+    D --> E
+    E --> F
+    F --> G
+    G --> D
+    D --> H
 ```
 
-See [Choose a workflow](../README.md#choose-a-workflow) for available entry points and [Architecture](architecture.md) for ownership boundaries.
+The historical strategy foundation currently provides validated descriptors and requirements, bounded causal fixed-duration closed bars, complete-boundary analysis, stateful callbacks, generated-signal scheduling, committed execution feedback, bounded decisions, non-economic journals, research-only annotations, and caller-ordered comparison of existing position-level metrics.
 
-## What we are building toward
+Current callers implement `HistoricalStrategy` directly in Rust. A generated fill-bearing action cannot execute on a quote already observed to make that decision.
 
-### Accept signals from more sources
+## Configured strategy implementation
 
-Reusable source-event, normalization, provenance, and durable source-state boundaries are available as library APIs while direct strict `RawSignal` input remains supported. Public adapters include Telegram, strict source-event and committed-batch JSONL codecs, and an authenticated HMAC webhook edge. Library composition is available for local ingestion, committed-batch publication, causal replay, and provider bindings. The next step is a deployable hosted ingestion product with restart-safe application processing, deployment configuration, and production sink support.
+The dependency-light synchronous `qs-strategy` core implements reusable configured behavior outside `qs-backtest`. Its purpose is to avoid requiring a dedicated Rust strategy type for every strategy that can be assembled from reusable materials. Historical backtesting adapts that core rather than owning the configuration compiler, materials, expressions, or state machine.
 
-**What this unlocks:** additional message sources and explicit handling of edits, deletes, retries, and duplicate delivery.
+The implemented historical flow and future live boundary are:
 
-### Represent instruments and trading intent explicitly
+```mermaid
+flowchart TD
+    A[Strict strategy configuration]
+    B[Explicit immutable material library]
+    C[Configured strategy compiler]
+    D[Reusable ConfiguredStrategy]
+    E[Completed historical facts]
+    F[Historical adapter]
+    G[Reusable StrategyInput]
+    H[Reusable strategy output]
+    I[Existing HistoricalStrategy and FutureQuote path]
+    J[Future live causal facts]
+    K[Future real-time adapter]
+    L[Future risk and execution runtime]
 
-A shared instrument foundation is available: source-neutral assets, broker- or exchange-qualified listings, exact grids, effective-dated specifications, immutable catalogs, guarded compatibility translation, and replay manifests now distinguish data-source coordinates from economic instruments. Trading platforms such as CTrader are also distinct from listing and execution venues.
+    A --> C
+    B --> C
+    C --> D
+    E --> F
+    F --> G
+    G --> D
+    D --> H
+    H --> F
+    F --> I
+    J --> K
+    K --> G
+    H --> K
+    K --> L
+```
 
-Source- and strategy-neutral `TradeIntent`, immutable execution-command and dispatch contracts, and venue `ExecutionReport` facts are also available in the pure trading-domain library. They are additive: current replay input remains strict `RawSignal`, and consumers must provide pinned instrument and state resolution rather than asking the domain types to perform IO.
+The configured core now provides:
 
-**What this unlocks:** safer multi-venue identity and economic capability checks plus a common contract for future ingestion, strategy, portfolio, replay, gateway, and venue consumers.
+- recursively strict configuration without a schema-version field;
+- an explicit immutable library of reusable causal materials;
+- compile-time source, named-input schema, reference, type, dependency, per-source lookback, trigger, state, expression, and bound validation;
+- bounded typed condition expressions rather than free-form strings;
+- ordered independent logical-source updates, total vacant/pending/open trade-slot facts, and deterministic finite-state transitions with atomic state and output;
+- typed strict `RawSignal` action templates carried by commands with deterministic correlation IDs, validated action-specific feedback lifecycles, plus generic decision and note templates;
+- one reusable configured strategy core independent from historical and real-time runtime ownership;
+- neutral conformance coverage and a custom material extension seam;
+- no content hash, digest, fingerprint, or content-derived strategy identity.
 
-### Run strategies through shared risk supervision
+The historical adapter binds complete logical source specifications to historical series, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, rejects supplied management profiles, and reuses unprofiled Entry plus the existing FutureQuote economic path. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles remain unavailable.
 
-Connect parsed signals and strategy decisions to common portfolio risk, allocation, and execution planning without treating them as the same kind of producer.
+Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
 
-**What this unlocks:** portfolio-level guardrails and comparable replay and live behavior independent of source or strategy implementation.
+## Design constraints
 
-### Connect supervised intent to live venues
+Configured strategy execution must preserve the current causal order:
 
-Build venue capability enforcement, restart-safe state, uncertain-outcome reconciliation, and provider-specific order adapters on the available venue-neutral command, dispatch, and execution-report contracts.
+1. settle existing FutureQuote work and commit feedback;
+2. update completed historical series and causal analysis;
+3. project one immutable reusable strategy input from completed facts;
+4. evaluate reusable materials in stable dependency order and select at most one configured transition;
+5. atomically commit configured state and output;
+6. return ordered correlated commands containing strict `RawSignal` payloads plus generic decisions and notes to the historical adapter;
+7. wait for a later eligible quote for fill-bearing work.
 
-**What this unlocks:** live order execution without embedding broker behavior in domain, parser, or strategy code.
+Emitting an Entry is not equivalent to a fill. Configured state must use committed execution feedback to distinguish requested, open, rejected, and closed lifecycle states.
 
-## Parallel exploration
+Before adapter readiness, causal materials advance but configured transitions, state assignments, decisions, notes, and signals do not. The first ready input evaluates the accumulated material state from unchanged configured state. EMA and ATR update only from new completed bars, crossing is a one-boundary pulse, and command feedback retains its originating correlation ID. Initial execution is limited to one configured instance, one primary symbol, and one active campaign. Missing arithmetic remains missing, comparisons with missing are false, required output cannot be missing, and every declared configured state must be reachable from the initial state or compilation fails.
 
-### Broader market economics
+## What will be reused
 
-Add explicit cryptocurrency models for exposure, balances, fees, market data, funding, margin, liquidation, and venue behavior without reusing Forex assumptions.
+The historical adapter reuses:
 
-### Advanced strategy components
+- historical feed and complete timestamp-batch abstractions;
+- `HistoricalStrategy`, `StrategyContext`, and `StrategyFeedback`;
+- causal series, observations, annotations, and analyzers;
+- strict `RawSignal` validation;
+- replay instrument specifications;
+- unprofiled Entry resolution for the initial configured path;
+- FutureQuote slippage, pending, stop, target, scale-in, and close behavior;
+- account-currency sizing and conversion;
+- fills, lifecycle, MTM, drawdown, and `BacktestResult`;
+- decision, journal, research annotation, and experiment output.
 
-Explore richer analysis and model-driven strategy components after neutral strategy, risk, replay, and market-event boundaries are established.
+## Neutral acceptance direction
 
-## Not available yet
+Public conformance should use neutral examples such as:
 
-Live execution, deployable hosted ingestion, restart-safe hosted application processing, non-local production sinks, committed-batch trading projection, portfolio supervision, execution-gateway orchestration, and general cryptocurrency accounting are not available yet. Applications compose the provided ingestion libraries into their own binaries. Existing `OfflineRunner`, `OnlineServer`, callback, and JSONL compatibility facades remain unchanged. See the root [current boundaries](../README.md#current-boundaries) for operational limitations.
+- a no-op configured strategy;
+- a moving-average crossover configuration;
+- a volatility-aware lifecycle configuration;
+- feedback-driven entry, break-even, partial-close, and exit behavior;
+- one custom material reused by more than one configuration;
+- economic parity with equivalent direct `RawSignal` replay.
+
+Concrete private strategy configurations may be added later when there is a real research need. They are not required to introduce named strategy types into the reusable framework.
+
+## What is not on the active roadmap
+
+- dedicated named strategy implementations as a framework requirement;
+- a universal or free-form scripting language;
+- global mutable component registries;
+- dynamic plugins or behavior discovery;
+- deployment compilers or content-addressed strategy artifacts;
+- strategy configuration over RPC;
+- ingestion-to-trading bridges;
+- multi-strategy portfolio allocation;
+- paper or live execution gateways;
+- restart-safe configured or live strategy state;
+- broker and exchange order adapters;
+- cryptocurrency economics beyond the current rejection guard;
+- model training and live inference;
+- Discord or screenshot integrations.
+
+An explicit immutable run-local material library and an in-process configured-strategy compiler are compatible with these boundaries. They must not grow into a global plugin or deployment platform.
+
+## Completion status
+
+The implementation now allows a developer to:
+
+1. define a nontrivial causal strategy through strict configuration and reusable materials;
+2. compile it in a reusable strategy core outside `qs-backtest` and reject invalid graphs, types, references, bounds, and transitions before execution;
+3. consume adapter-supplied causal context and committed execution feedback without importing historical runtime types;
+4. emit validated ordered commands with deterministic correlation IDs, strict `RawSignal` payloads, and bounded generic decisions and notes;
+5. adapt the same configured behavior to historical replay through the existing FutureQuote engine without another economic path;
+6. reproduce equivalent direct-signal economic results;
+7. reuse one custom material across several configurations;
+8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
+9. continue implementing direct Rust strategies without framework regression.
+
+The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. See [Backtesting](backtesting.md) for current replay behavior and limitations.

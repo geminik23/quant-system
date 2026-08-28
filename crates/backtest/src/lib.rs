@@ -8,8 +8,7 @@
 //!
 //! 1. **Strategy-driven** — implement the [`Strategy`] trait; the runner feeds
 //!    market data tick-by-tick and your strategy decides when to act.
-//! 2. **Signal replay** — provide a `Vec<Signal>` with timestamps; the runner
-//!    injects them at the correct moments while replaying price data.
+//! 2. **Signal replay** - provide strict timestamped [`RawSignal`] values; the runner injects them at the correct moments while replaying price data.
 //!
 //! # Key types
 //!
@@ -17,7 +16,7 @@
 //! |------|---------|
 //! | [`BacktestRunner`] | Orchestrates the backtest loop (both modes) |
 //! | [`BacktestExecutor`] | Tracks simulated fills, positions, and P&L |
-//! | [`BacktestResult`] | Final report — P&L, win rate, drawdown, trade log |
+//! | [`BacktestResult`] | Final report with P&L, drawdown, and execution artifacts |
 //! | [`DataFeed`] | Trait for sequential market event sources |
 //! | [`Strategy`] | Trait for strategy-driven backtests |
 
@@ -78,4 +77,36 @@ pub use report::{
 pub use runner::{
     BacktestRunner, FutureQuoteConfig, ReplayCancelled, ReplayProgress, StreamingReplayError,
 };
-pub use strategy::Strategy;
+pub use strategy::{
+    AnalysisBoundary, AnalysisBoundaryOutput, AnalysisContext, AnalysisError, AnalysisPipeline,
+    AnnotationError, AnnotationId, AnnotationLimits, AnnotationTimeline, AnnotationUse,
+    BacktestConfiguredStrategyAdapter, BarSeriesSpec, BarWindow, ClosedBar,
+    ConfiguredHistoricalBindings, ConfiguredNamedInputBinding, ConfiguredSourceBinding,
+    ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
+    ConfiguredStrategyAdapterPreflightError, ConfirmedPivotAnalyzer, HistoricalAnalyzer,
+    HistoricalNamedInputProjector, HistoricalObservationView, HistoricalSeriesView,
+    HistoricalStrategy, HistoricalVolumeProjection, JournalKind, MAX_ANALYZERS,
+    MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES, MAX_ANNOTATIONS, MAX_CHART_REF_BYTES,
+    MAX_DECISION_LATENCY_MS, MAX_DECISION_RECORDS, MAX_EXPERIMENT_LABEL_BYTES,
+    MAX_INSTRUMENT_BYTES, MAX_JOURNAL_PER_CALLBACK, MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS,
+    MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES, MAX_OBSERVATION_SOURCE_SERIES,
+    MAX_OBSERVATIONS_PER_BOUNDARY, MAX_PIVOT_SIDE_BARS, MAX_REASON_BYTES, MAX_RETAINED_BARS,
+    MAX_RETAINED_OBSERVATIONS, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
+    MAX_STRATEGY_ID_BYTES, MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES,
+    MAX_TRADE_ID_BYTES, MAX_WARMUP_BARS, MAX_ZONE_ID_BYTES, MissingIntervalPolicy, MomentumState,
+    MultiTimeframeSeries, NamedInputProjectionContext, NamedInputProjectionError,
+    ObservationOrigin, ObservationSelection, ObservationStore, ObservationStoreLimits,
+    ObservationWindow, PivotConfig, PriceBasis, PriceZone, ProjectedNamedInput, RejectionPattern,
+    SeriesError, SeriesId, SeriesRequirement, SeriesViewError, SeriesWarmupState, Strategy,
+    StrategyAnnotation, StrategyBacktestResult, StrategyComparisonMetrics,
+    StrategyComparisonSnapshot, StrategyConfigError, StrategyContext, StrategyDecisionDraft,
+    StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord, StrategyDecisionRecorder,
+    StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError, StrategyEvent,
+    StrategyExperimentComparison, StrategyExperimentError, StrategyFeedback, StrategyFeedbackEvent,
+    StrategyId, StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput,
+    StrategyJournalRecord, StrategyJournalRecorder, StrategyJournalRetention, StrategyObservation,
+    StrategyObservationDraft, StrategyObservationValue, StrategyOutput, StrategyReplayError,
+    StrategyReplayInputError, StrategyRequirements, StrategyResearchLimits, StrategyResearchOutput,
+    StrategyRetentionLimits, StrategyRuntimeError, SwingKind, SwingPoint, Timeframe,
+    WarmupRequirement, ZoneId, ZoneSide, ZoneSource, ZoneState,
+};

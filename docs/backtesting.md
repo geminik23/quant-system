@@ -64,12 +64,30 @@ The client streams retained-job progress by default. Polling and finite synchron
 
 `qs-backtest` also exposes in-process APIs:
 
-- implement `Strategy` for strategy-driven replay;
-- provide timestamped signals for predefined replay;
+- implement the legacy `Strategy` trait for action-producing replay;
+- describe future historical strategies with validated `StrategyDescriptor`, `StrategyRequirements`, fixed-duration `Timeframe`, per-series warmup, and bounded decision-record contracts;
+- derive bounded causal closed bars from complete primary-tick timestamp batches with explicit bid, ask, or midpoint aggregation;
+- inspect retained history and exact per-series or aggregate warmup readiness through read-only series views;
+- implement a stateful `HistoricalStrategy` that receives one complete timestamp boundary, read-only series, observations, engine state, and committed execution facts, then returns an optional bounded decision draft with ordered strict signals;
+- bind a compiled `qs-strategy::ConfiguredStrategy` through `BacktestConfiguredStrategyAdapter`, complete source and named-input bindings, exact tick-count volume projection, total trade-slot facts, and ordered command-correlated feedback;
+- run direct or configured historical strategies from a materialized `DataFeed` or complete `FallibleBatchFeed` timestamp stream through the existing FutureQuote scheduler and accounting path;
+- emit bounded ordered non-economic journal drafts during ordinary callbacks, including warmup, without changing executable scheduling or decision retention;
+- retain hindsight and journal-only annotations outside decision context and compare two completed strategy results through existing position-level metrics;
+- provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 
-This library path is separate from the production service contract.
+The historical strategy path invokes its strategy boundary once per complete timestamp after FutureQuote settlement, series updates, and causal analysis. Generated fill-bearing signals cannot consume the quote that produced their decision, generated latency comes from `StrategyRequirements`, warmup advances causal material state but rejects configured transitions and economic signals, and only committed effects plus newly terminal dispositions are delivered as ordered feedback. The configured adapter preserves opaque command IDs through scheduling and consumes any remaining committed feedback at a final non-market boundary. Decision and journal retention do not suppress execution. Journal timestamps and sequence are runtime-owned, hypothetical records remain non-economic, and hindsight or journal-only annotations are returned only as research output. This library path is separate from the production service contract. Callers may implement `HistoricalStrategy` directly or use the configured adapter.
+
+## Configured strategy core
+
+`qs-strategy` now provides the reusable synchronous configured strategy core as a library. It compiles recursively strict configuration without a schema-version field against bounded logical source IDs and an explicit immutable material library, derives ordered per-source lookback and named-input requirements, evaluates bounded typed expressions and causal materials, and atomically commits deterministic finite-state transitions. Adapter-supplied inputs include authoritative time, readiness, ordered completed-bar updates for independently changing logical sources, total vacant/pending/open trade-slot facts, named values, and command-correlated committed feedback. Ordered output contains deterministic correlation IDs and strict `RawSignal` payloads plus generic decisions and notes.
+
+The core advances causal materials while adapter readiness is false but leaves configured state and output unchanged. Feedback consumed while readiness is false updates custom pulse materials once and remains visible to built-in feedback conditions on the first ready input. Successful command correlations accept committed facts and terminal dispositions in either order and are released only when the action-specific lifecycle is complete. Compilation rejects invalid references, named-input schema conflicts, types, cycles, impossible material triggers, bounds, transition priorities, and unreachable states. Runtime failures commit no partial configured state or output.
+
+This capability is library-only. Applications own configuration file loading and persistence. `qs-backtest` provides the historical configured adapter, which binds every logical source to a historical series specification, validates retained history and warmup against source-specific lookbacks, converts completed-bar volume to an exactly representable tick count, invokes caller-owned typed named-input projectors, projects every declared trade slot as vacant, pending, or open, and maps configured decisions, signals, and notes into existing historical output. Configured commands retain their opaque IDs through FutureQuote scheduling, effect and disposition facts preserve commit order, and a final feedback boundary resolves terminal facts without another market evaluation. Configured runs reject any supplied `ManagementProfile` before feed polling and reuse current unprofiled Entry resolution, sizing, currency conversion, accounting, MTM, and reports.
+
+Neutral conformance covers no-op, EMA crossover, EMA/ATR lifecycle, pending cancellation, custom materials, profile rejection, final feedback, direct-signal economic parity, aligned-EOD materialized/streaming full-result parity, and strict research serde. Server or RPC execution, live runtime orchestration, persisted configured state, and configured-strategy composition with `ManagementProfile` remain unavailable.
 
 ## Operational boundaries
 

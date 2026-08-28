@@ -42,9 +42,13 @@ pub enum Timeframe {
 }
 
 impl Timeframe {
-    /// Parse from CLI string. Accepts "1m","M1","3m","M3", etc.
+    /// Parse a CLI or storage timeframe, preserving the canonical monthly `1M` label.
     pub fn parse(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
+        if s == "1M" {
+            return Ok(Self::MN1);
+        }
+
+        match s.to_ascii_lowercase().as_str() {
             "1m" | "m1" => Ok(Self::M1),
             "3m" | "m3" => Ok(Self::M3),
             "5m" | "m5" => Ok(Self::M5),

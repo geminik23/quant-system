@@ -3615,12 +3615,13 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "criterion",
  "qs-data-preprocess",
  "qs-instruments",
+ "qs-strategy",
  "qs-symbols",
  "quant-system-core",
  "serde",
@@ -3631,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-api"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3640,11 +3641,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "xrpc-rs",
 ]
 
 [[package]]
 name = "qs-backtest-server"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3672,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "qs-data-preprocess"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
@@ -3687,7 +3690,7 @@ dependencies = [
 
 [[package]]
 name = "qs-instruments"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3697,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3724,19 +3727,20 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data-api"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
  "qs-service",
  "qs-service-xrpc",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "qs-service"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3744,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service-xrpc"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "futures",
  "nanoid",
@@ -3758,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "qs-signal-parser"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64",
@@ -3782,8 +3786,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-strategy"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "quant-system-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "qs-symbols"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3793,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "quant-system-core"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "nanoid",

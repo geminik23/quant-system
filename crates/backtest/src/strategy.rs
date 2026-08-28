@@ -1,7 +1,72 @@
-//! Strategy trait for strategy-driven backtests.
+//! Historical strategy contracts and the legacy action-producing strategy trait.
 //!
-//! Implement [`Strategy`] to define custom trading logic that reacts to
-//! market events and produces [`Action`]s for the engine to process.
+//! The validated descriptor, series requirements, decision records, and retention values are additive foundations for FutureQuote historical strategies. The existing [`Strategy`] trait remains the legacy action-producing API.
+
+pub mod analysis;
+pub mod annotation;
+pub mod config;
+pub mod configured;
+pub mod context;
+pub mod domain;
+pub mod experiment;
+pub mod feedback;
+pub mod journal;
+pub mod replay;
+pub mod runtime;
+pub mod series;
+
+pub use analysis::{
+    AnalysisBoundary, AnalysisBoundaryOutput, AnalysisContext, AnalysisError, AnalysisPipeline,
+    ConfirmedPivotAnalyzer, HistoricalAnalyzer, HistoricalObservationView, MAX_ANALYZERS,
+    MAX_OBSERVATION_SOURCE_SERIES, MAX_OBSERVATIONS_PER_BOUNDARY, MAX_PIVOT_SIDE_BARS,
+    MAX_RETAINED_OBSERVATIONS, MAX_ZONE_ID_BYTES, MomentumState, ObservationOrigin,
+    ObservationSelection, ObservationStore, ObservationStoreLimits, ObservationWindow, PivotConfig,
+    PriceZone, RejectionPattern, StrategyObservation, StrategyObservationDraft,
+    StrategyObservationValue, SwingKind, SwingPoint, ZoneId, ZoneSide, ZoneSource, ZoneState,
+};
+pub use annotation::{
+    AnnotationError, AnnotationId, AnnotationLimits, AnnotationTimeline, AnnotationUse,
+    MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES, MAX_ANNOTATIONS, StrategyAnnotation,
+};
+pub use config::{
+    MAX_DECISION_RECORDS, MAX_REASON_BYTES, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
+    MAX_WARMUP_BARS, PriceBasis, SeriesId, StrategyConfigError, StrategyRetentionLimits, Timeframe,
+    WarmupRequirement,
+};
+pub use configured::{
+    BacktestConfiguredStrategyAdapter, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
+    ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
+    ConfiguredStrategyAdapterPreflightError, HistoricalNamedInputProjector,
+    HistoricalVolumeProjection, NamedInputProjectionContext, NamedInputProjectionError,
+    ProjectedNamedInput,
+};
+pub use context::StrategyContext;
+pub use domain::{
+    MAX_DECISION_LATENCY_MS, MAX_INSTRUMENT_BYTES, MAX_STRATEGY_ID_BYTES,
+    MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, SeriesRequirement,
+    StrategyBacktestResult, StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord,
+    StrategyDecisionRecorder, StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError,
+    StrategyId, StrategyRequirements, StrategyResearchOutput,
+};
+pub use experiment::{
+    StrategyComparisonMetrics, StrategyComparisonSnapshot, StrategyExperimentComparison,
+    StrategyExperimentError,
+};
+pub use feedback::{StrategyFeedback, StrategyFeedbackEvent};
+pub use journal::{
+    JournalKind, MAX_CHART_REF_BYTES, MAX_EXPERIMENT_LABEL_BYTES, MAX_JOURNAL_PER_CALLBACK,
+    MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,
+    StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput, StrategyJournalRecord,
+    StrategyJournalRecorder, StrategyJournalRetention, StrategyResearchLimits,
+};
+pub use replay::{StrategyReplayError, StrategyReplayInputError};
+pub use runtime::{
+    HistoricalStrategy, StrategyDecisionDraft, StrategyEvent, StrategyOutput, StrategyRuntimeError,
+};
+pub use series::{
+    BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_RETAINED_BARS,
+    MissingIntervalPolicy, MultiTimeframeSeries, SeriesError, SeriesViewError, SeriesWarmupState,
+};
 
 use qs_core::types::Action;
 
@@ -36,6 +101,7 @@ use crate::data_feed::MarketEvent;
 ///                 targets: vec![],
 ///                 rules: vec![],
 ///                 group: None,
+///                 trade_id: None,
 ///             }];
 ///         }
 ///         vec![]

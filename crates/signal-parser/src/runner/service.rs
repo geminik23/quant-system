@@ -232,7 +232,7 @@ pub trait IngestionService: Send + Sync {
     >;
 }
 
-/// Provider-neutral service facade over the IP03-backed ingestion runner.
+/// Provider-neutral service facade over the durable ingestion runner.
 pub struct DurableIngestionService {
     runner: Arc<RunnerIngestionService>,
     state: Arc<dyn SourceStateStore>,
