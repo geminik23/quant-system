@@ -57,7 +57,7 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 `qs-backtest` owns historical scheduling, deterministic FutureQuote execution, accounting, metrics, reports, profile-file loading, validated historical strategy contracts, bounded causal fixed-duration closed-bar series, complete-boundary causal observations and annotations, and stateful callback replay with read-only context, causal generated-signal scheduling, warmup enforcement, committed execution feedback, bounded non-economic journal output, research-only annotation results, and explicit completed-result comparison. It also owns the historical adapter for `qs-strategy`: complete logical-source-to-series binding, exact tick-count volume and named-input projection, total immutable trade-slot projection, opaque configured command-ID preservation, ordered effect/disposition feedback, final committed-feedback processing, generic decision and note mapping, management-profile rejection, and reuse of existing unprofiled Entry and FutureQuote economics. The existing action-producing `Strategy` mode and strict predefined-signal replay remain available and use their established behavior.
 
-`qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. It resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
+`qs-backtest-server` composes storage, an explicit instrument catalog or guarded symbol compatibility snapshot, profiles, retained jobs, artifacts, and the logical backtest API into an operator-facing service and CLI. Its shipped CLI and example use provider-neutral retained-job, artifact, synchronous-execution, and discovery capabilities through the typed xrpc facade rather than owning raw RPC clients or method names. The server resolves and pins active and conversion instruments before replay, rejects specification changes across a requested range, and records the physical Parquet coordinates as stored-series bindings.
 
 ### Data storage
 
@@ -65,7 +65,7 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 ### Service contracts and providers
 
-`qs-service` owns only provider-neutral endpoint and transport-failure vocabulary. Logical APIs own typed DTOs, events, errors, and client ports.
+`qs-service` owns only provider-neutral endpoint and transport-failure vocabulary. Logical APIs own typed DTOs, events, errors, and client ports. The backtest API separates retained-job and artifact consumption, finite synchronous execution, discovery, and profile administration into provider-neutral capabilities implemented by one optional xrpc facade.
 
 `qs-service-xrpc` owns the current runtime for in-process channels, shared memory, Unix sockets, and TCP. Provider-specific clients, handshakes, slots, codecs, and lifecycle handles do not enter domain APIs.
 
@@ -75,7 +75,7 @@ A future secure remote provider should implement the typed service boundary rath
 
 `qs-signal-parser` owns bounded source facts, stateless source-neutral routing and normalization, strict structured-signal decoding, durable source application, committed normalization lifecycle, checkpoints, and committed-batch outbox state. Telegram, strict JSONL, and authenticated webhook adapters translate provider input into source events. The runner composes the shipped local JSONL pipeline, SQLite state, committed-batch JSONL publication, causal replay, and optional provider bindings as library APIs. The append-only JSONL output is at-least-once. Deployment packages, restart-safe hosted application processing, non-local sinks, and committed-batch trading projection are not available. Parsing remains optional because direct strict `RawSignal` input is still supported.
 
-`qs-market-data` owns the CTrader FIX quote connection and market-data service. It does not own live order execution.
+`qs-market-data` owns the CTrader FIX quote connection and market-data service. It registers source disconnect callbacks, invalidates prior-session quotes during reconnect, retains one service observation timestamp per cached quote, timestamps source-state transitions, and exposes detected receiver lag or subscription rejection through combined-stream data-quality events. It does not own live order execution.
 
 External source transports, internal service transports, market-data sources, and execution venues are different adapters and failure domains.
 
@@ -129,13 +129,16 @@ A committed normalization batch is an authoritative ingestion result, but it doe
 ## Market-data flow
 
 ```text
-CTrader FIX -> reconnect and source state -> price cache and alerts
-                                              |
-                                              v
-                                     MarketDataClient consumers
+CTrader FIX -> disconnect callbacks and reconnect -> timestamped source state
+                                                       |
+                                                       v
+                                  observed quote cache -> prices and alerts
+                                                       |
+                                                       v
+                              combined price/state/data-quality consumers
 ```
 
-Transport health and upstream data freshness are observed separately.
+Local transport health, CTrader source state, and quote freshness are separate. Price timestamps are service callback-observation times, state timestamps are service transition times, reconnect invalidates prior-session cache entries, and detected stream gaps are visible without claiming replay or upstream source timestamps.
 
 ## Security boundary
 

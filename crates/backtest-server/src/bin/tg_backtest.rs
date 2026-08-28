@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::NaiveDateTime;
 use clap::{Parser, ValueEnum};
+use futures::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -23,8 +23,10 @@ use backtest_server::rpc_types::*;
 use qs_backtest::currency::{ConversionRoute, RunCurrencyPlan};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
 use qs_backtest::{DEFAULT_MTM_MAX_POINTS, MAX_MTM_MAX_POINTS, MIN_MTM_MAX_POINTS, VecFeed};
+use qs_backtest_api::provider::xrpc::BacktestXrpcClient;
+use qs_backtest_api::{BacktestClient, BacktestClientError, BacktestSyncClient};
 use qs_service::ServiceEndpoint;
-use qs_service_xrpc::{DynRpcClient, JsonCodec, XrpcClientSession, XrpcTransportConfig};
+use qs_service_xrpc::XrpcTransportConfig;
 use qs_symbols::SymbolRegistry;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -353,37 +355,30 @@ struct Args {
 
 // ── Connection ──────────────────────────────────────────────────────────────
 
-type BacktestRpcClient = DynRpcClient<JsonCodec>;
-
-struct BacktestClientSession {
-    client: Arc<BacktestRpcClient>,
-    session: XrpcClientSession<JsonCodec>,
-}
-
-impl BacktestClientSession {
-    fn client(&self) -> Arc<BacktestRpcClient> {
-        Arc::clone(&self.client)
-    }
-
-    async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
-        self.session.close().await?;
-        Ok(())
-    }
-}
-
 async fn connect(
     endpoint: &ServiceEndpoint,
-) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
+) -> Result<BacktestXrpcClient, Box<dyn std::error::Error>> {
     eprintln!("[connect] endpoint={endpoint}");
-    let session = qs_service_xrpc::connect(
-        endpoint,
-        "tg-backtest",
-        &XrpcTransportConfig::default(),
-        JsonCodec,
+    Ok(
+        BacktestXrpcClient::connect(endpoint, "tg-backtest", &XrpcTransportConfig::default())
+            .await?,
     )
-    .await?;
-    let client = session.raw_client();
-    Ok(BacktestClientSession { client, session })
+}
+
+async fn typed_call_with_timeout<T, F>(
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: Future<Output = Result<T, BacktestClientError>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+        Err(_) => Err(Box::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("Request timeout: request timed out after {timeout:?}"),
+        ))),
+    }
 }
 
 // ── Signal Loading ──────────────────────────────────────────────────────────
@@ -1025,24 +1020,28 @@ enum WatchAttempt {
     Interrupted,
 }
 
-async fn watch_backtest_attempt(client: &Arc<BacktestRpcClient>, job_id: &str) -> WatchAttempt {
-    let mut stream = match client
-        .call_server_stream::<_, BacktestEvent>(
-            "watch_backtest",
-            &WatchBacktestRequest {
-                job_id: job_id.to_owned(),
-            },
-        )
-        .await
-    {
+fn classify_watch_error(error: BacktestClientError) -> WatchAttempt {
+    match &error {
+        BacktestClientError::Transport(transport)
+            if transport.retry != qs_service::RetryDisposition::Never =>
+        {
+            WatchAttempt::Retry(error.to_string())
+        }
+        BacktestClientError::Transport(_)
+        | BacktestClientError::Service(_)
+        | BacktestClientError::Protocol(_) => WatchAttempt::Failed(error.to_string()),
+    }
+}
+
+async fn watch_backtest_attempt(client: &BacktestXrpcClient, job_id: &str) -> WatchAttempt {
+    let mut stream = match client.watch(job_id).await {
         Ok(stream) => stream,
-        Err(error) if !client.is_connected() => return WatchAttempt::Retry(error.to_string()),
-        Err(error) => return WatchAttempt::Failed(error.to_string()),
+        Err(error) => return classify_watch_error(error),
     };
 
     loop {
         let event = tokio::select! {
-            event = stream.recv() => event,
+            event = stream.next() => event,
             signal = tokio::signal::ctrl_c() => {
                 return match signal {
                     Ok(()) => WatchAttempt::Interrupted,
@@ -1055,10 +1054,7 @@ async fn watch_backtest_attempt(client: &Arc<BacktestRpcClient>, job_id: &str) -
 
         let event = match event {
             Some(Ok(event)) => event,
-            Some(Err(error)) if !client.is_connected() => {
-                return WatchAttempt::Retry(error.to_string());
-            }
-            Some(Err(error)) => return WatchAttempt::Failed(error.to_string()),
+            Some(Err(error)) => return classify_watch_error(error),
             None => {
                 return WatchAttempt::Retry(format!(
                     "Backtest stream for job '{job_id}' ended before a terminal snapshot"
@@ -1088,16 +1084,9 @@ async fn watch_backtest_attempt(client: &Arc<BacktestRpcClient>, job_id: &str) -
     }
 }
 
-async fn best_effort_cancel_streamed_job(client: &Arc<BacktestRpcClient>, job_id: &str) {
-    let response: Result<CancelBacktestResponse, _> = client
-        .call_with_timeout(
-            "cancel_backtest",
-            &CancelBacktestRequest {
-                job_id: job_id.to_owned(),
-            },
-            std::time::Duration::from_secs(2),
-        )
-        .await;
+async fn best_effort_cancel_streamed_job(client: &BacktestXrpcClient, job_id: &str) {
+    let response =
+        typed_call_with_timeout(std::time::Duration::from_secs(2), client.cancel(job_id)).await;
     match response {
         Ok(response) if response.success => {
             eprintln!("  Cancellation requested for job '{}'.", response.job_id);
@@ -1116,16 +1105,12 @@ async fn best_effort_cancel_streamed_job(client: &Arc<BacktestRpcClient>, job_id
 }
 
 async fn interrupt_streamed_job(
-    client: &Arc<BacktestRpcClient>,
+    client: &BacktestXrpcClient,
     job_id: &str,
     cancel_on_interrupt: bool,
 ) -> Box<dyn std::error::Error> {
-    if cancel_on_interrupt && client.is_connected() {
+    if cancel_on_interrupt {
         best_effort_cancel_streamed_job(client, job_id).await;
-    } else if cancel_on_interrupt {
-        eprintln!(
-            "  Job '{job_id}' could not be cancelled because no server connection is active."
-        );
     } else {
         eprintln!("  Detached from job '{job_id}'; the retained server job was not cancelled.");
     }
@@ -1136,18 +1121,17 @@ async fn interrupt_streamed_job(
 }
 
 async fn watch_backtest_with_reconnect(
-    session: &mut BacktestClientSession,
+    session: &mut BacktestXrpcClient,
     endpoint: &ServiceEndpoint,
     job_id: &str,
     cancel_on_interrupt: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let client = session.client();
-        match watch_backtest_attempt(&client, job_id).await {
+        match watch_backtest_attempt(session, job_id).await {
             WatchAttempt::Completed => return Ok(()),
             WatchAttempt::Failed(error) => return Err(io::Error::other(error).into()),
             WatchAttempt::Interrupted => {
-                return Err(interrupt_streamed_job(&client, job_id, cancel_on_interrupt).await);
+                return Err(interrupt_streamed_job(session, job_id, cancel_on_interrupt).await);
             }
             WatchAttempt::Retry(error) => {
                 eprintln!(
@@ -1163,7 +1147,7 @@ async fn watch_backtest_with_reconnect(
             signal = tokio::signal::ctrl_c() => {
                 return match signal {
                     Ok(()) => Err(interrupt_streamed_job(
-                        &session.client(),
+                        session,
                         job_id,
                         cancel_on_interrupt,
                     ).await),
@@ -1179,7 +1163,7 @@ async fn watch_backtest_with_reconnect(
             signal = tokio::signal::ctrl_c() => {
                 return match signal {
                     Ok(()) => Err(interrupt_streamed_job(
-                        &session.client(),
+                        session,
                         job_id,
                         cancel_on_interrupt,
                     ).await),
@@ -1375,39 +1359,28 @@ where
 }
 
 async fn download_artifact_from_rpc<W: Write>(
-    client: &Arc<BacktestRpcClient>,
+    client: &BacktestXrpcClient,
     reference: &ResultArtifactRefMsg,
     writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    download_artifact_chunks(reference, writer, |request| {
-        let client = client.clone();
-        async move {
-            client
-                .call_with_timeout(
-                    "get_result_artifact_chunk",
-                    &request,
-                    std::time::Duration::from_secs(30),
-                )
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
-        }
+    download_artifact_chunks(reference, writer, |request| async move {
+        typed_call_with_timeout(
+            std::time::Duration::from_secs(30),
+            client.get_result_artifact_chunk(request),
+        )
+        .await
     })
     .await
 }
 
-async fn delete_downloaded_artifact(
-    client: &Arc<BacktestRpcClient>,
-    reference: &ResultArtifactRefMsg,
-) {
-    let response: Result<DeleteResultArtifactResponse, _> = client
-        .call_with_timeout(
-            "delete_result_artifact",
-            &DeleteResultArtifactRequest {
-                artifact_id: reference.artifact_id.clone(),
-            },
-            std::time::Duration::from_secs(10),
-        )
-        .await;
+async fn delete_downloaded_artifact(client: &BacktestXrpcClient, reference: &ResultArtifactRefMsg) {
+    let response = typed_call_with_timeout(
+        std::time::Duration::from_secs(10),
+        client.delete_result_artifact(DeleteResultArtifactRequest {
+            artifact_id: reference.artifact_id.clone(),
+        }),
+    )
+    .await;
     match response {
         Ok(response) if response.success => {}
         Ok(response) => eprintln!(
@@ -1419,7 +1392,7 @@ async fn delete_downloaded_artifact(
 }
 
 async fn download_result_artifact(
-    client: &Arc<BacktestRpcClient>,
+    client: &BacktestXrpcClient,
     reference: &ResultArtifactRefMsg,
     summary: Option<BacktestResultMsg>,
     output_path: Option<&str>,
@@ -1466,7 +1439,7 @@ async fn download_result_artifact(
 }
 
 async fn receive_delivered_result(
-    client: &Arc<BacktestRpcClient>,
+    client: &BacktestXrpcClient,
     result: Option<BacktestResultMsg>,
     artifact: Option<ResultArtifactRefMsg>,
     inline_complete: bool,
@@ -1967,12 +1940,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect to the backtest service.
     print_header("Connecting to Backtest Server");
     let mut session = connect(&endpoint).await?;
-    let client = session.client();
     println!("  ✓ Connected");
 
     let operation_result: Result<(), Box<dyn std::error::Error>> = async {
         // 3. Ping server to confirm it's alive.
-        let ping: PingResponse = client.call("ping", &()).await?;
+        let ping = session.ping().await?;
         println!(
             "  Server status: {}, uptime: {}s",
             ping.status, ping.uptime_secs
@@ -2023,13 +1995,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match execution_mode(&args) {
             ExecutionMode::Stream | ExecutionMode::Poll => {
-                let submit: SubmitBacktestResponse = client
-                    .call(
-                        "submit_backtest",
-                        &SubmitBacktestRequest {
-                            request: future_request.clone(),
-                        },
-                    )
+                let submit = session
+                    .submit(SubmitBacktestRequest {
+                        request: future_request.clone(),
+                    })
                     .await?;
                 if !submit.success {
                     return Err(
@@ -2050,48 +2019,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await?;
                 } else {
-                    let status_client = client.clone();
+                    let status_client = &session;
                     let status_job_id = job_id.clone();
-                    let cancel_client = client.clone();
+                    let cancel_client = &session;
                     let cancel_job_id = job_id.clone();
                     poll_async_job(
                         &job_id,
                         std::time::Duration::from_secs(args.poll_timeout_secs),
                         std::time::Duration::from_secs(2),
                         move |remaining| {
-                            let client = status_client.clone();
                             let job_id = status_job_id.clone();
                             async move {
-                                client
-                                    .call_with_timeout(
-                                        "get_backtest_status",
-                                        &GetBacktestStatusRequest { job_id },
-                                        remaining,
-                                    )
+                                typed_call_with_timeout(remaining, status_client.status(&job_id))
                                     .await
-                                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
                             }
                         },
                         move || {
-                            let client = cancel_client.clone();
                             let job_id = cancel_job_id.clone();
                             async move {
-                                best_effort_cancel_streamed_job(&client, &job_id).await;
+                                best_effort_cancel_streamed_job(cancel_client, &job_id).await;
                             }
                         },
                     )
                     .await?;
                 }
 
-                let result_client = session.client();
-                let result_resp: GetBacktestResultResponse = result_client
-                    .call(
-                        "get_backtest_result",
-                        &GetBacktestResultRequest {
-                            job_id: job_id.clone(),
-                        },
-                    )
-                    .await?;
+                let result_resp = session.result(&job_id).await?;
                 if !result_resp.success {
                     return Err(server_response_error(
                         result_resp.error,
@@ -2100,7 +2053,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 let (result, output_written) = receive_delivered_result(
-                    &result_client,
+                    &session,
                     result_resp.result,
                     result_resp.artifact,
                     result_resp.inline_complete,
@@ -2110,20 +2063,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 present_result(&result, &args, output_written)?;
             }
             ExecutionMode::Sync => {
-                let resp: RunBacktestResponse = client
-                    .call_with_timeout(
-                        "run_backtest",
-                        &future_request,
-                        std::time::Duration::from_secs(300),
-                    )
-                    .await?;
+                let resp = typed_call_with_timeout(
+                    std::time::Duration::from_secs(300),
+                    session.run_backtest(future_request),
+                )
+                .await?;
                 println!("  Elapsed: {}ms", resp.elapsed_ms);
 
                 if !resp.success {
                     return Err(server_response_error(resp.error, "backtest failed").into());
                 }
                 let (result, output_written) = receive_delivered_result(
-                    &client,
+                    &session,
                     resp.result,
                     resp.artifact,
                     resp.inline_complete,
@@ -2141,7 +2092,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if operation_result.is_ok() {
         print_header("Done");
     }
-    let shutdown_result = session.close().await;
+    let shutdown_result: Result<(), Box<dyn std::error::Error>> = session
+        .close()
+        .await
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>);
 
     match (operation_result, shutdown_result) {
         (Ok(()), Ok(())) => {
@@ -2159,7 +2113,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use qs_service::{RetryDisposition, TransportFailure, TransportFailureKind};
+
     use super::*;
+
+    #[tokio::test]
+    async fn typed_call_timeout_preserves_request_timeout_meaning() {
+        let error = typed_call_with_timeout(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<(), BacktestClientError>>(),
+        )
+        .await
+        .expect_err("typed call should reach its application deadline");
+
+        assert_eq!(
+            error.to_string(),
+            "Request timeout: request timed out after 1ms"
+        );
+    }
+
+    #[test]
+    fn stream_reconnects_only_for_typed_transport_failures() {
+        let transport = TransportFailure::new(
+            TransportFailureKind::ConnectionClosed,
+            RetryDisposition::SafeBeforeInvocation,
+            None,
+            "connection closed",
+        );
+        assert!(matches!(
+            classify_watch_error(transport.into()),
+            WatchAttempt::Retry(_)
+        ));
+        let permanent_transport = TransportFailure::new(
+            TransportFailureKind::InvalidConfiguration,
+            RetryDisposition::Never,
+            None,
+            "invalid endpoint",
+        );
+        assert!(matches!(
+            classify_watch_error(permanent_transport.into()),
+            WatchAttempt::Failed(_)
+        ));
+        assert!(matches!(
+            classify_watch_error(BacktestClientError::Service("job rejected".into())),
+            WatchAttempt::Failed(_)
+        ));
+        assert!(matches!(
+            classify_watch_error(
+                BacktestServiceProtocolError {
+                    detail: "invalid stream frame".into(),
+                }
+                .into()
+            ),
+            WatchAttempt::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn shipped_clients_do_not_embed_canonical_rpc_method_names() {
+        let clients = [
+            include_str!("tg_backtest.rs"),
+            include_str!("../../examples/backtest_client.rs"),
+        ];
+        let method_parts = [
+            ("pi", "ng"),
+            ("submit_", "backtest"),
+            ("get_backtest_", "status"),
+            ("watch_", "backtest"),
+            ("get_backtest_", "result"),
+            ("get_result_artifact_", "chunk"),
+            ("delete_result_", "artifact"),
+            ("cancel_", "backtest"),
+            ("run_", "backtest"),
+            ("run_backtest_", "multi"),
+            ("list_", "profiles"),
+            ("list_", "symbols"),
+            ("add_", "profile"),
+            ("remove_", "profile"),
+            ("reload_", "profiles"),
+        ];
+
+        for source in clients {
+            for (prefix, suffix) in method_parts {
+                let method = format!("\"{prefix}{suffix}\"");
+                assert!(
+                    !source.contains(&method),
+                    "found RPC method literal {method}"
+                );
+            }
+        }
+    }
 
     fn entry_json(risk_field: &str) -> String {
         format!(

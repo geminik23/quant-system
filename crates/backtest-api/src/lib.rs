@@ -7,7 +7,8 @@ mod client;
 mod rpc_types;
 
 pub use client::{
-    BacktestClient, BacktestClientError, BacktestEventStream, BacktestServiceProtocolError,
+    BacktestAdminClient, BacktestClient, BacktestClientError, BacktestDiscoveryClient,
+    BacktestEventStream, BacktestServiceProtocolError, BacktestSyncClient,
 };
 pub use rpc_types::*;
 

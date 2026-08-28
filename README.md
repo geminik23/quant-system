@@ -2,7 +2,7 @@
 
 A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.2.x` development.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is under active `0.3.x` development.
 
 It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 
@@ -95,6 +95,8 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 - Current backtest service endpoints accept strict `RawSignal`; configured-strategy server or RPC execution is not included. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.
+- Shipped backtest clients use provider-neutral retained-job, artifact, synchronous-execution, and discovery capabilities through the typed xrpc facade; RPC method names and provider error mapping remain inside the API provider module.
+- Market-data snapshots and streams use service quote-observation timestamps rather than unavailable CTrader source timestamps. Reconnect invalidates prior-session quote cache entries, source-state events carry transition timestamps, and the combined event stream exposes detected receiver lag or subscription rejection without claiming replay or exactly-once delivery.
 - Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
 - Historical import accepts the documented MetaTrader-style tab-delimited tick and bar formats, not arbitrary CSV layouts.
 

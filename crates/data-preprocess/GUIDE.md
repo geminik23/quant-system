@@ -102,7 +102,7 @@ data-preprocess input tick [OPTIONS] <FILES>...
 data-preprocess input bar [OPTIONS] <FILES>...
 
   -e, --exchange <EX>      Exchange name (REQUIRED)
-  -t, --timeframe <TF>     Timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M (REQUIRED)
+  -t, --timeframe <TF>     Timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M (REQUIRED)
       --symbol <SYM>       Override symbol (default: from filename)
       --tz-offset <TZ>     Source timezone offset [default: +02:00]
 ```
@@ -151,6 +151,7 @@ Tab-delimited, with header. Filename convention: `{SYMBOL}_*.csv`
 
 ## Data Conventions
 
+- **Timeframes** use canonical storage labels; `1m` is one minute and the case-sensitive `1M` label is one month (`MN1` is also accepted as input)
 - **Exchanges** are always stored lowercase (`ctrader`, `binance`)
 - **Symbols** are always stored uppercase (`BTCUSD`, `EURUSD`)
 - **Timestamps** are stored in UTC — source timezone is converted on import

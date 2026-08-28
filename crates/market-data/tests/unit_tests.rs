@@ -104,14 +104,12 @@ fn rpc_types_alert_info_serde() {
 #[test]
 fn rpc_types_stream_event_serde() {
     // Price event
-    let price_event = StreamEvent {
-        event_type: "PRICE".into(),
-        symbol: Some("EURUSD".into()),
-        bid: Some(1.1234),
-        ask: Some(1.1236),
-        state: None,
+    let price_event = StreamEvent::price(PriceTick {
+        symbol: "EURUSD".into(),
+        bid: 1.1234,
+        ask: 1.1236,
         ts_ms: 1700000000000,
-    };
+    });
     let json = serde_json::to_string(&price_event).unwrap();
     let back: StreamEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(back.event_type, "PRICE");
@@ -119,14 +117,7 @@ fn rpc_types_stream_event_serde() {
     assert!(back.state.is_none());
 
     // State event
-    let state_event = StreamEvent {
-        event_type: "STATE".into(),
-        symbol: None,
-        bid: None,
-        ask: None,
-        state: Some("CONNECTED".into()),
-        ts_ms: 1700000000000,
-    };
+    let state_event = StreamEvent::source_state("CONNECTED", 1700000000000);
     let json = serde_json::to_string(&state_event).unwrap();
     let back: StreamEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(back.event_type, "STATE");

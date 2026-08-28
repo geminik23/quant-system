@@ -25,7 +25,7 @@ path = "src/bin/tg_backtest.rs"
 qs-core = { workspace = true }
 qs-instruments = { workspace = true }
 qs-backtest = { workspace = true }
-qs-backtest-api = { workspace = true }
+qs-backtest-api = { workspace = true, features = ["xrpc"] }
 qs-data-preprocess = { workspace = true, features = ["parquet"] }
 qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true }

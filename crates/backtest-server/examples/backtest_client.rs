@@ -28,13 +28,13 @@
 //!     --to 2024-06-01
 //! ```
 
-use std::sync::Arc;
-
 use clap::Parser;
 
 use backtest_server::rpc_types::*;
+use qs_backtest_api::provider::xrpc::BacktestXrpcClient;
+use qs_backtest_api::{BacktestClient, BacktestDiscoveryClient, BacktestSyncClient};
 use qs_service::ServiceEndpoint;
-use qs_service_xrpc::{DynRpcClient, JsonCodec, XrpcClientSession, XrpcTransportConfig};
+use qs_service_xrpc::XrpcTransportConfig;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -87,39 +87,13 @@ struct Args {
 
 // ── Connection Helper ───────────────────────────────────────────────────────
 
-type BacktestRpcClient = DynRpcClient<JsonCodec>;
-
-struct BacktestClientSession {
-    client: Arc<BacktestRpcClient>,
-    session: XrpcClientSession<JsonCodec>,
-}
-
-impl BacktestClientSession {
-    fn client(&self) -> Arc<BacktestRpcClient> {
-        Arc::clone(&self.client)
-    }
-
-    async fn close(self) -> Result<(), Box<dyn std::error::Error>> {
-        self.session.close().await?;
-        Ok(())
-    }
-}
-
 /// Connect through the configured logical service endpoint.
 async fn connect(
     endpoint: &ServiceEndpoint,
     client_name: &str,
-) -> Result<BacktestClientSession, Box<dyn std::error::Error>> {
+) -> Result<BacktestXrpcClient, Box<dyn std::error::Error>> {
     println!("  Connecting to {endpoint} ...");
-    let session = qs_service_xrpc::connect(
-        endpoint,
-        client_name,
-        &XrpcTransportConfig::default(),
-        JsonCodec,
-    )
-    .await?;
-    let client = session.raw_client();
-    Ok(BacktestClientSession { client, session })
+    Ok(BacktestXrpcClient::connect(endpoint, client_name, &XrpcTransportConfig::default()).await?)
 }
 
 // ── Display Helpers ─────────────────────────────────────────────────────────
@@ -413,22 +387,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(endpoint) => endpoint,
         None => format!("shm://{}", args.shm_name).parse()?,
     };
-    let session = connect(&endpoint, "example-backtest-client").await?;
-    let client = session.client();
+    let client = connect(&endpoint, "example-backtest-client").await?;
 
     let operation_result: Result<(), Box<dyn std::error::Error>> = async {
         println!("  ✓ Connected successfully");
 
         // ── 2. Ping ─────────────────────────────────────────────────────────
         print_header("Ping");
-        let ping: PingResponse = client.call("ping", &()).await?;
+        let ping = client.ping().await?;
         println!("  Status:   {}", ping.status);
         println!("  Uptime:   {}s", ping.uptime_secs);
         println!("  Data Dir: {}", ping.data_dir);
 
         // ── 3. List Profiles ────────────────────────────────────────────────
         print_header("Available Profiles");
-        let profiles_resp: ListProfilesResponse = client.call("list_profiles", &()).await?;
+        let profiles_resp = client.list_profiles().await?;
         if profiles_resp.profiles.is_empty() {
             println!("  (no profiles loaded on server)");
         } else {
@@ -451,14 +424,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── 4. List Symbols ─────────────────────────────────────────────────
         print_header("Available Data");
-        let symbols_resp: ListSymbolsResponse = client
-            .call(
-                "list_symbols",
-                &ListSymbolsRequest {
-                    exchange: Some(args.exchange.clone()),
-                    data_type: None,
-                },
-            )
+        let symbols_resp = client
+            .list_symbols(ListSymbolsRequest {
+                exchange: Some(args.exchange.clone()),
+                data_type: None,
+            })
             .await?;
 
         if symbols_resp.symbols.is_empty() {
@@ -588,19 +558,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
 
-        let raw_signal_response: RunBacktestResponse = client
-            .call(
-                "run_backtest",
-                &RunBacktestRequest {
-                    request: raw_signal_request,
-                    future: FutureQuoteConfigMsg {
-                        account_currency: "USD".into(),
-                        ..FutureQuoteConfigMsg::default()
-                    },
-                    evaluation: ProviderEvaluationOptionsMsg::default(),
-                    result_delivery: ResultDeliveryMsg::Auto,
+        let raw_signal_response = client
+            .run_backtest(RunBacktestRequest {
+                request: raw_signal_request,
+                future: FutureQuoteConfigMsg {
+                    account_currency: "USD".into(),
+                    ..FutureQuoteConfigMsg::default()
                 },
-            )
+                evaluation: ProviderEvaluationOptionsMsg::default(),
+                result_delivery: ResultDeliveryMsg::Inline,
+            })
             .await?;
         println!("  Elapsed: {}ms", raw_signal_response.elapsed_ms);
 
@@ -626,7 +593,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_header("Done");
     println!("  Closing connection...");
-    let shutdown_result = session.close().await;
+    let shutdown_result: Result<(), Box<dyn std::error::Error>> = client
+        .close()
+        .await
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>);
 
     match (operation_result, shutdown_result) {
         (Ok(()), Ok(())) => {

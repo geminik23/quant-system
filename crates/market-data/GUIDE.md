@@ -7,7 +7,7 @@ Real-time market-data service that connects to the CTrader FIX API for live fore
 - Live bid/ask streaming from CTrader FIX
 - Per-client price subscriptions with symbol filtering
 - One-shot ABOVE/BELOW price alerts with ownership cleanup
-- Automatic CTrader reconnection
+- CTrader disconnect detection and automatic reconnection with prior-session quote invalidation
 - Shared-memory default plus Unix-socket and loopback-TCP endpoints
 - One owned client lifecycle with deterministic close and task join
 
@@ -79,9 +79,13 @@ The provider-neutral `MarketDataClient` trait lives in `qs-market-data-api`. App
 |---|---|---|
 | Price stream | `PriceTick` | Subscription-filtered bid/ask updates |
 | Alert stream | `AlertResult` | Triggers for alerts owned by the client |
-| Combined event stream | `StreamEvent` | Price updates and CTrader source-state changes |
+| Combined event stream | `StreamEvent` | Current source-state snapshot followed by price, state-transition, and data-quality events |
 
-Transport connectivity and CTrader source freshness are separate states. A connected service session does not imply that the upstream venue connection is current, so consumers must observe source-state events and treat reconnect/resubscribe as potentially data-loss-visible behavior.
+The provider-neutral trait covers snapshots, source state, local subscription filters, alerts, combined events, and alert events. Ping, symbol discovery, and the direct price stream are currently provider-edge operations used by the bundled clients rather than methods on `MarketDataClient`.
+
+Transport connectivity, CTrader source state, and quote freshness are separate facts. Entering `CONNECTING` or `DISCONNECTED` clears cached quotes, so `found = false` remains authoritative until a replacement-session quote arrives. Price timestamps are service observation times shared by cache snapshots and streams; they are not exchange or FIX source timestamps. State timestamps are transition times rather than query times.
+
+The combined stream emits `DATA_QUALITY` for detected receiver lag and rejected spot subscriptions. A known lag includes the dropped item count and delivery continues when possible. This visibility does not imply replay, exactly-once delivery, source sequence tracking, or market-calendar-aware stale classification. The direct price stream remains price-only and best-effort.
 
 ## Provider compatibility
 
