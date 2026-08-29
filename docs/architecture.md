@@ -10,11 +10,15 @@ The workspace separates synchronous trading logic, historical replay, storage, l
                  +------------------+------------------+
                  |                                     |
                  v                                     v
-        Backtest application                  Market-data application
-        qs-backtest-server                    qs-market-data
+        qs-backtest-server                       qs-market-data
                  |                                     |
                  v                                     v
         qs-backtest-api                       qs-market-data-api
+                 ^                                     |
+                 |                                     |
+        qs-backtest-client                             |
+        connection/catalog utilities                   |
+                 |                                     |
                  +------------------+------------------+
                                     |
                                     v
@@ -66,6 +70,8 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 ### Service contracts and providers
 
 `qs-service` owns only provider-neutral endpoint and transport-failure vocabulary. Logical APIs own typed DTOs, events, errors, and client ports. The backtest API separates retained-job and artifact consumption, finite synchronous execution, discovery, and profile administration into provider-neutral capabilities implemented by one optional xrpc facade.
+
+`qs-backtest-client` currently owns provider-neutral desktop endpoint validation and a managed connection/catalog probe that performs ping, profile discovery, symbol availability discovery, and explicit close. Its default normal dependency graph remains xrpc-free; the optional xrpc connector is isolated under its provider module. Retained submit/watch/reconnect, input preparation, output delivery, and analysis workflows are not implemented by this crate yet.
 
 `qs-service-xrpc` owns the current runtime for in-process channels, shared memory, Unix sockets, and TCP. Provider-specific clients, handshakes, slots, codecs, and lifecycle handles do not enter domain APIs.
 

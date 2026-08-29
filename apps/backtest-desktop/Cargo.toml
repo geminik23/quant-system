@@ -1,0 +1,16 @@
+[package]
+name = "qs-backtest-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Quant System backtest desktop client"
+publish = false
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "5cdb7ab9d9546db683132cfa78e68acec3064cac", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "5cdb7ab9d9546db683132cfa78e68acec3064cac", default-features = false }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "5cdb7ab9d9546db683132cfa78e68acec3064cac" }
+qs-backtest-client = { path = "../../crates/backtest-client", version = "0.3.0", features = ["xrpc"] }
+tokio = { version = "1", features = ["time"] }
+unicode-segmentation = "1"

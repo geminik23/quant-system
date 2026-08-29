@@ -3647,6 +3647,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-backtest-client"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "qs-backtest-api",
+ "qs-service",
+ "qs-service-xrpc",
+ "thiserror 2.0.18",
+ "tokio",
+ "xrpc-rs",
+]
+
+[[package]]
 name = "qs-backtest-server"
 version = "0.3.0"
 dependencies = [

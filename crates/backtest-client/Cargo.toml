@@ -1,0 +1,29 @@
+[package]
+name = "qs-backtest-client"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Provider-neutral workflow and connection utilities for the quant-system backtest service"
+keywords = ["backtest", "client", "service", "trading"]
+categories = ["finance"]
+
+[features]
+default = []
+analysis = []
+xrpc = ["qs-backtest-api/xrpc", "dep:qs-service-xrpc"]
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+qs-backtest-api = { workspace = true }
+qs-service = { workspace = true }
+qs-service-xrpc = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+xrpc-rs = { workspace = true }
