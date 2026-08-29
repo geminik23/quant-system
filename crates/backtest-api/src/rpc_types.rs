@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use thiserror::Error;
 
 fn default_true() -> bool {
     true
@@ -1250,6 +1251,29 @@ where
     T: DeserializeOwned,
 {
     serde_json::from_value(serde_json::to_value(value)?)
+}
+
+/// Error returned by strict standalone raw-signal decoding.
+#[derive(Debug, Error)]
+pub enum RawSignalDecodeError {
+    #[error("invalid strict raw signal JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Entry risk must be finite and positive")]
+    InvalidEntryRisk,
+}
+
+/// Decode one standalone raw signal with recursively strict nested fields.
+pub fn decode_raw_signal_json_strict(input: &str) -> Result<RawSignalMsg, RawSignalDecodeError> {
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let strict = StrictRawSignalMsg::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    let signal = strict_into_wire(strict)?;
+    if let RawSignalMsg::Entry { risk, .. } = &signal
+        && (!risk.is_finite() || *risk <= 0.0)
+    {
+        return Err(RawSignalDecodeError::InvalidEntryRisk);
+    }
+    Ok(signal)
 }
 
 impl<'de> Deserialize<'de> for RunBacktestRequest {

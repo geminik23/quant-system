@@ -24,7 +24,10 @@ use qs_backtest::currency::{ConversionRoute, RunCurrencyPlan};
 use qs_backtest::runner::{BacktestConfig, BacktestRunner};
 use qs_backtest::{DEFAULT_MTM_MAX_POINTS, MAX_MTM_MAX_POINTS, MIN_MTM_MAX_POINTS, VecFeed};
 use qs_backtest_api::provider::xrpc::BacktestXrpcClient;
-use qs_backtest_api::{BacktestClient, BacktestClientError, BacktestSyncClient};
+use qs_backtest_api::{
+    BacktestClient, BacktestClientError, BacktestSyncClient, canonical_backtest_timestamp,
+    decode_raw_signal_json_strict, parse_backtest_timestamp,
+};
 use qs_service::ServiceEndpoint;
 use qs_service_xrpc::XrpcTransportConfig;
 use qs_symbols::SymbolRegistry;
@@ -404,7 +407,7 @@ fn parse_raw_signal_line(
         }
     }
 
-    serde_json::from_value(value)
+    decode_raw_signal_json_strict(line)
         .map_err(|error| format!("line {line_number}: failed to parse raw signal: {error}").into())
 }
 
@@ -429,41 +432,50 @@ fn load_raw_signals(path: &str) -> Result<Vec<RawSignalMsg>, Box<dyn std::error:
     Ok(signals)
 }
 
+/// Parse CLI and parser-outcome timestamps through the shared wire contract.
+fn parse_cli_timestamp(value: &str) -> Option<NaiveDateTime> {
+    parse_backtest_timestamp(value).ok()
+}
+
+fn canonicalize_cli_date_range(args: &mut Args) -> Result<(), String> {
+    let from = args
+        .from
+        .as_deref()
+        .map(parse_backtest_timestamp)
+        .transpose()
+        .map_err(|error| format!("invalid --from timestamp: {error}"))?;
+    let to = args
+        .to
+        .as_deref()
+        .map(parse_backtest_timestamp)
+        .transpose()
+        .map_err(|error| format!("invalid --to timestamp: {error}"))?;
+    if let (Some(from), Some(to)) = (from, to)
+        && from > to
+    {
+        return Err("--from must not be later than --to after UTC normalization".into());
+    }
+
+    args.from = args
+        .from
+        .as_deref()
+        .map(canonical_backtest_timestamp)
+        .transpose()
+        .map_err(|error| format!("invalid --from timestamp: {error}"))?;
+    args.to = args
+        .to
+        .as_deref()
+        .map(canonical_backtest_timestamp)
+        .transpose()
+        .map_err(|error| format!("invalid --to timestamp: {error}"))?;
+    Ok(())
+}
+
 /// Filter raw signal messages to only those within the requested date range.
 ///
 /// This is a client-side optimisation that reduces request payload size.
 /// The server also applies authoritative filtering, so correctness does not
 /// depend on this function.
-/// Parse a CLI or source timestamp: RFC 3339 first (normalized to UTC), then the
-/// naive ISO forms, then a bare date.
-///
-/// RFC 3339 support is required for `--outcomes-input` date filtering, not merely
-/// convenient: `RawTgMessage.ts` in parser outcome files is RFC 3339 with an offset
-/// (for example `2026-01-01T19:51:04Z`), which is the parser framework's documented
-/// input contract and what `signal_parser::parse_iso_datetime` accepts. Without this
-/// branch, combining `--outcomes-input` with `--from`/`--to` failed on every real
-/// parser output while passing on naive-timestamp test fixtures.
-fn parse_cli_timestamp(value: &str) -> Option<NaiveDateTime> {
-    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(timestamp.naive_utc());
-    }
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ];
-    for format in formats {
-        if let Ok(timestamp) = NaiveDateTime::parse_from_str(value, format) {
-            return Some(timestamp);
-        }
-    }
-    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-}
-
 fn filter_signals_by_date(
     signals: Vec<RawSignalMsg>,
     from: &Option<String>,
@@ -1844,7 +1856,9 @@ fn present_result(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    canonicalize_cli_date_range(&mut args)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     validate_evaluation_args(&args)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
@@ -2234,6 +2248,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(scale_in, RawSignalMsg::ScaleIn { size, .. } if size == 0.1));
+
+        let nested_unknown = parse_raw_signal_line(
+            r#"{"action":"Close","ts":"2026-01-15T10:00:00","position":{"type":"ByTradeId","trade_id":"trade-1","unexpected":true}}"#,
+            13,
+        )
+        .unwrap_err();
+        assert!(nested_unknown.to_string().contains("line 13"));
+        assert!(nested_unknown.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -2805,6 +2827,51 @@ mod tests {
     /// `--outcomes-input` plus `--from`/`--to` rejected every real parser output while
     /// naive-timestamp fixtures passed.
     #[test]
+    fn cli_date_range_is_canonicalized_and_validated_before_input_loading() {
+        let mut args = Args::try_parse_from([
+            "tg_backtest",
+            "--input",
+            "signals.jsonl",
+            "--exchange",
+            "test",
+            "--from",
+            "2026-01-01T00:30:00+02:00",
+            "--to",
+            "2026-01-02",
+        ])
+        .unwrap();
+        canonicalize_cli_date_range(&mut args).unwrap();
+        assert_eq!(args.from.as_deref(), Some("2025-12-31T22:30:00"));
+        assert_eq!(args.to.as_deref(), Some("2026-01-02T00:00:00"));
+
+        let mut invalid = Args::try_parse_from([
+            "tg_backtest",
+            "--input",
+            "signals.jsonl",
+            "--exchange",
+            "test",
+            "--from",
+            "not-a-timestamp",
+        ])
+        .unwrap();
+        assert!(canonicalize_cli_date_range(&mut invalid).is_err());
+
+        let mut reversed = Args::try_parse_from([
+            "tg_backtest",
+            "--input",
+            "signals.jsonl",
+            "--exchange",
+            "test",
+            "--from",
+            "2026-01-02T01:00:00+01:00",
+            "--to",
+            "2026-01-01T23:00:00Z",
+        ])
+        .unwrap();
+        assert!(canonicalize_cli_date_range(&mut reversed).is_err());
+    }
+
+    #[test]
     fn cli_timestamps_accept_rfc3339_and_normalize_offsets_to_utc() {
         // The exact shape emitted by the parser framework.
         assert_eq!(
@@ -2830,8 +2897,11 @@ mod tests {
         assert!(parse_cli_timestamp("2026-01-01T19:51:04").is_some());
         assert!(parse_cli_timestamp("2026-01-01 19:51:04").is_some());
         assert!(parse_cli_timestamp("2026-01-01").is_some());
-        // Garbage still fails, so the invalid-timestamp error path is intact.
+        // Ambiguous and non-canonical forms fail through the shared contract.
         assert!(parse_cli_timestamp("not-a-timestamp").is_none());
+        assert!(parse_cli_timestamp(" 2026-01-01T19:51:04Z").is_none());
+        assert!(parse_cli_timestamp("2026-01-01T19:51:04-00:00").is_none());
+        assert!(parse_cli_timestamp("2026-01-01T19:51:60Z").is_none());
     }
 
     fn outcome_fixture_path(label: &str) -> PathBuf {

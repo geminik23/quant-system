@@ -16,6 +16,7 @@ xrpc = ["dep:qs-service-xrpc"]
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true, optional = true }

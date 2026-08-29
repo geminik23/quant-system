@@ -1,6 +1,8 @@
 use qs_backtest_api::{
-    BacktestConfigMsg, BacktestRunSpec, FutureQuoteConfigMsg, PositionRefMsg,
-    ProviderEvaluationOptionsMsg, RawSignalMsg, ResultDeliveryMsg, RunBacktestRequest,
+    BacktestConfigMsg, BacktestRunSpec, BacktestTimestampError, FutureQuoteConfigMsg,
+    PositionRefMsg, ProviderEvaluationOptionsMsg, RawSignalDecodeError, RawSignalMsg,
+    ResultDeliveryMsg, RunBacktestRequest, canonical_backtest_timestamp,
+    decode_raw_signal_json_strict, parse_backtest_timestamp,
 };
 use serde_json::{Value, json};
 
@@ -82,6 +84,86 @@ fn standalone_raw_signal_messages_keep_the_compatibility_boundary() {
     nested_rule_field["rule"]["future_rule_field"] = json!(true);
     let add_rule: RawSignalMsg = serde_json::from_value(nested_rule_field).unwrap();
     assert!(matches!(add_rule, RawSignalMsg::AddRule { .. }));
+}
+
+#[test]
+fn strict_standalone_decode_reuses_recursive_request_strictness() {
+    let decoded = decode_raw_signal_json_strict(&entry().to_string()).unwrap();
+    assert!(matches!(decoded, RawSignalMsg::Entry { risk: 1.0, .. }));
+
+    let mut nested_position_field = close();
+    nested_position_field["position"]["future_position_field"] = json!(true);
+    assert!(
+        serde_json::from_value::<RawSignalMsg>(nested_position_field.clone()).is_ok(),
+        "compatibility decoding must remain unchanged"
+    );
+    assert!(decode_raw_signal_json_strict(&nested_position_field.to_string()).is_err());
+
+    let mut nested_rule_field = add_rule();
+    nested_rule_field["rule"]["future_rule_field"] = json!(true);
+    assert!(
+        serde_json::from_value::<RawSignalMsg>(nested_rule_field.clone()).is_ok(),
+        "compatibility decoding must remain unchanged"
+    );
+    assert!(decode_raw_signal_json_strict(&nested_rule_field.to_string()).is_err());
+}
+
+#[test]
+fn strict_standalone_decode_enforces_entry_risk_without_rejecting_scale_in_size() {
+    let mut missing_risk = entry();
+    missing_risk.as_object_mut().unwrap().remove("risk");
+    assert!(decode_raw_signal_json_strict(&missing_risk.to_string()).is_err());
+
+    for risk in [0.0, -1.0] {
+        let mut invalid_risk = entry();
+        invalid_risk["risk"] = json!(risk);
+        assert!(matches!(
+            decode_raw_signal_json_strict(&invalid_risk.to_string()),
+            Err(RawSignalDecodeError::InvalidEntryRisk)
+        ));
+    }
+
+    let mut obsolete_size = entry();
+    obsolete_size["size"] = json!(0.1);
+    assert!(decode_raw_signal_json_strict(&obsolete_size.to_string()).is_err());
+
+    let scale_in = json!({
+        "action": "ScaleIn",
+        "ts": "2026-01-15T10:01:00",
+        "position": {
+            "type": "ByTradeId",
+            "trade_id": "trade-1"
+        },
+        "price": null,
+        "size": 0.25
+    });
+    assert!(matches!(
+        decode_raw_signal_json_strict(&scale_in.to_string()).unwrap(),
+        RawSignalMsg::ScaleIn { size: 0.25, .. }
+    ));
+
+    let two_values = format!("{} {}", entry(), close());
+    assert!(decode_raw_signal_json_strict(&two_values).is_err());
+}
+
+#[test]
+fn public_timestamp_contract_normalizes_utc_without_local_timezone() {
+    assert_eq!(
+        canonical_backtest_timestamp("2026-01-01T00:30:00+02:00").unwrap(),
+        "2025-12-31T22:30:00"
+    );
+    assert_eq!(
+        canonical_backtest_timestamp("2026-01-01 19:51:04.120000").unwrap(),
+        "2026-01-01T19:51:04.12"
+    );
+    assert_eq!(
+        canonical_backtest_timestamp("2026-01-01").unwrap(),
+        "2026-01-01T00:00:00"
+    );
+    assert_eq!(
+        parse_backtest_timestamp("2026-01-01T19:51:04-00:00"),
+        Err(BacktestTimestampError::UnknownLocalOffset)
+    );
 }
 
 #[test]

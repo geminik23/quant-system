@@ -405,8 +405,9 @@ fn progress_stage_rank(stage: &str) -> u8 {
     match stage {
         "queued" => 0,
         "loading_data" => 1,
-        "replay" => 2,
-        "completed" | "failed" | "cancelled" => 3,
+        "loading_conversion_data" => 2,
+        "replay" => 3,
+        "completed" | "failed" | "cancelled" => 4,
         _ => 0,
     }
 }
@@ -504,7 +505,7 @@ fn update_job_progress(state: &ServerState, job_id: &str, progress: BacktestProg
         && !job.status.is_terminal()
     {
         match progress.stage.as_str() {
-            "loading_data" => job.status = JobStatus::LoadingData,
+            "loading_data" | "loading_conversion_data" => job.status = JobStatus::LoadingData,
             "replay" => job.status = JobStatus::Running,
             _ => {}
         }
@@ -890,6 +891,15 @@ fn execute_backtest_with_future_controlled(
     Ok(result)
 }
 
+fn canonical_requested_bound(value: &Option<String>) -> String {
+    match value {
+        Some(timestamp) => {
+            canonical_backtest_timestamp(timestamp).unwrap_or_else(|_| timestamp.clone())
+        }
+        None => "unbounded".into(),
+    }
+}
+
 fn attach_future_reproducibility_metadata(
     result: &mut BacktestResult,
     state: &ServerState,
@@ -910,11 +920,11 @@ fn attach_future_reproducibility_metadata(
     );
     tags.insert(
         "data.requested_from".into(),
-        req.from.clone().unwrap_or_else(|| "unbounded".into()),
+        canonical_requested_bound(&req.from),
     );
     tags.insert(
         "data.requested_to".into(),
-        req.to.clone().unwrap_or_else(|| "unbounded".into()),
+        canonical_requested_bound(&req.to),
     );
     tags.insert("data.symbols".into(), plan.active_symbols().join(","));
     tags.insert(
@@ -1698,28 +1708,10 @@ fn normalize_symbol(registry: &SymbolRegistry, raw: &str) -> String {
     registry.normalize_or_passthrough(raw)
 }
 
-/// Parse an ISO datetime string into NaiveDateTime.
+/// Parse a backtest wire timestamp as UTC without consulting local time.
 fn parse_datetime(s: &str) -> Result<NaiveDateTime> {
-    // Try multiple common formats.
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ];
-    for fmt in &formats {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(dt);
-        }
-    }
-    // Try date-only (appends midnight).
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(date.and_hms_opt(0, 0, 0).unwrap());
-    }
-    Err(BacktestServerError::InvalidRequest(format!(
-        "Cannot parse datetime: '{s}'. Use ISO format (e.g. '2026-01-15T10:30:00' or '2026-01-15')."
-    )))
+    parse_backtest_timestamp(s)
+        .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))
 }
 
 /// Parse an optional datetime string.
@@ -2306,6 +2298,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_datetime_normalizes_offset_to_utc() {
+        let dt = parse_datetime("2026-01-15T00:30:00+02:00").unwrap();
+        assert_eq!(dt.to_string(), "2026-01-14 22:30:00");
+    }
+
+    #[test]
     fn parse_datetime_space_separator() {
         let dt = parse_datetime("2026-01-15 10:30:00").unwrap();
         assert_eq!(dt.to_string(), "2026-01-15 10:30:00");
@@ -2320,6 +2318,9 @@ mod tests {
     #[test]
     fn parse_datetime_invalid() {
         assert!(parse_datetime("not-a-date").is_err());
+        assert!(parse_datetime(" 2026-01-15T10:30:00").is_err());
+        assert!(parse_datetime("2026-01-15T10:30:00-00:00").is_err());
+        assert!(parse_datetime("2026-01-15T10:30:60Z").is_err());
     }
 
     #[test]
@@ -3111,6 +3112,58 @@ lot_step_units = 1
             &state,
             &job_id,
             BacktestProgress {
+                stage: "loading_data".into(),
+                total_symbols: 2,
+                ..BacktestProgress::default()
+            },
+        );
+        let loading = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            loading,
+            BacktestEvent::Snapshot { ref status }
+                if status.status == "LoadingData" && status.progress.stage == "loading_data"
+        ));
+
+        update_job_progress(
+            &state,
+            &job_id,
+            BacktestProgress {
+                stage: "loading_conversion_data".into(),
+                processed_symbols: 1,
+                total_symbols: 2,
+                ..BacktestProgress::default()
+            },
+        );
+        let conversion = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            conversion,
+            BacktestEvent::Snapshot { ref status }
+                if status.status == "LoadingData"
+                    && status.progress.stage == "loading_conversion_data"
+        ));
+
+        update_job_progress(
+            &state,
+            &job_id,
+            BacktestProgress {
+                stage: "loading_data".into(),
+                processed_symbols: 2,
+                total_symbols: 2,
+                ..BacktestProgress::default()
+            },
+        );
+        let delayed_loading = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            delayed_loading,
+            BacktestEvent::Snapshot { ref status }
+                if status.progress.stage == "loading_conversion_data"
+                    && status.progress.processed_symbols == 2
+        ));
+
+        update_job_progress(
+            &state,
+            &job_id,
+            BacktestProgress {
                 stage: "replay".into(),
                 processed_events: 10,
                 total_events: 100,
@@ -3142,7 +3195,14 @@ lot_step_units = 1
         assert!(matches!(
             terminal,
             BacktestEvent::Snapshot { ref status }
-                if status.status == "Cancelled" && status.is_terminal()
+                if status.status == "Cancelled"
+                    && status.is_terminal()
+                    && status.progress.processed_events == 10
+                    && status.progress.total_events == 100
+                    && status.progress.processed_signals == 2
+                    && status.progress.total_signals == 8
+                    && status.progress.processed_symbols == 2
+                    && status.progress.total_symbols == 2
         ));
         assert!(stream.next().await.is_none());
     }

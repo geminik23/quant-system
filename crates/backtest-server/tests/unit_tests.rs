@@ -1571,8 +1571,8 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
             exchange: "FIXTURE".into(),
             data_type: "bar".into(),
             timeframe: Some("1m".into()),
-            from: Some("2026-01-15T10:00:00".into()),
-            to: Some("2026-01-15T10:00:02".into()),
+            from: Some("2026-01-15T12:00:00+02:00".into()),
+            to: Some("2026-01-15T05:00:02-05:00".into()),
             raw_signals: vec![RawSignalMsg::Entry {
                 ts: "2026-01-15T10:00:00".into(),
                 symbol: "EURUSD".into(),

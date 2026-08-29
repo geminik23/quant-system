@@ -33,6 +33,7 @@ use crate::rpc_types::{
     PendingOrderLifecycleStateMsg, PositionRefMsg, PositionSummaryMsg,
     ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg, RuleConfigDefMsg, SizingPolicyMsg,
     StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg, TargetSelectionMsg, TradeResultMsg,
+    parse_backtest_timestamp,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -1035,27 +1036,11 @@ fn rule_config_def_from_msg(msg: &RuleConfigDefMsg) -> RuleConfigDef {
     }
 }
 
-// ── Internal parsing helpers (duplicated from handlers to avoid circular deps) ──
+// Internal parsing helpers.
 
 fn parse_datetime_internal(s: &str) -> crate::error::Result<NaiveDateTime> {
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    ];
-    for fmt in &formats {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(dt);
-        }
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(date.and_hms_opt(0, 0, 0).unwrap());
-    }
-    Err(BacktestServerError::InvalidRequest(format!(
-        "Cannot parse datetime: '{s}'."
-    )))
+    parse_backtest_timestamp(s)
+        .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))
 }
 
 fn parse_side_internal(s: &str) -> crate::error::Result<Side> {
@@ -1608,6 +1593,32 @@ mod tests {
             }
             _ => panic!("Expected Entry"),
         }
+    }
+
+    #[test]
+    fn raw_signal_from_msg_normalizes_offset_timestamp_to_utc() {
+        let reg = qs_symbols::SymbolRegistry::empty();
+        let msg = RawSignalMsg::Entry {
+            ts: "2026-01-15T00:30:00+02:00".into(),
+            symbol: "eurusd".into(),
+            side: "Buy".into(),
+            order_type: "Market".into(),
+            price: None,
+            risk: 1.0,
+            stoploss: None,
+            targets: Vec::new(),
+            group: None,
+            trade_id: None,
+        };
+
+        let signal = raw_signal_from_msg(&msg, "default", &reg).unwrap();
+        assert_eq!(
+            signal.ts(),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 14)
+                .unwrap()
+                .and_hms_opt(22, 30, 0)
+                .unwrap()
+        );
     }
 
     #[test]

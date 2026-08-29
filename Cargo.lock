@@ -3635,6 +3635,7 @@ name = "qs-backtest-api"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "qs-service",
  "qs-service-xrpc",

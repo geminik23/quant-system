@@ -2,7 +2,7 @@
 
 `RawSignal` is the strict normalized input accepted by the current replay path. A JSONL file contains one action object per line in timestamp order.
 
-Top-level action objects reject unknown fields. Timestamps use naive ISO date-time values such as `2026-01-15T10:00:00`; the producer is responsible for aligning them with imported UTC market-data timestamps.
+Top-level action objects reject unknown fields. Timestamps accept UTC-naive ISO values such as `2026-01-15T10:00:00`, space-separated values, date-only values at UTC midnight, or RFC 3339 values with a known offset; offset values are normalized to UTC without consulting the OS timezone. Surrounding whitespace, timezone names, `24:00:00`, leap seconds, trailing text, and RFC 3339 `-00:00` offsets are rejected.
 
 ## Entry
 
