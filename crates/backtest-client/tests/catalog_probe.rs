@@ -59,6 +59,57 @@ async fn failed_probe_preserves_stage_and_still_closes() {
     );
 }
 
+#[tokio::test]
+async fn profile_symbol_and_close_failures_keep_exact_stage_and_order() {
+    let mut profiles = connector();
+    profiles
+        .client_mut()
+        .fail_profiles(BacktestClientError::Service("profiles unavailable".into()));
+    let error = probe_service_catalog(&profiles).await.unwrap_err();
+    assert_eq!(error.stage, CatalogProbeStage::Profiles);
+    assert_eq!(
+        profiles.calls(),
+        vec![
+            ScriptedCall::Connect,
+            ScriptedCall::Ping,
+            ScriptedCall::Profiles,
+            ScriptedCall::Close,
+        ]
+    );
+
+    let mut symbols = connector();
+    symbols
+        .client_mut()
+        .fail_symbols(BacktestClientError::Service("symbols unavailable".into()));
+    let error = probe_service_catalog(&symbols).await.unwrap_err();
+    assert_eq!(error.stage, CatalogProbeStage::Symbols);
+    assert_eq!(
+        symbols.calls(),
+        vec![
+            ScriptedCall::Connect,
+            ScriptedCall::Ping,
+            ScriptedCall::Profiles,
+            ScriptedCall::Symbols,
+            ScriptedCall::Close,
+        ]
+    );
+
+    let mut close = connector();
+    close.fail_close(BacktestClientError::Service("close failed".into()));
+    let error = probe_service_catalog(&close).await.unwrap_err();
+    assert_eq!(error.stage, CatalogProbeStage::Close);
+    assert_eq!(
+        close.calls(),
+        vec![
+            ScriptedCall::Connect,
+            ScriptedCall::Ping,
+            ScriptedCall::Profiles,
+            ScriptedCall::Symbols,
+            ScriptedCall::Close,
+        ]
+    );
+}
+
 #[test]
 fn desktop_endpoint_accepts_only_loopback_tcp() {
     let endpoint = parse_desktop_endpoint("tcp://127.0.0.1:41001").unwrap();

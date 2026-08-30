@@ -6,7 +6,7 @@ use qs_backtest_api::provider::xrpc::BacktestXrpcClient;
 use qs_service::ServiceEndpoint;
 use qs_service_xrpc::XrpcTransportConfig;
 
-use crate::BacktestCatalogConnector;
+use crate::{BacktestCatalogConnector, BacktestConnector, ManagedBacktestClient};
 
 /// Xrpc connector used by process composition roots.
 pub struct XrpcBacktestConnector {
@@ -41,6 +41,26 @@ impl XrpcBacktestConnector {
             client_name: client_name.into(),
             config,
         }
+    }
+}
+
+#[async_trait]
+impl ManagedBacktestClient for BacktestXrpcClient {
+    async fn close(self) -> Result<(), BacktestClientError> {
+        BacktestXrpcClient::close(self).await
+    }
+}
+
+#[async_trait]
+impl BacktestConnector for XrpcBacktestConnector {
+    type Client = BacktestXrpcClient;
+
+    fn endpoint_display(&self) -> String {
+        self.endpoint.redacted()
+    }
+
+    async fn connect(&self) -> Result<Self::Client, BacktestClientError> {
+        BacktestXrpcClient::connect(&self.endpoint, &self.client_name, &self.config).await
     }
 }
 

@@ -18,7 +18,23 @@ pub struct ServiceCatalogSnapshot {
     pub loaded_at: DateTime<Utc>,
 }
 
-/// Connector used by catalog probes and later workflow composition.
+/// Client session whose transport lifecycle can be closed explicitly.
+#[async_trait]
+pub trait ManagedBacktestClient: BacktestClient + Send + Sync + Sized {
+    async fn close(self) -> Result<(), BacktestClientError>;
+}
+
+/// Provider-neutral connector used by retained workflow composition.
+#[async_trait]
+pub trait BacktestConnector: Send + Sync + 'static {
+    type Client: ManagedBacktestClient;
+
+    fn endpoint_display(&self) -> String;
+
+    async fn connect(&self) -> Result<Self::Client, BacktestClientError>;
+}
+
+/// Connector used by catalog probes and desktop connection testing.
 #[async_trait]
 pub trait BacktestCatalogConnector: Send + Sync + 'static {
     type Client: BacktestClient + BacktestDiscoveryClient + Send + Sync;

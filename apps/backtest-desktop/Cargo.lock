@@ -3960,7 +3960,11 @@ dependencies = [
  "qs-backtest-api",
  "qs-service",
  "qs-service-xrpc",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
