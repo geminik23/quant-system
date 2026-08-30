@@ -76,6 +76,13 @@ pub struct MonthlyReturnCell {
     pub status: MonthlyReturnStatus,
 }
 
+/// One calendar year of monthly return presentation state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonthlyReturnYear {
+    pub year: i32,
+    pub months: [MonthlyReturnCell; 12],
+}
+
 impl FixtureScenario {
     pub const ALL: [FixtureScenario; 5] = [
         FixtureScenario::PersistedResult,
@@ -592,58 +599,61 @@ pub fn drawdown_series() -> Arc<[SeriesPoint]> {
     ])
 }
 
-pub fn monthly_returns() -> [MonthlyReturnCell; 12] {
+pub fn monthly_returns() -> Vec<MonthlyReturnYear> {
     use MonthlyReturnStatus::{Inactive, Missing, Observed};
-    [
-        MonthlyReturnCell {
-            label: "Jan",
-            status: Observed(2.1),
-        },
-        MonthlyReturnCell {
-            label: "Feb",
-            status: Observed(-1.4),
-        },
-        MonthlyReturnCell {
-            label: "Mar",
-            status: Observed(3.2),
-        },
-        MonthlyReturnCell {
-            label: "Apr",
-            status: Observed(0.6),
-        },
-        MonthlyReturnCell {
-            label: "May",
-            status: Observed(-2.0),
-        },
-        MonthlyReturnCell {
-            label: "Jun",
-            status: Observed(1.8),
-        },
-        MonthlyReturnCell {
-            label: "Jul",
-            status: Observed(2.4),
-        },
-        MonthlyReturnCell {
-            label: "Aug",
-            status: Inactive,
-        },
-        MonthlyReturnCell {
-            label: "Sep",
-            status: Observed(1.1),
-        },
-        MonthlyReturnCell {
-            label: "Oct",
-            status: Observed(-0.8),
-        },
-        MonthlyReturnCell {
-            label: "Nov",
-            status: Observed(2.0),
-        },
-        MonthlyReturnCell {
-            label: "Dec",
-            status: Missing,
-        },
-    ]
+    vec![MonthlyReturnYear {
+        year: 2024,
+        months: [
+            MonthlyReturnCell {
+                label: "Jan",
+                status: Observed(2.1),
+            },
+            MonthlyReturnCell {
+                label: "Feb",
+                status: Observed(-1.4),
+            },
+            MonthlyReturnCell {
+                label: "Mar",
+                status: Observed(3.2),
+            },
+            MonthlyReturnCell {
+                label: "Apr",
+                status: Observed(0.6),
+            },
+            MonthlyReturnCell {
+                label: "May",
+                status: Observed(-2.0),
+            },
+            MonthlyReturnCell {
+                label: "Jun",
+                status: Observed(1.8),
+            },
+            MonthlyReturnCell {
+                label: "Jul",
+                status: Observed(2.4),
+            },
+            MonthlyReturnCell {
+                label: "Aug",
+                status: Inactive,
+            },
+            MonthlyReturnCell {
+                label: "Sep",
+                status: Observed(1.1),
+            },
+            MonthlyReturnCell {
+                label: "Oct",
+                status: Observed(-0.8),
+            },
+            MonthlyReturnCell {
+                label: "Nov",
+                status: Observed(2.0),
+            },
+            MonthlyReturnCell {
+                label: "Dec",
+                status: Missing,
+            },
+        ],
+    }]
 }
 
 pub fn result_summary() -> Card {

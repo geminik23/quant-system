@@ -121,7 +121,7 @@ pub fn inspector(model: &Entity<BacktestAppModel>, cx: &mut Context<BacktestWind
         }
     };
 
-    let mut list = div().flex().flex_col();
+    let mut list = div().flex().flex_col().px_3().pb_3();
     for row in &rows {
         list = list.child(render_row(row));
     }
@@ -140,7 +140,7 @@ pub fn inspector(model: &Entity<BacktestAppModel>, cx: &mut Context<BacktestWind
                 .py_2()
                 .text_size(px(theme::SMALL_SIZE))
                 .text_color(theme::dim_text())
-                .child(format!("{title} (fixture)")),
+                .child(title),
         )
         .child(list)
 }

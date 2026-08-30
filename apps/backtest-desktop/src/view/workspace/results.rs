@@ -78,7 +78,7 @@ pub fn results_workspace(
                 frame = frame
                     .child(render_card(&crate::preview::summary_only_card()))
                     .child(
-                        primary_action("results-save-as", "Save summary as...").on_click(
+                        primary_action("results-save-as", "Preview save summary as...").on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.save_summary_as(cx);
                             }),
@@ -106,6 +106,12 @@ pub fn results_workspace(
                 frame = match nav_index {
                     0 => frame
                         .child(render_card(&crate::preview::result_summary()))
+                        .child(
+                            primary_action("results-export-summary", "Preview save summary as...")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.save_summary_as(cx);
+                                })),
+                        )
                         .child(result_charts())
                         .child(monthly_return_grid())
                         .child(
@@ -185,57 +191,66 @@ fn result_charts() -> Div {
 }
 
 fn monthly_return_grid() -> Div {
-    let months = crate::preview::monthly_returns();
-    let mut rows = div().flex().flex_col().gap_2();
-    for group in months.chunks(6) {
-        let mut row = div().flex().flex_row().gap_2();
-        for month in group {
-            let (value, color, background) = match month.status {
-                MonthlyReturnStatus::Observed(value) if value >= 0.0 => (
-                    format!("+{value:.1}% ▲"),
-                    theme::ok_green(),
-                    gpui::rgba(0x1A7F3717),
-                ),
-                MonthlyReturnStatus::Observed(value) => (
-                    format!("{value:.1}% ▼"),
-                    theme::error_red(),
-                    gpui::rgba(0xCF222E17),
-                ),
-                MonthlyReturnStatus::Inactive => {
-                    ("Inactive".to_string(), theme::dim_text(), theme::chip_bg())
-                }
-                MonthlyReturnStatus::Missing => {
-                    ("Missing".to_string(), theme::warn_amber(), theme::chip_bg())
-                }
-            };
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .gap_1()
-                    .p_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(background)
-                    .child(
-                        div()
-                            .text_size(px(theme::SMALL_SIZE))
-                            .text_color(theme::dim_text())
-                            .child(month.label),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::TEXT_SIZE))
-                            .text_color(color)
-                            .child(value),
+    let years = crate::preview::monthly_returns();
+    let mut content = div().flex().flex_col().gap_3();
+    for year in years {
+        let mut year_rows = div().flex().flex_col().gap_2().child(
+            div()
+                .text_size(px(theme::TITLE_SIZE))
+                .text_color(theme::text())
+                .child(year.year.to_string()),
+        );
+        for group in year.months.chunks(6) {
+            let mut row = div().flex().flex_row().gap_2();
+            for month in group {
+                let (value, color, background) = match month.status {
+                    MonthlyReturnStatus::Observed(value) if value >= 0.0 => (
+                        format!("+{value:.1}% ▲"),
+                        theme::ok_green(),
+                        gpui::rgba(0x1A7F3717),
                     ),
-            );
+                    MonthlyReturnStatus::Observed(value) => (
+                        format!("{value:.1}% ▼"),
+                        theme::error_red(),
+                        gpui::rgba(0xCF222E17),
+                    ),
+                    MonthlyReturnStatus::Inactive => {
+                        ("Inactive".to_string(), theme::dim_text(), theme::chip_bg())
+                    }
+                    MonthlyReturnStatus::Missing => {
+                        ("Missing".to_string(), theme::warn_amber(), theme::chip_bg())
+                    }
+                };
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap_1()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(background)
+                        .child(
+                            div()
+                                .text_size(px(theme::SMALL_SIZE))
+                                .text_color(theme::dim_text())
+                                .child(month.label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_SIZE))
+                                .text_color(color)
+                                .child(value),
+                        ),
+                );
+            }
+            year_rows = year_rows.child(row);
         }
-        rows = rows.child(row);
+        content = content.child(year_rows);
     }
-    section_frame("Monthly returns").child(rows)
+    section_frame("Monthly returns by year").child(content)
 }
 
 fn primary_action(id: &'static str, label: &str) -> gpui::Stateful<Div> {

@@ -141,11 +141,11 @@ pub fn run_workspace(model: &Entity<BacktestAppModel>, cx: &mut Context<Backtest
             }
             crate::preview::FixtureScenario::SummaryOnly => {
                 frame = frame.child(
-                    primary_action("run-save-as", "Save summary as...").on_click(cx.listener(
-                        move |this, _, _, cx| {
+                    primary_action("run-save-as", "Preview save summary as...").on_click(
+                        cx.listener(move |this, _, _, cx| {
                             this.save_summary_as(cx);
-                        },
-                    )),
+                        }),
+                    ),
                 );
                 if let Some(path) = saved_path {
                     frame = frame.child(

@@ -179,17 +179,18 @@ mod tests {
 
     #[test]
     fn monthly_fixture_distinguishes_observed_inactive_and_missing() {
-        let months = crate::preview::monthly_returns();
+        let years = crate::preview::monthly_returns();
+        assert_eq!(years[0].year, 2024);
         assert!(matches!(
-            months[0].status,
+            years[0].months[0].status,
             crate::preview::MonthlyReturnStatus::Observed(value) if value > 0.0
         ));
         assert_eq!(
-            months[7].status,
+            years[0].months[7].status,
             crate::preview::MonthlyReturnStatus::Inactive
         );
         assert_eq!(
-            months[11].status,
+            years[0].months[11].status,
             crate::preview::MonthlyReturnStatus::Missing
         );
     }
