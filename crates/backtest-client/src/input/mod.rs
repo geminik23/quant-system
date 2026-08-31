@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,6 @@ use qs_backtest_api::{
     PositionRefMsg, RawSignalMsg, SourceCoverageCountsMsg, canonical_backtest_timestamp,
     decode_raw_signal_json_strict, parse_backtest_timestamp,
 };
-use sha2::{Digest, Sha256};
 
 use crate::{ResultInputMetadata, WorkflowError};
 
@@ -101,7 +100,7 @@ pub enum InputWarning {
 pub struct SignalFileSummary {
     pub display_name: String,
     pub byte_len: u64,
-    pub sha256: String,
+
     pub physical_lines: u64,
     pub non_empty_lines: u64,
     pub signal_count: u64,
@@ -119,7 +118,7 @@ impl From<&SignalFileSummary> for ResultInputMetadata {
         Self {
             display_name: summary.display_name.clone(),
             byte_len: summary.byte_len,
-            sha256: summary.sha256.clone(),
+
             signal_count: summary.signal_count,
             retained_signal_count: summary.retained_signal_count,
             entry_count: summary.entry_count,
@@ -298,7 +297,7 @@ fn scan_reader(
     cancellation: PreparationCancellation,
 ) -> Result<InspectedSignalInput, WorkflowError> {
     let mut reader = BufReader::new(reader);
-    let mut digest = Sha256::new();
+
     let mut total_bytes = 0_u64;
     let mut line = Vec::new();
     let mut physical_lines = 0_u64;
@@ -340,7 +339,7 @@ fn scan_reader(
                 limit: limits.maximum_file_bytes,
             });
         }
-        digest.update(&chunk);
+
         total_bytes = next_total;
 
         let payload_len = chunk.len() - usize::from(newline.is_some());
@@ -412,7 +411,7 @@ fn scan_reader(
     let summary = SignalFileSummary {
         display_name,
         byte_len: total_bytes,
-        sha256: hex_digest(digest.finalize().as_slice()),
+
         physical_lines,
         non_empty_lines,
         signal_count: decoded_count,
@@ -591,7 +590,12 @@ fn sanitize_display_name(display_name: String) -> Result<String, WorkflowError> 
             detail: "must be non-empty and contain no control characters".into(),
         });
     }
-    Ok(display_name.to_owned())
+    let redacted = display_name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("<input>");
+    Ok(redacted.to_owned())
 }
 
 fn path_display_name(path: &Path) -> String {
@@ -692,12 +696,4 @@ fn set_signal_timestamp(signal: &mut RawSignalMsg, timestamp: String) {
         | RawSignalMsg::CloseAllInGroup { ts, .. }
         | RawSignalMsg::ModifyAllStoplossInGroup { ts, .. } => *ts = timestamp,
     }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    output
 }

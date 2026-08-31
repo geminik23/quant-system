@@ -70,9 +70,10 @@ pub use profile::{
     RuleConfigDef, StoplossMode, TargetResolution, TargetSelection, allocate_target_units,
     resolve_signal, resolve_unprofiled_entry,
 };
+pub use qs_core::{CloseReason, EffectiveStop, FillPurpose, OrderType, Side, StopOrigin};
 pub use report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
-    StreakStats, SubsetStats, TradeResult,
+    StreakStats, SubsetStats, TradeResult, evaluation_request_from_future_artifacts,
 };
 pub use runner::{
     BacktestRunner, FutureQuoteConfig, ReplayCancelled, ReplayProgress, StreamingReplayError,

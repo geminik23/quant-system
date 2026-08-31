@@ -65,7 +65,7 @@ impl From<&OutputIntent> for OutputIntentSummary {
 pub struct ResultInputMetadata {
     pub display_name: String,
     pub byte_len: u64,
-    pub sha256: String,
+
     pub signal_count: u64,
     pub retained_signal_count: u64,
     pub entry_count: u64,
@@ -118,8 +118,11 @@ pub struct ResumeRecord {
     pub last_known_state: ClientJobStatus,
     pub local_commit: LocalCommitState,
     pub commit_intent_id: Option<String>,
-    pub expected_document_sha256: Option<String>,
-    pub committed_document_sha256: Option<String>,
+
+    #[serde(default)]
+    pub pending_artifact_id: Option<String>,
+    #[serde(default)]
+    pub artifact_released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

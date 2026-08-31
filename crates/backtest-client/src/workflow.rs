@@ -1,9 +1,12 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use qs_backtest_api::{BacktestProgress, BacktestResultMsg};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::{CommittedOutput, LocalCommitState, OutputIntentSummary, OutputTarget, ResumeRecord};
 
 pub const DEFAULT_COMMAND_CAPACITY: usize = 8;
 pub const MAX_COMMAND_CAPACITY: usize = 64;
@@ -145,10 +148,12 @@ impl WorkflowSleeper for TokioWorkflowSleeper {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowCommand {
     Cancel,
     Detach,
+    SaveAs(OutputTarget),
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +169,7 @@ pub enum WorkflowState {
     DownloadingArtifact,
     ValidatingOutput,
     CommittingOutput,
+    CompletedAwaitingOutput,
     CancelRequested,
     CompletedPersisted,
     CompletedSummaryOnly,
@@ -173,13 +179,19 @@ pub enum WorkflowState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BacktestRunSnapshot {
     pub state_sequence: u64,
     pub dropped_event_count: u64,
     pub state: WorkflowState,
     pub job_id: Option<String>,
     pub reconnect_attempt: u32,
+    pub elapsed_ms: Option<u64>,
+    pub last_heartbeat_elapsed_ms: Option<u64>,
+    pub progress: BacktestProgress,
+    pub output: Option<OutputIntentSummary>,
+    pub local_commit: LocalCommitState,
+    pub resume_record: Option<ResumeRecord>,
     pub current_warning: Option<String>,
     pub current_error: Option<String>,
 }
@@ -192,6 +204,12 @@ impl Default for BacktestRunSnapshot {
             state: WorkflowState::Created,
             job_id: None,
             reconnect_attempt: 0,
+            elapsed_ms: None,
+            last_heartbeat_elapsed_ms: None,
+            progress: BacktestProgress::default(),
+            output: None,
+            local_commit: LocalCommitState::NotStarted,
+            resume_record: None,
             current_warning: None,
             current_error: None,
         }
@@ -213,12 +231,21 @@ pub struct BacktestWorkflowEvent {
     pub kind: BacktestWorkflowEventKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub struct CompletedBacktest {
+    pub job_id: String,
+    pub result: BacktestResultMsg,
+    pub output: Option<CommittedOutput>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum WorkflowCompletion {
-    CompletedPersisted,
-    CompletedSummaryOnly,
+    CompletedPersisted(CompletedBacktest),
+    CompletedSummaryOnly(CompletedBacktest),
+    OutputRequired(ResumeRecord),
     SubmissionUncertain,
-    Detached,
+    Detached(Option<ResumeRecord>),
     Cancelled,
     Failed(String),
 }
@@ -249,6 +276,18 @@ impl WorkflowFrontendChannels {
             .send(command)
             .await
             .map_err(|_| WorkflowChannelError::CommandClosed)
+    }
+
+    pub fn try_send_shutdown(&self) {
+        match self.command_tx.try_send(WorkflowCommand::Shutdown) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let sender = self.command_tx.clone();
+                tokio::spawn(async move {
+                    let _ = sender.send(command).await;
+                });
+            }
+        }
     }
 
     pub fn snapshot(&self) -> BacktestRunSnapshot {
@@ -288,6 +327,10 @@ pub struct WorkflowActorChannels {
 impl WorkflowActorChannels {
     pub async fn recv_command(&mut self) -> Option<WorkflowCommand> {
         self.command_rx.recv().await
+    }
+
+    pub fn try_recv_command(&mut self) -> Option<WorkflowCommand> {
+        self.command_rx.try_recv().ok()
     }
 
     pub fn snapshot(&self) -> &BacktestRunSnapshot {
@@ -403,11 +446,11 @@ mod tests {
             BacktestWorkflowEventKind::StateChanged(WorkflowState::Connecting)
         ));
 
-        actor.update_snapshot(|snapshot| snapshot.state = WorkflowState::CompletedSummaryOnly);
-        actor.complete(WorkflowCompletion::CompletedSummaryOnly);
-        assert_eq!(
+        actor.update_snapshot(|snapshot| snapshot.state = WorkflowState::Cancelled);
+        actor.complete(WorkflowCompletion::Cancelled);
+        assert!(matches!(
             frontend.join().await.unwrap(),
-            WorkflowCompletion::CompletedSummaryOnly
-        );
+            WorkflowCompletion::Cancelled
+        ));
     }
 }

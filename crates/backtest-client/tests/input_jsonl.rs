@@ -9,7 +9,29 @@ use qs_backtest_client::{
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[tokio::test]
-async fn inspection_preserves_raw_digest_order_lines_and_canonical_filter() {
+async fn reader_display_name_redacts_absolute_paths() {
+    let inspected = BacktestInputInspector
+        .inspect(
+            InspectSignalInput {
+                signals: SignalInputSource::Reader {
+                    display_name: "C:\\private\\signals.jsonl".into(),
+                    reader: Box::new(Cursor::new(Vec::<u8>::new())),
+                },
+                source_coverage: None,
+                decoding: SignalDecodingPolicy::Strict,
+                limits: SignalInputLimits::default(),
+                from: None,
+                to: None,
+            },
+            PreparationCancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.summary().display_name, "signals.jsonl");
+}
+
+#[tokio::test]
+async fn inspection_preserves_order_lines_and_canonical_filter() {
     let bytes = format!(
         "\n{}\r\n{}\n",
         entry("2026-01-15T00:30:00+02:00"),
@@ -27,7 +49,7 @@ async fn inspection_preserves_raw_digest_order_lines_and_canonical_filter() {
 
     let summary = inspected.summary();
     assert_eq!(summary.byte_len, bytes.len() as u64);
-    assert_eq!(summary.sha256.len(), 64);
+
     assert_eq!(summary.physical_lines, 3);
     assert_eq!(summary.non_empty_lines, 2);
     assert_eq!(summary.signal_count, 2);
@@ -54,7 +76,7 @@ async fn inspection_preserves_raw_digest_order_lines_and_canonical_filter() {
 }
 
 #[tokio::test]
-async fn path_and_reader_use_the_same_scanner_and_digest() {
+async fn path_and_reader_use_the_same_scanner() {
     let bytes = format!(
         "{}\n\n{}",
         entry("2026-01-15T10:00:00"),
@@ -88,7 +110,6 @@ async fn path_and_reader_use_the_same_scanner_and_digest() {
         .unwrap();
     std::fs::remove_file(path).unwrap();
 
-    assert_eq!(from_path.summary().sha256, from_reader.summary().sha256);
     assert_eq!(
         from_path.summary().physical_lines,
         from_reader.summary().physical_lines
@@ -168,7 +189,7 @@ async fn byte_line_signal_and_utf8_limits_fail_with_safe_context() {
 }
 
 #[tokio::test]
-async fn exact_limits_empty_digest_inclusive_bounds_and_order_are_preserved() {
+async fn exact_limits_inclusive_bounds_and_order_are_preserved() {
     let one = close_all("2026-01-15T10:00:00").into_bytes();
     let exact = inspect_reader(
         one.clone(),
@@ -190,10 +211,7 @@ async fn exact_limits_empty_digest_inclusive_bounds_and_order_are_preserved() {
         .unwrap();
     assert_eq!(blank.summary().physical_lines, 1);
     assert_eq!(blank.summary().signal_count, 0);
-    assert_eq!(
-        blank.summary().sha256,
-        "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
-    );
+
     assert_eq!(blank.summary().warnings, vec![InputWarning::NoSignals]);
 
     let rows = format!(

@@ -552,7 +552,7 @@ pub struct RunBacktestMultiRequest {
 // ── Backtest Result Message ─────────────────────────────────────────────────
 
 /// Serializable mirror of `BacktestResult` for wire transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BacktestResultMsg {
     pub initial_balance: f64,
     pub final_balance: f64,
@@ -616,7 +616,7 @@ impl Default for MtmOutputSummaryMsg {
 /// Format-versioned execution/accounting payload. Complex internal records remain
 /// JSON values so new additive fields do not require synchronized positional
 /// wire changes; the transport itself uses JsonCodec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FutureBacktestResultMsg {
     pub format_version: u32,
     pub execution_metadata: serde_json::Value,
@@ -676,7 +676,7 @@ pub struct PendingOrderLifecycleEventMsg {
 // ── Sub-message types ───────────────────────────────────────────────────────
 
 /// Wire-safe mirror of `SubsetStats`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubsetStatsMsg {
     pub total_trades: usize,
     pub winning_trades: usize,
@@ -696,7 +696,7 @@ pub struct SubsetStatsMsg {
 }
 
 /// Wire-safe mirror of `StreakStats`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreakStatsMsg {
     pub max_consecutive_wins: u32,
     pub max_consecutive_losses: u32,
@@ -704,7 +704,7 @@ pub struct StreakStatsMsg {
 }
 
 /// Wire-safe mirror of `RiskMetrics`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RiskMetricsMsg {
     pub sharpe_ratio: Option<f64>,
     pub sortino_ratio: Option<f64>,
@@ -716,7 +716,7 @@ pub struct RiskMetricsMsg {
 }
 
 /// Wire-safe mirror of `DurationStats`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DurationStatsMsg {
     pub avg_duration_secs: i64,
     pub min_duration_secs: i64,
@@ -726,7 +726,7 @@ pub struct DurationStatsMsg {
 }
 
 /// Wire-safe mirror of `MonthlyReturn`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MonthlyReturnMsg {
     pub year: i32,
     pub month: u32,
@@ -736,7 +736,7 @@ pub struct MonthlyReturnMsg {
 }
 
 /// Wire-safe mirror of `CloseReasonStats`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloseReasonStatsMsg {
     pub reason: String,
     pub count: usize,
@@ -746,7 +746,7 @@ pub struct CloseReasonStatsMsg {
 }
 
 /// Wire-safe mirror of `PositionSummary`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PositionSummaryMsg {
     pub position_id: String,
     pub symbol: String,
@@ -764,14 +764,14 @@ pub struct PositionSummaryMsg {
 }
 
 /// A single point on the equity curve.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EquityPoint {
     pub ts: String,
     pub balance: f64,
 }
 
 /// Wire-safe mirror of `TradeResult`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TradeResultMsg {
     pub position_id: String,
     pub symbol: String,

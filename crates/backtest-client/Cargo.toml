@@ -12,19 +12,23 @@ categories = ["finance"]
 
 [features]
 default = []
-analysis = []
+analysis = ["dep:qs-backtest"]
 xrpc = ["qs-backtest-api/xrpc", "dep:qs-service-xrpc"]
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+nanoid = { workspace = true }
+qs-backtest = { workspace = true, optional = true }
 qs-backtest-api = { workspace = true }
 qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 

@@ -66,6 +66,26 @@ pub enum WorkflowError {
     RequestTooLarge { actual: usize, limit: usize },
     #[error("background preparation task failed: {detail}")]
     PreparationTask { detail: String },
+    #[error("backtest service connection failed: {detail}")]
+    Connection { detail: String },
+    #[error("backtest submission failed: {detail}")]
+    Submission { detail: String },
+    #[error("backtest submission outcome is uncertain: {detail}")]
+    SubmissionUncertain { detail: String },
+    #[error("retained backtest job failed: {detail}")]
+    Job { detail: String },
+    #[error("retained backtest job '{job_id}' was not found")]
+    RetainedJobLost { job_id: String },
+    #[error("artifact integrity failure: {detail}")]
+    ArtifactIntegrity { detail: String },
+    #[error("result output failure: {detail}")]
+    Output { detail: String },
+    #[error("result format failure: {detail}")]
+    ResultFormat { detail: String },
+    #[error("local analysis failure: {detail}")]
+    Analysis { detail: String },
+    #[error("run transition store failure: {detail}")]
+    TransitionStore { detail: String },
 }
 
 impl WorkflowError {
@@ -84,6 +104,17 @@ impl WorkflowError {
             Self::InvalidConfiguration { .. }
             | Self::RequestSerialization { .. }
             | Self::RequestTooLarge { .. } => WorkflowErrorCategory::Configuration,
+            Self::Connection { .. } => WorkflowErrorCategory::Connection,
+            Self::Submission { .. } | Self::SubmissionUncertain { .. } => {
+                WorkflowErrorCategory::Submission
+            }
+            Self::Job { .. } | Self::RetainedJobLost { .. } | Self::TransitionStore { .. } => {
+                WorkflowErrorCategory::Job
+            }
+            Self::ArtifactIntegrity { .. } => WorkflowErrorCategory::ArtifactIntegrity,
+            Self::Output { .. } => WorkflowErrorCategory::Output,
+            Self::ResultFormat { .. } => WorkflowErrorCategory::ResultFormat,
+            Self::Analysis { .. } => WorkflowErrorCategory::Analysis,
         }
     }
 }

@@ -120,6 +120,7 @@ pub struct BacktestRequestSummary {
     pub stale_quote_after_ms: Option<i64>,
     pub conversion_stale_after_ms: i64,
     pub result_delivery: ResultDeliverySummary,
+    pub evaluation: ProviderEvaluationOptionsMsg,
 }
 
 pub struct PreparedBacktest {
@@ -165,6 +166,22 @@ impl PreparedBacktest {
 
     pub fn into_request(self) -> SubmitBacktestRequest {
         self.request
+    }
+
+    pub(crate) fn into_workflow_parts(
+        self,
+    ) -> (
+        SubmitBacktestRequest,
+        ResultInputMetadata,
+        BacktestRequestSummary,
+        usize,
+    ) {
+        (
+            self.request,
+            self.input_metadata,
+            self.request_summary,
+            self.serialized_request_bytes,
+        )
     }
 }
 
@@ -258,6 +275,7 @@ fn prepare_blocking(
         stale_quote_after_ms: future.stale_quote_after_ms,
         conversion_stale_after_ms: future.conversion_stale_after_ms,
         result_delivery: result_delivery_summary,
+        evaluation: evaluation.clone(),
     };
     let request = SubmitBacktestRequest {
         request: RunBacktestRequest {

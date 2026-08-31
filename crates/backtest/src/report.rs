@@ -1138,7 +1138,10 @@ impl BacktestResult {
         evaluation_options: EvaluationOptions,
     ) -> Self {
         let trade_log = future_trade_log(&artifacts);
-        let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
+        let provider_evaluation = evaluate(&evaluation_request_from_future_artifacts(
+            &artifacts,
+            evaluation_options,
+        ));
         let mut result = Self::from_trade_log(artifacts.execution.initial_balance, trade_log);
         result.replace_position_statistics(&artifacts.completed_positions);
         result.future_format_version = Some(artifacts.format_version);
@@ -1285,10 +1288,14 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
     rows
 }
 
-fn evaluate_future_positions(
+/// Project FutureQuote execution artifacts into the normalized evaluation input.
+///
+/// Server reporting and offline consumers use this projection so filtering and
+/// reevaluation start from the same completed-position and lifecycle facts.
+pub fn evaluation_request_from_future_artifacts(
     artifacts: &FutureBacktestArtifacts,
     options: EvaluationOptions,
-) -> EvaluationReport {
+) -> EvaluationRequest {
     let positions = artifacts
         .completed_positions
         .iter()
@@ -1403,11 +1410,11 @@ fn evaluate_future_positions(
             .count() as u64,
         open_at_end: artifacts.open_positions.len() as u64,
     };
-    evaluate(&EvaluationRequest {
+    EvaluationRequest {
         positions,
         lifecycle: Some(lifecycle),
         options,
-    })
+    }
 }
 
 fn position_fill_ratio(

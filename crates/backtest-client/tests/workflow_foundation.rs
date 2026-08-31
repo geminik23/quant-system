@@ -296,7 +296,7 @@ fn resume_record(sequence: u64) -> ResumeRecord {
         input: ResultInputMetadata {
             display_name: "signals.jsonl".into(),
             byte_len: 10,
-            sha256: "00".repeat(32),
+
             signal_count: 0,
             retained_signal_count: 0,
             entry_count: 0,
@@ -324,13 +324,15 @@ fn resume_record(sequence: u64) -> ResumeRecord {
             stale_quote_after_ms: None,
             conversion_stale_after_ms: 300_000,
             result_delivery: ResultDeliverySummary::Auto,
+            evaluation: ProviderEvaluationOptionsMsg::default(),
         },
         result_delivery: ResultDeliverySummary::Auto,
         submitted_at: chrono::Utc::now(),
         last_known_state: ClientJobStatus::Queued,
         local_commit: LocalCommitState::NotStarted,
         commit_intent_id: None,
-        expected_document_sha256: None,
-        committed_document_sha256: None,
+
+        pending_artifact_id: None,
+        artifact_released: false,
     }
 }

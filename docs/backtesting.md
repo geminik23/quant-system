@@ -58,7 +58,9 @@ Close-only bars cannot reconstruct an intrabar price path. Use tick data when ex
 
 Configure the data root, optional instrument catalog, symbol compatibility registry, management profiles, retained jobs, and result artifacts through [`config.example.toml`](../crates/backtest-server/config.example.toml).
 
-The client streams retained-job progress by default. Polling and finite synchronous execution remain available as explicit alternatives. Results may be returned inline or stored as verified artifacts when they exceed the inline limit.
+The current server-owned CLI streams retained-job progress by default. Polling and finite synchronous execution remain available as explicit alternatives. Results may be returned inline or stored as verified artifacts when they exceed the inline limit.
+
+The reusable `qs-backtest-client` library provides submit-once retained execution, same-job status-first reconnect, explicit cancel and detach behavior, bounded inline or artifact verification, no-clobber Result Document persistence, offline reopen and optional typed local analysis. CLI ownership migration and desktop backend integration remain separate follow-up work.
 
 ## Library execution
 

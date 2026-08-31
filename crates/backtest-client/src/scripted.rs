@@ -302,8 +302,25 @@ impl ScriptedConnectionStep {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct ScriptedSubmitGate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl ScriptedSubmitGate {
+    pub async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 pub struct ScriptedConnectionScript {
     connection_id: String,
+    submit_gate: Option<ScriptedSubmitGate>,
     ping: VecDeque<Result<PingResponse, BacktestClientError>>,
     submit: VecDeque<Result<SubmitBacktestResponse, BacktestClientError>>,
     status: VecDeque<Result<BacktestStatusResponse, BacktestClientError>>,
@@ -319,6 +336,7 @@ impl ScriptedConnectionScript {
     pub fn new(connection_id: impl Into<String>) -> Self {
         Self {
             connection_id: connection_id.into(),
+            submit_gate: None,
             ping: VecDeque::new(),
             submit: VecDeque::new(),
             status: VecDeque::new(),
@@ -337,6 +355,10 @@ impl ScriptedConnectionScript {
 
     pub fn push_submit(&mut self, response: Result<SubmitBacktestResponse, BacktestClientError>) {
         self.submit.push_back(response);
+    }
+
+    pub fn set_submit_gate(&mut self, gate: ScriptedSubmitGate) {
+        self.submit_gate = Some(gate);
     }
 
     pub fn push_status(&mut self, response: Result<BacktestStatusResponse, BacktestClientError>) {
@@ -513,6 +535,16 @@ impl BacktestClient for ScriptedBacktestClient {
         &self,
         request: SubmitBacktestRequest,
     ) -> Result<SubmitBacktestResponse, BacktestClientError> {
+        let gate = self
+            .script
+            .lock()
+            .expect("scripted connection lock is not poisoned")
+            .submit_gate
+            .clone();
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         let serialized_request_bytes = serde_json::to_vec(&request).map_or(0, |value| value.len());
         self.record(ScriptedRunCall::Submit {
             connection_id: self.connection_id.clone(),
