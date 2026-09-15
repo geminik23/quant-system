@@ -201,6 +201,15 @@ fn market_entries_use_first_eligible_quote_and_report_terminal_lifecycle() {
         .filter(|fill| fill.fill.purpose == FillPurpose::MarketEntry)
         .collect();
     assert_eq!(entry_fills.len(), 2);
+    assert_eq!(
+        result
+            .execution_metadata
+            .as_ref()
+            .unwrap()
+            .market_entry_sizing
+            .len(),
+        2
+    );
 
     assert_eq!(entry_fills[0].signal_ts, Some(ts(500)));
     assert_eq!(entry_fills[0].effective_ts, ts(500));

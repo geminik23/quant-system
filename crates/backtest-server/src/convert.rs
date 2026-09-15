@@ -20,7 +20,7 @@ use qs_backtest::report::{
     StreakStats, SubsetStats, TradeResult,
 };
 use qs_backtest::runner::{BacktestConfig, FutureQuoteConfig};
-use qs_backtest::{MtmOutputPolicy, MtmOutputSummary};
+use qs_backtest::{MarketEntrySizingBasis, MtmOutputPolicy, MtmOutputSummary};
 use qs_core::types::{FillModel, OrderType, Side};
 use qs_symbols::{SymbolRegistry, normalize_currency_code};
 
@@ -29,10 +29,11 @@ use crate::rpc_types::{
     BacktestConfigMsg, BacktestResultMsg, BreakdownDimensionMsg, CloseReasonStatsMsg,
     DurationStatsMsg, EquityPoint, EvaluationGroupFilterMsg, EvaluationPositionSideMsg,
     EvaluationSectionMsg, FutureBacktestResultMsg, FutureQuoteConfigMsg, ManagementProfileMsg,
-    MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg, PendingOrderLifecycleEventMsg,
-    PendingOrderLifecycleStateMsg, PositionRefMsg, PositionSummaryMsg,
-    ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg, RuleConfigDefMsg, SizingPolicyMsg,
-    StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg, TargetSelectionMsg, TradeResultMsg,
+    MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg,
+    PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg, PositionRefMsg,
+    PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
+    RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg,
+    TargetSelectionMsg, TradeResultMsg,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -103,6 +104,13 @@ fn mtm_output_policy_from_msg(msg: &MtmOutputPolicyMsg) -> crate::error::Result<
         BacktestServerError::InvalidRequest(format!("invalid mtm_output: {error}"))
     })?;
     Ok(policy)
+}
+
+fn market_entry_sizing_basis_from_msg(basis: MarketEntrySizingBasisMsg) -> MarketEntrySizingBasis {
+    match basis {
+        MarketEntrySizingBasisMsg::FillPrice => MarketEntrySizingBasis::FillPrice,
+        MarketEntrySizingBasisMsg::SignalEntryPrice => MarketEntrySizingBasis::SignalEntryPrice,
+    }
 }
 
 fn mtm_output_policy_to_msg(policy: MtmOutputPolicy) -> MtmOutputPolicyMsg {
@@ -181,6 +189,9 @@ pub fn future_config_from_msg(
         currency_plan: Some(currency_plan),
         conversion_stale_after_ms: msg.conversion_stale_after_ms,
         mtm_output,
+        market_entry_sizing_basis: market_entry_sizing_basis_from_msg(
+            msg.market_entry_sizing_basis,
+        ),
     })
 }
 
@@ -1171,6 +1182,22 @@ mod tests {
             MtmOutputPolicy::Bounded { max_points: 4_096 }
         );
         assert_eq!(config.currency_plan.unwrap().account_currency(), "USD");
+    }
+
+    #[test]
+    fn market_entry_sizing_basis_maps_both_wire_values() {
+        for (message, expected) in [
+            (
+                MarketEntrySizingBasisMsg::FillPrice,
+                MarketEntrySizingBasis::FillPrice,
+            ),
+            (
+                MarketEntrySizingBasisMsg::SignalEntryPrice,
+                MarketEntrySizingBasis::SignalEntryPrice,
+            ),
+        ] {
+            assert_eq!(market_entry_sizing_basis_from_msg(message), expected);
+        }
     }
 
     #[test]

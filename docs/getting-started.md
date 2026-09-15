@@ -76,7 +76,7 @@ Confirm that the import and client both use exchange `demo`, symbol `EURUSD`, an
 
 ### Entry sizing is rejected
 
-An Entry requires `--account-currency` and exactly one sizing basis: `--base-lot`, `--risk-per-trade`, or `--risk-percent`. This example uses fixed lot sizing so a stop is not required.
+An Entry requires `--account-currency` and exactly one sizing policy: `--base-lot`, `--risk-per-trade`, or `--risk-percent`. This example uses fixed lot sizing so a stop is not required. FutureQuote Market Entry quantity uses the fill price by default; `--market-entry-sizing-basis signal-entry-price` selects an explicit Entry price when present and otherwise falls back to the fill price.
 
 ## Next steps
 

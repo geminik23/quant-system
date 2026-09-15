@@ -15,14 +15,14 @@ Top-level action objects reject unknown fields. Timestamps use naive ISO date-ti
 | `symbol` | Must resolve consistently with imported data and symbol metadata |
 | `side` | `Buy` or `Sell` |
 | `order_type` | Current engine order type such as `Market`, `Limit`, or `Stop` |
-| `price` | `null` for a market entry; finite positive price for priced entries |
+| `price` | Required finite positive requested price for Limit/Stop; optional finite positive sizing reference for Market |
 | `risk` | Required finite positive multiplier applied to the selected sizing policy |
 | `stoploss` | Optional for fixed-lot sizing; required for monetary risk sizing |
 | `targets` | Optional ordered target prices |
 | `group` | Optional reporting and bulk-management tag |
 | `trade_id` | Optional application identity; required when later actions use `ByTradeId` |
 
-Entry does not accept `size`. The client must provide exactly one sizing policy when any Entry is present. `ScaleIn.size` is different: it is already a concrete final quantity.
+Entry does not accept `size`. The client must provide exactly one sizing policy when any Entry is present. FutureQuote Market sizing uses the actual fill price by default; a run may instead select the explicit Market `price` as the quantity reference, with automatic fill-price fallback when it is `null`. This choice does not change the actual fill, profile-relative levels, P&L, or actual fill-based risk. `ScaleIn.size` is different: it is already a concrete final quantity.
 
 ## Position references
 

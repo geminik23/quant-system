@@ -326,6 +326,7 @@ fn replay_request() -> RunBacktestRequest {
             account_currency: "USD".into(),
             conversion_stale_after_ms: 300_000,
             mtm_output: MtmOutputPolicyMsg::default(),
+            market_entry_sizing_basis: MarketEntrySizingBasisMsg::default(),
         },
         evaluation: ProviderEvaluationOptionsMsg {
             context: EvaluationContextMsg {

@@ -50,6 +50,13 @@ enum MtmOutputMode {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum MarketEntrySizingBasisMode {
+    #[default]
+    FillPrice,
+    SignalEntryPrice,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ResultDeliveryMode {
     Auto,
@@ -319,6 +326,11 @@ struct Args {
     /// Percentage of realized balance risked per trade, where 1 means 1 percent.
     #[arg(long, group = "sizing")]
     risk_percent: Option<f64>,
+
+    /// Price used to calculate the risk-sized quantity for market entries.
+    /// Signal entry price uses Entry.price when present and falls back to the fill price when absent.
+    #[arg(long, value_enum, default_value_t = MarketEntrySizingBasisMode::FillPrice)]
+    market_entry_sizing_basis: MarketEntrySizingBasisMode,
 
     /// Signal latency applied by FutureQuoteV1.
     #[arg(long, default_value_t = 0)]
@@ -706,6 +718,13 @@ fn mtm_output_policy(args: &Args) -> MtmOutputPolicyMsg {
     }
 }
 
+fn market_entry_sizing_basis_message(args: &Args) -> MarketEntrySizingBasisMsg {
+    match args.market_entry_sizing_basis {
+        MarketEntrySizingBasisMode::FillPrice => MarketEntrySizingBasisMsg::FillPrice,
+        MarketEntrySizingBasisMode::SignalEntryPrice => MarketEntrySizingBasisMsg::SignalEntryPrice,
+    }
+}
+
 fn future_config_message(args: &Args) -> FutureQuoteConfigMsg {
     FutureQuoteConfigMsg {
         signal_latency_ms: args.signal_latency_ms,
@@ -715,6 +734,7 @@ fn future_config_message(args: &Args) -> FutureQuoteConfigMsg {
         account_currency: args.account_currency.clone().unwrap_or_default(),
         conversion_stale_after_ms: args.conversion_stale_after_ms,
         mtm_output: mtm_output_policy(args),
+        market_entry_sizing_basis: market_entry_sizing_basis_message(args),
     }
 }
 
@@ -2392,6 +2412,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.conversion_stale_after_ms, 300_000);
+        assert_eq!(
+            args.market_entry_sizing_basis,
+            MarketEntrySizingBasisMode::FillPrice
+        );
         assert_eq!(args.mtm_output, MtmOutputMode::Bounded);
         assert_eq!(args.mtm_max_points, None);
         assert_eq!(args.result_delivery, ResultDeliveryMode::Auto);
@@ -2401,6 +2425,10 @@ mod tests {
             serde_json::json!("auto")
         );
         let future = future_config_message(&args);
+        assert_eq!(
+            future.market_entry_sizing_basis,
+            MarketEntrySizingBasisMsg::FillPrice
+        );
         assert_eq!(
             future.mtm_output,
             MtmOutputPolicyMsg::Bounded {
@@ -2419,6 +2447,7 @@ mod tests {
             "--risk-percent",
             "--account-currency",
             "--conversion-stale-after-ms",
+            "--market-entry-sizing-basis",
             "--mtm-output",
             "--mtm-max-points",
             "--result-delivery",
@@ -2426,9 +2455,44 @@ mod tests {
             assert!(help.contains(option), "help omitted {option}: {help}");
         }
         assert!(!help.contains("--execution-convention"));
+        assert!(help.contains("[default: fill-price]"));
+        assert!(help.contains("[possible values: fill-price, signal-entry-price]"));
+        assert!(help.contains("falls back to the fill price when absent"));
         assert!(help.contains("[default: bounded]"));
         assert!(help.contains("Default: 4096"));
         assert!(help.contains("--risk-per-trade 100 --account-currency USD"));
+    }
+
+    #[test]
+    fn market_entry_sizing_basis_cli_maps_explicit_values() {
+        for (option, expected_mode, expected_message) in [
+            (
+                "fill-price",
+                MarketEntrySizingBasisMode::FillPrice,
+                MarketEntrySizingBasisMsg::FillPrice,
+            ),
+            (
+                "signal-entry-price",
+                MarketEntrySizingBasisMode::SignalEntryPrice,
+                MarketEntrySizingBasisMsg::SignalEntryPrice,
+            ),
+        ] {
+            let args = Args::try_parse_from([
+                "tg_backtest",
+                "--input",
+                "signals.jsonl",
+                "--exchange",
+                "test",
+                "--market-entry-sizing-basis",
+                option,
+            ])
+            .unwrap();
+            assert_eq!(args.market_entry_sizing_basis, expected_mode);
+            assert_eq!(
+                future_config_message(&args).market_entry_sizing_basis,
+                expected_message
+            );
+        }
     }
 
     #[test]

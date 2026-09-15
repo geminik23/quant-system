@@ -435,7 +435,9 @@ pub fn compute_instrument_size(
     ))
 }
 
-/// Compute catalog-backed sizing with complete price, quantity, economics, and notional validation.
+/// Compute catalog-backed sizing using one price for sizing and final notional.
+///
+/// This compatibility wrapper preserves the original behavior by passing `entry_price` as both the sizing reference price and execution notional price to [`compute_instrument_size_for_spec_with_prices`].
 #[allow(clippy::too_many_arguments)]
 pub fn compute_instrument_size_for_spec(
     policy: &SizingPolicy,
@@ -447,11 +449,42 @@ pub fn compute_instrument_size_for_spec(
     spec: &InstrumentSpec,
     native_to_account_rate: Option<f64>,
 ) -> Result<SizingResult, InstrumentSizingError> {
+    compute_instrument_size_for_spec_with_prices(
+        policy,
+        risk_multiplier,
+        balance_before,
+        side,
+        entry_price,
+        entry_price,
+        protective_stop,
+        spec,
+        native_to_account_rate,
+    )
+}
+
+/// Compute catalog-backed sizing with separate sizing and execution prices.
+///
+/// `sizing_reference_price` determines stop distance, native loss, account loss, and raw quantity. `execution_notional_price` determines final notional after quantity adjustment. Both prices and the optional protective stop must be on the instrument price grid.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_instrument_size_for_spec_with_prices(
+    policy: &SizingPolicy,
+    risk_multiplier: f64,
+    balance_before: f64,
+    side: Side,
+    sizing_reference_price: f64,
+    execution_notional_price: f64,
+    protective_stop: Option<f64>,
+    spec: &InstrumentSpec,
+    native_to_account_rate: Option<f64>,
+) -> Result<SizingResult, InstrumentSizingError> {
     validate_risk_multiplier(risk_multiplier)?;
-    validate_entry_price(entry_price)?;
+    validate_entry_price(sizing_reference_price)?;
+    validate_entry_price(execution_notional_price)?;
     validate_instrument_economics(&spec.economics)?;
     let quantity_rules = validate_quantity_rules(&spec.quantity)?;
-    let entry_decimal = validate_price_grid("entry", entry_price, spec)?;
+    validate_price_grid("sizing reference", sizing_reference_price, spec)?;
+    let execution_notional_decimal =
+        validate_price_grid("execution notional", execution_notional_price, spec)?;
     if let Some(stop) = protective_stop {
         validate_price_grid("protective stop", stop, spec)?;
     }
@@ -460,7 +493,7 @@ pub fn compute_instrument_size_for_spec(
         .map(|stop_price| {
             compute_instrument_native_loss_per_lot(
                 side,
-                entry_price,
+                sizing_reference_price,
                 stop_price,
                 u16::from(spec.price.display_scale),
                 &spec.economics,
@@ -477,8 +510,11 @@ pub fn compute_instrument_size_for_spec(
     )?;
     let (final_lot_steps, final_lot, cap_status, quantity_adjustment) =
         apply_quantity_constraints(sizing.scaled_raw_lot, quantity_rules)?;
-    let final_notional =
-        validate_final_notional(entry_decimal, quantity_adjustment.adjusted, spec)?;
+    let final_notional = validate_final_notional(
+        execution_notional_decimal,
+        quantity_adjustment.adjusted,
+        spec,
+    )?;
 
     Ok(sizing.into_result(
         final_lot_steps,
@@ -1314,6 +1350,188 @@ mod tests {
                 direction: AdjustmentDirection::Unchanged,
             })
         );
+    }
+
+    #[test]
+    fn full_spec_sizing_wrapper_matches_separate_price_api() {
+        let usd = AssetId::new("USD").unwrap();
+        let spec = instrument_spec(
+            "0.01",
+            Some(NotionalRules {
+                asset: usd,
+                minimum: Some(positive("1000")),
+                maximum: Some(positive("50000")),
+            }),
+        );
+        let wrapper = compute_instrument_size_for_spec(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            Some(1.095),
+            &spec,
+            Some(1.0),
+        )
+        .unwrap();
+        let separate_prices = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            1.1,
+            Some(1.095),
+            &spec,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(wrapper, separate_prices);
+    }
+
+    #[test]
+    fn sizing_reference_price_changes_risk_lot_independently_of_execution_price() {
+        let spec = instrument_spec("0.01", None);
+        let nearer_reference = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            1.2,
+            Some(1.095),
+            &spec,
+            Some(1.0),
+        )
+        .unwrap();
+        let farther_reference = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedRiskAmount { amount: 100.0 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.105,
+            1.2,
+            Some(1.095),
+            &spec,
+            Some(1.0),
+        )
+        .unwrap();
+
+        assert_eq!(nearer_reference.native_loss_per_lot, Some(500.0));
+        assert_eq!(nearer_reference.account_loss_per_lot, Some(500.0));
+        assert_close(nearer_reference.scaled_raw_lot, 0.2);
+        assert_eq!(nearer_reference.final_lot_steps, 20);
+        assert_eq!(farther_reference.native_loss_per_lot, Some(1_000.0));
+        assert_eq!(farther_reference.account_loss_per_lot, Some(1_000.0));
+        assert_close(farther_reference.scaled_raw_lot, 0.1);
+        assert_eq!(farther_reference.final_lot_steps, 10);
+    }
+
+    #[test]
+    fn execution_notional_price_enforces_notional_bounds() {
+        let usd = AssetId::new("USD").unwrap();
+        let minimum_spec = instrument_spec(
+            "0.01",
+            Some(NotionalRules {
+                asset: usd.clone(),
+                minimum: Some(positive("2200")),
+                maximum: None,
+            }),
+        );
+        let minimum_error = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.2,
+            1.05,
+            None,
+            &minimum_spec,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            minimum_error,
+            InstrumentSizingError::BelowMinimumNotional {
+                notional: decimal("2100"),
+                minimum: decimal("2200"),
+            }
+        );
+
+        let maximum_spec = instrument_spec(
+            "0.01",
+            Some(NotionalRules {
+                asset: usd,
+                minimum: None,
+                maximum: Some(positive("2200")),
+            }),
+        );
+        let maximum_error = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.05,
+            1.2,
+            None,
+            &maximum_spec,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            maximum_error,
+            InstrumentSizingError::AboveMaximumNotional {
+                notional: decimal("2400"),
+                maximum: decimal("2200"),
+            }
+        );
+    }
+
+    #[test]
+    fn separate_sizing_prices_require_instrument_grid_alignment() {
+        let mut spec = instrument_spec("0.01", None);
+        spec.price.grid = DecimalGrid::new(Decimal::ZERO, positive("0.00005"));
+
+        let reference_error = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.10003,
+            1.1,
+            None,
+            &spec,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            reference_error,
+            InstrumentSizingError::PriceOffGrid {
+                field: "sizing reference",
+                ..
+            }
+        ));
+
+        let execution_error = compute_instrument_size_for_spec_with_prices(
+            &SizingPolicy::FixedLot { lots: 0.02 },
+            1.0,
+            10_000.0,
+            Side::Buy,
+            1.1,
+            1.10003,
+            None,
+            &spec,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            execution_error,
+            InstrumentSizingError::PriceOffGrid {
+                field: "execution notional",
+                ..
+            }
+        ));
     }
 
     #[test]

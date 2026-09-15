@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use qs_backtest::runner::BacktestConfig;
 use qs_backtest::{
-    BacktestRunner, FutureBacktestArtifacts, FutureQuoteConfig, MarketEvent, PositionRef,
-    RawSignal, ReplayInstrumentArtifact, ReplayInstrumentManifest, VecFeed,
-    guarded_instrument_spec, resolve_legacy_economics,
+    BacktestRunner, FutureBacktestArtifacts, FutureQuoteConfig, MarketEntrySizingBasis,
+    MarketEvent, PositionRef, RawSignal, ReplayInstrumentArtifact, ReplayInstrumentManifest,
+    VecFeed, guarded_instrument_spec, resolve_legacy_economics,
 };
 use qs_core::{OrderType, Side, SizingPolicy};
 use qs_instruments::{
     CatalogSnapshotId, EconomicsModelId, EffectiveInterval, InstrumentId, MarketDataSourceId,
-    QuantityUnit, ResolvedInstrumentRef, StoredSeriesBinding,
+    NotionalRules, QuantityUnit, ResolvedInstrumentRef, StoredSeriesBinding,
 };
 use qs_symbols::{SymbolCurrencyMetadata, SymbolSpec};
 
@@ -211,6 +211,61 @@ fn explicit_instrument_preserves_legacy_sizing_and_pnl() {
 }
 
 #[test]
+fn catalog_notional_uses_execution_price_with_signal_sizing_basis() {
+    let mut manifest = explicit_manifest(2);
+    let spec = &mut manifest.instruments.get_mut(SYMBOL).unwrap().spec;
+    spec.notional = Some(NotionalRules {
+        asset: spec.economics.settlement_asset.clone(),
+        minimum: None,
+        maximum: None,
+    });
+    let config = BacktestConfig {
+        close_on_finish: false,
+        sizing: Some(SizingPolicy::FixedLot { lots: 1.25 }),
+        instrument_manifest: Some(manifest),
+        ..BacktestConfig::default()
+    };
+    let future = FutureQuoteConfig {
+        market_entry_sizing_basis: MarketEntrySizingBasis::SignalEntryPrice,
+        ..FutureQuoteConfig::default()
+    };
+    let mut feed = VecFeed::new(vec![MarketEvent::Tick {
+        symbol: SYMBOL.into(),
+        ts: ts(0),
+        bid: 1.1,
+        ask: 1.1,
+    }]);
+    let signal = RawSignal::Entry {
+        ts: ts(0),
+        symbol: SYMBOL.into(),
+        side: Side::Buy,
+        order_type: OrderType::Market,
+        price: Some(1.0),
+        risk_multiplier: 1.0,
+        stoploss: None,
+        targets: Vec::new(),
+        group: None,
+        trade_id: Some("catalog-notional".into()),
+    };
+
+    let result = BacktestRunner::new_future(config, future).run_raw_signals_future(
+        &mut feed,
+        vec![signal],
+        None,
+    );
+
+    let metadata = result.execution_metadata.as_ref().unwrap();
+    assert_eq!(metadata.market_entry_sizing.len(), 1);
+    assert_eq!(metadata.market_entry_sizing[0].sizing_reference_price, 1.0);
+    assert_eq!(metadata.market_entry_sizing[0].execution_price, 1.1);
+    let notional = metadata.instrument_sizing[0]
+        .final_notional
+        .as_ref()
+        .unwrap();
+    assert_eq!(notional.amount.to_string(), "137500");
+}
+
+#[test]
 fn quantity_storage_scale_does_not_change_sizing_or_pnl() {
     let low_scale = run_explicit(2);
     let high_scale = run_explicit(18);
@@ -281,6 +336,11 @@ fn older_artifact_json_defaults_the_instrument_manifest() {
 
     assert_eq!(artifacts.execution.instrument_manifest, None);
     assert!(artifacts.execution.instrument_sizing.is_empty());
+    assert_eq!(
+        artifacts.execution.market_entry_sizing_basis,
+        MarketEntrySizingBasis::FillPrice
+    );
+    assert!(artifacts.execution.market_entry_sizing.is_empty());
     assert_eq!(
         artifacts.execution.contract_sizes.get(SYMBOL),
         Some(&100_000.0)

@@ -52,7 +52,7 @@ pub use rules::Rule;
 pub use sizing::{
     InstrumentSizingError, LotCapStatus, SizingError, SizingPolicy, SizingResult,
     compute_instrument_native_loss_per_lot, compute_instrument_size,
-    compute_instrument_size_for_spec, compute_size,
+    compute_instrument_size_for_spec, compute_instrument_size_for_spec_with_prices, compute_size,
 };
 pub use types::{
     Action, CloseReason, Effect, EffectiveStop, ExecutionConvention, ExecutionFill, ExecutionModel,

@@ -231,8 +231,10 @@ fn configured_and_direct_lifecycle_runs_have_full_economic_parity() {
         direct.future_format_version
     );
     assert_eq!(
-        json_without_termination_reason(&configured.execution_metadata),
-        json_without_termination_reason(&direct.execution_metadata)
+        json_without_action_ids(&json_without_termination_reason(
+            &configured.execution_metadata,
+        )),
+        json_without_action_ids(&json_without_termination_reason(&direct.execution_metadata))
     );
     assert_eq!(
         active_mtm_economics(&configured.mtm_equity_curve),

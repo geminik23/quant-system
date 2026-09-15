@@ -295,6 +295,7 @@ fn help_documents_current_sizing_currency_and_future_defaults() {
         "--risk-percent",
         "--account-currency",
         "--conversion-stale-after-ms",
+        "--market-entry-sizing-basis",
         "--mtm-output",
         "--mtm-max-points",
         "--result-delivery",
@@ -308,6 +309,15 @@ fn help_documents_current_sizing_currency_and_future_defaults() {
         "stdout: {stdout}"
     );
     assert!(stdout.contains("[default: standard]"), "stdout: {stdout}");
+    assert!(stdout.contains("[default: fill-price]"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("[possible values: fill-price, signal-entry-price]"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("falls back to the fill price when absent"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("[default: bounded]"), "stdout: {stdout}");
     assert!(stdout.contains("[default: stream]"), "stdout: {stdout}");
     for value in ["- stream:", "- poll:", "- sync:"] {

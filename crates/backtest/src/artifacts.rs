@@ -50,6 +50,34 @@ pub struct ReplayInstrumentManifest {
     pub stored_series: Vec<StoredSeriesBinding>,
 }
 
+/// Price basis used to size market entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MarketEntrySizingBasis {
+    #[default]
+    FillPrice,
+    SignalEntryPrice,
+}
+
+/// Sizing inputs and outputs recorded for one successfully executed market entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketEntrySizingAudit {
+    pub action_id: String,
+    pub trade_id: Option<String>,
+    pub configured_basis: MarketEntrySizingBasis,
+    pub applied_basis: MarketEntrySizingBasis,
+    pub fallback_to_fill: bool,
+    pub original_signal_price: Option<f64>,
+    pub sizing_reference_price: f64,
+    pub execution_price: f64,
+    pub protective_stop: Option<f64>,
+    pub requested_account_risk: Option<f64>,
+    pub native_loss_per_lot: Option<f64>,
+    pub account_loss_per_lot: Option<f64>,
+    pub final_lot: f64,
+}
+
 /// Exact catalog-backed sizing adjustment recorded before one Entry action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +104,10 @@ pub struct ExecutionMetadata {
     pub instrument_manifest: Option<ReplayInstrumentManifest>,
     /// Exact requested and adjusted quantities for catalog-backed Entry sizing.
     pub instrument_sizing: Vec<InstrumentSizingArtifact>,
+    /// Configured price basis for market-entry sizing.
+    pub market_entry_sizing_basis: MarketEntrySizingBasis,
+    /// Per-entry sizing audits for successfully executed market entries.
+    pub market_entry_sizing: Vec<MarketEntrySizingAudit>,
     /// Quotes older than this at an equity observation are counted as stale.
     pub stale_quote_after_millis: Option<i64>,
     #[serde(default = "default_pnl_epsilon")]
@@ -95,6 +127,8 @@ impl Default for ExecutionMetadata {
             contract_sizes: BTreeMap::new(),
             instrument_manifest: None,
             instrument_sizing: Vec::new(),
+            market_entry_sizing_basis: MarketEntrySizingBasis::default(),
+            market_entry_sizing: Vec::new(),
             stale_quote_after_millis: None,
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
@@ -898,6 +932,11 @@ mod tests {
         assert_eq!(decoded.execution_model, ExecutionModel::default());
         assert_eq!(decoded.instrument_manifest, None);
         assert!(decoded.instrument_sizing.is_empty());
+        assert_eq!(
+            decoded.market_entry_sizing_basis,
+            MarketEntrySizingBasis::FillPrice
+        );
+        assert!(decoded.market_entry_sizing.is_empty());
 
         let metadata = ExecutionMetadata {
             execution_model: ExecutionModel::new(

@@ -40,9 +40,10 @@ pub mod strategy;
 
 pub use artifacts::{
     CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts,
-    InstrumentSizingArtifact, NetPnlOutcome, OpenPositionSnapshot, PendingOrderLifecycleEvent,
-    PendingOrderLifecycleState, PendingOrderSnapshot, RecordedFill, ReplayInstrumentArtifact,
-    ReplayInstrumentManifest, RiskBasisStatus, RiskTranche,
+    InstrumentSizingArtifact, MarketEntrySizingAudit, MarketEntrySizingBasis, NetPnlOutcome,
+    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+    PendingOrderSnapshot, RecordedFill, ReplayInstrumentArtifact, ReplayInstrumentManifest,
+    RiskBasisStatus, RiskTranche,
 };
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,

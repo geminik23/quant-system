@@ -268,6 +268,15 @@ impl Default for MtmOutputPolicyMsg {
     }
 }
 
+/// Price basis used to size market entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MarketEntrySizingBasisMsg {
+    #[default]
+    FillPrice,
+    SignalEntryPrice,
+}
+
 /// FutureQuoteV1 execution settings used by the backtest RPC methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -279,6 +288,7 @@ pub struct FutureQuoteConfigMsg {
     pub account_currency: String,
     pub conversion_stale_after_ms: i64,
     pub mtm_output: MtmOutputPolicyMsg,
+    pub market_entry_sizing_basis: MarketEntrySizingBasisMsg,
 }
 
 impl Default for FutureQuoteConfigMsg {
@@ -291,6 +301,7 @@ impl Default for FutureQuoteConfigMsg {
             account_currency: String::new(),
             conversion_stale_after_ms: 300_000,
             mtm_output: MtmOutputPolicyMsg::default(),
+            market_entry_sizing_basis: MarketEntrySizingBasisMsg::default(),
         }
     }
 }
@@ -1413,10 +1424,37 @@ mod tests {
             future.mtm_output,
             MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
         );
+        assert_eq!(
+            future.market_entry_sizing_basis,
+            MarketEntrySizingBasisMsg::FillPrice
+        );
         assert!(
             serde_json::from_value::<FutureQuoteConfigMsg>(json!({
                 "account_currency": "USD",
                 "conversion_rates": {}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn market_entry_sizing_basis_uses_strict_snake_case_wire_values() {
+        for (value, expected) in [
+            (json!("fill_price"), MarketEntrySizingBasisMsg::FillPrice),
+            (
+                json!("signal_entry_price"),
+                MarketEntrySizingBasisMsg::SignalEntryPrice,
+            ),
+        ] {
+            let basis: MarketEntrySizingBasisMsg = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(basis, expected);
+            assert_eq!(serde_json::to_value(basis).unwrap(), value);
+        }
+
+        assert!(serde_json::from_value::<MarketEntrySizingBasisMsg>(json!("mark_price")).is_err());
+        assert!(
+            serde_json::from_value::<FutureQuoteConfigMsg>(json!({
+                "market_entry_sizing_basis": "mark_price"
             }))
             .is_err()
         );
@@ -1508,6 +1546,10 @@ mod tests {
         assert_eq!(
             request.future.mtm_output,
             MtmOutputPolicyMsg::Bounded { max_points: 4_096 }
+        );
+        assert_eq!(
+            request.future.market_entry_sizing_basis,
+            MarketEntrySizingBasisMsg::FillPrice
         );
 
         let submitted: SubmitBacktestRequest = serde_json::from_value(json!({

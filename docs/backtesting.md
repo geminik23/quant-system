@@ -29,7 +29,7 @@ Every Entry must contain a finite positive `risk` multiplier. It does not contai
 - `--risk-per-trade`;
 - `--risk-percent`.
 
-`--account-currency` is required when an Entry is present. Monetary risk sizing also requires a protective stop. `ScaleIn.size` remains a concrete final quantity and is not interpreted as an Entry risk multiplier.
+`--account-currency` is required when an Entry is present. Monetary risk sizing also requires a protective stop. `--market-entry-sizing-basis` selects `fill-price` or `signal-entry-price` for FutureQuote Market Entry quantity calculation; the default is `fill-price`, and `signal-entry-price` falls back to the fill when `Entry.price` is absent. `ScaleIn.size` remains a concrete final quantity and is not interpreted as an Entry risk multiplier.
 
 See the [RawSignal reference](reference/raw-signal.md) for action shapes.
 
@@ -50,7 +50,10 @@ The production service uses deterministic FutureQuote replay.
 - Tick replay uses stored bid and ask values.
 - Bar replay converts each bar close into a zero-spread synthetic quote.
 - Actions become eligible according to signal timestamp and configured latency.
-- Market entries use the appropriate future quote side.
+- Market entries use the appropriate future quote side and retain that actual fill for position state, P&L, MTM, and actual risk artifacts.
+- Market Entry sizing defaults to the actual fill price. The optional signal-entry basis uses an explicit original `Entry.price` only for quantity calculation and falls back to the fill price when it is absent.
+- Profiles, relative stops, targets, and rules still resolve from the actual fill price. Signal-entry sizing can therefore produce actual fill-to-stop risk above or below the requested risk, and the execution metadata records both price roles and the resulting quantity.
+- Limit and Stop Entries remain sized at placement from their required requested price; their quantity stays frozen through later fill, balance, FX, or quote changes.
 
 Close-only bars cannot reconstruct an intrabar price path. Use tick data when exact ordering of stop, target, and management events matters.
 
@@ -94,4 +97,4 @@ Neutral conformance covers no-op, EMA crossover, EMA/ATR lifecycle, pending canc
 - Signal symbols and timestamps must overlap imported data.
 - Explicit instrument specifications control catalog-aware quantity rules, contract multipliers, and supported economics; the symbol registry supplies the guarded compatibility form when no catalog is configured.
 - The current replay implementation supports the existing quote-linear FX/CFD economics with standard-lot quantities. Declaring another model in a catalog does not make it executable.
-- Catalog-backed Entry sizing normalizes prices to the declared display scale, validates the price grid, floors quantity with exact decimal grid arithmetic, validates post-rounding notional bounds, and records the adjustment. Other established engine-facing values remain compatibility-oriented `f64`; this is not a general decimal migration.
+- Catalog-backed Entry sizing normalizes prices to the declared display scale, validates the price grid, floors quantity with exact decimal grid arithmetic, validates post-rounding notional bounds, and records the adjustment. For signal-entry Market sizing, stop-distance risk uses the selected signal reference while final notional uses the actual execution price. Other established engine-facing values remain compatibility-oriented `f64`; this is not a general decimal migration.

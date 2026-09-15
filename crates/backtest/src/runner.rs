@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 
 use chrono::{Duration, NaiveDateTime};
-use qs_core::sizing::{compute_instrument_native_loss_per_lot, compute_instrument_size_for_spec};
+use qs_core::sizing::{
+    compute_instrument_native_loss_per_lot, compute_instrument_size_for_spec_with_prices,
+};
 use qs_core::types::{
     Action, CloseReason, Effect, ExecutionFill, ExecutionModel, FillModel, FutureEffect, OrderType,
     PositionStatus, PreparedPendingFill, PriceQuote, Side, SlippageModel, position_size_tolerance,
@@ -28,7 +30,8 @@ use qs_instruments::{Decimal, EconomicsModelId, InstrumentSpec, ListingStatus, Q
 
 use crate::artifacts::{
     ExecutionMetadata, FUTURE_ARTIFACT_FORMAT_VERSION, FutureBacktestArtifacts,
-    InstrumentSizingArtifact, PendingOrderSnapshot, ReplayInstrumentManifest,
+    InstrumentSizingArtifact, MarketEntrySizingAudit, MarketEntrySizingBasis, PendingOrderSnapshot,
+    ReplayInstrumentManifest,
 };
 use crate::currency::{ConversionQuoteBook, RunCurrencyPlan};
 use crate::data_feed::{DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch};
@@ -72,6 +75,8 @@ pub struct FutureQuoteConfig {
     pub conversion_stale_after_ms: i64,
     /// Controls how many exact mark-to-market observations are emitted.
     pub mtm_output: MtmOutputPolicy,
+    /// Selects the risk reference price for market-entry sizing.
+    pub market_entry_sizing_basis: MarketEntrySizingBasis,
 }
 
 impl Default for FutureQuoteConfig {
@@ -84,6 +89,7 @@ impl Default for FutureQuoteConfig {
             currency_plan: None,
             conversion_stale_after_ms: 300_000,
             mtm_output: MtmOutputPolicy::default(),
+            market_entry_sizing_basis: MarketEntrySizingBasis::default(),
         }
     }
 }
@@ -169,7 +175,16 @@ struct QueuedAction {
     effective_ts: NaiveDateTime,
     entry_signal: Option<RawSignal>,
     entry_profile: Option<ManagementProfile>,
+    market_entry_sizing_audit: Option<MarketEntrySizingAudit>,
     requires_later_quote: bool,
+}
+
+struct FinalizedEntry {
+    action: Action,
+    requested_account_risk: Option<f64>,
+    native_loss_per_lot: Option<f64>,
+    account_loss_per_lot: Option<f64>,
+    final_lot: f64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -860,6 +875,7 @@ pub struct BacktestRunner {
     evaluation_options: EvaluationOptions,
     strategy_research_limits: StrategyResearchLimits,
     instrument_sizing: Vec<InstrumentSizingArtifact>,
+    market_entry_sizing: Vec<MarketEntrySizingAudit>,
     committed_feedback: Vec<FutureEffect>,
     committed_feedback_events: Vec<StrategyFeedbackEvent>,
 }
@@ -877,6 +893,7 @@ impl BacktestRunner {
             evaluation_options: EvaluationOptions::default(),
             strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
+            market_entry_sizing: Vec::new(),
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
         }
@@ -895,6 +912,7 @@ impl BacktestRunner {
             evaluation_options: EvaluationOptions::default(),
             strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
+            market_entry_sizing: Vec::new(),
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
         }
@@ -1630,9 +1648,9 @@ impl BacktestRunner {
             };
             if let Ok(Some(resolved)) = resolved
                 && let Ok(action) =
-                    self.finalize_resolved_entry(resolved, self.executor.balance, ts, None)
+                    self.finalize_resolved_entry(resolved, self.executor.balance, ts, None, None)
             {
-                self.apply_single_action(action, ts, quote);
+                self.apply_single_action(action.action, ts, quote);
             }
         } else {
             let actions = resolve_signal(signal, &self.engine);
@@ -1648,7 +1666,8 @@ impl BacktestRunner {
         balance_before: f64,
         operation_ts: NaiveDateTime,
         conversion_quotes: Option<&ConversionQuoteBook>,
-    ) -> Result<Action, String> {
+        sizing_reference_price: Option<f64>,
+    ) -> Result<FinalizedEntry, String> {
         let policy = self
             .config
             .sizing
@@ -1661,6 +1680,7 @@ impl BacktestRunner {
                 "pending entry requires a requested price".to_owned()
             }
         })?;
+        let sizing_reference_price = sizing_reference_price.unwrap_or(entry_price);
         let explicit_spec = explicit_instrument_spec(&self.config, &resolved.symbol);
         let legacy_spec = self.config.symbol_specs.get(&resolved.symbol);
         if explicit_spec.is_none() && legacy_spec.is_none() {
@@ -1677,7 +1697,7 @@ impl BacktestRunner {
             let native_loss = match explicit_spec {
                 Some(spec) => compute_instrument_native_loss_per_lot(
                     resolved.side,
-                    entry_price,
+                    sizing_reference_price,
                     stop,
                     u16::from(spec.price.display_scale),
                     &spec.economics,
@@ -1685,7 +1705,7 @@ impl BacktestRunner {
                 .map_err(|error| error.to_string())?,
                 None => compute_native_loss_per_lot(
                     resolved.side,
-                    entry_price,
+                    sizing_reference_price,
                     stop,
                     legacy_spec.expect("legacy spec presence checked"),
                 )
@@ -1715,11 +1735,12 @@ impl BacktestRunner {
         };
 
         let sizing = match explicit_spec {
-            Some(spec) => compute_instrument_size_for_spec(
+            Some(spec) => compute_instrument_size_for_spec_with_prices(
                 policy,
                 resolved.risk_multiplier,
                 balance_before,
                 resolved.side,
+                sizing_reference_price,
                 entry_price,
                 resolved.stoploss,
                 spec,
@@ -1731,7 +1752,7 @@ impl BacktestRunner {
                 resolved.risk_multiplier,
                 balance_before,
                 resolved.side,
-                entry_price,
+                sizing_reference_price,
                 resolved.stoploss,
                 legacy_spec.expect("legacy spec presence checked"),
                 account_loss_per_lot,
@@ -1759,7 +1780,13 @@ impl BacktestRunner {
             target.close_ratio = steps as f64 / sizing.final_lot_steps as f64;
         }
 
-        Ok(resolved.into_action(sizing.final_lot))
+        Ok(FinalizedEntry {
+            action: resolved.into_action(sizing.final_lot),
+            requested_account_risk: sizing.requested_account_risk,
+            native_loss_per_lot: sizing.native_loss_per_lot,
+            account_loss_per_lot: sizing.account_loss_per_lot,
+            final_lot: sizing.final_lot,
+        })
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -2590,6 +2617,8 @@ impl BacktestRunner {
                 contract_sizes: contract_sizes.into_iter().collect(),
                 instrument_manifest: self.config.instrument_manifest.clone(),
                 instrument_sizing: std::mem::take(&mut self.instrument_sizing),
+                market_entry_sizing_basis: future.market_entry_sizing_basis,
+                market_entry_sizing: std::mem::take(&mut self.market_entry_sizing),
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
@@ -2783,6 +2812,7 @@ impl BacktestRunner {
                 effective_ts: scheduled.effective_ts,
                 entry_signal: Some(scheduled.signal),
                 entry_profile: profile.cloned(),
+                market_entry_sizing_audit: None,
                 requires_later_quote: scheduled.requires_later_quote,
             });
             return;
@@ -2880,6 +2910,7 @@ impl BacktestRunner {
                     effective_ts: scheduled.effective_ts,
                     entry_signal: None,
                     entry_profile: None,
+                    market_entry_sizing_audit: None,
                     requires_later_quote: scheduled.requires_later_quote,
                 });
             } else {
@@ -2920,21 +2951,24 @@ impl BacktestRunner {
             future_executor.balance(),
             scheduled.effective_ts,
             Some(conversion_quotes),
+            None,
         ) {
-            Ok(action) => self.apply_future_action(
-                action_id,
-                "entry".into(),
-                action,
-                None,
-                scheduled.signal_ts,
-                scheduled.effective_ts,
-                quote,
-                lifecycle,
-                future_executor,
-                portfolio,
-                pricer,
-                conversion_quotes,
-            ),
+            Ok(finalized) => {
+                self.apply_future_action(
+                    action_id,
+                    "entry".into(),
+                    finalized.action,
+                    None,
+                    scheduled.signal_ts,
+                    scheduled.effective_ts,
+                    quote,
+                    lifecycle,
+                    future_executor,
+                    portfolio,
+                    pricer,
+                    conversion_quotes,
+                );
+            }
             Err(error) => {
                 let mut disposition = ActionDisposition::rejected(action_id, error);
                 disposition.action_kind = Some("entry".into());
@@ -2973,8 +3007,13 @@ impl BacktestRunner {
             }
 
             if let Some(mut signal) = action.entry_signal.take() {
-                let (side, symbol) = match &signal {
-                    RawSignal::Entry { side, symbol, .. } => (*side, symbol.clone()),
+                let (side, symbol, original_signal_price) = match &signal {
+                    RawSignal::Entry {
+                        side,
+                        symbol,
+                        price,
+                        ..
+                    } => (*side, symbol.clone(), *price),
                     _ => unreachable!("queued entry metadata must contain an entry signal"),
                 };
                 let execution = match pricer.market_entry(side, quote, self.pip_size(&symbol)) {
@@ -2993,6 +3032,23 @@ impl BacktestRunner {
                     *price = Some(execution.price);
                 }
                 action.execution = Some(execution);
+                let configured_basis = self
+                    .future_config
+                    .as_ref()
+                    .map(|config| config.market_entry_sizing_basis)
+                    .unwrap_or_default();
+                let (applied_basis, fallback_to_fill, sizing_reference_price) =
+                    match (configured_basis, original_signal_price) {
+                        (MarketEntrySizingBasis::SignalEntryPrice, Some(price)) => {
+                            (MarketEntrySizingBasis::SignalEntryPrice, false, price)
+                        }
+                        (MarketEntrySizingBasis::SignalEntryPrice, None) => {
+                            (MarketEntrySizingBasis::FillPrice, true, execution.price)
+                        }
+                        (MarketEntrySizingBasis::FillPrice, _) => {
+                            (MarketEntrySizingBasis::FillPrice, false, execution.price)
+                        }
+                    };
                 let resolved = match action.entry_profile.as_ref() {
                     Some(profile) => profile.apply_entry_signal(&signal),
                     None => resolve_unprofiled_entry(&signal),
@@ -3003,8 +3059,32 @@ impl BacktestRunner {
                         future_executor.balance(),
                         quote.ts,
                         Some(conversion_quotes),
+                        Some(sizing_reference_price),
                     ) {
-                        Ok(finalized) => action.action = finalized,
+                        Ok(finalized) => {
+                            let (trade_id, protective_stop) = match &finalized.action {
+                                Action::Open {
+                                    trade_id, stoploss, ..
+                                } => (trade_id.clone(), *stoploss),
+                                _ => unreachable!("finalized entry must be an open action"),
+                            };
+                            action.market_entry_sizing_audit = Some(MarketEntrySizingAudit {
+                                action_id: action.action_id.clone(),
+                                trade_id,
+                                configured_basis,
+                                applied_basis,
+                                fallback_to_fill,
+                                original_signal_price,
+                                sizing_reference_price,
+                                execution_price: execution.price,
+                                protective_stop,
+                                requested_account_risk: finalized.requested_account_risk,
+                                native_loss_per_lot: finalized.native_loss_per_lot,
+                                account_loss_per_lot: finalized.account_loss_per_lot,
+                                final_lot: finalized.final_lot,
+                            });
+                            action.action = finalized.action;
+                        }
                         Err(error) => {
                             let mut disposition =
                                 ActionDisposition::rejected(action.action_id, error);
@@ -3035,7 +3115,7 @@ impl BacktestRunner {
                     }
                 }
             }
-            self.apply_future_action(
+            let committed = self.apply_future_action(
                 action.action_id,
                 action.action_kind,
                 action.action,
@@ -3049,6 +3129,9 @@ impl BacktestRunner {
                 pricer,
                 conversion_quotes,
             );
+            if committed && let Some(audit) = action.market_entry_sizing_audit {
+                self.market_entry_sizing.push(audit);
+            }
         }
         *queued = remaining;
     }
@@ -3090,7 +3173,7 @@ impl BacktestRunner {
         portfolio: &mut PortfolioRecorder,
         pricer: &ExecutionPricer,
         conversion_quotes: &ConversionQuoteBook,
-    ) {
+    ) -> bool {
         if let Action::Open {
             trade_id: Some(trade_id),
             ..
@@ -3102,7 +3185,7 @@ impl BacktestRunner {
             disposition.signal_ts = Some(signal_ts);
             disposition.effective_ts = Some(effective_ts);
             self.record_disposition(lifecycle, disposition);
-            return;
+            return false;
         }
         if let Action::ScaleIn { position_id, .. } = &action
             && future_executor.has_close(position_id)
@@ -3114,7 +3197,7 @@ impl BacktestRunner {
             disposition.effective_ts = Some(effective_ts);
             disposition.position_ids.push(position_id.clone());
             self.record_disposition(lifecycle, disposition);
-            return;
+            return false;
         }
 
         let execution = match self.prepare_future_action(&mut action, execution, quote, pricer) {
@@ -3125,7 +3208,7 @@ impl BacktestRunner {
                 disposition.signal_ts = Some(signal_ts);
                 disposition.effective_ts = Some(effective_ts);
                 self.record_disposition(lifecycle, disposition);
-                return;
+                return false;
             }
         };
 
@@ -3143,7 +3226,7 @@ impl BacktestRunner {
                 disposition.signal_ts = Some(signal_ts);
                 disposition.effective_ts = Some(effective_ts);
                 self.record_disposition(lifecycle, disposition);
-                return;
+                return false;
             }
         };
 
@@ -3167,7 +3250,7 @@ impl BacktestRunner {
                     disposition.signal_ts = Some(signal_ts);
                     disposition.effective_ts = Some(effective_ts);
                     self.record_disposition(lifecycle, disposition);
-                    return;
+                    return false;
                 }
             }
         } else {
@@ -3192,6 +3275,7 @@ impl BacktestRunner {
         disposition.effective_ts = Some(effective_ts);
         disposition.position_ids = affected;
         self.record_disposition(lifecycle, disposition);
+        true
     }
 
     fn prepare_future_action(
@@ -3843,6 +3927,8 @@ fn rejected_future_result(
                 .collect(),
             instrument_manifest: config.instrument_manifest.clone(),
             instrument_sizing: Vec::new(),
+            market_entry_sizing_basis: future.market_entry_sizing_basis,
+            market_entry_sizing: Vec::new(),
             stale_quote_after_millis: future.stale_quote_after_ms,
             pnl_epsilon: if future.pnl_epsilon.is_finite() && future.pnl_epsilon >= 0.0 {
                 future.pnl_epsilon
@@ -6162,6 +6248,7 @@ mod tests {
         spec.lot_step_units = 1;
         let future = FutureQuoteConfig {
             currency_plan: Some(identity_currency_plan("EURUSD")),
+            market_entry_sizing_basis: MarketEntrySizingBasis::SignalEntryPrice,
             ..FutureQuoteConfig::default()
         };
         let signals = vec![
@@ -6212,6 +6299,12 @@ mod tests {
             Some("pending")
         );
         assert!((result.open_position_snapshots[0].remaining_size - 100.0).abs() < 1.0e-12);
+        let metadata = result.execution_metadata.as_ref().unwrap();
+        assert_eq!(metadata.market_entry_sizing.len(), 1);
+        assert_eq!(
+            metadata.market_entry_sizing[0].trade_id.as_deref(),
+            Some("market")
+        );
     }
 
     #[test]
