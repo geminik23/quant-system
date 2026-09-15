@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "qs-data-preprocess"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3690,7 +3690,7 @@ dependencies = [
 
 [[package]]
 name = "qs-instruments"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3740,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3748,7 +3748,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service-xrpc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures",
  "nanoid",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "qs-signal-parser"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "qs-strategy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "quant-system-core",
@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "qs-symbols"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "quant-system-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "nanoid",
