@@ -11,12 +11,12 @@ use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
     BarSeriesSpec, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
     ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
-    FutureQuoteConfig, HistoricalNamedInputProjector, HistoricalVolumeProjection,
-    ManagementProfile, MarketEvent, MissingIntervalPolicy, NamedInputProjectionContext,
-    NamedInputProjectionError, ObservationStoreLimits, PendingOrderLifecycleState, PriceBasis,
-    ProjectedNamedInput, SeriesId, SeriesRequirement, StoplossMode, StrategyDescriptor, StrategyId,
-    StrategyReplayError, StrategyReplayInputError, StrategyRetentionLimits, Timeframe, VecFeed,
-    WarmupRequirement,
+    EntryGeometryPolicy, FutureQuoteConfig, HistoricalNamedInputProjector,
+    HistoricalVolumeProjection, ManagementProfile, MarketEvent, MissingIntervalPolicy,
+    NamedInputProjectionContext, NamedInputProjectionError, ObservationStoreLimits,
+    PendingOrderLifecycleState, PriceBasis, ProjectedNamedInput, SeriesId, SeriesRequirement,
+    StoplossMode, StrategyDescriptor, StrategyId, StrategyReplayError, StrategyReplayInputError,
+    StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
 };
 use qs_core::{OrderType, Side};
 use qs_strategy::{
@@ -1264,13 +1264,11 @@ fn rejected_entry_and_management_preserve_command_id_and_reason() {
     );
     assert_eq!(
         management_disposition.status,
-        qs_backtest::ledger::ActionDispositionStatus::Rejected
+        qs_backtest::ledger::ActionDispositionStatus::Skipped
     );
-    assert!(
-        management_disposition
-            .reason
-            .as_deref()
-            .is_some_and(|reason| !reason.is_empty())
+    assert_eq!(
+        management_disposition.reason.as_deref(),
+        Some("position_closed")
     );
 }
 
@@ -1566,6 +1564,7 @@ fn management_profile_is_rejected_before_feed_polling() {
         rules: vec![],
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: EntryGeometryPolicy::Strict,
     };
     let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .run_configured_strategy_future(

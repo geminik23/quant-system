@@ -6,9 +6,9 @@ use qs_backtest::ledger::ActionDispositionStatus;
 use qs_backtest::runner::BacktestConfig;
 use qs_backtest::sizing::SizingPolicy;
 use qs_backtest::{
-    BacktestResult, BacktestRunner, ConversionRoute, FutureQuoteConfig, ManagementProfile,
-    MarketEvent, PendingOrderLifecycleState, PositionRef, RawSignal, RiskBasisStatus,
-    RuleConfigDef, RunCurrencyPlan, StoplossMode, VecFeed,
+    BacktestResult, BacktestRunner, ConversionRoute, EntryGeometryPolicy, FutureQuoteConfig,
+    ManagementProfile, MarketEvent, PendingOrderLifecycleState, PositionRef, RawSignal,
+    RiskBasisStatus, RuleConfigDef, RunCurrencyPlan, StoplossMode, VecFeed,
 };
 use qs_core::types::{CloseReason, FillPurpose, OrderType, Side, StopOrigin};
 use qs_symbols::SymbolSpec;
@@ -785,6 +785,7 @@ fn future_atomic_target_modification_retains_non_default_ratio() {
         rules: vec![],
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: EntryGeometryPolicy::Strict,
     };
     let signals = vec![
         entry(0, "modified-target", None, vec![101.0, 103.0]),

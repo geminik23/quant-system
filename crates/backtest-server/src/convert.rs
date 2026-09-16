@@ -13,7 +13,8 @@ use qs_backtest::evaluation::{
     GroupFilter, PositionFilter, PositionSide, SourceCoverageCounts,
 };
 use qs_backtest::profile::{
-    ManagementProfile, PositionRef, RawSignal, RuleConfigDef, StoplossMode, TargetSelection,
+    EntryGeometryPolicy, ManagementProfile, PositionRef, RawSignal, RuleConfigDef, StoplossMode,
+    TargetSelection,
 };
 use qs_backtest::report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
@@ -27,11 +28,11 @@ use qs_symbols::{SymbolRegistry, normalize_currency_code};
 use crate::error::BacktestServerError;
 use crate::rpc_types::{
     BacktestConfigMsg, BacktestResultMsg, BreakdownDimensionMsg, CloseReasonStatsMsg,
-    DurationStatsMsg, EquityPoint, EvaluationGroupFilterMsg, EvaluationPositionSideMsg,
-    EvaluationSectionMsg, FutureBacktestResultMsg, FutureQuoteConfigMsg, ManagementProfileMsg,
-    MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg,
-    PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg, PositionRefMsg,
-    PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
+    DurationStatsMsg, EntryGeometryPolicyMsg, EquityPoint, EvaluationGroupFilterMsg,
+    EvaluationPositionSideMsg, EvaluationSectionMsg, FutureBacktestResultMsg, FutureQuoteConfigMsg,
+    ManagementProfileMsg, MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg,
+    MtmOutputSummaryMsg, PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg,
+    PositionRefMsg, PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
     RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg,
     TargetSelectionMsg, TradeResultMsg,
 };
@@ -468,6 +469,20 @@ fn target_selection_to_msg(selection: &TargetSelection) -> TargetSelectionMsg {
     }
 }
 
+fn entry_geometry_from_msg(msg: EntryGeometryPolicyMsg) -> EntryGeometryPolicy {
+    match msg {
+        EntryGeometryPolicyMsg::Strict => EntryGeometryPolicy::Strict,
+        EntryGeometryPolicyMsg::Permissive => EntryGeometryPolicy::Permissive,
+    }
+}
+
+fn entry_geometry_to_msg(policy: EntryGeometryPolicy) -> EntryGeometryPolicyMsg {
+    match policy {
+        EntryGeometryPolicy::Strict => EntryGeometryPolicyMsg::Strict,
+        EntryGeometryPolicy::Permissive => EntryGeometryPolicyMsg::Permissive,
+    }
+}
+
 /// Convert a wire-format `ManagementProfileMsg` into the internal `ManagementProfile`.
 ///
 /// An explicit `target_selection` is preserved and takes precedence during strict
@@ -523,6 +538,10 @@ pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<Mana
         rules,
         group_override: msg.group_override.clone(),
         let_remainder_run: msg.let_remainder_run,
+        entry_geometry: msg
+            .entry_geometry
+            .map(entry_geometry_from_msg)
+            .unwrap_or_default(),
     })
 }
 
@@ -577,6 +596,7 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
         rules,
         group_override: p.group_override.clone(),
         let_remainder_run: p.let_remainder_run,
+        entry_geometry: Some(entry_geometry_to_msg(p.entry_geometry)),
     }
 }
 
@@ -1360,6 +1380,7 @@ mod tests {
             rules: vec![RuleConfigDefMsg::TrailingStop { distance: 10.0 }],
             group_override: Some("grp".into()),
             let_remainder_run: true,
+            entry_geometry: None,
         };
         let p = profile_from_msg(&msg).unwrap();
         assert_eq!(p.name, "test");
@@ -1382,6 +1403,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         };
         let p = profile_from_msg(&msg).unwrap();
         assert!(matches!(p.stoploss_mode, StoplossMode::FromSignal));
@@ -1402,6 +1424,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         };
         let p = profile_from_msg(&msg).unwrap();
         assert!(matches!(p.stoploss_mode, StoplossMode::FromSignal));
@@ -1462,6 +1485,7 @@ mod tests {
             rules,
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         };
         let p = profile_from_msg(&msg).unwrap();
         assert_eq!(p.rules.len(), 7);
@@ -1478,6 +1502,49 @@ mod tests {
             RuleConfigDef::BreakevenAfterTargets { .. }
         ));
         assert!(matches!(p.rules[6], RuleConfigDef::TimeExit { .. }));
+    }
+
+    #[test]
+    fn profile_entry_geometry_serde_and_conversion_roundtrip() {
+        for policy in [
+            EntryGeometryPolicyMsg::Strict,
+            EntryGeometryPolicyMsg::Permissive,
+        ] {
+            let msg = ManagementProfileMsg {
+                name: "geometry".into(),
+                target_selection: None,
+                use_targets: vec![1],
+                close_ratios: vec![1.0],
+                stoploss_mode: None,
+                rules: vec![],
+                group_override: None,
+                let_remainder_run: false,
+                entry_geometry: Some(policy.clone()),
+            };
+            let profile = profile_from_msg(&msg).unwrap();
+            assert_eq!(
+                profile.entry_geometry,
+                entry_geometry_from_msg(policy.clone())
+            );
+
+            let roundtrip = profile_to_msg(&profile);
+            assert_eq!(roundtrip.entry_geometry, Some(policy));
+        }
+
+        // Omission preserves the Strict default.
+        let omitted = ManagementProfileMsg {
+            name: "omitted".into(),
+            target_selection: None,
+            use_targets: vec![1],
+            close_ratios: vec![1.0],
+            stoploss_mode: None,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: None,
+        };
+        let profile = profile_from_msg(&omitted).unwrap();
+        assert_eq!(profile.entry_geometry, EntryGeometryPolicy::Strict);
     }
 
     #[test]
@@ -1498,6 +1565,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             };
             let json = serde_json::to_value(&msg).unwrap();
             assert!(json.get("target_selection").is_some());
@@ -1545,6 +1613,7 @@ mod tests {
             ],
             group_override: Some("mygroup".into()),
             let_remainder_run: true,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         let msg = profile_to_msg(&original);
         let back = profile_from_msg(&msg).unwrap();

@@ -2762,6 +2762,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: false,
         };
@@ -2784,6 +2785,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: false,
         };
@@ -2807,6 +2809,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: false,
         };
@@ -2821,6 +2824,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: true,
         };
@@ -2842,6 +2846,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: false,
         };
@@ -2865,6 +2870,7 @@ mod tests {
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
+                entry_geometry: None,
             },
             overwrite: false,
         };

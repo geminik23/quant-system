@@ -1153,6 +1153,23 @@ trigger_price_offset = 0.0020
         }
     }
 
+    #[test]
+    fn shipped_profiles_have_explicit_entry_geometry() {
+        let registry = ProfileRegistry::from_toml(include_str!("../profiles.toml")).unwrap();
+        assert!(!registry.is_empty());
+        for name in registry.names() {
+            let profile = registry.get(name).unwrap();
+            assert!(matches!(
+                profile.entry_geometry,
+                EntryGeometryPolicy::Strict | EntryGeometryPolicy::Permissive
+            ));
+        }
+        assert_eq!(
+            registry.get("conservative").unwrap().entry_geometry,
+            EntryGeometryPolicy::Permissive
+        );
+    }
+
     // ── Same signals, different profiles produce different results ───────
 
     #[test]
@@ -1289,6 +1306,7 @@ close_ratios = [1.0]
         let profile = registry.get("legacy").unwrap();
 
         assert_eq!(profile.target_selection, None);
+        assert_eq!(profile.entry_geometry, EntryGeometryPolicy::Strict);
         assert_eq!(
             profile.effective_target_selection(),
             TargetSelection::Selected(vec![1])
@@ -1639,6 +1657,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         assert!(reg.insert(p, false).is_ok());
         assert_eq!(reg.len(), 1);
@@ -1657,6 +1676,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         reg.insert(p.clone(), false).unwrap();
         let result = reg.insert(p, false);
@@ -1679,6 +1699,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         reg.insert(p1, false).unwrap();
 
@@ -1691,6 +1712,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         assert!(reg.insert(p2, true).is_ok());
         assert_eq!(reg.len(), 1);
@@ -1709,6 +1731,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         assert!(reg.insert(bad, false).is_err());
         assert_eq!(reg.len(), 0);
@@ -1726,6 +1749,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         reg.insert(p, false).unwrap();
         assert!(reg.remove("rm"));
@@ -1750,6 +1774,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         assert!(good.validate().is_ok());
 
@@ -1762,6 +1787,7 @@ close_ratios = [0.5, 0.5]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         assert!(bad.validate().is_err());
     }
@@ -2432,6 +2458,7 @@ close_ratios = [1.0]
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let signal = RawSignal::Entry {
@@ -2470,7 +2497,14 @@ close_ratios = [1.0]
             rules: vec![],
             group_override: None,
             let_remainder_run,
+            entry_geometry: EntryGeometryPolicy::Strict,
         }
+    }
+
+    fn permissive_profile(use_targets: Vec<usize>, close_ratios: Vec<f64>) -> ManagementProfile {
+        let mut profile = strict_profile(use_targets, close_ratios, false);
+        profile.entry_geometry = EntryGeometryPolicy::Permissive;
+        profile
     }
 
     fn resolved_targets(resolved: &ResolvedEntry) -> &[TargetSpec] {
@@ -2750,6 +2784,67 @@ close_ratios = [1.0]
     }
 
     #[test]
+    fn permissive_keeps_wrong_side_signal_levels() {
+        let mut buy = buy_signal();
+        if let RawSignal::Entry {
+            stoploss, targets, ..
+        } = &mut buy
+        {
+            *stoploss = Some(1.0900);
+            targets[0] = 1.0800;
+        }
+        let resolved = permissive_profile(vec![1], vec![1.0])
+            .apply_entry_signal(&buy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.stoploss, Some(1.0900));
+        assert_eq!(resolved_targets(&resolved)[0].price, 1.0800);
+
+        let mut sell = sell_signal();
+        if let RawSignal::Entry {
+            stoploss, targets, ..
+        } = &mut sell
+        {
+            *stoploss = Some(1.0800);
+            targets[0] = 1.0900;
+        }
+        let resolved = permissive_profile(vec![1], vec![1.0])
+            .apply_entry_signal(&sell)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.stoploss, Some(1.0800));
+        assert_eq!(resolved_targets(&resolved)[0].price, 1.0900);
+    }
+
+    #[test]
+    fn permissive_still_rejects_profile_rule_level_geometry() {
+        let toml = r#"
+[[profile]]
+name = "permissive_bad_rule"
+target_selection = { Selected = [1] }
+use_targets = [1]
+close_ratios = [1.0]
+stoploss_mode = { type = "FromSignal" }
+let_remainder_run = false
+entry_geometry = "permissive"
+
+[[profile.rules]]
+type = "FixedStoploss"
+price = 1.0900
+"#;
+        let registry = ProfileRegistry::from_toml(toml).unwrap();
+        let error = registry
+            .get("permissive_bad_rule")
+            .unwrap()
+            .apply_entry_signal(&buy_signal())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProfileApplicationError::InvalidStopGeometry { .. }
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_entry_numeric_inputs() {
         for risk_multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut signal = buy_signal();
@@ -2925,6 +3020,7 @@ close_ratios = []
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let mut duplicate_selection = base_profile();

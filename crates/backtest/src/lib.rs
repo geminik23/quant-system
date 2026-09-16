@@ -66,10 +66,10 @@ pub use mtm::{
     MtmOutputPolicy, MtmOutputPolicyError, MtmOutputSummary,
 };
 pub use profile::{
-    ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError, ProfileError,
-    ProfileRegistry, ProfileRegistryError, ProfileValidationError, RawSignal, ResolvedEntry,
-    RuleConfigDef, StoplossMode, TargetResolution, TargetSelection, allocate_target_units,
-    resolve_signal, resolve_unprofiled_entry,
+    EntryGeometryPolicy, ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError,
+    ProfileError, ProfileRegistry, ProfileRegistryError, ProfileValidationError, RawSignal,
+    ResolvedEntry, RuleConfigDef, StoplossMode, TargetResolution, TargetSelection,
+    allocate_target_units, resolve_signal, resolve_unprofiled_entry,
 };
 pub use report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,

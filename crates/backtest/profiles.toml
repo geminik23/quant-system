@@ -14,9 +14,12 @@
 #   group_override    — if set, overrides the signal's group tag
 #   let_remainder_run — required in strict resolution when explicit weights sum below 1.0;
 #                       the unallocated remainder rides with SL/rules only
+#   entry_geometry    — strict (default) rejects signal stoploss and selected targets on the wrong side of
+#                       the execution price; permissive attaches them unchanged and the first tick
+#                       evaluation closes already-crossed levels at market
 #
-# Shipped profiles state current target intent explicitly. `use_targets` is retained as
-# a compatibility mirror while older serialized profile payloads remain readable.
+# Shipped profiles state current target intent and entry geometry policy explicitly. `use_targets` is
+# retained as a compatibility mirror while older serialized profile payloads remain readable.
 
 [[profile]]
 name = "conservative"
@@ -25,6 +28,7 @@ use_targets = [1]
 close_ratios = [1.0]
 stoploss_mode = { type = "FromSignal" }
 let_remainder_run = false
+entry_geometry = "permissive"
 
 [[profile]]
 name = "aggressive"
@@ -33,6 +37,7 @@ use_targets = [1, 2]
 close_ratios = [0.5, 0.5]
 stoploss_mode = { type = "FromSignal" }
 let_remainder_run = false
+entry_geometry = "strict"
 
 [[profile.rules]]
 type = "BreakevenAfterTargets"
@@ -49,6 +54,7 @@ use_targets = [1]
 close_ratios = [0.3]
 stoploss_mode = { type = "FromSignal" }
 let_remainder_run = true
+entry_geometry = "strict"
 
 [[profile.rules]]
 type = "BreakevenAfterTargets"
@@ -64,6 +70,7 @@ target_selection = { Selected = [1] }
 use_targets = [1]
 close_ratios = [1.0]
 let_remainder_run = false
+entry_geometry = "strict"
 
 [profile.stoploss_mode]
 type = "FixedDistance"
@@ -76,6 +83,7 @@ use_targets = [1, 2]
 close_ratios = [0.5, 0.5]
 stoploss_mode = { type = "FromSignal" }
 let_remainder_run = false
+entry_geometry = "strict"
 
 [[profile.rules]]
 type = "TimeExit"

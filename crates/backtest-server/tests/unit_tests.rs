@@ -269,6 +269,7 @@ fn fixture_inline_profile() -> ManagementProfileMsg {
         rules: Vec::new(),
         group_override: Some("parity-group".into()),
         let_remainder_run: false,
+        entry_geometry: None,
     }
 }
 
@@ -2365,6 +2366,7 @@ fn handler_list_profiles_with_loaded_profiles() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };
@@ -2796,6 +2798,7 @@ fn profile_from_msg_basic() {
         rules: vec![RuleConfigDefMsg::TrailingStop { distance: 10.0 }],
         group_override: Some("grp".into()),
         let_remainder_run: true,
+        entry_geometry: None,
     };
     let p = profile_from_msg(&msg).unwrap();
     assert_eq!(p.name, "test");
@@ -2818,6 +2821,7 @@ fn profile_from_msg_defaults() {
         rules: vec![],
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: None,
     };
     let p = profile_from_msg(&msg).unwrap();
     assert!(matches!(p.stoploss_mode, StoplossMode::FromSignal));
@@ -2837,6 +2841,7 @@ fn profile_from_msg_all_stoploss_modes() {
         rules: vec![],
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: None,
     };
     let p = profile_from_msg(&msg).unwrap();
     assert!(matches!(p.stoploss_mode, StoplossMode::FromSignal));
@@ -2894,6 +2899,7 @@ fn profile_from_msg_all_rule_types() {
         rules,
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: None,
     };
     let p = profile_from_msg(&msg).unwrap();
     assert_eq!(p.rules.len(), 7);
@@ -2926,6 +2932,7 @@ fn profile_to_msg_roundtrip() {
         ],
         group_override: Some("mygroup".into()),
         let_remainder_run: true,
+        entry_geometry: qs_backtest::EntryGeometryPolicy::Strict,
     };
     let msg = profile_to_msg(&original);
     let back = profile_from_msg(&msg).unwrap();
@@ -2956,6 +2963,7 @@ fn management_profile_msg_serde_roundtrip() {
         ],
         group_override: Some("ovr".into()),
         let_remainder_run: true,
+        entry_geometry: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: ManagementProfileMsg = serde_json::from_str(&json).unwrap();
@@ -3020,6 +3028,7 @@ fn profile_ref_inline_serde() {
         rules: vec![],
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: None,
     };
     let json = serde_json::to_string(&ProfileRef::Inline(msg)).unwrap();
     let decoded: ProfileRef = serde_json::from_str(&json).unwrap();
@@ -3051,6 +3060,7 @@ fn run_backtest_request_with_profile_def_serde() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         }),
         config: BacktestConfigMsg {
             initial_balance: None,
@@ -3092,6 +3102,7 @@ fn inline_profile_validation_error() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         }),
         config: BacktestConfigMsg {
             initial_balance: None,
@@ -3177,6 +3188,7 @@ fn handler_add_profile_success() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };
@@ -3199,6 +3211,7 @@ fn handler_add_profile_duplicate_rejected() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };
@@ -3222,6 +3235,7 @@ fn handler_add_profile_overwrite_success() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };
@@ -3236,6 +3250,7 @@ fn handler_add_profile_overwrite_success() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: true,
     };
@@ -3257,6 +3272,7 @@ fn handler_add_profile_invalid_rejected() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };
@@ -3279,6 +3295,7 @@ fn handler_remove_profile_success() {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         },
         overwrite: false,
     };

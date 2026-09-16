@@ -313,6 +313,7 @@ mod tests {
             rules: Vec::new(),
             group_override: None,
             let_remainder_run: true,
+            entry_geometry: None,
         }
     }
 

@@ -53,6 +53,10 @@ The production service uses deterministic FutureQuote replay.
 - Market entries use the appropriate future quote side and retain that actual fill for position state, P&L, MTM, and actual risk artifacts.
 - Market Entry sizing defaults to the actual fill price. The optional signal-entry basis uses an explicit original `Entry.price` only for quantity calculation and falls back to the fill price when it is absent.
 - Profiles, relative stops, targets, and rules still resolve from the actual fill price. Signal-entry sizing can therefore produce actual fill-to-stop risk above or below the requested risk, and the execution metadata records both price roles and the resulting quantity.
+- Management profiles carry an `entry_geometry` policy. The `strict` default rejects an Entry when the signal stoploss or a selected target sits on the wrong side of the execution price. The `permissive` policy attaches those signal levels unchanged.
+- Under `permissive`, the first tick evaluation after the fill closes already-crossed levels at market: a crossed take profit exits with `Target`, a violated stop with `Stoploss`, and the stop wins when both cross. The market entry sizing audit lists these levels in `levels_crossed_at_fill`. Profile rule levels and numeric validation stay strict under both policies, and runs without a profile stay strict.
+- The shipped `conservative` profile states `permissive`; the other shipped profiles state `strict`.
+- Management actions that reference an already-closed position resolve as skipped no-ops with reason `position_closed` instead of failed actions.
 - Limit and Stop Entries remain sized at placement from their required requested price; their quantity stays frozen through later fill, balance, FX, or quote changes.
 
 Close-only bars cannot reconstruct an intrabar price path. Use tick data when exact ordering of stop, target, and management events matters.

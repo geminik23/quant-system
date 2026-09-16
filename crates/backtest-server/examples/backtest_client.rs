@@ -536,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rules: vec![RuleConfigDefMsg::BreakevenAfterTargets { after_n: 1 }],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: None,
         };
 
         let raw_signal_request = BacktestRunSpec {

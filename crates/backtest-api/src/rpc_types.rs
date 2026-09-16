@@ -809,6 +809,19 @@ pub enum TargetSelectionMsg {
     Selected(Vec<usize>),
 }
 
+/// Wire-safe entry geometry policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryGeometryPolicyMsg {
+    /// Reject entry resolution when a signal level sits on the wrong side
+    /// of the entry price.
+    #[default]
+    Strict,
+    /// Attach signal levels unchanged; already-crossed levels close at
+    /// market on the first tick evaluation.
+    Permissive,
+}
+
 /// Wire-safe management profile definition sent inline with a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagementProfileMsg {
@@ -828,6 +841,10 @@ pub struct ManagementProfileMsg {
     pub group_override: Option<String>,
     #[serde(default)]
     pub let_remainder_run: bool,
+    /// Directional geometry policy for signal stoploss/targets vs the
+    /// execution price. Omission preserves the Strict default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_geometry: Option<EntryGeometryPolicyMsg>,
 }
 
 /// Wire-safe stoploss mode enum.
@@ -1070,6 +1087,8 @@ struct StrictManagementProfileMsg {
     group_override: Option<String>,
     #[serde(default)]
     let_remainder_run: bool,
+    #[serde(default)]
+    entry_geometry: Option<EntryGeometryPolicyMsg>,
 }
 
 #[derive(Serialize, Deserialize)]

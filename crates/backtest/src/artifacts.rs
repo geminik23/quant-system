@@ -76,6 +76,10 @@ pub struct MarketEntrySizingAudit {
     pub native_loss_per_lot: Option<f64>,
     pub account_loss_per_lot: Option<f64>,
     pub final_lot: f64,
+    /// Signal levels already crossed by the execution price at fill time.
+    /// Empty when every attached level was on its protective side.
+    #[serde(default)]
+    pub levels_crossed_at_fill: Vec<String>,
 }
 
 /// Exact catalog-backed sizing adjustment recorded before one Entry action.

@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use qs_backtest::runner::BacktestConfig;
 use qs_backtest::{
-    BacktestResult, BacktestRunner, ConversionRoute, FutureQuoteConfig, ManagementProfile,
-    MarketEntrySizingBasis, MarketEvent, RawSignal, RunCurrencyPlan, StoplossMode, VecFeed,
+    BacktestResult, BacktestRunner, ConversionRoute, EntryGeometryPolicy, FutureQuoteConfig,
+    ManagementProfile, MarketEntrySizingBasis, MarketEvent, RawSignal, RunCurrencyPlan,
+    StoplossMode, VecFeed,
 };
 use qs_core::{OrderType, Side, SizingPolicy};
 use qs_symbols::SymbolSpec;
@@ -268,6 +269,7 @@ fn fixed_distance_profile_uses_fill_while_sizing_uses_signal_price() {
         rules: Vec::new(),
         group_override: None,
         let_remainder_run: false,
+        entry_geometry: EntryGeometryPolicy::Strict,
     };
     let result = run(
         SizingPolicy::FixedRiskAmount { amount: 100.0 },

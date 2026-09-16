@@ -3054,47 +3054,77 @@ impl BacktestRunner {
                     None => resolve_unprofiled_entry(&signal),
                 };
                 match resolved {
-                    Ok(Some(resolved)) => match self.finalize_resolved_entry(
-                        resolved,
-                        future_executor.balance(),
-                        quote.ts,
-                        Some(conversion_quotes),
-                        Some(sizing_reference_price),
-                    ) {
-                        Ok(finalized) => {
-                            let (trade_id, protective_stop) = match &finalized.action {
-                                Action::Open {
-                                    trade_id, stoploss, ..
-                                } => (trade_id.clone(), *stoploss),
-                                _ => unreachable!("finalized entry must be an open action"),
-                            };
-                            action.market_entry_sizing_audit = Some(MarketEntrySizingAudit {
-                                action_id: action.action_id.clone(),
-                                trade_id,
-                                configured_basis,
-                                applied_basis,
-                                fallback_to_fill,
-                                original_signal_price,
-                                sizing_reference_price,
-                                execution_price: execution.price,
-                                protective_stop,
-                                requested_account_risk: finalized.requested_account_risk,
-                                native_loss_per_lot: finalized.native_loss_per_lot,
-                                account_loss_per_lot: finalized.account_loss_per_lot,
-                                final_lot: finalized.final_lot,
-                            });
-                            action.action = finalized.action;
+                    Ok(Some(resolved)) => {
+                        let side_for_audit = resolved.side;
+                        let resolved_target_prices: Vec<f64> =
+                            resolved.targets.iter().map(|target| target.price).collect();
+                        match self.finalize_resolved_entry(
+                            resolved,
+                            future_executor.balance(),
+                            quote.ts,
+                            Some(conversion_quotes),
+                            Some(sizing_reference_price),
+                        ) {
+                            Ok(finalized) => {
+                                let (trade_id, protective_stop) = match &finalized.action {
+                                    Action::Open {
+                                        trade_id, stoploss, ..
+                                    } => (trade_id.clone(), *stoploss),
+                                    _ => unreachable!("finalized entry must be an open action"),
+                                };
+                                // Levels already past their trigger at fill close at
+                                // market on the first tick evaluation under Permissive.
+                                let mut levels_crossed_at_fill = Vec::new();
+                                if let Some(stop) = protective_stop {
+                                    let crossed = match side_for_audit {
+                                        Side::Buy => execution.price <= stop,
+                                        Side::Sell => execution.price >= stop,
+                                    };
+                                    if crossed {
+                                        levels_crossed_at_fill.push("stop".to_owned());
+                                    }
+                                }
+                                for (offset, target_price) in
+                                    resolved_target_prices.iter().enumerate()
+                                {
+                                    let crossed = match side_for_audit {
+                                        Side::Buy => execution.price >= *target_price,
+                                        Side::Sell => execution.price <= *target_price,
+                                    };
+                                    if crossed {
+                                        levels_crossed_at_fill
+                                            .push(format!("target{}", offset + 1));
+                                    }
+                                }
+                                action.market_entry_sizing_audit = Some(MarketEntrySizingAudit {
+                                    action_id: action.action_id.clone(),
+                                    trade_id,
+                                    configured_basis,
+                                    applied_basis,
+                                    fallback_to_fill,
+                                    original_signal_price,
+                                    sizing_reference_price,
+                                    execution_price: execution.price,
+                                    protective_stop,
+                                    requested_account_risk: finalized.requested_account_risk,
+                                    native_loss_per_lot: finalized.native_loss_per_lot,
+                                    account_loss_per_lot: finalized.account_loss_per_lot,
+                                    final_lot: finalized.final_lot,
+                                    levels_crossed_at_fill,
+                                });
+                                action.action = finalized.action;
+                            }
+                            Err(error) => {
+                                let mut disposition =
+                                    ActionDisposition::rejected(action.action_id, error);
+                                disposition.action_kind = Some(action.action_kind);
+                                disposition.signal_ts = Some(action.signal_ts);
+                                disposition.effective_ts = Some(action.effective_ts);
+                                self.record_disposition(lifecycle, disposition);
+                                continue;
+                            }
                         }
-                        Err(error) => {
-                            let mut disposition =
-                                ActionDisposition::rejected(action.action_id, error);
-                            disposition.action_kind = Some(action.action_kind);
-                            disposition.signal_ts = Some(action.signal_ts);
-                            disposition.effective_ts = Some(action.effective_ts);
-                            self.record_disposition(lifecycle, disposition);
-                            continue;
-                        }
-                    },
+                    }
                     Ok(None) => {
                         let mut disposition =
                             ActionDisposition::skipped(action.action_id, "not_an_entry");
@@ -3221,7 +3251,17 @@ impl BacktestRunner {
         let engine_transaction = match engine_transaction {
             Ok(transaction) => transaction,
             Err(error) => {
-                let mut disposition = ActionDisposition::rejected(action_id, error.to_string());
+                // A closed-position state mismatch on a management action mirrors
+                // a live broker no-op, so it is skipped rather than failed.
+                let closed_state = matches!(
+                    error,
+                    FutureApplyError::Core(qs_core::CoreError::InvalidState { .. })
+                ) && action_kind != "entry";
+                let mut disposition = if closed_state {
+                    ActionDisposition::skipped(action_id, "position_closed")
+                } else {
+                    ActionDisposition::rejected(action_id, error.to_string())
+                };
                 disposition.action_kind = Some(action_kind);
                 disposition.signal_ts = Some(signal_ts);
                 disposition.effective_ts = Some(effective_ts);
@@ -4045,7 +4085,9 @@ mod tests {
     use super::*;
     use crate::currency::{ConversionRoute, FxPair};
     use crate::data_feed::{EventMetadata, FeedEvent, MarketEvent, SeriesRoles, VecFeed};
-    use crate::profile::{ManagementProfile, PositionRef, RawSignal, StoplossMode};
+    use crate::profile::{
+        EntryGeometryPolicy, ManagementProfile, PositionRef, RawSignal, StoplossMode,
+    };
     use chrono::NaiveDate;
     use qs_core::types::{CloseReason, FillPurpose, OrderType, Side, TargetSpec};
 
@@ -4928,6 +4970,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let result = BacktestRunner::new(BacktestConfig {
@@ -5232,6 +5275,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let raw_signals = vec![RawSignal::Entry {
@@ -5274,6 +5318,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let raw_signals = vec![
@@ -5588,6 +5633,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let raw_signals = vec![
@@ -5642,6 +5688,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let raw_signals = vec![
@@ -5700,6 +5747,7 @@ mod tests {
             rules: vec![],
             group_override: Some("alpha".into()),
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
 
         let raw_signals = vec![
@@ -5968,6 +6016,7 @@ mod tests {
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
         };
         let signals = vec![RawSignal::Entry {
             ts: ts(10, 0, 0),

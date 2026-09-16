@@ -527,6 +527,20 @@ pub enum StoplossMode {
     FixedPrice { price: f64 },
 }
 
+/// Directional geometry policy for signal stoploss and targets resolved
+/// against the execution price.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryGeometryPolicy {
+    /// Reject entry resolution when a signal level sits on the wrong side
+    /// of the entry price.
+    #[default]
+    Strict,
+    /// Attach signal levels unchanged. The execution engine closes
+    /// already-crossed levels at market on the first tick evaluation.
+    Permissive,
+}
+
 // ─── TOML-friendly rule definition ──────────────────────────────────────────
 
 /// Profile-specific rule definition with `#[serde(tag = "type")]` for TOML.
@@ -692,6 +706,12 @@ pub struct ManagementProfile {
     /// When true and ratios sum < 1.0, the remainder rides with just SL/rules.
     #[serde(default)]
     pub let_remainder_run: bool,
+
+    /// Directional geometry policy for the signal stoploss and targets when
+    /// they are validated against the execution price. Profile rule levels
+    /// and numeric validation are always strict.
+    #[serde(default)]
+    pub entry_geometry: EntryGeometryPolicy,
 }
 
 fn default_stoploss_mode() -> StoplossMode {
@@ -722,7 +742,9 @@ impl ManagementProfile {
     /// Transform a `RawSignal::Entry` while retaining target-resolution metadata.
     ///
     /// This canonical path rejects malformed numeric values, target selections,
-    /// geometry, and weights. An explicit `target_selection` takes precedence; when it is
+    /// and weights. Under the Strict geometry policy it also rejects signal
+    /// levels on the wrong side of the entry price; Permissive attaches them
+    /// unchanged. An explicit `target_selection` takes precedence; when it is
     /// omitted, an empty `use_targets` means [`TargetSelection::None`] and non-empty
     /// `use_targets` means [`TargetSelection::Selected`]. When targets are selected and
     /// `close_ratios` is empty, equal `1 / N` weights are synthesized.
@@ -776,8 +798,15 @@ impl ManagementProfile {
             selection,
             &self.close_ratios,
             self.let_remainder_run,
+            self.entry_geometry,
         )?;
-        let stoploss = resolve_stoploss(&self.stoploss_mode, *signal_stoploss, *price, *side)?;
+        let stoploss = resolve_stoploss(
+            &self.stoploss_mode,
+            *signal_stoploss,
+            *price,
+            *side,
+            self.entry_geometry,
+        )?;
         let rules = resolve_rules(&self.rules, *price, *side)?;
 
         Ok(Some(ResolvedEntry {
@@ -871,6 +900,7 @@ fn resolve_targets(
     selection: TargetSelection,
     explicit_weights: &[f64],
     let_remainder_run: bool,
+    geometry_policy: EntryGeometryPolicy,
 ) -> Result<(Vec<TargetSpec>, TargetResolution), ProfileApplicationError> {
     let selected_indices = match &selection {
         TargetSelection::All => (1..=signal_targets.len()).collect(),
@@ -939,7 +969,7 @@ fn resolve_targets(
                 Side::Buy => target > entry,
                 Side::Sell => target < entry,
             };
-            if !valid_geometry {
+            if !valid_geometry && geometry_policy == EntryGeometryPolicy::Strict {
                 return Err(ProfileApplicationError::InvalidTargetGeometry {
                     index,
                     side,
@@ -1012,6 +1042,7 @@ fn resolve_stoploss(
     signal_stoploss: Option<f64>,
     entry_price: Option<f64>,
     side: Side,
+    geometry_policy: EntryGeometryPolicy,
 ) -> Result<Option<f64>, ProfileApplicationError> {
     let stoploss = match mode {
         StoplossMode::FromSignal => signal_stoploss,
@@ -1030,7 +1061,9 @@ fn resolve_stoploss(
     };
     if let Some(stoploss) = stoploss {
         require_positive_finite("resolved stoploss", stoploss)?;
-        if let Some(entry) = entry_price {
+        if let Some(entry) = entry_price
+            && geometry_policy == EntryGeometryPolicy::Strict
+        {
             validate_stop_geometry(side, entry, stoploss)?;
         }
     }
@@ -1184,6 +1217,7 @@ pub fn resolve_unprofiled_entry(
         TargetSelection::All,
         &[],
         false,
+        EntryGeometryPolicy::Strict,
     )?;
 
     Ok(Some(ResolvedEntry {
@@ -1339,11 +1373,16 @@ pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileValidationEr
         }
     }
 
-    resolve_stoploss(&p.stoploss_mode, None, None, Side::Buy).map_err(|error| {
-        ProfileValidationError::InvalidConfiguration {
-            profile: p.name.clone(),
-            reason: error.to_string(),
-        }
+    resolve_stoploss(
+        &p.stoploss_mode,
+        None,
+        None,
+        Side::Buy,
+        EntryGeometryPolicy::Strict,
+    )
+    .map_err(|error| ProfileValidationError::InvalidConfiguration {
+        profile: p.name.clone(),
+        reason: error.to_string(),
     })?;
     resolve_rules(&p.rules, None, Side::Buy).map_err(|error| {
         ProfileValidationError::InvalidConfiguration {
