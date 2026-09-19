@@ -264,6 +264,7 @@ mod tests {
                 raw_signals: Vec::new(),
                 profile: None,
                 profile_def: None,
+                entry_profile_routes: Vec::new(),
                 config: BacktestConfigMsg {
                     initial_balance: None,
                     close_on_finish: None,
@@ -290,6 +291,7 @@ mod tests {
                 to: None,
                 raw_signals: Vec::new(),
                 profiles: vec![ProfileRef::Named("default".into())],
+                entry_profile_routes: Vec::new(),
                 config: BacktestConfigMsg {
                     initial_balance: None,
                     close_on_finish: None,
@@ -309,6 +311,7 @@ mod tests {
             target_selection: None,
             use_targets: Vec::new(),
             close_ratios: Vec::new(),
+            target_source: None,
             stoploss_mode: None,
             rules: Vec::new(),
             group_override: None,
@@ -376,6 +379,7 @@ mod tests {
                             name: "default".into(),
                             use_targets: Vec::new(),
                             close_ratios: Vec::new(),
+                            target_source: "FromSignal".into(),
                             stoploss_mode: "None".into(),
                             rules_count: 0,
                             let_remainder_run: true,

@@ -218,10 +218,9 @@ fn register_client_handlers(
                 let submitted = handle_submit_backtest(&state, &req);
                 if let Some(ref id) = submitted.job_id {
                     let id = id.clone();
-                    let inner_req = req.request.clone();
                     let st = state.clone();
                     let handle = tokio::task::spawn_blocking(move || {
-                        run_job_and_store(st, id, inner_req);
+                        run_job_and_store(st, id);
                     });
                     track_blocking_job(&blocking_jobs, handle);
                 }
@@ -569,6 +568,7 @@ mod tests {
                         progress: BacktestProgress::default(),
                     })
                     .0,
+                    accepted: None,
                 },
             )])),
             max_retained_jobs: 10,

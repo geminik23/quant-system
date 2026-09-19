@@ -107,6 +107,7 @@ fn signals() -> Vec<RawSignal> {
             targets: Vec::new(),
             group: None,
             trade_id: Some("instrument-parity".into()),
+            entry_class: None,
         },
         RawSignal::Close {
             ts: ts(1_000),
@@ -246,6 +247,7 @@ fn catalog_notional_uses_execution_price_with_signal_sizing_basis() {
         targets: Vec::new(),
         group: None,
         trade_id: Some("catalog-notional".into()),
+        entry_class: None,
     };
 
     let result = BacktestRunner::new_future(config, future).run_raw_signals_future(

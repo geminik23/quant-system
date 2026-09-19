@@ -132,6 +132,7 @@ fn entry(timestamp: NaiveDateTime) -> RawSignal {
         targets: vec![],
         group: Some("campaign".into()),
         trade_id: Some("trade-1".into()),
+        entry_class: None,
     }
 }
 
@@ -342,6 +343,7 @@ impl HistoricalStrategy for PendingEntryStrategy {
             targets: vec![],
             group: Some("pending-campaign".into()),
             trade_id: Some("pending-trade".into()),
+            entry_class: None,
         };
         Ok(StrategyOutput::from_decision(
             StrategyDecisionDraft::new(

@@ -61,6 +61,7 @@ fn run_linear_round_trip(
             targets: Vec::new(),
             group: None,
             trade_id: Some("economic-guard-baseline".into()),
+            entry_class: None,
         },
         RawSignal::Close {
             ts: ts(1_000),

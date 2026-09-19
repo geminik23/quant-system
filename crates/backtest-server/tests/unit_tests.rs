@@ -51,8 +51,8 @@ fn submit_for_test(state: &ServerState, request: &BacktestRunSpec) -> SubmitBack
     )
 }
 
-fn run_job_for_test(state: Arc<ServerState>, job_id: String, request: BacktestRunSpec) {
-    run_job_and_store(state, job_id, test_request(request));
+fn run_job_for_test(state: Arc<ServerState>, job_id: String, _request: BacktestRunSpec) {
+    run_job_and_store(state, job_id);
 }
 
 fn run_multi_for_test(
@@ -164,6 +164,7 @@ fn sample_raw_signal() -> RawSignalMsg {
         targets: vec![1.0900, 1.0950],
         group: None,
         trade_id: None,
+        entry_class: None,
     }
 }
 
@@ -180,6 +181,7 @@ fn sample_run_request() -> BacktestRunSpec {
         raw_signals: vec![sample_raw_signal()],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: Some(10_000.0),
             close_on_finish: None,
@@ -265,6 +267,7 @@ fn fixture_inline_profile() -> ManagementProfileMsg {
         target_selection: Some(TargetSelectionMsg::Selected(vec![1])),
         use_targets: vec![1],
         close_ratios: vec![1.0],
+        target_source: None,
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
         rules: Vec::new(),
         group_override: Some("parity-group".into()),
@@ -296,6 +299,7 @@ fn replay_request() -> RunBacktestRequest {
                     targets: vec![1.1015],
                     group: Some("signal-group".into()),
                     trade_id: Some("future-parity-trade".into()),
+                    entry_class: None,
                 },
                 RawSignalMsg::Entry {
                     ts: "2026-01-15T10:00:00".into(),
@@ -308,10 +312,12 @@ fn replay_request() -> RunBacktestRequest {
                     targets: vec![1.0990],
                     group: Some("signal-group".into()),
                     trade_id: Some("future-parity-filtered".into()),
+                    entry_class: None,
                 },
             ],
             profile: None,
             profile_def: Some(fixture_inline_profile()),
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(25_000.0),
                 close_on_finish: Some(true),
@@ -383,6 +389,7 @@ fn multi_request(single: &RunBacktestRequest) -> RunBacktestMultiRequest {
             profiles: vec![ProfileRef::Inline(
                 request.profile_def.clone().expect("inline fixture profile"),
             )],
+            entry_profile_routes: Vec::new(),
             config: request.config.clone(),
         },
         future: single.future.clone(),
@@ -497,6 +504,7 @@ fn active_symbol_request() -> RunBacktestRequest {
                     targets: vec![189.0],
                     group: None,
                     trade_id: Some("filtered-gbpjpy".into()),
+                    entry_class: None,
                 },
                 RawSignalMsg::Entry {
                     ts: "2026-01-15T10:00:00".into(),
@@ -509,10 +517,12 @@ fn active_symbol_request() -> RunBacktestRequest {
                     targets: vec![2001.0],
                     group: None,
                     trade_id: Some("active-xauusd".into()),
+                    entry_class: None,
                 },
             ],
             profile: None,
             profile_def: Some(fixture_inline_profile()),
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -673,6 +683,7 @@ fn run_backtest_request_serde_roundtrip() {
         raw_signals: vec![sample_raw_signal()],
         profile: Some("aggressive".into()),
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: Some(10000.0),
             close_on_finish: None,
@@ -1112,6 +1123,107 @@ fn multi_artifact_response_reconstructs_all_profile_results() {
 }
 
 #[test]
+fn submit_rejects_unknown_entry_class_before_job_admission() {
+    let fixture = replay_path_fixture();
+    let mut request = replay_request();
+    if let RawSignalMsg::Entry { entry_class, .. } = &mut request.request.raw_signals[0] {
+        *entry_class = Some("missing".into());
+    }
+    let response = handle_submit_backtest(&fixture.state, &SubmitBacktestRequest { request });
+    assert!(!response.success);
+    assert!(response.job_id.is_none());
+    assert!(
+        response
+            .error
+            .unwrap()
+            .contains("no management-profile route")
+    );
+    assert!(fixture.state.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn sync_run_routes_labeled_entry_to_inline_profile() {
+    let fixture = replay_path_fixture();
+    let mut request = replay_request();
+    if let RawSignalMsg::Entry { entry_class, .. } = &mut request.request.raw_signals[0] {
+        *entry_class = Some("expanded".into());
+    }
+    let mut routed = fixture_inline_profile();
+    routed.name = "routed".into();
+    routed.group_override = Some("routed-group".into());
+    request.request.entry_profile_routes = vec![EntryProfileRouteMsg {
+        entry_class: "expanded".into(),
+        profile: ProfileRef::Inline(routed),
+    }];
+
+    let response = handle_run_backtest(&fixture.state, &request);
+    assert!(response.success, "run: {:?}", response.error);
+    let execution = &response.result.unwrap().future.unwrap().execution_metadata;
+    let audits = execution["entry_profile_resolutions"].as_array().unwrap();
+    assert_eq!(audits[0]["selection_source"], "mapped");
+    assert_eq!(audits[0]["entry_class"], "expanded");
+    assert_eq!(audits[0]["selected_profile_name"], "routed");
+    assert!(
+        execution["tags"]["profile.entry_routes"]
+            .as_str()
+            .unwrap()
+            .contains("routed")
+    );
+}
+
+#[test]
+fn retained_job_uses_profile_snapshot_accepted_at_submission() {
+    let fixture = replay_path_fixture();
+    let mut before = fixture_inline_profile();
+    before.name = "snapshot".into();
+    before.group_override = Some("before".into());
+    assert!(
+        handle_add_profile(
+            &fixture.state,
+            &AddProfileRequest {
+                profile: before,
+                overwrite: false,
+            },
+        )
+        .success
+    );
+
+    let mut request = replay_request();
+    request.request.profile = Some("snapshot".into());
+    request.request.profile_def = None;
+    let submission = handle_submit_backtest(
+        &fixture.state,
+        &SubmitBacktestRequest {
+            request: request.clone(),
+        },
+    );
+    assert!(submission.success, "submit: {:?}", submission.error);
+    let job_id = submission.job_id.unwrap();
+
+    let mut after = fixture_inline_profile();
+    after.name = "snapshot".into();
+    after.group_override = Some("after".into());
+    assert!(
+        handle_add_profile(
+            &fixture.state,
+            &AddProfileRequest {
+                profile: after,
+                overwrite: true,
+            },
+        )
+        .success
+    );
+
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let jobs = fixture.state.jobs.lock().unwrap();
+    let result = jobs[&job_id].result.as_ref().unwrap();
+    let tags = &result.future.as_ref().unwrap().execution_metadata["tags"];
+    let options = tags["profile.options"].as_str().unwrap();
+    assert!(options.contains("before"), "{options}");
+    assert!(!options.contains("after"), "{options}");
+}
+
+#[test]
 fn async_artifact_job_retains_only_a_compact_result_summary() {
     let fixture = replay_path_fixture();
     let mut request = replay_request();
@@ -1124,7 +1236,7 @@ fn async_artifact_job_retains_only_a_compact_result_summary() {
     );
     assert!(submission.success, "submit: {:?}", submission.error);
     let job_id = submission.job_id.unwrap();
-    run_job_and_store(fixture.state.clone(), job_id.clone(), request);
+    run_job_and_store(fixture.state.clone(), job_id.clone());
 
     {
         let jobs = fixture.state.jobs.lock().unwrap();
@@ -1224,7 +1336,7 @@ fn sync_async_and_multi_profile_future_quote_results_are_equivalent() {
     );
     assert!(submission.success, "async submit: {:?}", submission.error);
     let job_id = submission.job_id.expect("submitted job id");
-    run_job_and_store(fixture.state.clone(), job_id.clone(), request.clone());
+    run_job_and_store(fixture.state.clone(), job_id.clone());
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1389,7 +1501,7 @@ fn prunes_idle_explicit_symbols_and_matches_sync_async_multi() {
     );
     assert!(submission.success, "async submit: {:?}", submission.error);
     let job_id = submission.job_id.expect("submitted job id");
-    run_job_and_store(fixture.state.clone(), job_id.clone(), request.clone());
+    run_job_and_store(fixture.state.clone(), job_id.clone());
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1444,6 +1556,7 @@ fn filtered_entry_and_management_only_run_is_idle_without_market_data() {
                     targets: vec![189.0],
                     group: None,
                     trade_id: Some("filtered-out-of-scope".into()),
+                    entry_class: None,
                 },
                 RawSignalMsg::CloseAll {
                     ts: "2026-01-15T10:00:00".into(),
@@ -1451,6 +1564,7 @@ fn filtered_entry_and_management_only_run_is_idle_without_market_data() {
             ],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -1586,9 +1700,11 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
                 targets: vec![1.1015],
                 group: None,
                 trade_id: Some("bar-metadata".into()),
+                entry_class: None,
             }],
             profile: None,
             profile_def: Some(fixture_inline_profile()),
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -1650,7 +1766,7 @@ fn cancelled_job_remains_cancelled_and_never_stores_a_result() {
     );
     assert!(cancelled.success);
 
-    run_job_and_store(fixture.state.clone(), job_id.clone(), request);
+    run_job_and_store(fixture.state.clone(), job_id.clone());
     let status = handle_get_backtest_status(
         &fixture.state,
         &GetBacktestStatusRequest {
@@ -1782,6 +1898,7 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
                     progress: BacktestProgress::default(),
                 })
                 .0,
+                accepted: None,
             },
         );
         artifact
@@ -2030,6 +2147,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
             ProfileRef::Named("conservative".into()),
             ProfileRef::Named("aggressive".into()),
         ],
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2067,6 +2185,7 @@ fn profile_info_serde_roundtrip() {
         name: "aggressive".into(),
         use_targets: vec![0, 1, 2],
         close_ratios: vec![0.5, 0.3, 0.2],
+        target_source: "FromSignal".into(),
         stoploss_mode: "FixedDistance".into(),
         rules_count: 3,
         let_remainder_run: false,
@@ -2075,6 +2194,17 @@ fn profile_info_serde_roundtrip() {
     let decoded: ProfileInfo = serde_json::from_str(&json).unwrap();
     assert_eq!(decoded.name, "aggressive");
     assert_eq!(decoded.rules_count, 3);
+
+    let legacy: ProfileInfo = serde_json::from_value(serde_json::json!({
+        "name": "legacy",
+        "use_targets": [],
+        "close_ratios": [],
+        "stoploss_mode": "FromSignal",
+        "rules_count": 0,
+        "let_remainder_run": false
+    }))
+    .unwrap();
+    assert_eq!(legacy.target_source, "FromSignal");
 }
 
 #[test]
@@ -2362,6 +2492,7 @@ fn handler_list_profiles_with_loaded_profiles() {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -2444,6 +2575,7 @@ fn handler_run_backtest_invalid_data_type() {
         raw_signals: vec![sample_raw_signal()],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2473,6 +2605,7 @@ fn handler_run_backtest_bar_without_timeframe() {
         raw_signals: vec![sample_raw_signal()],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2500,6 +2633,7 @@ fn handler_run_backtest_empty_signals() {
         raw_signals: vec![],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2544,6 +2678,7 @@ fn handler_run_backtest_no_data_returns_error() {
         raw_signals: vec![sample_raw_signal()],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2573,6 +2708,7 @@ fn handler_run_backtest_unknown_profile() {
         to: None,
         raw_signals: vec![sample_raw_signal()],
         profiles: vec![ProfileRef::Named("nonexistent".into())],
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2600,6 +2736,7 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
         to: None,
         raw_signals: vec![sample_raw_signal()],
         profiles: vec![ProfileRef::Named("a".into()), ProfileRef::Named("b".into())],
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -2794,6 +2931,7 @@ fn profile_from_msg_basic() {
         target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.5, 0.5],
+        target_source: None,
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
         rules: vec![RuleConfigDefMsg::TrailingStop { distance: 10.0 }],
         group_override: Some("grp".into()),
@@ -2817,6 +2955,7 @@ fn profile_from_msg_defaults() {
         target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
+        target_source: None,
         stoploss_mode: None,
         rules: vec![],
         group_override: None,
@@ -2837,6 +2976,7 @@ fn profile_from_msg_all_stoploss_modes() {
         target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
+        target_source: None,
         stoploss_mode: Some(StoplossModeMsg::FromSignal),
         rules: vec![],
         group_override: None,
@@ -2895,6 +3035,7 @@ fn profile_from_msg_all_rule_types() {
         target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
+        target_source: None,
         stoploss_mode: None,
         rules,
         group_override: None,
@@ -2925,6 +3066,7 @@ fn profile_to_msg_roundtrip() {
         target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.6, 0.4],
+        target_source: qs_backtest::TargetSource::FromSignal,
         stoploss_mode: StoplossMode::FixedDistance { distance: 25.0 },
         rules: vec![
             RuleConfigDef::TrailingStop { distance: 15.0 },
@@ -2956,6 +3098,7 @@ fn management_profile_msg_serde_roundtrip() {
         target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.6, 0.4],
+        target_source: None,
         stoploss_mode: Some(StoplossModeMsg::FixedDistance { distance: 20.0 }),
         rules: vec![
             RuleConfigDefMsg::TrailingStop { distance: 10.0 },
@@ -3024,6 +3167,7 @@ fn profile_ref_inline_serde() {
         target_selection: None,
         use_targets: vec![1],
         close_ratios: vec![1.0],
+        target_source: None,
         stoploss_mode: None,
         rules: vec![],
         group_override: None,
@@ -3056,12 +3200,14 @@ fn run_backtest_request_with_profile_def_serde() {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
             entry_geometry: None,
         }),
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -3098,12 +3244,14 @@ fn inline_profile_validation_error() {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![1.0], // mismatch
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
             let_remainder_run: false,
             entry_geometry: None,
         }),
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -3137,6 +3285,7 @@ fn backward_compat_no_profile_def() {
         raw_signals: vec![sample_raw_signal()],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -3184,6 +3333,7 @@ fn handler_add_profile_success() {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3207,6 +3357,7 @@ fn handler_add_profile_duplicate_rejected() {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3231,6 +3382,7 @@ fn handler_add_profile_overwrite_success() {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3246,6 +3398,7 @@ fn handler_add_profile_overwrite_success() {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3268,6 +3421,7 @@ fn handler_add_profile_invalid_rejected() {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![1.0], // mismatch
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3291,6 +3445,7 @@ fn handler_remove_profile_success() {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -3339,6 +3494,7 @@ fn raw_signal_msg_serde_entry() {
         targets: vec![1.0900],
         group: Some("grp".into()),
         trade_id: Some("t1".into()),
+        entry_class: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: RawSignalMsg = serde_json::from_str(&json).unwrap();
@@ -3386,6 +3542,7 @@ fn raw_signal_msg_serde_all_variants() {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         },
         RawSignalMsg::Close {
             ts: "2026-01-15T10:30:00".into(),
@@ -3537,6 +3694,7 @@ fn run_backtest_request_raw_signals_serde() {
                 targets: vec![1.0900],
                 group: Some("grp".into()),
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignalMsg::CloseAllInGroup {
                 ts: "2026-01-15T11:00:00".into(),
@@ -3545,6 +3703,7 @@ fn run_backtest_request_raw_signals_serde() {
         ],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -3571,6 +3730,7 @@ fn raw_signal_from_msg_entry_converts() {
         targets: vec![1.0900],
         group: Some("grp".into()),
         trade_id: Some("t1".into()),
+        entry_class: None,
     };
     let result = raw_signal_from_msg(&msg, "default", &reg).unwrap();
     assert!(result.is_entry());
@@ -3650,6 +3810,7 @@ fn raw_signal_from_msg_empty_symbol_uses_default() {
         targets: vec![],
         group: None,
         trade_id: None,
+        entry_class: None,
     };
     let result = raw_signal_from_msg(&msg, "xauusd", &reg).unwrap();
     assert!(result.is_entry());
@@ -3778,6 +3939,7 @@ fn raw_signal_from_msg_invalid_side_errors() {
         targets: vec![],
         group: None,
         trade_id: None,
+        entry_class: None,
     };
     assert!(raw_signal_from_msg(&msg, "eurusd", &reg).is_err());
 }
@@ -3816,8 +3978,10 @@ fn run_backtest_multi_request_raw_signals_serde() {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         }],
         profiles: vec![ProfileRef::Named("test".into())],
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,
@@ -3845,6 +4009,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
         raw_signals: vec![],
         profile: None,
         profile_def: None,
+        entry_profile_routes: Vec::new(),
         config: BacktestConfigMsg {
             initial_balance: None,
             close_on_finish: None,

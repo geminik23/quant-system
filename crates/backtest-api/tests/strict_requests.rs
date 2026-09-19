@@ -1,6 +1,6 @@
 use qs_backtest_api::{
-    BacktestConfigMsg, BacktestRunSpec, FutureQuoteConfigMsg, PositionRefMsg,
-    ProviderEvaluationOptionsMsg, RawSignalMsg, ResultDeliveryMsg, RunBacktestRequest,
+    BacktestConfigMsg, BacktestRunSpec, EntryProfileRouteMsg, FutureQuoteConfigMsg, PositionRefMsg,
+    ProfileRef, ProviderEvaluationOptionsMsg, RawSignalMsg, ResultDeliveryMsg, RunBacktestRequest,
 };
 use serde_json::{Value, json};
 
@@ -166,6 +166,7 @@ fn run_requests_support_parser_free_direct_construction() {
                     targets: Vec::new(),
                     group: None,
                     trade_id: Some("trade-1".into()),
+                    entry_class: Some("expanded".into()),
                 },
                 RawSignalMsg::ScaleIn {
                     ts: "2026-01-15T10:01:00".into(),
@@ -178,6 +179,10 @@ fn run_requests_support_parser_free_direct_construction() {
             ],
             profile: None,
             profile_def: None,
+            entry_profile_routes: vec![EntryProfileRouteMsg {
+                entry_class: "expanded".into(),
+                profile: ProfileRef::Named("demo".into()),
+            }],
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),
@@ -193,6 +198,7 @@ fn run_requests_support_parser_free_direct_construction() {
     let decoded: RunBacktestRequest =
         serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
     assert_eq!(decoded.request.raw_signals.len(), 2);
+    assert_eq!(decoded.request.entry_profile_routes.len(), 1);
     assert!(matches!(
         decoded.request.raw_signals[1],
         RawSignalMsg::ScaleIn { size: 0.25, .. }

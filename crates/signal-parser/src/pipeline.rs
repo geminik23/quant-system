@@ -459,6 +459,7 @@ mod tests {
                 targets: vec![1.09],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             };
 
             assert!(matches!(
@@ -759,6 +760,7 @@ mod tests {
                     targets: vec![],
                     group: None,
                     trade_id: Some(format!("tg:{}:{}", current.chat_id, current.msg_id)),
+                    entry_class: None,
                 })
             }
 
@@ -827,6 +829,7 @@ mod tests {
                     targets: vec![1.09],
                     group: Some("tg_test".into()),
                     trade_id: Some("tg_test-trade-1".into()),
+                    entry_class: None,
                 })
             }
 

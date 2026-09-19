@@ -149,6 +149,7 @@ impl TemplateParser {
             targets,
             group: Some(self.group_prefix.clone()),
             trade_id: None,
+            entry_class: None,
         }])
     }
 }

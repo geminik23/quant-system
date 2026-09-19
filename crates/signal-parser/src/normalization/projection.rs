@@ -63,7 +63,11 @@ fn encode_raw_signal(
             targets,
             group,
             trade_id,
+            entry_class,
         } => {
+            if entry_class.is_some() {
+                return Err(IdentityError::UnsupportedEntryClass);
+            }
             writer.u16(1);
             encode_timestamp(*ts, writer);
             writer.text(symbol)?;
@@ -318,5 +322,40 @@ fn order_type_tag(value: OrderType) -> u16 {
         OrderType::Market => 1,
         OrderType::Limit => 2,
         OrderType::Stop => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn entry(entry_class: Option<&str>) -> RawSignal {
+        RawSignal::Entry {
+            ts: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.1),
+            risk_multiplier: 1.0,
+            stoploss: Some(1.09),
+            targets: vec![1.11],
+            group: None,
+            trade_id: Some("trade-1".into()),
+            entry_class: entry_class.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn version_one_projection_rejects_entry_class_without_changing_unlabeled_bytes() {
+        let unlabeled = normalized_signal_semantic_projection(&entry(None), None).unwrap();
+        assert!(!unlabeled.as_bytes().is_empty());
+        assert_eq!(
+            normalized_signal_semantic_projection(&entry(Some("expanded")), None),
+            Err(IdentityError::UnsupportedEntryClass)
+        );
     }
 }

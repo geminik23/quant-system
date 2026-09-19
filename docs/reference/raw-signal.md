@@ -7,7 +7,7 @@ Top-level action objects reject unknown fields. Timestamps use naive ISO date-ti
 ## Entry
 
 ```json
-{"action":"Entry","ts":"2026-01-15T10:00:00","symbol":"EURUSD","side":"Buy","order_type":"Market","price":null,"risk":1.0,"stoploss":1.0950,"targets":[1.1050],"group":"example","trade_id":"example-1"}
+{"action":"Entry","ts":"2026-01-15T10:00:00","symbol":"EURUSD","side":"Buy","order_type":"Market","price":null,"risk":1.0,"stoploss":1.0950,"targets":[1.1050],"group":"example","trade_id":"example-1","entry_class":"expanded"}
 ```
 
 | Field | Requirement |
@@ -21,8 +21,13 @@ Top-level action objects reject unknown fields. Timestamps use naive ISO date-ti
 | `targets` | Optional ordered target prices |
 | `group` | Optional reporting and bulk-management tag |
 | `trade_id` | Optional application identity; required when later actions use `ByTradeId` |
+| `entry_class` | Optional exact semantic class used by an explicit backtest class-to-profile route |
 
 Entry does not accept `size`. The client must provide exactly one sizing policy when any Entry is present. FutureQuote Market sizing uses the actual fill price by default; a run may instead select the explicit Market `price` as the quantity reference, with automatic fill-price fallback when it is `null`. This choice does not change the actual fill, profile-relative levels, P&L, or actual fill-based risk. `ScaleIn.size` is different: it is already a concrete final quantity.
+
+`entry_class` is optional and omitted from serialized JSON when absent. When present it must be non-empty, have no leading or trailing whitespace or control characters, and contain at most 128 UTF-8 bytes. Matching is case-sensitive and does not trim or normalize. It is not a profile name, group, or trade identity. A run must provide an exact route for every retained labeled Entry; unknown classes fail instead of using the default profile.
+
+The field belongs to the direct strict RawSignal replay path. The frozen normalized-signal version 1 and committed-normalization envelope contracts do not carry it and reject labeled signals rather than silently dropping the class.
 
 ## Position references
 
@@ -76,6 +81,7 @@ Examples:
 ## Validation notes
 
 - Entry risk must be finite and greater than zero.
+- Entry classes must satisfy the exact bounded-label contract and require an explicit route when present.
 - Stop and target geometry must be valid for the resolved entry side and price.
 - Management actions that cannot resolve a position are recorded as skipped rather than reinterpreted.
 - The wire format is strict and currently unversioned. Producers should test their serialized fixtures against the matching workspace release.

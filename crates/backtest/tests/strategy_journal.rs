@@ -120,6 +120,7 @@ fn entry(timestamp: NaiveDateTime) -> RawSignal {
         targets: vec![],
         group: Some("campaign".into()),
         trade_id: Some("trade-1".into()),
+        entry_class: None,
     }
 }
 

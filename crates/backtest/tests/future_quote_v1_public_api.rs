@@ -48,6 +48,7 @@ fn entry(milliseconds: i64, trade_id: &str, stoploss: Option<f64>, targets: Vec<
         targets,
         group: None,
         trade_id: Some(trade_id.into()),
+        entry_class: None,
     }
 }
 
@@ -435,6 +436,7 @@ fn pending_order_lifecycle_records_place_then_fill() {
             targets: vec![],
             group: None,
             trade_id: Some("pending-fill".into()),
+            entry_class: None,
         }],
         false,
     );
@@ -494,6 +496,7 @@ fn pending_order_lifecycle_records_place_then_cancel() {
                 targets: vec![],
                 group: None,
                 trade_id: Some("pending-cancel".into()),
+                entry_class: None,
             },
             RawSignal::CancelPending {
                 ts: ts(500),
@@ -554,6 +557,7 @@ fn pending_order_lifecycle_marks_unfilled_at_end_without_synthetic_fill_or_cance
             targets: vec![],
             group: None,
             trade_id: Some("pending-at-end".into()),
+            entry_class: None,
         }],
         true,
     );
@@ -601,6 +605,7 @@ fn pending_stop_gap_uses_one_carried_quote_fill() {
             targets: vec![],
             group: None,
             trade_id: Some("gap-stop".into()),
+            entry_class: None,
         }],
         false,
     );
@@ -642,6 +647,7 @@ fn pending_limit_improvement_and_pending_stop_adverse_gap_use_carried_fills() {
                 targets: vec![],
                 group: None,
                 trade_id: Some("improved-limit".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(0),
@@ -654,6 +660,7 @@ fn pending_limit_improvement_and_pending_stop_adverse_gap_use_carried_fills() {
                 targets: vec![],
                 group: None,
                 trade_id: Some("gapped-stop".into()),
+                entry_class: None,
             },
         ],
         false,
@@ -781,6 +788,7 @@ fn future_atomic_target_modification_retains_non_default_ratio() {
         target_selection: None,
         use_targets: vec![1, 2],
         close_ratios: vec![0.25, 0.75],
+        target_source: qs_backtest::TargetSource::FromSignal,
         stoploss_mode: StoplossMode::FromSignal,
         rules: vec![],
         group_override: None,
@@ -986,6 +994,7 @@ fn repeated_multi_symbol_bulk_replay_preserves_hidden_drawdown_and_json_bytes() 
                     targets: vec![],
                     group: Some("fx".into()),
                     trade_id: Some("bulk-eur".into()),
+                    entry_class: None,
                 },
                 RawSignal::Entry {
                     ts: ts(0),
@@ -998,6 +1007,7 @@ fn repeated_multi_symbol_bulk_replay_preserves_hidden_drawdown_and_json_bytes() 
                     targets: vec![],
                     group: Some("metal".into()),
                     trade_id: Some("bulk-xau".into()),
+                    entry_class: None,
                 },
                 RawSignal::CloseAll { ts: ts(1_500) },
             ],
@@ -1075,6 +1085,7 @@ fn repeated_multi_symbol_bulk_replay_preserves_hidden_drawdown_and_json_bytes() 
                 targets: vec![],
                 group: None,
                 trade_id: Some("unmatched-eur".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(0),
@@ -1087,6 +1098,7 @@ fn repeated_multi_symbol_bulk_replay_preserves_hidden_drawdown_and_json_bytes() 
                 targets: vec![],
                 group: None,
                 trade_id: Some("unmatched-xau".into()),
+                entry_class: None,
             },
             RawSignal::CloseAll { ts: ts(1_500) },
         ],
@@ -1215,6 +1227,7 @@ fn pending_modified_stop_preserves_origin_through_fill_and_completion() {
                 targets: vec![],
                 group: None,
                 trade_id: Some("pending-modified-stop".into()),
+                entry_class: None,
             },
             RawSignal::ModifyStoploss {
                 ts: ts(500),
@@ -1272,6 +1285,7 @@ fn stale_multi_symbol_eod_close_uses_global_execution_time_and_source_quote_age(
         targets: vec![],
         group: None,
         trade_id: Some("stale-eod".into()),
+        entry_class: None,
     }];
     let result = BacktestRunner::new_future(
         fixed_lot_config(true, 1.0, &["STALE"]),
@@ -1595,6 +1609,7 @@ fn runner_conserves_size_and_pnl_and_records_normal_fill_timestamps() {
             targets: vec![],
             group: None,
             trade_id: Some("conservation".into()),
+            entry_class: None,
         },
         RawSignal::ScaleIn {
             ts: ts(1_100),
@@ -1671,6 +1686,7 @@ fn tiny_sizes_are_rejected_in_legacy_and_future_without_ghost_positions() {
         targets: vec![],
         group: None,
         trade_id: Some("tiny".into()),
+        entry_class: None,
     };
     let events = vec![quote(0, 100.0, 100.0)];
     let config = BacktestConfig {

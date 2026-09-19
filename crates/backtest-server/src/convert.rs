@@ -14,7 +14,7 @@ use qs_backtest::evaluation::{
 };
 use qs_backtest::profile::{
     EntryGeometryPolicy, ManagementProfile, PositionRef, RawSignal, RuleConfigDef, StoplossMode,
-    TargetSelection,
+    TargetSelection, TargetSource,
 };
 use qs_backtest::report::{
     BacktestResult, CloseReasonStats, DurationStats, MonthlyReturn, PositionSummary, RiskMetrics,
@@ -34,7 +34,7 @@ use crate::rpc_types::{
     MtmOutputSummaryMsg, PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg,
     PositionRefMsg, PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
     RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg,
-    TargetSelectionMsg, TradeResultMsg,
+    TargetSelectionMsg, TargetSourceMsg, TradeResultMsg,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -496,6 +496,11 @@ pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<Mana
             distance: *distance,
         },
         Some(StoplossModeMsg::FixedPrice { price }) => StoplossMode::FixedPrice { price: *price },
+        Some(StoplossModeMsg::FromSignalDistance { multiplier }) => {
+            StoplossMode::FromSignalDistance {
+                multiplier: *multiplier,
+            }
+        }
     };
 
     let rules: Vec<RuleConfigDef> = msg
@@ -534,6 +539,14 @@ pub fn profile_from_msg(msg: &ManagementProfileMsg) -> crate::error::Result<Mana
         target_selection: msg.target_selection.as_ref().map(target_selection_from_msg),
         use_targets: msg.use_targets.clone(),
         close_ratios: msg.close_ratios.clone(),
+        target_source: match msg.target_source.as_ref() {
+            Some(TargetSourceMsg::StopDistanceMultiples { multiples }) => {
+                TargetSource::StopDistanceMultiples {
+                    multiples: multiples.clone(),
+                }
+            }
+            Some(TargetSourceMsg::FromSignal) | None => TargetSource::FromSignal,
+        },
         stoploss_mode,
         rules,
         group_override: msg.group_override.clone(),
@@ -554,6 +567,9 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
             distance: *distance,
         },
         StoplossMode::FixedPrice { price } => StoplossModeMsg::FixedPrice { price: *price },
+        StoplossMode::FromSignalDistance { multiplier } => StoplossModeMsg::FromSignalDistance {
+            multiplier: *multiplier,
+        },
     });
 
     let rules = p
@@ -592,6 +608,14 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
         target_selection: p.target_selection.as_ref().map(target_selection_to_msg),
         use_targets: p.use_targets.clone(),
         close_ratios: p.close_ratios.clone(),
+        target_source: match &p.target_source {
+            TargetSource::FromSignal => None,
+            TargetSource::StopDistanceMultiples { multiples } => {
+                Some(TargetSourceMsg::StopDistanceMultiples {
+                    multiples: multiples.clone(),
+                })
+            }
+        },
         stoploss_mode,
         rules,
         group_override: p.group_override.clone(),
@@ -896,6 +920,7 @@ fn decode_raw_signal_msg(
             targets,
             group,
             trade_id,
+            entry_class,
         } => {
             let parsed_ts = parse_datetime_internal(ts)?;
             let parsed_symbol = if symbol.is_empty() {
@@ -916,6 +941,7 @@ fn decode_raw_signal_msg(
                 targets: targets.clone(),
                 group: group.clone(),
                 trade_id: trade_id.clone(),
+                entry_class: entry_class.clone(),
             })
         }
         RawSignalMsg::Close { ts, position } => Ok(RawSignal::Close {
@@ -1376,6 +1402,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
+            target_source: None,
             stoploss_mode: Some(StoplossModeMsg::FromSignal),
             rules: vec![RuleConfigDefMsg::TrailingStop { distance: 10.0 }],
             group_override: Some("grp".into()),
@@ -1399,6 +1426,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -1420,6 +1448,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: Some(StoplossModeMsg::FromSignal),
             rules: vec![],
             group_override: None,
@@ -1458,6 +1487,34 @@ mod tests {
             p4.stoploss_mode,
             StoplossMode::FixedPrice { price } if (price - 1.0800).abs() < f64::EPSILON
         ));
+
+        let msg5 = ManagementProfileMsg {
+            use_targets: vec![],
+            close_ratios: vec![0.5, 0.5],
+            target_source: Some(TargetSourceMsg::StopDistanceMultiples {
+                multiples: vec![1.3, 1.6],
+            }),
+            stoploss_mode: Some(StoplossModeMsg::FromSignalDistance { multiplier: 1.5 }),
+            ..msg
+        };
+        let p5 = profile_from_msg(&msg5).unwrap();
+        assert!(matches!(
+            p5.stoploss_mode,
+            StoplossMode::FromSignalDistance { multiplier }
+                if (multiplier - 1.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            p5.target_source,
+            TargetSource::StopDistanceMultiples { ref multiples }
+                if multiples == &[1.3, 1.6]
+        ));
+        let roundtrip = profile_from_msg(&profile_to_msg(&p5)).unwrap();
+        assert_eq!(roundtrip.close_ratios, vec![0.5, 0.5]);
+        assert!(matches!(
+            roundtrip.target_source,
+            TargetSource::StopDistanceMultiples { ref multiples }
+                if multiples == &[1.3, 1.6]
+        ));
     }
 
     #[test]
@@ -1481,6 +1538,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules,
             group_override: None,
@@ -1515,17 +1573,15 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
                 let_remainder_run: false,
-                entry_geometry: Some(policy.clone()),
+                entry_geometry: Some(policy),
             };
             let profile = profile_from_msg(&msg).unwrap();
-            assert_eq!(
-                profile.entry_geometry,
-                entry_geometry_from_msg(policy.clone())
-            );
+            assert_eq!(profile.entry_geometry, entry_geometry_from_msg(policy));
 
             let roundtrip = profile_to_msg(&profile);
             assert_eq!(roundtrip.entry_geometry, Some(policy));
@@ -1537,6 +1593,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: None,
             stoploss_mode: None,
             rules: vec![],
             group_override: None,
@@ -1561,6 +1618,7 @@ mod tests {
                 target_selection: Some(selection.clone()),
                 use_targets: vec![1],
                 close_ratios: vec![],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -1606,6 +1664,7 @@ mod tests {
             target_selection: Some(TargetSelection::Selected(vec![2, 1])),
             use_targets: vec![1, 2],
             close_ratios: vec![0.6, 0.4],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FixedDistance { distance: 25.0 },
             rules: vec![
                 RuleConfigDef::TrailingStop { distance: 15.0 },
@@ -1678,6 +1737,7 @@ mod tests {
             targets: vec![1.0900],
             group: Some("grp".into()),
             trade_id: Some("t1".into()),
+            entry_class: None,
         };
         let result = raw_signal_from_msg(&msg, "default", &reg).unwrap();
         assert!(result.is_entry());
@@ -1833,6 +1893,7 @@ mod tests {
             order_type: "Market".into(),
             price: None,
             trade_id: None,
+            entry_class: None,
             risk: 0.01,
             stoploss: None,
             targets: vec![],
@@ -1863,6 +1924,7 @@ mod tests {
             stoploss: None,
             targets: vec![],
             trade_id: None,
+            entry_class: None,
             group: None,
         };
         let result = raw_signal_from_msg(&msg, "xauusd", &reg).unwrap();

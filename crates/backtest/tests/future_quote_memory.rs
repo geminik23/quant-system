@@ -113,6 +113,7 @@ fn fixture(primary_events: usize) -> (BacktestRunner, VecFeed, Vec<RawSignal>) {
         targets: Vec::new(),
         group: None,
         trade_id: Some("memory-slope".to_owned()),
+        entry_class: None,
     }];
 
     (

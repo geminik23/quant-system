@@ -576,6 +576,7 @@ pub fn direct_lifecycle_signals() -> Vec<RawSignal> {
             targets: vec![],
             group: Some("9:lifecycle|10:instance_a|campaign:1".into()),
             trade_id: Some(trade_id.clone()),
+            entry_class: None,
         },
         RawSignal::MoveStoplossToEntry {
             ts: ts(4),
@@ -609,5 +610,6 @@ pub fn direct_entry() -> RawSignal {
         targets: vec![],
         group: Some("5:alpha|10:instance_a|campaign:1".into()),
         trade_id: Some("5:alpha|10:instance_a|trade:1".into()),
+        entry_class: None,
     }
 }

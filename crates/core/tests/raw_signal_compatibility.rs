@@ -51,6 +51,35 @@ fn entry_risk_is_required_and_must_be_a_positive_number() {
 }
 
 #[test]
+fn entry_class_is_optional_omitted_and_roundtrips_when_present() {
+    let unlabeled: RawSignal = serde_json::from_value(entry(json!(1.0))).unwrap();
+    assert!(matches!(
+        unlabeled,
+        RawSignal::Entry {
+            entry_class: None,
+            ..
+        }
+    ));
+    let unlabeled_json = serde_json::to_value(&unlabeled).unwrap();
+    assert!(unlabeled_json.get("entry_class").is_none());
+
+    let mut labeled = entry(json!(1.0));
+    labeled["entry_class"] = json!("expanded");
+    let labeled: RawSignal = serde_json::from_value(labeled).unwrap();
+    assert!(matches!(
+        &labeled,
+        RawSignal::Entry {
+            entry_class: Some(value),
+            ..
+        } if value == "expanded"
+    ));
+    assert_eq!(
+        serde_json::to_value(labeled).unwrap()["entry_class"],
+        json!("expanded")
+    );
+}
+
+#[test]
 fn action_fields_are_strict_while_nested_compatibility_is_retained() {
     for signal in [
         json!({

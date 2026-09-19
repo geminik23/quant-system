@@ -500,6 +500,7 @@ fn generate_full_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSig
             targets: vec![buy_tp1, buy_tp2, buy_tp3],
             group: Some("alpha".into()),
             trade_id: Some("alpha-buy-1".into()),
+            entry_class: None,
         },
         // 2. Tighten stoploss on trade "alpha-buy-1"
         RawSignal::ModifyStoploss {
@@ -536,6 +537,7 @@ fn generate_full_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSig
             targets: vec![sell_tp1],
             group: Some("beta".into()),
             trade_id: Some("beta-sell-1".into()),
+            entry_class: None,
         },
         // 6. Scale into "beta-sell-1"
         RawSignal::ScaleIn {
@@ -568,6 +570,7 @@ fn generate_full_raw_signals(events: &[MarketEvent], symbol: &str) -> Vec<RawSig
             targets: vec![buy3_tp1, buy3_tp2],
             group: Some("alpha".into()),
             trade_id: Some("alpha-buy-2".into()),
+            entry_class: None,
         },
         // 9. Close all positions in group "beta"
         RawSignal::CloseAllInGroup {

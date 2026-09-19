@@ -1108,6 +1108,17 @@ fn parse_normalized_id(
 }
 
 fn encode_raw_signal_value_v1(signal: &RawSignal) -> Result<Value, StructuredJsonError> {
+    if matches!(
+        signal,
+        RawSignal::Entry {
+            entry_class: Some(_),
+            ..
+        }
+    ) {
+        return Err(invalid_record(
+            "entry_class is not supported by the strict raw-signal version 1 contract",
+        ));
+    }
     let mut value = serde_json::to_value(signal).map_err(|error| {
         StructuredJsonError::new(
             StructuredJsonErrorKind::Serialization,
@@ -1248,4 +1259,33 @@ fn bounded_error_message_with_limit(mut message: String, maximum: usize) -> Stri
     }
     message.truncate(boundary);
     message
+}
+
+#[cfg(test)]
+mod entry_class_tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use qs_core::{OrderType, Side};
+
+    #[test]
+    fn strict_version_one_encoder_rejects_labeled_entry() {
+        let signal = RawSignal::Entry {
+            ts: NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            symbol: "eurusd".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.1),
+            risk_multiplier: 1.0,
+            stoploss: Some(1.09),
+            targets: vec![1.11],
+            group: None,
+            trade_id: Some("trade-1".into()),
+            entry_class: Some("expanded".into()),
+        };
+        let error = encode_raw_signal_value_v1(&signal).unwrap_err();
+        assert!(error.to_string().contains("entry_class"));
+    }
 }

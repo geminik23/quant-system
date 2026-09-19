@@ -66,9 +66,11 @@ pub use mtm::{
     MtmOutputPolicy, MtmOutputPolicyError, MtmOutputSummary,
 };
 pub use profile::{
-    EntryGeometryPolicy, ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError,
-    ProfileError, ProfileRegistry, ProfileRegistryError, ProfileValidationError, RawSignal,
-    ResolvedEntry, RuleConfigDef, StoplossMode, TargetResolution, TargetSelection,
+    EntryGeometryPolicy, EntryLevelResolution, EntryProfileRoutingError, EntryResolutionContext,
+    GeneratedTargetResolution, ManagementProfile, PositionRef, PositionResolver,
+    PreparedEntryProfiles, PriceGridSource, ProfileApplicationError, ProfileError, ProfileRegistry,
+    ProfileRegistryError, ProfileValidationError, RawSignal, ResolvedEntry, RuleConfigDef,
+    StoplossMode, TargetResolution, TargetResolutionSource, TargetSelection, TargetSource,
     allocate_target_units, resolve_signal, resolve_unprofiled_entry,
 };
 pub use report::{

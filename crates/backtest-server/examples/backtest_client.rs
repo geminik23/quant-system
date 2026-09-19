@@ -290,6 +290,7 @@ fn generate_full_signal_actions(symbol: &str) -> Vec<RawSignalMsg> {
             targets: vec![1.1050, 1.1100],
             group: Some("lifecycle-demo".into()),
             trade_id: Some("lifecycle-demo-buy-1".into()),
+            entry_class: None,
         },
         // 2. Tighten the stoploss on the trade by trade_id.
         RawSignalMsg::ModifyStoploss {
@@ -326,6 +327,7 @@ fn generate_full_signal_actions(symbol: &str) -> Vec<RawSignalMsg> {
             targets: vec![1.0900],
             group: Some("lifecycle-hedge".into()),
             trade_id: Some("lifecycle-hedge-sell-1".into()),
+            entry_class: None,
         },
         // 6. Scale into the short trade by trade_id.
         RawSignalMsg::ScaleIn {
@@ -356,6 +358,7 @@ fn generate_full_signal_actions(symbol: &str) -> Vec<RawSignalMsg> {
             targets: vec![1.1000, 1.1050],
             group: Some("lifecycle-demo".into()),
             trade_id: Some("lifecycle-demo-buy-2".into()),
+            entry_class: None,
         },
         // 9. Close all positions in the hedge group.
         RawSignalMsg::CloseAllInGroup {
@@ -532,6 +535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_selection: Some(TargetSelectionMsg::Selected(vec![1, 2])),
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
+            target_source: None,
             stoploss_mode: Some(StoplossModeMsg::FromSignal),
             rules: vec![RuleConfigDefMsg::BreakevenAfterTargets { after_n: 1 }],
             group_override: None,
@@ -551,6 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raw_signals,
             profile: None,
             profile_def: Some(inline_profile),
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(args.balance),
                 close_on_finish: Some(true),

@@ -1550,8 +1550,8 @@ impl qs_backtest::DataFeed for PollTrackingFeed {
 
 #[test]
 fn management_profile_is_rejected_before_feed_polling() {
-    let mut adapter = adapter(false, None, spec(1, 32)).unwrap();
-    let mut feed = PollTrackingFeed {
+    let mut first_adapter = adapter(false, None, spec(1, 32)).unwrap();
+    let mut first_feed = PollTrackingFeed {
         inner: feed(),
         polls: Cell::new(0),
     };
@@ -1560,6 +1560,7 @@ fn management_profile_is_rejected_before_feed_polling() {
         target_selection: None,
         use_targets: vec![],
         close_ratios: vec![],
+        target_source: qs_backtest::TargetSource::FromSignal,
         stoploss_mode: StoplossMode::FromSignal,
         rules: vec![],
         group_override: None,
@@ -1568,11 +1569,39 @@ fn management_profile_is_rejected_before_feed_polling() {
     };
     let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .run_configured_strategy_future(
+            &mut first_feed,
+            &mut first_adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            Some(&profile),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StrategyReplayError::Input(
+            StrategyReplayInputError::ConfiguredManagementProfileUnsupported
+        )
+    ));
+    assert_eq!(first_feed.polls.get(), 0);
+
+    let mut adapter = adapter(false, None, spec(1, 32)).unwrap();
+    let mut feed = PollTrackingFeed {
+        inner: feed(),
+        polls: Cell::new(0),
+    };
+    let prepared = qs_backtest::PreparedEntryProfiles::try_new(
+        Some(profile),
+        Vec::<(String, ManagementProfile)>::new(),
+    )
+    .unwrap();
+    let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .with_entry_profiles(prepared)
+        .run_configured_strategy_future(
             &mut feed,
             &mut adapter,
             analysis(),
             StrategyRetentionLimits::default(),
-            Some(&profile),
+            None,
         )
         .unwrap_err();
     assert!(matches!(

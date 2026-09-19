@@ -182,6 +182,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: None,
+            entry_class: None,
         }
     }
 

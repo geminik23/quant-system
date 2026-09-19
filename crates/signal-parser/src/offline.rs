@@ -580,6 +580,7 @@ mod tests {
             targets: vec![1.09],
             group: Some("test".to_string()),
             trade_id: None,
+            entry_class: None,
         }];
 
         write_jsonl(&Some(path.to_str().unwrap().to_string()), &signals).unwrap();

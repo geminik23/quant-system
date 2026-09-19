@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use chrono::NaiveDateTime;
+use qs_instruments::{AdjustmentDirection, Decimal, DecimalGrid, GridRounding};
 use serde::{Deserialize, Serialize};
 
 use crate::TradeEngine;
@@ -117,6 +118,18 @@ pub enum ProfileApplicationError {
 
     #[error("{field} must be greater than zero, got {value}")]
     InvalidCountInput { field: String, value: u64 },
+
+    #[error("entry resolution requires a price grid for {mode}")]
+    MissingPriceGrid { mode: &'static str },
+
+    #[error("entry resolution requires an entry price for {mode}")]
+    MissingEntryPrice { mode: &'static str },
+
+    #[error("entry resolution requires a signal stoploss for {mode}")]
+    MissingSignalStoploss { mode: &'static str },
+
+    #[error("price-grid resolution failed: {reason}")]
+    PriceGrid { reason: String },
 }
 
 // ─── PositionRef ────────────────────────────────────────────────────────────
@@ -187,6 +200,9 @@ pub enum RawSignal {
         /// resolution. Older JSONL without this field is still accepted.
         #[serde(default)]
         trade_id: Option<TradeId>,
+        /// Optional semantic class used by replay-owned profile routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_class: Option<String>,
     },
 
     // ── Per-position management ─────────────────────────────────────
@@ -514,7 +530,7 @@ pub fn resolve_signal(signal: &RawSignal, resolver: &impl PositionResolver) -> V
 // ─── StoplossMode ───────────────────────────────────────────────────────────
 
 /// How the profile handles the stoploss from the raw signal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StoplossMode {
     /// Use the stoploss price from the signal as-is.
@@ -525,6 +541,8 @@ pub enum StoplossMode {
     FixedDistance { distance: f64 },
     /// Override with a specific absolute price.
     FixedPrice { price: f64 },
+    /// Scale the directional distance from the applied entry to the signal stop.
+    FromSignalDistance { multiplier: f64 },
 }
 
 /// Directional geometry policy for signal stoploss and targets resolved
@@ -536,8 +554,8 @@ pub enum EntryGeometryPolicy {
     /// of the entry price.
     #[default]
     Strict,
-    /// Attach signal levels unchanged. The execution engine closes
-    /// already-crossed levels at market on the first tick evaluation.
+    /// Retain crossed signal levels at profile resolution. The engine may still
+    /// reject ordinary Open geometry before a position is created.
     Permissive,
 }
 
@@ -548,7 +566,7 @@ pub enum EntryGeometryPolicy {
 /// Converts to the core `RuleConfig` enum. Includes an offset-based
 /// `BreakevenWhenOffset` variant that computes the absolute trigger price
 /// from the signal's entry price at apply time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RuleConfigDef {
     /// Fixed stoploss at an absolute price.
@@ -610,6 +628,71 @@ impl RuleConfigDef {
 
 // ─── Strict target resolution ────────────────────────────────────────────────
 
+/// Source used to produce initial targets.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum TargetSource {
+    /// Select targets supplied by the entry signal.
+    #[default]
+    FromSignal,
+    /// Generate targets from multiples of the final protective-stop distance.
+    StopDistanceMultiples { multiples: Vec<f64> },
+}
+
+/// Source recorded for resolved target metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetResolutionSource {
+    #[default]
+    FromSignal,
+    StopDistanceMultiples,
+}
+
+/// Metadata for one generated target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedTargetResolution {
+    pub ordinal: usize,
+    pub multiple: f64,
+    pub multiple_decimal: String,
+    pub requested_price: f64,
+    pub resolved_price: f64,
+}
+
+/// Origin of the price grid supplied by the replay adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceGridSource {
+    InstrumentPriceGrid,
+    LegacyDigitsFallback,
+}
+
+/// Instrument-aware context for profile-generated price levels.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryResolutionContext {
+    pub price_grid: DecimalGrid,
+    pub price_grid_source: PriceGridSource,
+}
+
+/// Auditable requested and resolved profile levels.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntryLevelResolution {
+    pub price_grid_source: Option<PriceGridSource>,
+    pub original_signal_stoploss: Option<f64>,
+    pub stop_distance_multiplier: Option<f64>,
+    pub stop_distance_multiplier_decimal: Option<String>,
+    pub source_stop_distance: Option<f64>,
+    pub final_stop_distance: Option<f64>,
+    pub requested_stoploss: Option<f64>,
+    pub resolved_stoploss: Option<f64>,
+    pub stop_adjustment: Option<AdjustmentDirection>,
+    #[serde(default)]
+    pub requested_targets: Vec<f64>,
+    #[serde(default)]
+    pub resolved_targets: Vec<f64>,
+    #[serde(default)]
+    pub target_adjustments: Vec<AdjustmentDirection>,
+}
+
 /// Which 1-based target indices participate in strict target resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetSelection {
@@ -624,10 +707,14 @@ pub enum TargetSelection {
 /// Metadata describing how signal targets were selected and weighted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TargetResolution {
+    #[serde(default)]
+    pub source: TargetResolutionSource,
     pub selection: TargetSelection,
-    /// Resolved 1-based indices in output order.
+    /// Resolved 1-based signal indices in output order.
     pub selected_indices: Vec<usize>,
-    /// Close weights corresponding one-to-one with `selected_indices`.
+    #[serde(default)]
+    pub generated: Vec<GeneratedTargetResolution>,
+    /// Close weights corresponding one-to-one with resolved targets.
     pub weights: Vec<f64>,
     /// Fraction of the original position not assigned to a target.
     pub remainder: f64,
@@ -647,6 +734,8 @@ pub struct ResolvedEntry {
     pub group: Option<GroupId>,
     pub trade_id: Option<TradeId>,
     pub target_resolution: TargetResolution,
+    #[serde(default)]
+    pub level_resolution: EntryLevelResolution,
 }
 
 impl ResolvedEntry {
@@ -670,7 +759,7 @@ impl ResolvedEntry {
 // ─── ManagementProfile ──────────────────────────────────────────────────────
 
 /// A named management profile that resolves raw entry signals before sizing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagementProfile {
     /// Profile name (e.g. "conservative", "aggressive", "runner").
     pub name: String,
@@ -690,6 +779,10 @@ pub struct ManagementProfile {
     /// vector assigns equal weights to all selected targets; otherwise its
     /// length must match the effective target selection.
     pub close_ratios: Vec<f64>,
+
+    /// Source used to select or generate initial targets.
+    #[serde(default, skip_serializing_if = "target_source_is_default")]
+    pub target_source: TargetSource,
 
     /// How to handle the stoploss from the signal.
     #[serde(default = "default_stoploss_mode")]
@@ -718,6 +811,10 @@ fn default_stoploss_mode() -> StoplossMode {
     StoplossMode::FromSignal
 }
 
+fn target_source_is_default(source: &TargetSource) -> bool {
+    matches!(source, TargetSource::FromSignal)
+}
+
 impl ManagementProfile {
     /// Return the target selection used by current application.
     ///
@@ -739,18 +836,27 @@ impl ManagementProfile {
         validate_profile(self)
     }
 
-    /// Transform a `RawSignal::Entry` while retaining target-resolution metadata.
-    ///
-    /// This canonical path rejects malformed numeric values, target selections,
-    /// and weights. Under the Strict geometry policy it also rejects signal
-    /// levels on the wrong side of the entry price; Permissive attaches them
-    /// unchanged. An explicit `target_selection` takes precedence; when it is
-    /// omitted, an empty `use_targets` means [`TargetSelection::None`] and non-empty
-    /// `use_targets` means [`TargetSelection::Selected`]. When targets are selected and
-    /// `close_ratios` is empty, equal `1 / N` weights are synthesized.
+    /// Transform an Entry using compatibility behavior for signal-backed levels.
     pub fn apply_entry_signal(
         &self,
         signal: &RawSignal,
+    ) -> Result<Option<ResolvedEntry>, ProfileApplicationError> {
+        self.apply_entry_signal_internal(signal, None)
+    }
+
+    /// Transform an Entry with the instrument price grid required by generated levels.
+    pub fn apply_entry_signal_with_context(
+        &self,
+        signal: &RawSignal,
+        context: EntryResolutionContext,
+    ) -> Result<Option<ResolvedEntry>, ProfileApplicationError> {
+        self.apply_entry_signal_internal(signal, Some(context))
+    }
+
+    fn apply_entry_signal_internal(
+        &self,
+        signal: &RawSignal,
+        context: Option<EntryResolutionContext>,
     ) -> Result<Option<ResolvedEntry>, ProfileApplicationError> {
         let (
             symbol,
@@ -790,23 +896,35 @@ impl ManagementProfile {
 
         validate_entry_numbers(*price, *risk_multiplier, *signal_stoploss, signal_targets)?;
 
-        let selection = self.effective_target_selection();
-        let (targets, target_resolution) = resolve_targets(
-            signal_targets,
-            *side,
-            *price,
-            selection,
-            &self.close_ratios,
-            self.let_remainder_run,
-            self.entry_geometry,
-        )?;
-        let stoploss = resolve_stoploss(
+        let (stoploss, mut level_resolution) = resolve_stoploss(
             &self.stoploss_mode,
             *signal_stoploss,
             *price,
             *side,
             self.entry_geometry,
+            context,
         )?;
+        let (targets, target_resolution, target_level_resolution) = resolve_target_source(
+            &self.target_source,
+            signal_targets,
+            stoploss,
+            *side,
+            *price,
+            self.effective_target_selection(),
+            &self.close_ratios,
+            self.let_remainder_run,
+            self.entry_geometry,
+            context,
+        )?;
+        level_resolution.requested_targets = target_level_resolution.requested_targets;
+        level_resolution.resolved_targets = target_level_resolution.resolved_targets;
+        level_resolution.target_adjustments = target_level_resolution.target_adjustments;
+        if level_resolution.price_grid_source.is_none() {
+            level_resolution.price_grid_source = target_level_resolution.price_grid_source;
+        }
+        if level_resolution.final_stop_distance.is_none() {
+            level_resolution.final_stop_distance = target_level_resolution.final_stop_distance;
+        }
         let rules = resolve_rules(&self.rules, *price, *side)?;
 
         Ok(Some(ResolvedEntry {
@@ -821,6 +939,7 @@ impl ManagementProfile {
             group: self.group_override.clone().or(group.clone()),
             trade_id: trade_id.clone(),
             target_resolution,
+            level_resolution,
         }))
     }
 }
@@ -935,8 +1054,10 @@ fn resolve_targets(
         return Ok((
             Vec::new(),
             TargetResolution {
+                source: TargetResolutionSource::FromSignal,
                 selection,
                 selected_indices,
+                generated: Vec::new(),
                 weights: Vec::new(),
                 remainder: 1.0,
             },
@@ -987,12 +1108,221 @@ fn resolve_targets(
     Ok((
         targets,
         TargetResolution {
+            source: TargetResolutionSource::FromSignal,
             selection,
             selected_indices,
+            generated: Vec::new(),
             weights,
             remainder,
         },
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_target_source(
+    source: &TargetSource,
+    signal_targets: &[f64],
+    stoploss: Option<f64>,
+    side: Side,
+    entry_price: Option<f64>,
+    selection: TargetSelection,
+    explicit_weights: &[f64],
+    let_remainder_run: bool,
+    geometry_policy: EntryGeometryPolicy,
+    context: Option<EntryResolutionContext>,
+) -> Result<(Vec<TargetSpec>, TargetResolution, EntryLevelResolution), ProfileApplicationError> {
+    match source {
+        TargetSource::FromSignal => {
+            let (targets, resolution) = resolve_targets(
+                signal_targets,
+                side,
+                entry_price,
+                selection,
+                explicit_weights,
+                let_remainder_run,
+                geometry_policy,
+            )?;
+            let resolved_targets = targets
+                .iter()
+                .map(|target| target.price)
+                .collect::<Vec<_>>();
+            Ok((
+                targets,
+                resolution,
+                EntryLevelResolution {
+                    requested_targets: resolved_targets.clone(),
+                    resolved_targets,
+                    ..EntryLevelResolution::default()
+                },
+            ))
+        }
+        TargetSource::StopDistanceMultiples { multiples } => resolve_generated_targets(
+            multiples,
+            stoploss,
+            side,
+            entry_price,
+            explicit_weights,
+            let_remainder_run,
+            context,
+        ),
+    }
+}
+
+fn resolve_generated_targets(
+    multiples: &[f64],
+    stoploss: Option<f64>,
+    side: Side,
+    entry_price: Option<f64>,
+    explicit_weights: &[f64],
+    let_remainder_run: bool,
+    context: Option<EntryResolutionContext>,
+) -> Result<(Vec<TargetSpec>, TargetResolution, EntryLevelResolution), ProfileApplicationError> {
+    if multiples.is_empty() {
+        return Err(ProfileApplicationError::PriceGrid {
+            reason: "generated target multiples cannot be empty".to_owned(),
+        });
+    }
+    let entry = entry_price.ok_or(ProfileApplicationError::MissingEntryPrice {
+        mode: "stop-distance targets",
+    })?;
+    let stop = stoploss.ok_or(ProfileApplicationError::MissingSignalStoploss {
+        mode: "stop-distance targets",
+    })?;
+    validate_stop_geometry(side, entry, stop)?;
+    let context = context.ok_or(ProfileApplicationError::MissingPriceGrid {
+        mode: "stop-distance targets",
+    })?;
+
+    let entry_decimal = decimal_from_f64(entry)?;
+    let stop_decimal = decimal_from_f64(stop)?;
+    context
+        .price_grid
+        .adjust(stop_decimal, GridRounding::Reject)
+        .map_err(price_grid_error)?;
+    let distance = directional_stop_distance(side, entry_decimal, stop_decimal)?;
+
+    let weights = if explicit_weights.is_empty() {
+        vec![1.0 / multiples.len() as f64; multiples.len()]
+    } else {
+        if explicit_weights.len() != multiples.len() {
+            return Err(ProfileApplicationError::TargetWeightCountMismatch {
+                targets: multiples.len(),
+                weights: explicit_weights.len(),
+            });
+        }
+        explicit_weights.to_vec()
+    };
+    let remainder = validate_weights(&weights, let_remainder_run)?;
+
+    let mut targets = Vec::with_capacity(multiples.len());
+    let mut generated = Vec::with_capacity(multiples.len());
+    let mut requested_targets = Vec::with_capacity(multiples.len());
+    let mut resolved_targets = Vec::with_capacity(multiples.len());
+    let mut target_adjustments = Vec::with_capacity(multiples.len());
+    let mut seen = HashSet::with_capacity(multiples.len());
+    let mut seen_engine_prices = HashSet::with_capacity(multiples.len());
+    for (offset, (&multiple, &weight)) in multiples.iter().zip(&weights).enumerate() {
+        require_positive_finite(format!("target multiple {}", offset + 1), multiple)?;
+        let multiple_decimal = decimal_from_f64(multiple)?;
+        let offset_decimal = distance
+            .checked_mul(multiple_decimal)
+            .map_err(price_grid_error)?;
+        let requested = match side {
+            Side::Buy => entry_decimal.checked_add(offset_decimal),
+            Side::Sell => entry_decimal.checked_sub(offset_decimal),
+        }
+        .map_err(price_grid_error)?;
+        let rounding = match side {
+            Side::Buy => GridRounding::Ceil,
+            Side::Sell => GridRounding::Floor,
+        };
+        let adjustment = context
+            .price_grid
+            .adjust(requested, rounding)
+            .map_err(price_grid_error)?;
+        if !seen.insert(adjustment.adjusted) {
+            return Err(ProfileApplicationError::DuplicateTargetPrice {
+                price: decimal_to_f64(adjustment.adjusted),
+            });
+        }
+        let requested_price = decimal_to_f64(requested);
+        let resolved_price = decimal_to_f64(adjustment.adjusted);
+        let engine_price_key = (resolved_price * 1_000_000.0).round() as i64;
+        if !seen_engine_prices.insert(engine_price_key) {
+            return Err(ProfileApplicationError::DuplicateTargetPrice {
+                price: resolved_price,
+            });
+        }
+        require_positive_finite(format!("generated target {}", offset + 1), resolved_price)?;
+        validate_target_geometry(offset + 1, side, entry, resolved_price)?;
+        targets.push(TargetSpec {
+            price: resolved_price,
+            close_ratio: weight,
+        });
+        generated.push(GeneratedTargetResolution {
+            ordinal: offset + 1,
+            multiple,
+            multiple_decimal: multiple_decimal.to_string(),
+            requested_price,
+            resolved_price,
+        });
+        requested_targets.push(requested_price);
+        resolved_targets.push(resolved_price);
+        target_adjustments.push(adjustment.direction);
+    }
+
+    Ok((
+        targets,
+        TargetResolution {
+            source: TargetResolutionSource::StopDistanceMultiples,
+            selection: TargetSelection::None,
+            selected_indices: Vec::new(),
+            generated,
+            weights,
+            remainder,
+        },
+        EntryLevelResolution {
+            price_grid_source: Some(context.price_grid_source),
+            final_stop_distance: Some(decimal_to_f64(distance)),
+            requested_targets,
+            resolved_targets,
+            target_adjustments,
+            ..EntryLevelResolution::default()
+        },
+    ))
+}
+
+fn decimal_from_f64(value: f64) -> Result<Decimal, ProfileApplicationError> {
+    Decimal::checked_from_f64(value).map_err(price_grid_error)
+}
+
+fn decimal_to_f64(value: Decimal) -> f64 {
+    value.coefficient() as f64 / 10_f64.powi(i32::from(value.scale()))
+}
+
+fn price_grid_error(error: impl std::fmt::Display) -> ProfileApplicationError {
+    ProfileApplicationError::PriceGrid {
+        reason: error.to_string(),
+    }
+}
+
+fn directional_stop_distance(
+    side: Side,
+    entry: Decimal,
+    stop: Decimal,
+) -> Result<Decimal, ProfileApplicationError> {
+    let distance = match side {
+        Side::Buy => entry.checked_sub(stop),
+        Side::Sell => stop.checked_sub(entry),
+    }
+    .map_err(price_grid_error)?;
+    if distance.is_positive() {
+        Ok(distance)
+    } else {
+        Err(ProfileApplicationError::PriceGrid {
+            reason: "stop distance must be strictly protective".to_owned(),
+        })
+    }
 }
 
 fn validate_stop_geometry(
@@ -1043,31 +1373,88 @@ fn resolve_stoploss(
     entry_price: Option<f64>,
     side: Side,
     geometry_policy: EntryGeometryPolicy,
-) -> Result<Option<f64>, ProfileApplicationError> {
-    let stoploss = match mode {
-        StoplossMode::FromSignal => signal_stoploss,
-        StoplossMode::None => None,
+    context: Option<EntryResolutionContext>,
+) -> Result<(Option<f64>, EntryLevelResolution), ProfileApplicationError> {
+    let mut resolution = EntryLevelResolution {
+        original_signal_stoploss: signal_stoploss,
+        ..EntryLevelResolution::default()
+    };
+    let (stoploss, signal_level) = match mode {
+        StoplossMode::FromSignal => (signal_stoploss, true),
+        StoplossMode::None => (None, false),
         StoplossMode::FixedDistance { distance } => {
             require_positive_finite("stoploss fixed distance", *distance)?;
-            entry_price.map(|entry| match side {
-                Side::Buy => entry - distance,
-                Side::Sell => entry + distance,
-            })
+            (
+                entry_price.map(|entry| match side {
+                    Side::Buy => entry - distance,
+                    Side::Sell => entry + distance,
+                }),
+                false,
+            )
         }
         StoplossMode::FixedPrice { price } => {
             require_positive_finite("stoploss fixed price", *price)?;
-            Some(*price)
+            (Some(*price), false)
+        }
+        StoplossMode::FromSignalDistance { multiplier } => {
+            require_positive_finite("stoploss signal-distance multiplier", *multiplier)?;
+            let entry = entry_price.ok_or(ProfileApplicationError::MissingEntryPrice {
+                mode: "signal-distance stoploss",
+            })?;
+            let signal_stop =
+                signal_stoploss.ok_or(ProfileApplicationError::MissingSignalStoploss {
+                    mode: "signal-distance stoploss",
+                })?;
+            validate_stop_geometry(side, entry, signal_stop)?;
+            let context = context.ok_or(ProfileApplicationError::MissingPriceGrid {
+                mode: "signal-distance stoploss",
+            })?;
+            let entry_decimal = decimal_from_f64(entry)?;
+            let stop_decimal = decimal_from_f64(signal_stop)?;
+            let distance = directional_stop_distance(side, entry_decimal, stop_decimal)?;
+            let multiplier_decimal = decimal_from_f64(*multiplier)?;
+            let scaled = distance
+                .checked_mul(multiplier_decimal)
+                .map_err(price_grid_error)?;
+            let requested = match side {
+                Side::Buy => entry_decimal.checked_sub(scaled),
+                Side::Sell => entry_decimal.checked_add(scaled),
+            }
+            .map_err(price_grid_error)?;
+            let rounding = match side {
+                Side::Buy => GridRounding::Floor,
+                Side::Sell => GridRounding::Ceil,
+            };
+            let adjustment = context
+                .price_grid
+                .adjust(requested, rounding)
+                .map_err(price_grid_error)?;
+            let requested_price = decimal_to_f64(requested);
+            let resolved_price = decimal_to_f64(adjustment.adjusted);
+            resolution.price_grid_source = Some(context.price_grid_source);
+            let final_distance =
+                directional_stop_distance(side, entry_decimal, adjustment.adjusted)?;
+            resolution.stop_distance_multiplier = Some(*multiplier);
+            resolution.stop_distance_multiplier_decimal = Some(multiplier_decimal.to_string());
+            resolution.source_stop_distance = Some(decimal_to_f64(distance));
+            resolution.final_stop_distance = Some(decimal_to_f64(final_distance));
+            resolution.requested_stoploss = Some(requested_price);
+            resolution.resolved_stoploss = Some(resolved_price);
+            resolution.stop_adjustment = Some(adjustment.direction);
+            (Some(resolved_price), false)
         }
     };
     if let Some(stoploss) = stoploss {
         require_positive_finite("resolved stoploss", stoploss)?;
         if let Some(entry) = entry_price
-            && geometry_policy == EntryGeometryPolicy::Strict
+            && (!signal_level || geometry_policy == EntryGeometryPolicy::Strict)
         {
             validate_stop_geometry(side, entry, stoploss)?;
         }
+        resolution.resolved_stoploss.get_or_insert(stoploss);
+        resolution.requested_stoploss.get_or_insert(stoploss);
     }
-    Ok(stoploss)
+    Ok((stoploss, resolution))
 }
 
 fn resolve_rules(
@@ -1232,6 +1619,14 @@ pub fn resolve_unprofiled_entry(
         group: group.clone(),
         trade_id: trade_id.clone(),
         target_resolution,
+        level_resolution: EntryLevelResolution {
+            original_signal_stoploss: *stoploss,
+            requested_stoploss: *stoploss,
+            resolved_stoploss: *stoploss,
+            requested_targets: signal_targets.clone(),
+            resolved_targets: signal_targets.clone(),
+            ..EntryLevelResolution::default()
+        },
     }))
 }
 
@@ -1318,17 +1713,69 @@ pub fn allocate_target_units(
 
 /// Validate a management profile without performing configuration I/O.
 pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileValidationError> {
+    let invalid = |reason: String| ProfileValidationError::InvalidConfiguration {
+        profile: p.name.clone(),
+        reason,
+    };
     let selection = p.effective_target_selection();
 
-    // Empty ratios are the strict sentinel for equal target weights.
-    // Explicit ratios must correspond one-to-one when the selected target
-    // count is profile-known. `All` is signal-dependent and is checked by
-    // `apply_entry_signal` once the signal targets are available.
-    let selected_count = match &selection {
-        TargetSelection::All => None,
-        TargetSelection::None => Some(0),
-        TargetSelection::Selected(indices) => Some(indices.len()),
+    let selected_count = match &p.target_source {
+        TargetSource::FromSignal => match &selection {
+            TargetSelection::All => None,
+            TargetSelection::None => Some(0),
+            TargetSelection::Selected(indices) => Some(indices.len()),
+        },
+        TargetSource::StopDistanceMultiples { multiples } => {
+            if p.target_selection.is_some() || !p.use_targets.is_empty() {
+                return Err(invalid(
+                    "generated targets cannot be combined with signal target selection".into(),
+                ));
+            }
+            if multiples.is_empty() {
+                return Err(invalid("generated target multiples cannot be empty".into()));
+            }
+            let mut previous = None;
+            for (offset, &multiple) in multiples.iter().enumerate() {
+                if !multiple.is_finite() || multiple <= 0.0 {
+                    return Err(invalid(format!(
+                        "target multiple {} must be finite and positive",
+                        offset + 1
+                    )));
+                }
+                if previous.is_some_and(|value| multiple <= value) {
+                    return Err(invalid(
+                        "generated target multiples must be strictly increasing".into(),
+                    ));
+                }
+                previous = Some(multiple);
+            }
+            if matches!(p.stoploss_mode, StoplossMode::None) {
+                return Err(invalid(
+                    "generated targets require a protective stoploss mode".into(),
+                ));
+            }
+            if p.rules
+                .iter()
+                .any(|rule| matches!(rule, RuleConfigDef::TakeProfit { .. }))
+            {
+                return Err(invalid(
+                    "generated targets cannot be combined with take-profit rules".into(),
+                ));
+            }
+            for rule in &p.rules {
+                if let RuleConfigDef::BreakevenAfterTargets { after_n } = rule
+                    && *after_n as usize > multiples.len()
+                {
+                    return Err(invalid(format!(
+                        "breakeven target count {after_n} exceeds generated target count {}",
+                        multiples.len()
+                    )));
+                }
+            }
+            Some(multiples.len())
+        }
     };
+
     if let Some(targets) = selected_count
         && !p.close_ratios.is_empty()
         && targets != p.close_ratios.len()
@@ -1340,8 +1787,6 @@ pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileValidationEr
         });
     }
 
-    // Keep both the legacy field and the effective strict selection safe even
-    // when an explicit selection takes precedence.
     let mut seen = HashSet::new();
     for &index in &p.use_targets {
         if index == 0 {
@@ -1373,23 +1818,22 @@ pub fn validate_profile(p: &ManagementProfile) -> Result<(), ProfileValidationEr
         }
     }
 
-    resolve_stoploss(
-        &p.stoploss_mode,
-        None,
-        None,
-        Side::Buy,
-        EntryGeometryPolicy::Strict,
-    )
-    .map_err(|error| ProfileValidationError::InvalidConfiguration {
-        profile: p.name.clone(),
-        reason: error.to_string(),
-    })?;
-    resolve_rules(&p.rules, None, Side::Buy).map_err(|error| {
-        ProfileValidationError::InvalidConfiguration {
-            profile: p.name.clone(),
-            reason: error.to_string(),
+    match &p.stoploss_mode {
+        StoplossMode::FixedDistance { distance } => {
+            require_positive_finite("stoploss fixed distance", *distance)
+                .map_err(|error| invalid(error.to_string()))?;
         }
-    })?;
+        StoplossMode::FixedPrice { price } => {
+            require_positive_finite("stoploss fixed price", *price)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
+        StoplossMode::FromSignalDistance { multiplier } => {
+            require_positive_finite("stoploss signal-distance multiplier", *multiplier)
+                .map_err(|error| invalid(error.to_string()))?;
+        }
+        StoplossMode::FromSignal | StoplossMode::None => {}
+    }
+    resolve_rules(&p.rules, None, Side::Buy).map_err(|error| invalid(error.to_string()))?;
 
     if p.close_ratios.is_empty() {
         return Ok(());

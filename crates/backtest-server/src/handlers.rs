@@ -26,7 +26,7 @@ use qs_backtest::BacktestResult;
 use qs_backtest::data_feed::{DataFeed, MarketEvent, VecFeed, bars_to_feed, ticks_to_feed};
 use qs_backtest::data_feed::{EventBatchFeedError, KWayMergeError};
 use qs_backtest::evaluation::EvaluationOptions;
-use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RawSignal};
+use qs_backtest::profile::{ManagementProfile, PreparedEntryProfiles, ProfileRegistry, RawSignal};
 use qs_backtest::runner::{
     BacktestConfig, BacktestRunner, FutureQuoteConfig, ReplayProgress, StreamingReplayError,
 };
@@ -70,6 +70,12 @@ pub struct ServerState {
     pub artifact_store: ArtifactStore,
 }
 
+#[derive(Debug, Clone)]
+pub struct AcceptedBacktestJobInput {
+    request: RunBacktestRequest,
+    profiles: PreparedEntryProfiles,
+}
+
 /// Internal representation of an async backtest job.
 #[derive(Debug, Clone)]
 pub struct BacktestJob {
@@ -97,6 +103,8 @@ pub struct BacktestJob {
     pub worker_active: bool,
     /// Coalesced current status published to server-streaming subscribers.
     pub updates: watch::Sender<BacktestStatusResponse>,
+    /// Accepted request and immutable profile snapshot until the worker starts.
+    pub accepted: Option<AcceptedBacktestJobInput>,
 }
 
 /// Lightweight per-job cancellation token without an additional runtime dependency.
@@ -554,6 +562,7 @@ pub fn handle_list_profiles(state: &ServerState) -> ListProfilesResponse {
                 name: p.name.clone(),
                 use_targets: p.use_targets.clone(),
                 close_ratios: p.close_ratios.clone(),
+                target_source: format!("{:?}", p.target_source),
                 stoploss_mode: format!("{:?}", p.stoploss_mode),
                 rules_count: p.rules.len(),
                 let_remainder_run: p.let_remainder_run,
@@ -668,7 +677,7 @@ fn execute_backtest_with_future(
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
 ) -> Result<BacktestResult> {
-    execute_backtest_with_future_controlled(state, req, future, evaluation, None, &mut |_| {})
+    execute_backtest_with_future_controlled(state, req, future, evaluation, None, None, &mut |_| {})
 }
 
 fn ensure_not_cancelled(cancellation: Option<&JobCancellationToken>) -> Result<()> {
@@ -697,21 +706,13 @@ fn execute_backtest_with_future_controlled(
     req: &BacktestRunSpec,
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
+    prepared_profiles: Option<&PreparedEntryProfiles>,
     cancellation: Option<&JobCancellationToken>,
     progress: &mut dyn FnMut(BacktestProgress),
 ) -> Result<BacktestResult> {
     ensure_not_cancelled(cancellation)?;
     validate_request(req)?;
     validate_future_quote_scalars(future)?;
-
-    // Validate and resolve profiles before expensive data loading.
-    if let Some(ref profile_msg) = req.profile_def {
-        let profile = profile_from_msg(profile_msg)?;
-        profile.validate().map_err(|error| {
-            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {error}"))
-        })?;
-    }
-    let profile = resolve_profile(state, req)?;
 
     let from = parse_optional_datetime(&req.from)?;
     let to = parse_optional_datetime(&req.to)?;
@@ -726,6 +727,15 @@ fn execute_backtest_with_future_controlled(
         future.signal_latency_ms,
     )?;
     validate_replay_sizing(req, &plan)?;
+    let owned_profiles;
+    let prepared_profiles = match prepared_profiles {
+        Some(profiles) => profiles,
+        None => {
+            owned_profiles = resolve_prepared_entry_profiles(state, req, plan.retained_signals())?;
+            &owned_profiles
+        }
+    };
+    let profile = prepared_profiles.default_profile().cloned();
     let evaluation_options = evaluation_options_from_msg_for_symbols(
         evaluation,
         &state.symbol_registry,
@@ -844,14 +854,15 @@ fn execute_backtest_with_future_controlled(
             ..BacktestProgress::default()
         });
         tracing::info!("run_backtest: starting streaming FutureQuote engine...");
-        let mut runner = BacktestRunner::new_future(config, future_config);
+        let mut runner = BacktestRunner::new_future(config, future_config)
+            .with_entry_profiles(prepared_profiles.clone());
         runner = runner.with_evaluation_options(evaluation_options.clone());
         runner
             .run_raw_signals_future_streaming_controlled(
                 &mut feed,
                 primary_eod,
                 plan.retained_signals().to_vec(),
-                profile.as_ref(),
+                None,
                 || cancellation.is_some_and(JobCancellationToken::is_cancelled),
                 |ReplayProgress {
                      processed_events,
@@ -881,6 +892,7 @@ fn execute_backtest_with_future_controlled(
         &plan,
         future,
         profile.as_ref(),
+        prepared_profiles,
     );
     tracing::info!(
         "run_backtest: done, {} trades, {} positions",
@@ -897,6 +909,7 @@ fn attach_future_reproducibility_metadata(
     plan: &ReplayPlan,
     future: &FutureQuoteConfigMsg,
     profile: Option<&ManagementProfile>,
+    prepared_profiles: &PreparedEntryProfiles,
 ) {
     let Some(metadata) = result.execution_metadata.as_mut() else {
         return;
@@ -961,6 +974,10 @@ fn attach_future_reproducibility_metadata(
             tags.insert("profile.options".into(), "null".into());
         }
     }
+    tags.insert(
+        "profile.entry_routes".into(),
+        serde_json::to_string(prepared_profiles.routes()).unwrap_or_else(|_| "unavailable".into()),
+    );
     match req.config.sizing.as_ref() {
         Some(sizing) => {
             let identity = match sizing {
@@ -1230,30 +1247,50 @@ fn execute_backtest_multi_with_future(
         };
         let metadata_request = single_request_from_multi(req);
 
-        req.profiles
+        let registry = state.profile_registry.read().unwrap();
+        let routes = match req
+            .entry_profile_routes
+            .iter()
+            .map(|route| {
+                resolve_profile_ref(&registry, &route.profile)
+                    .map(|profile| (route.entry_class.clone(), profile))
+            })
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(routes) => routes,
+            Err(error) => return profile_error_results(req, error.to_string()),
+        };
+        let profiles = req
+            .profiles
             .iter()
             .map(|profile_ref| {
-                let name = profile_ref_name(profile_ref);
-                let profile = match profile_ref {
-                    ProfileRef::Named(profile_name) => state
-                        .profile_registry
-                        .read()
-                        .unwrap()
-                        .get(profile_name)
-                        .cloned()
-                        .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.clone())),
-                    ProfileRef::Inline(message) => profile_from_msg(message).and_then(|profile| {
-                        profile.validate().map_err(|error| {
+                (
+                    profile_ref_name(profile_ref),
+                    resolve_profile_ref(&registry, profile_ref),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(registry);
+
+        profiles
+            .into_iter()
+            .map(|(name, profile)| {
+                let run_result = profile.and_then(|profile| {
+                    let prepared = PreparedEntryProfiles::try_new(Some(profile), routes.clone())
+                        .map_err(|error| {
                             BacktestServerError::InvalidRequest(format!(
-                                "Invalid inline profile: {error}"
+                                "Invalid entry profile routing: {error}"
                             ))
                         })?;
-                        Ok(profile)
-                    }),
-                };
-                let run_result = profile.and_then(|profile| {
+                    prepared
+                        .validate_signals(plan.retained_signals())
+                        .map_err(|error| {
+                            BacktestServerError::InvalidRequest(format!(
+                                "Invalid entry profile routing: {error}"
+                            ))
+                        })?;
                     run_profile_streaming(
-                        &profile,
+                        &prepared,
                         plan.retained_signals(),
                         &bundle.description,
                         primary_eod,
@@ -1298,6 +1335,7 @@ fn single_request_from_multi(req: &BacktestMultiRunSpec) -> BacktestRunSpec {
         raw_signals: req.raw_signals.clone(),
         profile: None,
         profile_def: None,
+        entry_profile_routes: req.entry_profile_routes.clone(),
         config: req.config.clone(),
     }
 }
@@ -1324,7 +1362,7 @@ fn profile_error_results(req: &BacktestMultiRunSpec, error: String) -> Vec<Profi
 
 #[allow(clippy::too_many_arguments)]
 fn run_profile_streaming(
-    profile: &ManagementProfile,
+    prepared_profiles: &PreparedEntryProfiles,
     raw_signals: &[RawSignal],
     description: &MarketStreamDescription,
     primary_eod: Option<NaiveDateTime>,
@@ -1338,7 +1376,8 @@ fn run_profile_streaming(
 ) -> Result<BacktestResult> {
     let cancellation: CancellationCheck = Arc::new(|| false);
     let mut feed = description.open(cancellation)?;
-    let mut runner = BacktestRunner::new_future(config.clone(), future_config.clone());
+    let mut runner = BacktestRunner::new_future(config.clone(), future_config.clone())
+        .with_entry_profiles(prepared_profiles.clone());
     if let Some(options) = evaluation {
         runner = runner.with_evaluation_options(options.clone());
     }
@@ -1347,7 +1386,7 @@ fn run_profile_streaming(
             &mut feed,
             primary_eod,
             raw_signals.to_vec(),
-            Some(profile),
+            None,
             || false,
             |_| {},
         )
@@ -1358,7 +1397,8 @@ fn run_profile_streaming(
         metadata_request,
         plan,
         future,
-        Some(profile),
+        prepared_profiles.default_profile(),
+        prepared_profiles,
     );
     Ok(result)
 }
@@ -1427,26 +1467,57 @@ fn resolve_requested_symbol_scope(
     Ok(RequestedSymbolScope::explicit(resolved))
 }
 
-/// Resolve the management profile from a request (inline or named).
-fn resolve_profile(
+fn resolve_profile_ref(
+    registry: &ProfileRegistry,
+    profile_ref: &ProfileRef,
+) -> Result<ManagementProfile> {
+    match profile_ref {
+        ProfileRef::Named(name) => registry
+            .get(name)
+            .cloned()
+            .ok_or_else(|| BacktestServerError::ProfileNotFound(name.clone())),
+        ProfileRef::Inline(message) => profile_from_msg(message),
+    }
+}
+
+fn resolve_prepared_entry_profiles(
     state: &ServerState,
     req: &BacktestRunSpec,
-) -> Result<Option<ManagementProfile>> {
-    if let Some(ref profile_msg) = req.profile_def {
-        let profile = profile_from_msg(profile_msg)?;
-        profile.validate().map_err(|e| {
-            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {e}"))
+    signals: &[RawSignal],
+) -> Result<PreparedEntryProfiles> {
+    let registry = state.profile_registry.read().unwrap();
+    let default = if let Some(message) = req.profile_def.as_ref() {
+        let profile = profile_from_msg(message)?;
+        profile.validate().map_err(|error| {
+            BacktestServerError::InvalidRequest(format!("Invalid inline profile: {error}"))
         })?;
-        Ok(Some(profile))
-    } else if let Some(ref profile_name) = req.profile {
-        let registry = state.profile_registry.read().unwrap();
-        let profile = registry
-            .get(profile_name)
-            .ok_or_else(|| BacktestServerError::ProfileNotFound(profile_name.clone()))?;
-        Ok(Some(profile.clone()))
+        Some(profile)
+    } else if let Some(name) = req.profile.as_ref() {
+        Some(
+            registry
+                .get(name)
+                .cloned()
+                .ok_or_else(|| BacktestServerError::ProfileNotFound(name.clone()))?,
+        )
     } else {
-        Ok(None)
-    }
+        None
+    };
+    let routes = req
+        .entry_profile_routes
+        .iter()
+        .map(|route| {
+            resolve_profile_ref(&registry, &route.profile)
+                .map(|profile| (route.entry_class.clone(), profile))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(registry);
+    let prepared = PreparedEntryProfiles::try_new(default, routes).map_err(|error| {
+        BacktestServerError::InvalidRequest(format!("Invalid entry profile routing: {error}"))
+    })?;
+    prepared.validate_signals(signals).map_err(|error| {
+        BacktestServerError::InvalidRequest(format!("Invalid entry profile routing: {error}"))
+    })?;
+    Ok(prepared)
 }
 
 // ── Data Loading ────────────────────────────────────────────────────────────
@@ -1814,7 +1885,10 @@ pub fn handle_reload_profiles(state: &ServerState) -> ReloadProfilesResponse {
 // ── Async Job API Handlers (Issue 2) ─────────────────────────────────────────
 
 /// Admit a validated request to the bounded async job store.
-fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
+fn admit_backtest_job(
+    state: &ServerState,
+    accepted: AcceptedBacktestJobInput,
+) -> SubmitBacktestResponse {
     let job_id = format!("job-{}", uuid_v4_simple());
     let initial_progress = BacktestProgress {
         stage: "queued".into(),
@@ -1841,6 +1915,7 @@ fn admit_backtest_job(state: &ServerState) -> SubmitBacktestResponse {
         cancellation: JobCancellationToken::default(),
         worker_active: true,
         updates,
+        accepted: Some(accepted),
     };
     if state.max_retained_jobs == 0 {
         return SubmitBacktestResponse {
@@ -1884,7 +1959,7 @@ pub fn handle_submit_backtest(
     state: &ServerState,
     req: &SubmitBacktestRequest,
 ) -> SubmitBacktestResponse {
-    let validation = (|| -> Result<()> {
+    let validation = (|| -> Result<AcceptedBacktestJobInput> {
         let request = &req.request.request;
         validate_future_quote_scalars(&req.request.future)?;
         validate_request(request)?;
@@ -1919,16 +1994,23 @@ pub fn handle_submit_backtest(
             &state.symbol_registry,
             plan.requested_symbols(),
         )?;
-        Ok(())
+        let profiles = resolve_prepared_entry_profiles(state, request, plan.retained_signals())?;
+        Ok(AcceptedBacktestJobInput {
+            request: req.request.clone(),
+            profiles,
+        })
     })();
-    if let Err(error) = validation {
-        return SubmitBacktestResponse {
-            success: false,
-            job_id: None,
-            error: Some(error.to_string()),
-        };
-    }
-    admit_backtest_job(state)
+    let accepted = match validation {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            return SubmitBacktestResponse {
+                success: false,
+                job_id: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    admit_backtest_job(state, accepted)
 }
 
 /// Handle `get_backtest_status` — poll the status of a submitted job.
@@ -2112,25 +2194,32 @@ pub fn handle_cancel_backtest(
     }
 }
 
-pub fn run_job_and_store(state: Arc<ServerState>, job_id: String, req: RunBacktestRequest) {
-    run_job_and_store_inner(
-        state,
-        job_id,
-        req.request,
-        req.future,
-        req.evaluation,
-        req.result_delivery,
-    );
+pub fn run_job_and_store(state: Arc<ServerState>, job_id: String) {
+    let accepted = {
+        let mut jobs = state.jobs.lock().unwrap();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.accepted.take()
+    };
+    let Some(accepted) = accepted else {
+        return;
+    };
+    run_job_and_store_inner(state, job_id, accepted);
 }
 
 fn run_job_and_store_inner(
     state: Arc<ServerState>,
     job_id: String,
-    req: BacktestRunSpec,
-    future: FutureQuoteConfigMsg,
-    evaluation: ProviderEvaluationOptionsMsg,
-    delivery: ResultDeliveryMsg,
+    accepted: AcceptedBacktestJobInput,
 ) {
+    let AcceptedBacktestJobInput { request, profiles } = accepted;
+    let RunBacktestRequest {
+        request: req,
+        future,
+        evaluation,
+        result_delivery: delivery,
+    } = request;
     let cancellation = {
         let mut jobs = state.jobs.lock().unwrap();
         let Some(job) = jobs.get_mut(&job_id) else {
@@ -2151,6 +2240,7 @@ fn run_job_and_store_inner(
         &req,
         &future,
         &evaluation,
+        Some(&profiles),
         Some(&cancellation),
         &mut |progress| update_job_progress(&state, &job_id, progress),
     );
@@ -2270,8 +2360,8 @@ mod tests {
         )
     }
 
-    fn run_job_for_test(state: Arc<ServerState>, job_id: String, request: BacktestRunSpec) {
-        run_job_and_store(state, job_id, test_request(request));
+    fn run_job_for_test(state: Arc<ServerState>, job_id: String, _request: BacktestRunSpec) {
+        run_job_and_store(state, job_id);
     }
 
     fn test_state() -> ServerState {
@@ -2370,6 +2460,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             },
             RawSignalMsg::Entry {
                 ts: "2026-01-15T10:01:00".into(),
@@ -2382,6 +2473,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             },
         ];
         let plan = build_replay_plan(&state, "", &[], true, &signals, None, None, 0).unwrap();
@@ -2403,6 +2495,7 @@ mod tests {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
         let replay =
             build_replay_plan(&state, "XAU/USD", &[], false, &signals, None, None, 0).unwrap();
@@ -2424,6 +2517,7 @@ mod tests {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
         let error = build_replay_plan(
             &state,
@@ -2454,6 +2548,7 @@ mod tests {
             raw_signals: vec![],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: None,
                 close_on_finish: None,
@@ -2486,9 +2581,11 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             }],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: None,
                 close_on_finish: None,
@@ -2521,9 +2618,11 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             }],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: None,
                 close_on_finish: None,
@@ -2556,9 +2655,11 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             }],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: None,
                 close_on_finish: None,
@@ -2591,9 +2692,11 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             }],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: None,
                 close_on_finish: None,
@@ -2758,6 +2861,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2781,6 +2885,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2805,6 +2910,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2820,6 +2926,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1, 2],
                 close_ratios: vec![0.5, 0.5],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2842,6 +2949,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1, 2],
                 close_ratios: vec![1.0], // mismatch
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2866,6 +2974,7 @@ mod tests {
                 target_selection: None,
                 use_targets: vec![1],
                 close_ratios: vec![1.0],
+                target_source: None,
                 stoploss_mode: None,
                 rules: vec![],
                 group_override: None,
@@ -2924,6 +3033,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: t(9),
@@ -2936,6 +3046,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: t(12),
@@ -2948,6 +3059,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             },
         ];
         let replay = ReplayPlan::build(
@@ -2978,6 +3090,7 @@ mod tests {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
         let replay = ReplayPlan::build(
             RequestedSymbolScope::explicit(["X".into()]),
@@ -3039,9 +3152,11 @@ lot_step_units = 1
                 targets: vec![],
                 group: None,
                 trade_id: None,
+                entry_class: None,
             }],
             profile: None,
             profile_def: None,
+            entry_profile_routes: Vec::new(),
             config: BacktestConfigMsg {
                 initial_balance: Some(10_000.0),
                 close_on_finish: Some(true),

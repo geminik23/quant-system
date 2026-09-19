@@ -12,6 +12,8 @@ pub enum IdentityError {
     InvalidSemanticVersion,
     #[error("canonical floating-point value must be finite")]
     NonFiniteFloat,
+    #[error("entry_class is not supported by normalized signal semantic projection version 1")]
+    UnsupportedEntryClass,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 //! Backtest compatibility surface and configuration loader for core management profiles.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -74,6 +74,116 @@ impl From<ProfileValidationError> for ProfileRegistryError {
                 Self::InvalidConfiguration { profile, reason }
             }
         }
+    }
+}
+
+/// Immutable per-run management-profile selection.
+#[derive(Clone, Debug, Default)]
+pub struct PreparedEntryProfiles {
+    default: Option<ManagementProfile>,
+    routes: BTreeMap<String, ManagementProfile>,
+}
+
+/// Errors returned while compiling or applying per-entry profile routes.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum EntryProfileRoutingError {
+    #[error("invalid entry class `{entry_class}`: {reason}")]
+    InvalidEntryClass { entry_class: String, reason: String },
+    #[error("entry class `{0}` is mapped more than once")]
+    DuplicateEntryClass(String),
+    #[error("entry class `{0}` has no management-profile route")]
+    UnknownEntryClass(String),
+    #[error("invalid management profile `{profile}`: {reason}")]
+    InvalidProfile { profile: String, reason: String },
+}
+
+impl PreparedEntryProfiles {
+    pub fn try_new(
+        default: Option<ManagementProfile>,
+        routes: impl IntoIterator<Item = (String, ManagementProfile)>,
+    ) -> Result<Self, EntryProfileRoutingError> {
+        if let Some(profile) = default.as_ref() {
+            profile
+                .validate()
+                .map_err(|error| EntryProfileRoutingError::InvalidProfile {
+                    profile: profile.name.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        let mut prepared = Self {
+            default,
+            routes: BTreeMap::new(),
+        };
+        for (entry_class, profile) in routes {
+            qs_core::validate_entry_class(&entry_class).map_err(|error| {
+                EntryProfileRoutingError::InvalidEntryClass {
+                    entry_class: entry_class.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            profile
+                .validate()
+                .map_err(|error| EntryProfileRoutingError::InvalidProfile {
+                    profile: profile.name.clone(),
+                    reason: error.to_string(),
+                })?;
+            if prepared
+                .routes
+                .insert(entry_class.clone(), profile)
+                .is_some()
+            {
+                return Err(EntryProfileRoutingError::DuplicateEntryClass(entry_class));
+            }
+        }
+        Ok(prepared)
+    }
+
+    pub fn default_only(profile: Option<ManagementProfile>) -> Self {
+        Self {
+            default: profile,
+            routes: BTreeMap::new(),
+        }
+    }
+
+    pub fn select(
+        &self,
+        signal: &RawSignal,
+    ) -> Result<Option<&ManagementProfile>, EntryProfileRoutingError> {
+        match signal {
+            RawSignal::Entry {
+                entry_class: Some(entry_class),
+                ..
+            } => self
+                .routes
+                .get(entry_class)
+                .map(Some)
+                .ok_or_else(|| EntryProfileRoutingError::UnknownEntryClass(entry_class.clone())),
+            RawSignal::Entry {
+                entry_class: None, ..
+            } => Ok(self.default.as_ref()),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn validate_signals(&self, signals: &[RawSignal]) -> Result<(), EntryProfileRoutingError> {
+        for signal in signals {
+            if signal.is_entry() {
+                let _ = self.select(signal)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn default_profile(&self) -> Option<&ManagementProfile> {
+        self.default.as_ref()
+    }
+
+    pub fn routes(&self) -> &BTreeMap<String, ManagementProfile> {
+        &self.routes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.routes.is_empty()
     }
 }
 
@@ -195,6 +305,7 @@ mod tests {
     use qs_core::types::{
         Action, CloseReason, OrderType, PositionId, RuleConfig, Side, TargetSpec,
     };
+    use qs_instruments::{Decimal, DecimalGrid, PositiveDecimal};
     use qs_symbols::SymbolSpec;
 
     const WEIGHT_TOLERANCE: f64 = 1e-12;
@@ -221,6 +332,7 @@ mod tests {
             targets: vec![1.0900, 1.0950],
             group: None,
             trade_id: None,
+            entry_class: None,
         }
     }
 
@@ -237,6 +349,7 @@ mod tests {
             targets: vec![1.0800, 1.0750],
             group: None,
             trade_id: None,
+            entry_class: None,
         }
     }
 
@@ -1653,6 +1766,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1672,6 +1786,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1695,6 +1810,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1708,6 +1824,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.5, 0.5],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1727,6 +1844,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![1.0], // mismatch
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1745,6 +1863,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1770,6 +1889,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1783,6 +1903,7 @@ close_ratios = [0.5, 0.5]
             target_selection: None,
             use_targets: vec![0], // zero index
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -1826,6 +1947,7 @@ close_ratios = [1.0]
             targets: vec![1.0900],
             group: None,
             trade_id: Some("t1".into()),
+            entry_class: None,
         };
         assert_eq!(sig.ts(), ts(10, 0, 0));
     }
@@ -1854,6 +1976,7 @@ close_ratios = [1.0]
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         };
         assert!(sig.is_entry());
     }
@@ -1882,6 +2005,7 @@ close_ratios = [1.0]
             targets: vec![1.0900],
             group: None,
             trade_id: Some("t1".into()),
+            entry_class: None,
         };
         let json = serde_json::to_value(&sig).unwrap();
         assert_eq!(json["risk"], 1.25);
@@ -2043,6 +2167,7 @@ close_ratios = [1.0]
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         };
         let resolver = MockResolver::with_ids(vec!["pos1"]);
         let actions = resolve_signal(&sig, &resolver);
@@ -2454,6 +2579,7 @@ close_ratios = [1.0]
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -2472,6 +2598,7 @@ close_ratios = [1.0]
             targets: vec![1.0900],
             group: None,
             trade_id: Some("t1".into()),
+            entry_class: None,
         };
 
         let resolved = profile
@@ -2493,6 +2620,7 @@ close_ratios = [1.0]
             target_selection: None,
             use_targets,
             close_ratios,
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -2904,6 +3032,223 @@ price = 1.0900
         ));
     }
 
+    #[test]
+    fn generates_buy_targets_from_final_scaled_stop_distance() {
+        let profile = ManagementProfile {
+            name: "risk_multiple".into(),
+            target_selection: None,
+            use_targets: vec![],
+            close_ratios: vec![0.5, 0.5],
+            target_source: TargetSource::StopDistanceMultiples {
+                multiples: vec![1.3, 1.6],
+            },
+            stoploss_mode: StoplossMode::FromSignalDistance { multiplier: 1.5 },
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        profile.validate().unwrap();
+        let signal = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "synthetic".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(100.0),
+            risk_multiplier: 1.0,
+            stoploss: Some(80.0),
+            targets: vec![],
+            group: None,
+            trade_id: Some("buy-risk".into()),
+            entry_class: Some("expanded".into()),
+        };
+        let context = EntryResolutionContext {
+            price_grid: DecimalGrid::new(
+                Decimal::ZERO,
+                PositiveDecimal::new(Decimal::new(1, 2).unwrap()).unwrap(),
+            ),
+            price_grid_source: PriceGridSource::InstrumentPriceGrid,
+        };
+        let resolved = profile
+            .apply_entry_signal_with_context(&signal, context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.stoploss, Some(70.0));
+        assert_eq!(resolved_targets(&resolved)[0].price, 139.0);
+        assert_eq!(resolved_targets(&resolved)[1].price, 148.0);
+        assert_eq!(
+            resolved.target_resolution.source,
+            TargetResolutionSource::StopDistanceMultiples
+        );
+        assert_eq!(resolved.target_resolution.weights, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn scales_sell_stop_and_generates_targets_symmetrically() {
+        let profile = ManagementProfile {
+            name: "risk_multiple".into(),
+            target_selection: None,
+            use_targets: vec![],
+            close_ratios: vec![],
+            target_source: TargetSource::StopDistanceMultiples {
+                multiples: vec![1.3, 1.6],
+            },
+            stoploss_mode: StoplossMode::FromSignalDistance { multiplier: 1.5 },
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let signal = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "synthetic".into(),
+            side: Side::Sell,
+            order_type: OrderType::Market,
+            price: Some(100.0),
+            risk_multiplier: 1.0,
+            stoploss: Some(120.0),
+            targets: vec![],
+            group: None,
+            trade_id: Some("sell-risk".into()),
+            entry_class: None,
+        };
+        let context = EntryResolutionContext {
+            price_grid: DecimalGrid::new(
+                Decimal::ZERO,
+                PositiveDecimal::new(Decimal::new(1, 2).unwrap()).unwrap(),
+            ),
+            price_grid_source: PriceGridSource::InstrumentPriceGrid,
+        };
+        let resolved = profile
+            .apply_entry_signal_with_context(&signal, context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.stoploss, Some(130.0));
+        assert_eq!(resolved_targets(&resolved)[0].price, 61.0);
+        assert_eq!(resolved_targets(&resolved)[1].price, 52.0);
+    }
+
+    #[test]
+    fn generated_levels_round_outward_and_use_the_adjusted_stop_distance() {
+        let profile = ManagementProfile {
+            name: "grid".into(),
+            target_selection: None,
+            use_targets: vec![],
+            close_ratios: vec![1.0],
+            target_source: TargetSource::StopDistanceMultiples {
+                multiples: vec![1.33],
+            },
+            stoploss_mode: StoplossMode::FromSignalDistance { multiplier: 1.0 },
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let signal = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "synthetic".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(100.0),
+            risk_multiplier: 1.0,
+            stoploss: Some(80.1),
+            targets: vec![],
+            group: None,
+            trade_id: None,
+            entry_class: None,
+        };
+        let context = EntryResolutionContext {
+            price_grid: DecimalGrid::new(
+                Decimal::ZERO,
+                PositiveDecimal::new(Decimal::new(25, 2).unwrap()).unwrap(),
+            ),
+            price_grid_source: PriceGridSource::InstrumentPriceGrid,
+        };
+        let resolved = profile
+            .apply_entry_signal_with_context(&signal, context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.stoploss, Some(80.0));
+        assert_eq!(resolved.targets[0].price, 126.75);
+        assert_eq!(
+            resolved.level_resolution.stop_adjustment,
+            Some(qs_instruments::AdjustmentDirection::Down)
+        );
+        assert_eq!(
+            resolved.level_resolution.target_adjustments,
+            vec![qs_instruments::AdjustmentDirection::Up]
+        );
+    }
+
+    #[test]
+    fn generated_targets_reject_engine_micro_price_collisions() {
+        let profile = ManagementProfile {
+            name: "micro_collision".into(),
+            target_selection: None,
+            use_targets: vec![],
+            close_ratios: vec![0.5, 0.5],
+            target_source: TargetSource::StopDistanceMultiples {
+                multiples: vec![1.000001, 1.000002],
+            },
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let signal = RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "synthetic".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.0),
+            risk_multiplier: 1.0,
+            stoploss: Some(0.9),
+            targets: vec![],
+            group: None,
+            trade_id: None,
+            entry_class: None,
+        };
+        let context = EntryResolutionContext {
+            price_grid: DecimalGrid::new(
+                Decimal::ZERO,
+                PositiveDecimal::new(Decimal::new(1, 7).unwrap()).unwrap(),
+            ),
+            price_grid_source: PriceGridSource::InstrumentPriceGrid,
+        };
+        assert!(matches!(
+            profile.apply_entry_signal_with_context(&signal, context),
+            Err(ProfileApplicationError::DuplicateTargetPrice { .. })
+        ));
+    }
+
+    #[test]
+    fn generated_profiles_reject_conflicting_signal_targets_and_take_profit_rules() {
+        let mut profile = strict_profile(vec![1], vec![1.0], false);
+        profile.target_source = TargetSource::StopDistanceMultiples {
+            multiples: vec![1.0],
+        };
+        assert!(profile.validate().is_err());
+
+        profile.target_selection = None;
+        profile.use_targets.clear();
+        profile.rules = vec![RuleConfigDef::TakeProfit {
+            price: 120.0,
+            close_ratio: 1.0,
+        }];
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn permissive_profile_still_rejects_wrong_side_fixed_stop() {
+        let mut profile = permissive_profile(vec![1], vec![1.0]);
+        profile.stoploss_mode = StoplossMode::FixedPrice { price: 1.0900 };
+        assert!(matches!(
+            profile.apply_entry_signal(&buy_signal()),
+            Err(ProfileApplicationError::InvalidStopGeometry { .. })
+        ));
+    }
+
     // ── Deterministic target lot allocation ─────────────────────────────
 
     #[test]
@@ -3016,6 +3361,7 @@ close_ratios = []
             target_selection: Some(TargetSelection::Selected(vec![1])),
             use_targets: vec![1],
             close_ratios: vec![],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,

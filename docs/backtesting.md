@@ -31,6 +31,8 @@ Every Entry must contain a finite positive `risk` multiplier. It does not contai
 
 `--account-currency` is required when an Entry is present. Monetary risk sizing also requires a protective stop. `--market-entry-sizing-basis` selects `fill-price` or `signal-entry-price` for FutureQuote Market Entry quantity calculation; the default is `fill-price`, and `signal-entry-price` falls back to the fill when `Entry.price` is absent. `ScaleIn.size` remains a concrete final quantity and is not interpreted as an Entry risk multiplier.
 
+An Entry may carry an optional exact, case-sensitive `entry_class`. `tg_backtest --entry-profile-map routes.toml` maps classes to named or inline management profiles while `--profile` remains the default for unlabeled entries. Unknown classes, duplicate routes, malformed labels, and missing named profiles fail before market data is consumed; they never fall back silently. Accepted retained jobs freeze the resolved definitions, so later profile add, remove, or reload operations do not change the run.
+
 See the [RawSignal reference](reference/raw-signal.md) for action shapes.
 
 ## Instrument identity and economics
@@ -53,13 +55,55 @@ The production service uses deterministic FutureQuote replay.
 - Market entries use the appropriate future quote side and retain that actual fill for position state, P&L, MTM, and actual risk artifacts.
 - Market Entry sizing defaults to the actual fill price. The optional signal-entry basis uses an explicit original `Entry.price` only for quantity calculation and falls back to the fill price when it is absent.
 - Profiles, relative stops, targets, and rules still resolve from the actual fill price. Signal-entry sizing can therefore produce actual fill-to-stop risk above or below the requested risk, and the execution metadata records both price roles and the resulting quantity.
-- Management profiles carry an `entry_geometry` policy. The `strict` default rejects an Entry when the signal stoploss or a selected target sits on the wrong side of the execution price. The `permissive` policy attaches those signal levels unchanged.
-- Under `permissive`, the first tick evaluation after the fill closes already-crossed levels at market: a crossed take profit exits with `Target`, a violated stop with `Stoploss`, and the stop wins when both cross. The market entry sizing audit lists these levels in `levels_crossed_at_fill`. Profile rule levels and numeric validation stay strict under both policies, and runs without a profile stay strict.
-- The shipped `conservative` profile states `permissive`; the other shipped profiles state `strict`.
+- Management profiles carry an `entry_geometry` policy. The `strict` default rejects an Entry during profile resolution when a signal stoploss or selected signal target sits on the wrong side of the execution price. `permissive` retains those signal levels at the resolver boundary, but the current engine still validates ordinary `Action::Open` geometry strictly; crossed signal levels can therefore still be rejected before a position opens. Profile-generated levels, profile rule levels, numeric validation, and unprofiled entries are always strict.
+- The shipped profile file states each current geometry policy explicitly. Operators should inspect the deployed file rather than infer a policy from a profile name.
 - Management actions that reference an already-closed position resolve as skipped no-ops with reason `position_closed` instead of failed actions.
 - Limit and Stop Entries remain sized at placement from their required requested price; their quantity stays frozen through later fill, balance, FX, or quote changes.
 
 Close-only bars cannot reconstruct an intrabar price path. Use tick data when exact ordering of stop, target, and management events matters.
+
+## Management profile routing and generated levels
+
+Class routes are explicit run input and do not reuse `group` or `trade_id`. Group remains a reporting and bulk-management address, while trade ID remains per-trade management identity. Entries without a class use the run default profile or the existing unprofiled path when no default exists.
+
+A profile can retain signal targets or generate targets from the final protective-stop distance. The generated form is strict and uses existing target weights, remainder handling, integer lot-step allocation, and zero-unit rejection:
+
+```toml
+[[profile]]
+name = "risk_multiple_example"
+use_targets = []
+close_ratios = [0.5, 0.5]
+let_remainder_run = false
+entry_geometry = "strict"
+
+[profile.stoploss_mode]
+type = "FromSignalDistance"
+multiplier = 1.5
+
+[profile.target_source]
+type = "StopDistanceMultiples"
+multiples = [1.3, 1.6]
+```
+
+For a Buy at 100 with signal stop 80, the stop multiplier produces a requested stop at 70. The stop is aligned outward to the declared instrument price grid, and the final grid-adjusted stop distance becomes the R basis. If the final distance remains 30, the targets are 139 and 148 before any required outward target-grid adjustment. Sell calculations are symmetric. The multiplier is applied to price distance, so no pip conversion is required. Existing `FixedDistance` and trailing distances are raw price distances, not universal pip counts.
+
+Market Entries resolve these levels from the actual fill. The optional signal-entry sizing basis changes quantity calculation only. Limit and Stop Entries resolve and freeze their levels and quantity at placement; a later fill gap does not regenerate them. Generated targets cannot be combined with signal-target selection or profile-level `TakeProfit` rules.
+
+`BreakevenAfterTargets` counts executed take profits rather than a target identifier. A configured `TrailingStop` is active from the first rule evaluation; combining it with breakeven does not delay trailing until the first target. Initial generated targets are not regenerated after scale-in, break-even, or later stop/target management.
+
+Execution metadata records frozen route definitions and applied Entry profile resolution, including class, selected profile, level reference, original and resolved stop, generated targets, grid adjustments, target allocation, and action ID.
+
+A route file uses exact labels:
+
+```toml
+[[route]]
+entry_class = "baseline"
+profile = "signal_targets"
+
+[[route]]
+entry_class = "expanded"
+profile = "risk_multiple_example"
+```
 
 ## Service execution
 

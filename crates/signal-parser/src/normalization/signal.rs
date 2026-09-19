@@ -513,6 +513,7 @@ pub(crate) fn finalize_draft(draft: SignalDraft) -> FinalizedSignal {
                 .collect(),
             group: group.map(GroupText::into_inner),
             trade_id: trade_id.map(TradeKeyText::into_inner),
+            entry_class: None,
         },
         SignalDraftAction::Close { position } => RawSignal::Close {
             ts,

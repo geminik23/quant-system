@@ -62,6 +62,7 @@ fn signal(price: Option<f64>, stoploss: Option<f64>, trade_id: &str) -> RawSigna
         targets: Vec::new(),
         group: None,
         trade_id: Some(trade_id.into()),
+        entry_class: None,
     }
 }
 
@@ -221,6 +222,7 @@ fn signal_price_sizing_preserves_sell_direction() {
         targets: Vec::new(),
         group: None,
         trade_id: Some("sell-signal".into()),
+        entry_class: None,
     };
     let config = BacktestConfig {
         close_on_finish: true,
@@ -265,6 +267,7 @@ fn fixed_distance_profile_uses_fill_while_sizing_uses_signal_price() {
         target_selection: None,
         use_targets: Vec::new(),
         close_ratios: Vec::new(),
+        target_source: qs_backtest::TargetSource::FromSignal,
         stoploss_mode: StoplossMode::FixedDistance { distance: 10.0 },
         rules: Vec::new(),
         group_override: None,

@@ -11,6 +11,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_target_source_info() -> String {
+    "FromSignal".into()
+}
+
 /// Current format version for complete result JSON artifacts.
 pub const RESULT_FORMAT_VERSION: u32 = 1;
 
@@ -32,6 +36,8 @@ pub struct ProfileInfo {
     pub name: String,
     pub use_targets: Vec<usize>,
     pub close_ratios: Vec<f64>,
+    #[serde(default = "default_target_source_info")]
+    pub target_source: String,
     pub stoploss_mode: String,
     pub rules_count: usize,
     pub let_remainder_run: bool,
@@ -465,6 +471,8 @@ pub struct BacktestRunSpec {
     pub profile: Option<String>,
     #[serde(default)]
     pub profile_def: Option<ManagementProfileMsg>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_profile_routes: Vec<EntryProfileRouteMsg>,
     pub config: BacktestConfigMsg,
 }
 
@@ -519,6 +527,8 @@ pub struct BacktestMultiRunSpec {
     #[serde(default)]
     pub raw_signals: Vec<RawSignalMsg>,
     pub profiles: Vec<ProfileRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_profile_routes: Vec<EntryProfileRouteMsg>,
     pub config: BacktestConfigMsg,
 }
 
@@ -809,6 +819,17 @@ pub enum TargetSelectionMsg {
     Selected(Vec<usize>),
 }
 
+/// Wire-safe source used to select or generate targets.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum TargetSourceMsg {
+    #[default]
+    FromSignal,
+    StopDistanceMultiples {
+        multiples: Vec<f64>,
+    },
+}
+
 /// Wire-safe entry geometry policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -833,6 +854,8 @@ pub struct ManagementProfileMsg {
     /// Compatibility selection retained for older serialized profiles.
     pub use_targets: Vec<usize>,
     pub close_ratios: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_source: Option<TargetSourceMsg>,
     #[serde(default)]
     pub stoploss_mode: Option<StoplossModeMsg>,
     #[serde(default)]
@@ -855,6 +878,7 @@ pub enum StoplossModeMsg {
     None,
     FixedDistance { distance: f64 },
     FixedPrice { price: f64 },
+    FromSignalDistance { multiplier: f64 },
 }
 
 /// Wire-safe rule configuration definition.
@@ -876,6 +900,14 @@ pub enum RuleConfigDefMsg {
 pub enum ProfileRef {
     Named(String),
     Inline(ManagementProfileMsg),
+}
+
+/// One exact entry-class route to a named or inline management profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryProfileRouteMsg {
+    pub entry_class: String,
+    pub profile: ProfileRef,
 }
 
 // Full raw-signal action messages.
@@ -903,6 +935,9 @@ pub enum RawSignalMsg {
         /// Application-defined trade id. Required for `ByTradeId` resolution.
         #[serde(default)]
         trade_id: Option<String>,
+        /// Optional semantic class used for per-entry profile routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_class: Option<String>,
     },
     /// Close position(s) at market.
     Close {
@@ -1057,6 +1092,14 @@ enum StrictStoplossModeMsg {
     None,
     FixedDistance { distance: f64 },
     FixedPrice { price: f64 },
+    FromSignalDistance { multiplier: f64 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum StrictTargetSourceMsg {
+    FromSignal,
+    StopDistanceMultiples { multiples: Vec<f64> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1079,6 +1122,8 @@ struct StrictManagementProfileMsg {
     target_selection: Option<TargetSelectionMsg>,
     use_targets: Vec<usize>,
     close_ratios: Vec<f64>,
+    #[serde(default)]
+    target_source: Option<StrictTargetSourceMsg>,
     #[serde(default)]
     stoploss_mode: Option<StrictStoplossModeMsg>,
     #[serde(default)]
@@ -1116,6 +1161,8 @@ enum StrictRawSignalMsg {
         group: Option<String>,
         #[serde(default)]
         trade_id: Option<String>,
+        #[serde(default)]
+        entry_class: Option<String>,
     },
     Close {
         ts: String,
@@ -1216,6 +1263,8 @@ struct StrictBacktestRunSpec {
     profile: Option<String>,
     #[serde(default)]
     profile_def: Option<StrictManagementProfileMsg>,
+    #[serde(default)]
+    entry_profile_routes: Vec<StrictEntryProfileRouteMsg>,
     config: StrictBacktestConfigMsg,
 }
 
@@ -1224,6 +1273,13 @@ struct StrictBacktestRunSpec {
 enum StrictProfileRef {
     Named(String),
     Inline(StrictManagementProfileMsg),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictEntryProfileRouteMsg {
+    entry_class: String,
+    profile: StrictProfileRef,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1242,6 +1298,8 @@ struct StrictBacktestMultiRunSpec {
     #[serde(default)]
     raw_signals: Vec<StrictRawSignalMsg>,
     profiles: Vec<StrictProfileRef>,
+    #[serde(default)]
+    entry_profile_routes: Vec<StrictEntryProfileRouteMsg>,
     config: StrictBacktestConfigMsg,
 }
 

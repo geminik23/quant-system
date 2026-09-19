@@ -214,9 +214,13 @@ struct Args {
     #[arg(long)]
     to: Option<String>,
 
-    /// Named management profile to apply (must exist on server).
+    /// Named management profile to apply to entries without an entry class.
     #[arg(long)]
     profile: Option<String>,
+
+    /// TOML file containing exact entry-class to profile routes.
+    #[arg(long)]
+    entry_profile_map: Option<PathBuf>,
 
     /// Initial account balance.
     #[arg(long, default_value_t = 10_000.0)]
@@ -420,7 +424,55 @@ fn parse_raw_signal_line(
         .map_err(|error| format!("line {line_number}: failed to parse raw signal: {error}").into())
 }
 
-/// Read parsed raw signal JSONL from a file or stdin.
+/// Read and recursively validate entry-profile routes without losing unknown TOML keys.
+fn load_entry_profile_routes(
+    path: Option<&Path>,
+) -> Result<Vec<EntryProfileRouteMsg>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let content = std::fs::read_to_string(path)?;
+    let value: toml::Value = toml::from_str(&content)?;
+    let table = value
+        .as_table()
+        .ok_or("entry profile map must be a TOML table")?;
+    if table.keys().any(|key| key != "route") {
+        return Err("entry profile map contains an unknown top-level field".into());
+    }
+    let routes = table
+        .get("route")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Array(Vec::new()));
+    let routes = serde_json::to_value(routes)?;
+    let probe = serde_json::json!({
+        "request": {
+            "symbol": "",
+            "symbols": [],
+            "all_symbols": false,
+            "exchange": "",
+            "data_type": "tick",
+            "timeframe": null,
+            "from": null,
+            "to": null,
+            "raw_signals": [],
+            "profile": null,
+            "profile_def": null,
+            "entry_profile_routes": routes,
+            "config": {
+                "initial_balance": null,
+                "close_on_finish": null,
+                "fill_model": null,
+                "sizing": null
+            }
+        },
+        "future": {},
+        "evaluation": {},
+        "result_delivery": "auto"
+    });
+    let request: RunBacktestRequest = serde_json::from_value(probe)?;
+    Ok(request.request.entry_profile_routes)
+}
+
 fn load_raw_signals(path: &str) -> Result<Vec<RawSignalMsg>, Box<dyn std::error::Error>> {
     let reader: Box<dyn BufRead> = if path == "-" {
         Box::new(io::BufReader::new(io::stdin()))
@@ -1874,6 +1926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_loaded_signal_contract(&args, &raw_signals)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let loaded_signal_count = raw_signals.len();
+    let entry_profile_routes = load_entry_profile_routes(args.entry_profile_map.as_deref())?;
     println!(
         "  Loaded {} raw signals from {}",
         loaded_signal_count, args.input
@@ -1998,6 +2051,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raw_signals,
             profile: args.profile.clone(),
             profile_def: None,
+            entry_profile_routes: entry_profile_routes.clone(),
             config: BacktestConfigMsg {
                 initial_balance: Some(args.balance),
                 close_on_finish: Some(true),
@@ -2139,6 +2193,28 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn entry_profile_map_is_recursively_strict() {
+        let path =
+            std::env::temp_dir().join(format!("qs_entry_profile_map_{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[[route]]\nentry_class = \"expanded\"\nprofile = \"named\"\n",
+        )
+        .unwrap();
+        let routes = load_entry_profile_routes(Some(&path)).unwrap();
+        assert_eq!(routes.len(), 1);
+
+        std::fs::write(
+            &path,
+            "[[route]]\nentry_class = \"expanded\"\n[route.profile]\nname = \"inline\"\nuse_targets = []\nclose_ratios = []\ntarget_sorce = { type = \"FromSignal\" }\n",
+        )
+        .unwrap();
+        let error = load_entry_profile_routes(Some(&path)).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn typed_call_timeout_preserves_request_timeout_meaning() {
         let error = typed_call_with_timeout(
@@ -2270,6 +2346,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: None,
+            entry_class: None,
         };
         let entry_error =
             backtest_server::convert::raw_signal_from_msg(&invalid_entry, "EURUSD", &registry)
@@ -3018,6 +3095,7 @@ mod tests {
                         targets: Vec::new(),
                         group: None,
                         trade_id: Some("entry-1".into()),
+                        entry_class: None,
                     },
                     RawSignal::CloseAll { ts: signal_ts },
                 ]

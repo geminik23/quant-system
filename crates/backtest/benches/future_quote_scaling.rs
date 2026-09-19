@@ -179,6 +179,7 @@ fn fixture(primary_events: usize, case: CurrencyCase) -> ReplayFixture {
         targets: Vec::new(),
         group: None,
         trade_id: Some("benchmark-active".to_owned()),
+        entry_class: None,
     }];
 
     ReplayFixture {

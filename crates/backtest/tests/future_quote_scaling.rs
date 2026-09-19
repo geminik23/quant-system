@@ -144,6 +144,7 @@ fn active_signal() -> RawSignal {
         targets: Vec::new(),
         group: None,
         trade_id: Some(TRADE_ID.to_owned()),
+        entry_class: None,
     }
 }
 

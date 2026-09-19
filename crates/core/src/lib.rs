@@ -43,10 +43,11 @@ pub use error::{CoreError, Result};
 pub use execution::{ExecutionError, ExecutionPricer, ExecutionResult};
 pub use position::Position;
 pub use profile::{
-    ManagementProfile, PositionRef, PositionResolver, ProfileApplicationError,
+    EntryLevelResolution, EntryResolutionContext, GeneratedTargetResolution, ManagementProfile,
+    PositionRef, PositionResolver, PriceGridSource, ProfileApplicationError,
     ProfileValidationError, RawSignal, ResolvedEntry, RuleConfigDef, StoplossMode,
-    TargetResolution, TargetSelection, allocate_target_steps, allocate_target_units,
-    resolve_signal, resolve_unprofiled_entry, validate_profile,
+    TargetResolution, TargetResolutionSource, TargetSelection, TargetSource, allocate_target_steps,
+    allocate_target_units, resolve_signal, resolve_unprofiled_entry, validate_profile,
 };
 pub use rules::Rule;
 pub use sizing::{
@@ -60,4 +61,6 @@ pub use types::{
     PositionId, PositionRecord, PositionStatus, PreparedPendingFill, PriceQuote, RuleConfig, Side,
     Signal, SlippageModel, StopOrigin, TargetSpec, TradeId,
 };
-pub use validation::{RawSignalValidationError, validate_raw_signal, validate_raw_signals};
+pub use validation::{
+    RawSignalValidationError, validate_entry_class, validate_raw_signal, validate_raw_signals,
+};

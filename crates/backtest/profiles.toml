@@ -9,14 +9,15 @@
 #   use_targets       — compatibility mirror for older serialized profiles
 #   close_ratios      — target weights. An empty list means equal 1/N weights; explicit weights must match
 #                       the effective selection and sum to <= 1.0.
-#   stoploss_mode     — FromSignal, None, FixedDistance, or FixedPrice
+#   target_source     — omitted/FromSignal selects signal targets; StopDistanceMultiples generates targets
+#                       from the final grid-adjusted protective-stop distance
+#   stoploss_mode     — FromSignal, None, FixedDistance, FixedPrice, or FromSignalDistance
 #   rules             — additional management rules to attach
 #   group_override    — if set, overrides the signal's group tag
 #   let_remainder_run — required in strict resolution when explicit weights sum below 1.0;
 #                       the unallocated remainder rides with SL/rules only
-#   entry_geometry    — strict (default) rejects signal stoploss and selected targets on the wrong side of
-#                       the execution price; permissive attaches them unchanged and the first tick
-#                       evaluation closes already-crossed levels at market
+#   entry_geometry    — strict (default) rejects crossed signal stoploss/targets during profile resolution;
+#                       permissive retains them there, but current engine Open validation remains strict
 #
 # Shipped profiles state current target intent and entry geometry policy explicitly. `use_targets` is
 # retained as a compatibility mirror while older serialized profile payloads remain readable.
@@ -32,20 +33,12 @@ entry_geometry = "permissive"
 
 [[profile]]
 name = "aggressive"
-target_selection = { Selected = [1, 2] }
+target_selection = "All"
 use_targets = [1, 2]
-close_ratios = [0.5, 0.5]
+close_ratios = []
 stoploss_mode = { type = "FromSignal" }
 let_remainder_run = false
-entry_geometry = "strict"
-
-[[profile.rules]]
-type = "BreakevenAfterTargets"
-after_n = 1
-
-[[profile.rules]]
-type = "TrailingStop"
-distance = 0.0020
+entry_geometry = "permissive"
 
 [[profile]]
 name = "runner"

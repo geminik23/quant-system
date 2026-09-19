@@ -33,6 +33,11 @@ pub enum RawSignalValidationError {
     #[error("entry price must be finite and positive, got {value}")]
     EntryPrice { value: f64 },
 
+    #[error(
+        "entry class must be non-empty, trimmed, control-character-free, and at most 128 UTF-8 bytes"
+    )]
+    EntryClass,
+
     #[error("stoploss is not protective for the entry side")]
     StoplossNotProtective,
 
@@ -52,6 +57,19 @@ pub enum RawSignalValidationError {
     ScaleIn,
 }
 
+/// Validate one optional semantic entry class without normalizing it.
+pub fn validate_entry_class(value: &str) -> Result<(), RawSignalValidationError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > 128
+        || value.chars().any(char::is_control)
+    {
+        Err(RawSignalValidationError::EntryClass)
+    } else {
+        Ok(())
+    }
+}
+
 /// Validate one raw signal against the common signal contract.
 ///
 /// Entry geometry is only checked when the entry price is known, because a
@@ -66,12 +84,16 @@ pub fn validate_raw_signal(signal: &RawSignal) -> Result<(), RawSignalValidation
             risk_multiplier,
             stoploss,
             targets,
+            entry_class,
             ..
         } => {
             if !risk_multiplier.is_finite() || *risk_multiplier <= 0.0 {
                 return Err(RawSignalValidationError::EntryRisk {
                     value: *risk_multiplier,
                 });
+            }
+            if let Some(entry_class) = entry_class {
+                validate_entry_class(entry_class)?;
             }
             if matches!(order_type, OrderType::Limit | OrderType::Stop)
                 && !price.is_some_and(|value| value.is_finite() && value > 0.0)
@@ -196,6 +218,7 @@ mod tests {
             targets,
             group: None,
             trade_id: None,
+            entry_class: None,
         }
     }
 
@@ -216,6 +239,38 @@ mod tests {
             vec![2010.0, 2020.0],
         );
         assert_eq!(validate_raw_signal(&signal), Ok(()));
+    }
+
+    #[test]
+    fn entry_class_is_exact_bounded_and_control_free() {
+        let mut signal = entry(
+            Side::Buy,
+            OrderType::Market,
+            Some(2000.0),
+            1.0,
+            Some(1990.0),
+            vec![2010.0],
+        );
+        for value in ["", " spaced", "spaced ", "line\nbreak"] {
+            if let RawSignal::Entry { entry_class, .. } = &mut signal {
+                *entry_class = Some(value.into());
+            }
+            assert_eq!(
+                validate_raw_signal(&signal),
+                Err(RawSignalValidationError::EntryClass)
+            );
+        }
+        if let RawSignal::Entry { entry_class, .. } = &mut signal {
+            *entry_class = Some("x".repeat(128));
+        }
+        assert_eq!(validate_raw_signal(&signal), Ok(()));
+        if let RawSignal::Entry { entry_class, .. } = &mut signal {
+            *entry_class = Some("x".repeat(129));
+        }
+        assert_eq!(
+            validate_raw_signal(&signal),
+            Err(RawSignalValidationError::EntryClass)
+        );
     }
 
     #[test]

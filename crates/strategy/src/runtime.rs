@@ -1528,6 +1528,7 @@ fn lower_action(
                     targets,
                     group: identity.campaign_id.clone(),
                     trade_id: Some(trade_id),
+                    entry_class: None,
                 },
                 slot.clone(),
             )

@@ -26,9 +26,13 @@ use qs_core::types::{
     PositionStatus, PreparedPendingFill, PriceQuote, Side, SlippageModel, position_size_tolerance,
 };
 use qs_core::{ExecutionPricer, FutureApplyError, TradeEngine};
-use qs_instruments::{Decimal, EconomicsModelId, InstrumentSpec, ListingStatus, QuantityUnit};
+use qs_instruments::{
+    Decimal, DecimalGrid, EconomicsModelId, InstrumentSpec, ListingStatus, PositiveDecimal,
+    QuantityUnit,
+};
 
 use crate::artifacts::{
+    EntryProfileResolutionAudit, EntryProfileSelectionSource, EntryResolutionStage,
     ExecutionMetadata, FUTURE_ARTIFACT_FORMAT_VERSION, FutureBacktestArtifacts,
     InstrumentSizingArtifact, MarketEntrySizingAudit, MarketEntrySizingBasis, PendingOrderSnapshot,
     ReplayInstrumentManifest,
@@ -39,11 +43,12 @@ use crate::economic_support::{LEGACY_ECONOMIC_GUARD_ID, resolve_legacy_economics
 use crate::evaluation::EvaluationOptions;
 use crate::executor::BacktestExecutor;
 use crate::future_executor::{FutureExecutor, FutureExecutorError};
-use crate::ledger::{ActionDisposition, LifecycleLedger};
+use crate::ledger::{ActionDisposition, ActionDispositionStatus, LifecycleLedger};
 use crate::mtm::{MtmCurveCollector, MtmOutputPolicy, MtmOutputSummary};
 use crate::portfolio::{EquityPoint, PortfolioRecorder};
 use crate::profile::{
-    ManagementProfile, RawSignal, ResolvedEntry, allocate_target_steps, resolve_signal,
+    EntryProfileRoutingError, EntryResolutionContext, ManagementProfile, PreparedEntryProfiles,
+    PriceGridSource, RawSignal, ResolvedEntry, allocate_target_steps, resolve_signal,
     resolve_unprofiled_entry,
 };
 use crate::report::BacktestResult;
@@ -175,8 +180,19 @@ struct QueuedAction {
     effective_ts: NaiveDateTime,
     entry_signal: Option<RawSignal>,
     entry_profile: Option<ManagementProfile>,
+    entry_profile_selection_source: Option<EntryProfileSelectionSource>,
+    selected_profile_name: Option<String>,
     market_entry_sizing_audit: Option<MarketEntrySizingAudit>,
+    entry_profile_resolution_audit: Option<EntryProfileResolutionAudit>,
     requires_later_quote: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedEntryProfile {
+    profile: Option<ManagementProfile>,
+    source: EntryProfileSelectionSource,
+    entry_class: Option<String>,
+    profile_name: Option<String>,
 }
 
 struct FinalizedEntry {
@@ -185,6 +201,11 @@ struct FinalizedEntry {
     native_loss_per_lot: Option<f64>,
     account_loss_per_lot: Option<f64>,
     final_lot: f64,
+    level_resolution: qs_core::EntryLevelResolution,
+    target_resolution: qs_core::TargetResolution,
+    configured_weights: Vec<f64>,
+    allocated_target_steps: Vec<u64>,
+    remainder_steps: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -876,8 +897,10 @@ pub struct BacktestRunner {
     strategy_research_limits: StrategyResearchLimits,
     instrument_sizing: Vec<InstrumentSizingArtifact>,
     market_entry_sizing: Vec<MarketEntrySizingAudit>,
+    entry_profile_resolutions: Vec<EntryProfileResolutionAudit>,
     committed_feedback: Vec<FutureEffect>,
     committed_feedback_events: Vec<StrategyFeedbackEvent>,
+    entry_profiles: Option<PreparedEntryProfiles>,
 }
 
 impl BacktestRunner {
@@ -894,8 +917,10 @@ impl BacktestRunner {
             strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
             market_entry_sizing: Vec::new(),
+            entry_profile_resolutions: Vec::new(),
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
+            entry_profiles: None,
         }
     }
 
@@ -913,14 +938,22 @@ impl BacktestRunner {
             strategy_research_limits: StrategyResearchLimits::default(),
             instrument_sizing: Vec::new(),
             market_entry_sizing: Vec::new(),
+            entry_profile_resolutions: Vec::new(),
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
+            entry_profiles: None,
         }
     }
 
     /// Create a runner with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(BacktestConfig::default())
+    }
+
+    /// Apply an immutable per-entry profile routing snapshot.
+    pub fn with_entry_profiles(mut self, profiles: PreparedEntryProfiles) -> Self {
+        self.entry_profiles = Some(profiles);
+        self
     }
 
     /// Apply typed provider-evaluation options to FutureQuoteV1 results.
@@ -1104,6 +1137,7 @@ impl BacktestRunner {
         }
         if validate_replay_config(&self.config, None, &raw_signals).is_err()
             || profile.is_some_and(|profile| profile.validate().is_err())
+            || self.validate_entry_profile_routes(&raw_signals).is_err()
         {
             return Ok(rejected_legacy_result(&self.config));
         }
@@ -1267,6 +1301,14 @@ impl BacktestRunner {
                 error.to_string(),
             ));
         }
+        if let Err(error) = self.validate_entry_profile_routes(&raw_signals) {
+            return Ok(rejected_future_result(
+                &self.config,
+                &future,
+                self.evaluation_options,
+                error,
+            ));
+        }
 
         let mut hook = StaticReplayHook;
         match self.run_raw_signals_future_batches(
@@ -1330,6 +1372,14 @@ impl BacktestRunner {
                 &future,
                 self.evaluation_options,
                 error.to_string(),
+            ));
+        }
+        if let Err(error) = self.validate_entry_profile_routes(&raw_signals) {
+            return Ok(rejected_future_result(
+                &self.config,
+                &future,
+                self.evaluation_options,
+                error,
             ));
         }
 
@@ -1496,7 +1546,12 @@ impl BacktestRunner {
     where
         F: DataFeed,
     {
-        if profile.is_some() {
+        if profile.is_some()
+            || self
+                .entry_profiles
+                .as_ref()
+                .is_some_and(|profiles| !profiles.is_empty())
+        {
             return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
         }
         adapter
@@ -1560,7 +1615,12 @@ impl BacktestRunner {
     where
         F: FallibleBatchFeed,
     {
-        if profile.is_some() {
+        if profile.is_some()
+            || self
+                .entry_profiles
+                .as_ref()
+                .is_some_and(|profiles| !profiles.is_empty())
+        {
             return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
         }
         adapter
@@ -1617,6 +1677,70 @@ impl BacktestRunner {
         })
     }
 
+    fn validate_entry_profile_routes(&self, signals: &[RawSignal]) -> Result<(), String> {
+        if let Some(profiles) = self.entry_profiles.as_ref() {
+            return profiles
+                .validate_signals(signals)
+                .map_err(|error| error.to_string());
+        }
+        if let Some(entry_class) = signals.iter().find_map(|signal| match signal {
+            RawSignal::Entry {
+                entry_class: Some(entry_class),
+                ..
+            } => Some(entry_class),
+            _ => None,
+        }) {
+            return Err(
+                EntryProfileRoutingError::UnknownEntryClass(entry_class.clone()).to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn select_entry_profile(
+        &self,
+        signal: &RawSignal,
+        fallback: Option<&ManagementProfile>,
+    ) -> Result<SelectedEntryProfile, EntryProfileRoutingError> {
+        let entry_class = match signal {
+            RawSignal::Entry { entry_class, .. } => entry_class.clone(),
+            _ => None,
+        };
+        if let Some(profiles) = self.entry_profiles.as_ref() {
+            let profile = profiles.select(signal)?.cloned();
+            let source = if entry_class.is_some() {
+                EntryProfileSelectionSource::Mapped
+            } else if profile.is_some() {
+                EntryProfileSelectionSource::RunDefault
+            } else {
+                EntryProfileSelectionSource::Unprofiled
+            };
+            let profile_name = profile.as_ref().map(|profile| profile.name.clone());
+            return Ok(SelectedEntryProfile {
+                profile,
+                source,
+                entry_class,
+                profile_name,
+            });
+        }
+        if let Some(entry_class) = entry_class {
+            return Err(EntryProfileRoutingError::UnknownEntryClass(entry_class));
+        }
+        let profile = fallback.cloned();
+        let source = if profile.is_some() {
+            EntryProfileSelectionSource::RunDefault
+        } else {
+            EntryProfileSelectionSource::Unprofiled
+        };
+        let profile_name = profile.as_ref().map(|profile| profile.name.clone());
+        Ok(SelectedEntryProfile {
+            profile,
+            source,
+            entry_class: None,
+            profile_name,
+        })
+    }
+
     /// Process a single raw signal: entry signals go through profile transform,
     /// management signals are resolved against live engine state.
     fn process_raw_signal(
@@ -1642,8 +1766,12 @@ impl BacktestRunner {
                     Side::Sell => quote.bid,
                 });
             }
-            let resolved = match profile {
-                Some(profile) => profile.apply_entry_signal(&signal),
+            let selected_profile = match self.select_entry_profile(&signal, profile) {
+                Ok(profile) => profile,
+                Err(_) => return,
+            };
+            let resolved = match selected_profile.profile.as_ref() {
+                Some(profile) => self.resolve_profiled_entry(profile, &signal),
                 None => resolve_unprofiled_entry(&signal),
             };
             if let Ok(Some(resolved)) = resolved
@@ -1658,6 +1786,43 @@ impl BacktestRunner {
                 self.apply_single_action(action, ts, quote);
             }
         }
+    }
+
+    fn resolve_profiled_entry(
+        &self,
+        profile: &ManagementProfile,
+        signal: &RawSignal,
+    ) -> Result<Option<ResolvedEntry>, qs_core::ProfileApplicationError> {
+        let symbol = match signal {
+            RawSignal::Entry { symbol, .. } => symbol,
+            _ => return profile.apply_entry_signal(signal),
+        };
+        match self.entry_resolution_context(symbol) {
+            Ok(context) => profile.apply_entry_signal_with_context(signal, context),
+            Err(_) => profile.apply_entry_signal(signal),
+        }
+    }
+
+    fn entry_resolution_context(&self, symbol: &str) -> Result<EntryResolutionContext, String> {
+        if let Some(spec) = explicit_instrument_spec(&self.config, symbol) {
+            return Ok(EntryResolutionContext {
+                price_grid: spec.price.grid,
+                price_grid_source: PriceGridSource::InstrumentPriceGrid,
+            });
+        }
+        let legacy = self
+            .config
+            .symbol_specs
+            .get(symbol)
+            .ok_or_else(|| format!("missing price grid for {symbol}"))?;
+        let scale = u8::try_from(legacy.digits)
+            .map_err(|_| format!("price scale is too large for {symbol}"))?;
+        let step = Decimal::new(1, scale).map_err(|error| error.to_string())?;
+        let step = PositiveDecimal::new(step).map_err(|error| error.to_string())?;
+        Ok(EntryResolutionContext {
+            price_grid: DecimalGrid::new(Decimal::ZERO, step),
+            price_grid_source: PriceGridSource::LegacyDigitsFallback,
+        })
     }
 
     fn finalize_resolved_entry(
@@ -1767,18 +1932,23 @@ impl BacktestRunner {
                 final_notional: sizing.final_notional.clone(),
             });
         }
+        let configured_weights = resolved.target_resolution.weights.clone();
+        let target_resolution = resolved.target_resolution.clone();
+        let level_resolution = resolved.level_resolution.clone();
         let target_steps = allocate_target_steps(
             sizing.final_lot_steps,
-            &resolved.target_resolution.weights,
+            &configured_weights,
             resolved.target_resolution.remainder,
         )
         .map_err(|error| error.to_string())?;
         if target_steps.len() != resolved.targets.len() {
             return Err("target allocation does not match resolved targets".to_owned());
         }
-        for (target, steps) in resolved.targets.iter_mut().zip(target_steps) {
-            target.close_ratio = steps as f64 / sizing.final_lot_steps as f64;
+        for (target, steps) in resolved.targets.iter_mut().zip(&target_steps) {
+            target.close_ratio = *steps as f64 / sizing.final_lot_steps as f64;
         }
+        let allocated_steps: u64 = target_steps.iter().sum();
+        let remainder_steps = sizing.final_lot_steps.saturating_sub(allocated_steps);
 
         Ok(FinalizedEntry {
             action: resolved.into_action(sizing.final_lot),
@@ -1786,6 +1956,11 @@ impl BacktestRunner {
             native_loss_per_lot: sizing.native_loss_per_lot,
             account_loss_per_lot: sizing.account_loss_per_lot,
             final_lot: sizing.final_lot,
+            level_resolution,
+            target_resolution,
+            configured_weights,
+            allocated_target_steps: target_steps,
+            remainder_steps,
         })
     }
 
@@ -1883,6 +2058,14 @@ impl BacktestRunner {
                 &future,
                 self.evaluation_options,
                 error.to_string(),
+            ));
+        }
+        if let Err(error) = self.validate_entry_profile_routes(&raw_signals) {
+            return Ok(rejected_future_result(
+                &self.config,
+                &future,
+                self.evaluation_options,
+                error,
             ));
         }
 
@@ -2422,6 +2605,28 @@ impl BacktestRunner {
             if is_cancelled() {
                 return Err(FutureBatchReplayError::Cancelled);
             }
+            if let Some(signal) = action.entry_signal.as_ref() {
+                self.record_entry_resolution_rejection(
+                    action.action_id.clone(),
+                    signal,
+                    Some(&SelectedEntryProfile {
+                        profile: action.entry_profile.clone(),
+                        source: action
+                            .entry_profile_selection_source
+                            .unwrap_or(EntryProfileSelectionSource::Unprofiled),
+                        entry_class: match signal {
+                            RawSignal::Entry { entry_class, .. } => entry_class.clone(),
+                            _ => None,
+                        },
+                        profile_name: action.selected_profile_name.clone(),
+                    }),
+                    EntryResolutionStage::MarketExecution,
+                    None,
+                    None,
+                    "quote_eligibility",
+                    "no_eligible_quote".into(),
+                );
+            }
             let mut disposition =
                 ActionDisposition::rejected(action.action_id, "no_eligible_quote");
             disposition.action_kind = Some(action.action_kind);
@@ -2433,8 +2638,28 @@ impl BacktestRunner {
             if is_cancelled() {
                 return Err(FutureBatchReplayError::Cancelled);
             }
-            let mut disposition =
-                ActionDisposition::rejected(signal.resolved_action_id(), "no_eligible_quote");
+            let action_id = signal.resolved_action_id();
+            if signal.signal.is_entry() {
+                let selected = self.select_entry_profile(&signal.signal, profile).ok();
+                let stage = match &signal.signal {
+                    RawSignal::Entry {
+                        order_type: OrderType::Market,
+                        ..
+                    } => EntryResolutionStage::MarketExecution,
+                    _ => EntryResolutionStage::PendingPlacement,
+                };
+                self.record_entry_resolution_rejection(
+                    action_id.clone(),
+                    &signal.signal,
+                    selected.as_ref(),
+                    stage,
+                    None,
+                    None,
+                    "quote_eligibility",
+                    "no_eligible_quote".into(),
+                );
+            }
+            let mut disposition = ActionDisposition::rejected(action_id, "no_eligible_quote");
             disposition.action_kind = Some(raw_signal_kind(&signal.signal).to_owned());
             disposition.signal_ts = Some(signal.signal_ts);
             disposition.effective_ts = Some(signal.effective_ts);
@@ -2604,6 +2829,15 @@ impl BacktestRunner {
         );
         insert_economic_support_metadata(&mut tags, &self.config);
         let (equity_curve, mtm_output_summary) = mtm_curve.into_parts();
+        let entry_profile_default = self
+            .entry_profiles
+            .as_ref()
+            .and_then(|profiles| profiles.default_profile().cloned());
+        let entry_profile_routes = self
+            .entry_profiles
+            .as_ref()
+            .map(|profiles| profiles.routes().clone())
+            .unwrap_or_default();
         let artifacts = FutureBacktestArtifacts {
             format_version: FUTURE_ARTIFACT_FORMAT_VERSION,
             execution: ExecutionMetadata {
@@ -2619,6 +2853,9 @@ impl BacktestRunner {
                 instrument_sizing: std::mem::take(&mut self.instrument_sizing),
                 market_entry_sizing_basis: future.market_entry_sizing_basis,
                 market_entry_sizing: std::mem::take(&mut self.market_entry_sizing),
+                entry_profile_default,
+                entry_profile_routes,
+                entry_profile_resolutions: std::mem::take(&mut self.entry_profile_resolutions),
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
@@ -2784,6 +3021,44 @@ impl BacktestRunner {
     ) {
         let explicit_action_id = scheduled.action_id.is_some();
         let base_id = scheduled.resolved_action_id();
+        let selected_profile = if scheduled.signal.is_entry() {
+            match self.select_entry_profile(&scheduled.signal, profile) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    let reason = error.to_string();
+                    let stage = match scheduled.signal {
+                        RawSignal::Entry {
+                            order_type: OrderType::Market,
+                            ..
+                        } => EntryResolutionStage::MarketExecution,
+                        _ => EntryResolutionStage::PendingPlacement,
+                    };
+                    self.record_entry_resolution_rejection(
+                        base_id.clone(),
+                        &scheduled.signal,
+                        None,
+                        stage,
+                        None,
+                        None,
+                        "profile_selection",
+                        reason.clone(),
+                    );
+                    let mut disposition = ActionDisposition::rejected(base_id, reason);
+                    disposition.action_kind = Some("entry".into());
+                    disposition.signal_ts = Some(scheduled.signal_ts);
+                    disposition.effective_ts = Some(scheduled.effective_ts);
+                    self.record_disposition(lifecycle, disposition);
+                    return;
+                }
+            }
+        } else {
+            SelectedEntryProfile {
+                profile: None,
+                source: EntryProfileSelectionSource::Unprofiled,
+                entry_class: None,
+                profile_name: None,
+            }
+        };
         if let RawSignal::Entry {
             symbol,
             side,
@@ -2811,15 +3086,18 @@ impl BacktestRunner {
                 signal_ts: scheduled.signal_ts,
                 effective_ts: scheduled.effective_ts,
                 entry_signal: Some(scheduled.signal),
-                entry_profile: profile.cloned(),
+                entry_profile: selected_profile.profile,
+                entry_profile_selection_source: Some(selected_profile.source),
+                selected_profile_name: selected_profile.profile_name,
                 market_entry_sizing_audit: None,
+                entry_profile_resolution_audit: None,
                 requires_later_quote: scheduled.requires_later_quote,
             });
             return;
         }
         if scheduled.signal.is_entry() {
-            let resolved = match profile {
-                Some(profile) => profile.apply_entry_signal(&scheduled.signal),
+            let resolved = match selected_profile.profile.as_ref() {
+                Some(profile) => self.resolve_profiled_entry(profile, &scheduled.signal),
                 None => resolve_unprofiled_entry(&scheduled.signal),
             };
             match resolved {
@@ -2835,6 +3113,7 @@ impl BacktestRunner {
                         portfolio,
                         pricer,
                         conversion_quotes,
+                        &selected_profile,
                     )
                 }
                 Ok(None) => {
@@ -2845,7 +3124,21 @@ impl BacktestRunner {
                     self.record_disposition(lifecycle, disposition);
                 }
                 Err(error) => {
-                    let mut disposition = ActionDisposition::rejected(base_id, error.to_string());
+                    let reason = error.to_string();
+                    self.record_entry_resolution_rejection(
+                        base_id.clone(),
+                        &scheduled.signal,
+                        Some(&selected_profile),
+                        EntryResolutionStage::PendingPlacement,
+                        match &scheduled.signal {
+                            RawSignal::Entry { price, .. } => *price,
+                            _ => None,
+                        },
+                        None,
+                        "profile_resolution",
+                        reason.clone(),
+                    );
+                    let mut disposition = ActionDisposition::rejected(base_id, reason);
                     disposition.action_kind = Some("entry".into());
                     disposition.signal_ts = Some(scheduled.signal_ts);
                     disposition.effective_ts = Some(scheduled.effective_ts);
@@ -2910,7 +3203,10 @@ impl BacktestRunner {
                     effective_ts: scheduled.effective_ts,
                     entry_signal: None,
                     entry_profile: None,
+                    entry_profile_selection_source: None,
+                    selected_profile_name: None,
                     market_entry_sizing_audit: None,
+                    entry_profile_resolution_audit: None,
                     requires_later_quote: scheduled.requires_later_quote,
                 });
             } else {
@@ -2945,7 +3241,10 @@ impl BacktestRunner {
         portfolio: &mut PortfolioRecorder,
         pricer: &ExecutionPricer,
         conversion_quotes: &ConversionQuoteBook,
+        selected_profile: &SelectedEntryProfile,
     ) {
+        let level_reference_price = resolved.price;
+        let level_resolution = resolved.level_resolution.clone();
         match self.finalize_resolved_entry(
             resolved,
             future_executor.balance(),
@@ -2954,7 +3253,41 @@ impl BacktestRunner {
             None,
         ) {
             Ok(finalized) => {
-                self.apply_future_action(
+                let original_signal_price = match &scheduled.signal {
+                    RawSignal::Entry { price, .. } => *price,
+                    _ => None,
+                };
+                let (trade_id, level_reference_price) = match &finalized.action {
+                    Action::Open {
+                        trade_id, price, ..
+                    } => (
+                        trade_id.clone(),
+                        price.unwrap_or(quote.open_price(match &finalized.action {
+                            Action::Open { side, .. } => *side,
+                            _ => unreachable!(),
+                        })),
+                    ),
+                    _ => unreachable!("finalized entry must be an open action"),
+                };
+                let mut audit = EntryProfileResolutionAudit {
+                    action_id: action_id.clone(),
+                    trade_id,
+                    entry_class: selected_profile.entry_class.clone(),
+                    selection_source: selected_profile.source,
+                    selected_profile_name: selected_profile.profile_name.clone(),
+                    resolution_stage: EntryResolutionStage::PendingPlacement,
+                    original_signal_price,
+                    level_reference_price: Some(level_reference_price),
+                    level_resolution: Some(finalized.level_resolution.clone()),
+                    target_resolution: Some(finalized.target_resolution.clone()),
+                    configured_weights: finalized.configured_weights.clone(),
+                    allocated_target_steps: finalized.allocated_target_steps.clone(),
+                    remainder_steps: finalized.remainder_steps,
+                    outcome: crate::ledger::ActionDispositionStatus::Applied,
+                    rejection_stage: None,
+                    reason: None,
+                };
+                let committed = self.apply_future_action(
                     action_id,
                     "entry".into(),
                     finalized.action,
@@ -2968,8 +3301,33 @@ impl BacktestRunner {
                     pricer,
                     conversion_quotes,
                 );
+                if committed {
+                    self.entry_profile_resolutions.push(audit);
+                } else {
+                    if let Some(disposition) = lifecycle
+                        .as_slice()
+                        .iter()
+                        .rev()
+                        .find(|disposition| disposition.action_id == audit.action_id)
+                    {
+                        audit.outcome = disposition.status;
+                        audit.rejection_stage = Some("engine_or_accounting".into());
+                        audit.reason = disposition.reason.clone();
+                    }
+                    self.entry_profile_resolutions.push(audit);
+                }
             }
             Err(error) => {
+                self.record_entry_resolution_rejection(
+                    action_id.clone(),
+                    &scheduled.signal,
+                    Some(selected_profile),
+                    EntryResolutionStage::PendingPlacement,
+                    level_reference_price,
+                    Some(level_resolution),
+                    "sizing",
+                    error.clone(),
+                );
                 let mut disposition = ActionDisposition::rejected(action_id, error);
                 disposition.action_kind = Some("entry".into());
                 disposition.signal_ts = Some(scheduled.signal_ts);
@@ -3007,13 +3365,14 @@ impl BacktestRunner {
             }
 
             if let Some(mut signal) = action.entry_signal.take() {
-                let (side, symbol, original_signal_price) = match &signal {
+                let (side, symbol, original_signal_price, entry_class) = match &signal {
                     RawSignal::Entry {
                         side,
                         symbol,
                         price,
+                        entry_class,
                         ..
-                    } => (*side, symbol.clone(), *price),
+                    } => (*side, symbol.clone(), *price, entry_class.clone()),
                     _ => unreachable!("queued entry metadata must contain an entry signal"),
                 };
                 let execution = match pricer.market_entry(side, quote, self.pip_size(&symbol)) {
@@ -3050,12 +3409,13 @@ impl BacktestRunner {
                         }
                     };
                 let resolved = match action.entry_profile.as_ref() {
-                    Some(profile) => profile.apply_entry_signal(&signal),
+                    Some(profile) => self.resolve_profiled_entry(profile, &signal),
                     None => resolve_unprofiled_entry(&signal),
                 };
                 match resolved {
                     Ok(Some(resolved)) => {
                         let side_for_audit = resolved.side;
+                        let level_resolution = resolved.level_resolution.clone();
                         let resolved_target_prices: Vec<f64> =
                             resolved.targets.iter().map(|target| target.price).collect();
                         match self.finalize_resolved_entry(
@@ -3072,8 +3432,8 @@ impl BacktestRunner {
                                     } => (trade_id.clone(), *stoploss),
                                     _ => unreachable!("finalized entry must be an open action"),
                                 };
-                                // Levels already past their trigger at fill close at
-                                // market on the first tick evaluation under Permissive.
+                                // Record resolved levels already crossed at the fill;
+                                // later engine validation remains authoritative.
                                 let mut levels_crossed_at_fill = Vec::new();
                                 if let Some(stop) = protective_stop {
                                     let crossed = match side_for_audit {
@@ -3096,6 +3456,31 @@ impl BacktestRunner {
                                             .push(format!("target{}", offset + 1));
                                     }
                                 }
+                                action.entry_profile_resolution_audit =
+                                    Some(EntryProfileResolutionAudit {
+                                        action_id: action.action_id.clone(),
+                                        trade_id: trade_id.clone(),
+                                        entry_class,
+                                        selection_source: action
+                                            .entry_profile_selection_source
+                                            .unwrap_or(EntryProfileSelectionSource::Unprofiled),
+                                        selected_profile_name: action.selected_profile_name.clone(),
+                                        resolution_stage: EntryResolutionStage::MarketExecution,
+                                        original_signal_price,
+                                        level_reference_price: Some(execution.price),
+                                        level_resolution: Some(finalized.level_resolution.clone()),
+                                        target_resolution: Some(
+                                            finalized.target_resolution.clone(),
+                                        ),
+                                        configured_weights: finalized.configured_weights.clone(),
+                                        allocated_target_steps: finalized
+                                            .allocated_target_steps
+                                            .clone(),
+                                        remainder_steps: finalized.remainder_steps,
+                                        outcome: crate::ledger::ActionDispositionStatus::Applied,
+                                        rejection_stage: None,
+                                        reason: None,
+                                    });
                                 action.market_entry_sizing_audit = Some(MarketEntrySizingAudit {
                                     action_id: action.action_id.clone(),
                                     trade_id,
@@ -3115,6 +3500,23 @@ impl BacktestRunner {
                                 action.action = finalized.action;
                             }
                             Err(error) => {
+                                self.record_entry_resolution_rejection(
+                                    action.action_id.clone(),
+                                    &signal,
+                                    Some(&SelectedEntryProfile {
+                                        profile: action.entry_profile.clone(),
+                                        source: action
+                                            .entry_profile_selection_source
+                                            .unwrap_or(EntryProfileSelectionSource::Unprofiled),
+                                        entry_class: entry_class.clone(),
+                                        profile_name: action.selected_profile_name.clone(),
+                                    }),
+                                    EntryResolutionStage::MarketExecution,
+                                    Some(execution.price),
+                                    Some(level_resolution),
+                                    "sizing",
+                                    error.clone(),
+                                );
                                 let mut disposition =
                                     ActionDisposition::rejected(action.action_id, error);
                                 disposition.action_kind = Some(action.action_kind);
@@ -3135,8 +3537,25 @@ impl BacktestRunner {
                         continue;
                     }
                     Err(error) => {
-                        let mut disposition =
-                            ActionDisposition::rejected(action.action_id, error.to_string());
+                        let reason = error.to_string();
+                        self.record_entry_resolution_rejection(
+                            action.action_id.clone(),
+                            &signal,
+                            Some(&SelectedEntryProfile {
+                                profile: action.entry_profile.clone(),
+                                source: action
+                                    .entry_profile_selection_source
+                                    .unwrap_or(EntryProfileSelectionSource::Unprofiled),
+                                entry_class: entry_class.clone(),
+                                profile_name: action.selected_profile_name.clone(),
+                            }),
+                            EntryResolutionStage::MarketExecution,
+                            Some(execution.price),
+                            None,
+                            "profile_resolution",
+                            reason.clone(),
+                        );
+                        let mut disposition = ActionDisposition::rejected(action.action_id, reason);
                         disposition.action_kind = Some(action.action_kind);
                         disposition.signal_ts = Some(action.signal_ts);
                         disposition.effective_ts = Some(action.effective_ts);
@@ -3159,11 +3578,81 @@ impl BacktestRunner {
                 pricer,
                 conversion_quotes,
             );
-            if committed && let Some(audit) = action.market_entry_sizing_audit {
-                self.market_entry_sizing.push(audit);
+            if committed {
+                if let Some(audit) = action.market_entry_sizing_audit {
+                    self.market_entry_sizing.push(audit);
+                }
+                if let Some(audit) = action.entry_profile_resolution_audit {
+                    self.entry_profile_resolutions.push(audit);
+                }
+            } else if let Some(mut audit) = action.entry_profile_resolution_audit {
+                if let Some(disposition) = lifecycle
+                    .as_slice()
+                    .iter()
+                    .rev()
+                    .find(|disposition| disposition.action_id == audit.action_id)
+                {
+                    audit.outcome = disposition.status;
+                    audit.rejection_stage = Some("engine_or_accounting".into());
+                    audit.reason = disposition.reason.clone();
+                }
+                self.entry_profile_resolutions.push(audit);
             }
         }
         *queued = remaining;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_entry_resolution_rejection(
+        &mut self,
+        action_id: String,
+        signal: &RawSignal,
+        selected: Option<&SelectedEntryProfile>,
+        stage: EntryResolutionStage,
+        level_reference_price: Option<f64>,
+        level_resolution: Option<qs_core::EntryLevelResolution>,
+        rejection_stage: &str,
+        reason: String,
+    ) {
+        let (trade_id, original_signal_price, entry_class) = match signal {
+            RawSignal::Entry {
+                trade_id,
+                price,
+                entry_class,
+                ..
+            } => (trade_id.clone(), *price, entry_class.clone()),
+            _ => (None, None, None),
+        };
+        let selection_source = selected.map_or_else(
+            || {
+                if entry_class.is_some() {
+                    EntryProfileSelectionSource::Mapped
+                } else {
+                    EntryProfileSelectionSource::Unprofiled
+                }
+            },
+            |selection| selection.source,
+        );
+        self.entry_profile_resolutions
+            .push(EntryProfileResolutionAudit {
+                action_id,
+                trade_id,
+                entry_class,
+                selection_source,
+                selected_profile_name: selected
+                    .and_then(|selection| selection.profile_name.clone()),
+                resolution_stage: stage,
+                original_signal_price,
+                level_reference_price,
+                level_resolution,
+                target_resolution: None,
+                configured_weights: Vec::new(),
+                allocated_target_steps: Vec::new(),
+                remainder_steps: 0,
+                outcome: ActionDispositionStatus::Rejected,
+                rejection_stage: Some(rejection_stage.into()),
+                reason: Some(reason),
+            });
     }
 
     fn record_disposition(
@@ -4086,7 +4575,7 @@ mod tests {
     use crate::currency::{ConversionRoute, FxPair};
     use crate::data_feed::{EventMetadata, FeedEvent, MarketEvent, SeriesRoles, VecFeed};
     use crate::profile::{
-        EntryGeometryPolicy, ManagementProfile, PositionRef, RawSignal, StoplossMode,
+        EntryGeometryPolicy, ManagementProfile, PositionRef, RawSignal, StoplossMode, TargetSource,
     };
     use chrono::NaiveDate;
     use qs_core::types::{CloseReason, FillPurpose, OrderType, Side, TargetSpec};
@@ -4227,6 +4716,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some(format!("{symbol}-blocker")),
+            entry_class: None,
         }
     }
 
@@ -4349,6 +4839,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("later-pending".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: execution_ts,
@@ -4411,6 +4902,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("later-stop".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: execution_ts,
@@ -4467,6 +4959,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some(trade_id.into()),
+            entry_class: None,
         };
         let close = |trade_id: &str| RawSignal::Close {
             ts: close_ts,
@@ -4616,6 +5109,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some("mtm-policy-blocker".into()),
+            entry_class: None,
         };
         let run = |policy| {
             let mut feed = VecFeed::new(events.clone());
@@ -4688,6 +5182,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some("mtm-kind".into()),
+            entry_class: None,
         };
         let result = BacktestRunner::new_future(
             BacktestConfig {
@@ -4906,6 +5401,7 @@ mod tests {
             targets: vec![1.1000, 1.2000],
             group: None,
             trade_id: Some("equal-targets".into()),
+            entry_class: None,
         }];
 
         let result = BacktestRunner::new(BacktestConfig {
@@ -4953,6 +5449,7 @@ mod tests {
                 targets: vec![1.1000, 1.3000],
                 group: None,
                 trade_id: Some("modified-target".into()),
+                entry_class: None,
             },
             RawSignal::ModifyTarget {
                 ts: ts(10, 0, 0),
@@ -4966,6 +5463,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1, 2],
             close_ratios: vec![0.25, 0.75],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -5007,6 +5505,7 @@ mod tests {
             targets: vec![1.0900],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
 
         let runner = BacktestRunner::new(fixed_lot_config());
@@ -5038,6 +5537,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: ts(10, 0, 2),
@@ -5084,6 +5584,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::ModifyStoploss {
                 ts: ts(10, 0, 2),
@@ -5128,6 +5629,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::ClosePartial {
                 ts: ts(10, 0, 1),
@@ -5174,6 +5676,7 @@ mod tests {
                 targets: vec![],
                 group: Some("grp1".into()),
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 1),
@@ -5186,6 +5689,7 @@ mod tests {
                 targets: vec![],
                 group: Some("grp1".into()),
                 trade_id: Some("t2".into()),
+                entry_class: None,
             },
             // Close entire group
             RawSignal::CloseAllInGroup {
@@ -5227,6 +5731,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 0),
@@ -5239,6 +5744,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t2".into()),
+                entry_class: None,
             },
             RawSignal::CloseAllOf {
                 ts: ts(10, 0, 2),
@@ -5271,6 +5777,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -5289,6 +5796,7 @@ mod tests {
             targets: vec![1.0900],
             group: None,
             trade_id: Some("t1".into()),
+            entry_class: None,
         }];
 
         let runner = BacktestRunner::new(fixed_lot_config());
@@ -5314,6 +5822,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -5333,6 +5842,7 @@ mod tests {
                 targets: vec![1.0900],
                 group: None,
                 trade_id: Some("msg-100".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: ts(10, 0, 1),
@@ -5370,6 +5880,7 @@ mod tests {
             targets: vec![],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
 
         let config = BacktestConfig {
@@ -5406,6 +5917,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 1),
@@ -5418,6 +5930,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t2".into()),
+                entry_class: None,
             },
             // Close only the second opened position via its trade_id
             RawSignal::Close {
@@ -5492,6 +6005,7 @@ mod tests {
             targets: vec![1.0900],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
 
         let runner = BacktestRunner::new(fixed_lot_config());
@@ -5526,6 +6040,7 @@ mod tests {
                 targets: vec![1.0900],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 1),
@@ -5538,6 +6053,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("t2".into()),
+                entry_class: None,
             },
         ];
 
@@ -5578,6 +6094,7 @@ mod tests {
             targets: vec![1.0900],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
 
         let runner = BacktestRunner::new(fixed_lot_config());
@@ -5629,6 +6146,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -5648,6 +6166,7 @@ mod tests {
                 targets: vec![1.0900],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::ModifyStoploss {
                 ts: ts(10, 0, 2),
@@ -5684,6 +6203,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -5703,6 +6223,7 @@ mod tests {
                 targets: vec![1.0900],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::ClosePartial {
                 ts: ts(10, 0, 1),
@@ -5743,6 +6264,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![1.0],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: Some("alpha".into()),
@@ -5762,6 +6284,7 @@ mod tests {
                 targets: vec![1.0910],
                 group: None,
                 trade_id: Some("t1".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 1),
@@ -5774,6 +6297,7 @@ mod tests {
                 targets: vec![1.0910],
                 group: None,
                 trade_id: Some("t2".into()),
+                entry_class: None,
             },
             // Close only t1 by trade_id.
             RawSignal::Close {
@@ -5848,6 +6372,7 @@ mod tests {
                 targets: vec![],
                 group: None,
                 trade_id: Some("xau-1".into()),
+                entry_class: None,
             },
             // Manual close at ts(10,0,3) while current event is GBPJPY.
             RawSignal::Close {
@@ -5932,6 +6457,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some("cancellation-blocker".into()),
+            entry_class: None,
         };
         let outcome = runner.run_raw_signals_controlled(
             &mut feed,
@@ -5994,6 +6520,7 @@ mod tests {
             targets: vec![],
             group: None,
             trade_id: Some("safe-feed".into()),
+            entry_class: None,
         }];
 
         let result =
@@ -6012,6 +6539,7 @@ mod tests {
             target_selection: None,
             use_targets: vec![1],
             close_ratios: vec![],
+            target_source: TargetSource::FromSignal,
             stoploss_mode: StoplossMode::FromSignal,
             rules: vec![],
             group_override: None,
@@ -6029,6 +6557,7 @@ mod tests {
             targets: vec![101.0],
             group: None,
             trade_id: Some("profile-parity".into()),
+            entry_class: None,
         }];
         let events = vec![
             tick("EURUSD", 100.0, 100.0, ts(10, 0, 0)),
@@ -6110,6 +6639,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: Some("shared-conversion".into()),
+            entry_class: None,
         }];
 
         let mut feed = VecFeed::from_feed_events(events);
@@ -6188,6 +6718,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("conversion-only".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: ts(10, 0, 1),
@@ -6248,6 +6779,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("first".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: ts(10, 0, 1),
@@ -6266,6 +6798,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("second".into()),
+                entry_class: None,
             },
         ];
         let mut feed = VecFeed::new(vec![
@@ -6312,6 +6845,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("market".into()),
+                entry_class: None,
             },
             RawSignal::Entry {
                 ts: ts(10, 0, 0),
@@ -6324,6 +6858,7 @@ mod tests {
                 targets: Vec::new(),
                 group: None,
                 trade_id: Some("pending".into()),
+                entry_class: None,
             },
             RawSignal::Close {
                 ts: ts(10, 0, 1),
@@ -6354,6 +6889,11 @@ mod tests {
             metadata.market_entry_sizing[0].trade_id.as_deref(),
             Some("market")
         );
+        assert_eq!(metadata.entry_profile_resolutions.len(), 2);
+        assert!(metadata.entry_profile_resolutions.iter().any(|audit| {
+            audit.trade_id.as_deref() == Some("pending")
+                && audit.resolution_stage == EntryResolutionStage::PendingPlacement
+        }));
     }
 
     #[test]
@@ -6369,6 +6909,7 @@ mod tests {
             targets: Vec::new(),
             group: None,
             trade_id: None,
+            entry_class: None,
         };
         let mut entry_feed = VecFeed::new(vec![tick("EURUSD", 100.0, 100.0, ts(10, 0, 0))]);
         let rejected =
@@ -6426,6 +6967,7 @@ mod tests {
             targets: vec![1.0900],
             group: None,
             trade_id: None,
+            entry_class: None,
         }];
 
         let runner = BacktestRunner::new(fixed_lot_config());
@@ -6433,5 +6975,147 @@ mod tests {
 
         // Library still injects it; server filtering is the authoritative gate.
         assert_eq!(result.total_trades, 1);
+    }
+
+    #[test]
+    fn future_replay_audits_profile_resolution_rejection() {
+        let profile = ManagementProfile {
+            name: "requires_stop".into(),
+            target_selection: Some(crate::profile::TargetSelection::None),
+            use_targets: vec![],
+            close_ratios: vec![],
+            target_source: TargetSource::FromSignal,
+            stoploss_mode: StoplossMode::FromSignalDistance { multiplier: 1.5 },
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: true,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let profiles = PreparedEntryProfiles::try_new(
+            Some(profile),
+            Vec::<(String, ManagementProfile)>::new(),
+        )
+        .unwrap();
+        let signals = vec![RawSignal::Entry {
+            ts: ts(10, 0, 0),
+            symbol: "EURUSD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            price: Some(1.1000),
+            risk_multiplier: 1.0,
+            stoploss: None,
+            targets: vec![],
+            group: None,
+            trade_id: Some("missing-stop".into()),
+            entry_class: None,
+        }];
+        let mut feed = VecFeed::new(vec![tick("EURUSD", 1.1000, 1.1000, ts(10, 0, 1))]);
+        let result = BacktestRunner::new_future(fixed_lot_config(), FutureQuoteConfig::default())
+            .with_entry_profiles(profiles)
+            .run_raw_signals_future(&mut feed, signals, None);
+        let audit = &result
+            .execution_metadata
+            .as_ref()
+            .unwrap()
+            .entry_profile_resolutions[0];
+        assert_eq!(audit.outcome, ActionDispositionStatus::Rejected);
+        assert_eq!(audit.rejection_stage.as_deref(), Some("profile_resolution"));
+        assert!(audit.reason.as_deref().unwrap().contains("signal stoploss"));
+    }
+
+    #[test]
+    fn future_replay_routes_entry_profiles_and_audits_resolved_levels() {
+        let default_profile = ManagementProfile {
+            name: "default".into(),
+            target_selection: Some(crate::profile::TargetSelection::None),
+            use_targets: vec![],
+            close_ratios: vec![],
+            target_source: TargetSource::FromSignal,
+            stoploss_mode: StoplossMode::FromSignal,
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: true,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let expanded_profile = ManagementProfile {
+            name: "expanded".into(),
+            target_selection: None,
+            use_targets: vec![],
+            close_ratios: vec![1.0],
+            target_source: TargetSource::StopDistanceMultiples {
+                multiples: vec![1.0],
+            },
+            stoploss_mode: StoplossMode::FromSignalDistance { multiplier: 1.5 },
+            rules: vec![],
+            group_override: None,
+            let_remainder_run: false,
+            entry_geometry: EntryGeometryPolicy::Strict,
+        };
+        let profiles = PreparedEntryProfiles::try_new(
+            Some(default_profile),
+            [("expanded".to_owned(), expanded_profile)],
+        )
+        .unwrap();
+        let signals = vec![
+            RawSignal::Entry {
+                ts: ts(10, 0, 0),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.1000),
+                risk_multiplier: 1.0,
+                stoploss: Some(1.0990),
+                targets: vec![],
+                group: Some("same-group".into()),
+                trade_id: Some("default-entry".into()),
+                entry_class: None,
+            },
+            RawSignal::Entry {
+                ts: ts(10, 0, 1),
+                symbol: "EURUSD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                price: Some(1.1000),
+                risk_multiplier: 1.0,
+                stoploss: Some(1.0990),
+                targets: vec![],
+                group: Some("same-group".into()),
+                trade_id: Some("expanded-entry".into()),
+                entry_class: Some("expanded".into()),
+            },
+        ];
+        let mut feed = VecFeed::new(vec![
+            tick("EURUSD", 1.1000, 1.1000, ts(10, 0, 1)),
+            tick("EURUSD", 1.1002, 1.1002, ts(10, 0, 2)),
+            tick("EURUSD", 1.1003, 1.1003, ts(10, 0, 3)),
+        ]);
+        let result = BacktestRunner::new_future(fixed_lot_config(), FutureQuoteConfig::default())
+            .with_entry_profiles(profiles)
+            .run_raw_signals_future(&mut feed, signals, None);
+
+        let audits = &result
+            .execution_metadata
+            .as_ref()
+            .unwrap()
+            .entry_profile_resolutions;
+        assert_eq!(audits.len(), 2);
+        assert_eq!(
+            audits[0].selection_source,
+            EntryProfileSelectionSource::RunDefault
+        );
+        assert_eq!(audits[0].selected_profile_name.as_deref(), Some("default"));
+        assert_eq!(
+            audits[1].selection_source,
+            EntryProfileSelectionSource::Mapped
+        );
+        assert_eq!(audits[1].entry_class.as_deref(), Some("expanded"));
+        assert_eq!(audits[1].selected_profile_name.as_deref(), Some("expanded"));
+        let levels = audits[1].level_resolution.as_ref().unwrap();
+        let reference = audits[1].level_reference_price.unwrap();
+        let stop = levels.resolved_stoploss.unwrap();
+        let target = levels.resolved_targets[0];
+        let risk_distance = reference - stop;
+        assert!(risk_distance > 0.0);
+        assert!((target - reference - risk_distance).abs() < 1.0e-9);
     }
 }

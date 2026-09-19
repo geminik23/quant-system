@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDateTime;
 use qs_core::{
-    CloseReason, EffectiveStop, ExecutionFill, ExecutionModel, OrderType, PriceQuote, Side,
+    CloseReason, EffectiveStop, EntryLevelResolution, ExecutionFill, ExecutionModel,
+    ManagementProfile, OrderType, PriceQuote, Side, TargetResolution,
 };
 use qs_instruments::{
     Decimal, GridAdjustment, InstrumentSpec, Money, ResolvedInstrumentRef, StoredSeriesBinding,
@@ -16,7 +17,7 @@ use qs_instruments::{
 use serde::{Deserialize, Serialize};
 
 use crate::currency::{ConversionResult, RunCurrencyPlan};
-use crate::ledger::LifecycleLedger;
+use crate::ledger::{ActionDispositionStatus, LifecycleLedger};
 use crate::mtm::MtmOutputSummary;
 use crate::portfolio::EquityPoint;
 
@@ -82,6 +83,48 @@ pub struct MarketEntrySizingAudit {
     pub levels_crossed_at_fill: Vec<String>,
 }
 
+/// How an Entry selected its initial management profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryProfileSelectionSource {
+    Mapped,
+    RunDefault,
+    Unprofiled,
+}
+
+/// Stage at which initial Entry levels were resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryResolutionStage {
+    MarketExecution,
+    PendingPlacement,
+}
+
+/// Auditable profile selection and initial level resolution for one applied Entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryProfileResolutionAudit {
+    pub action_id: String,
+    pub trade_id: Option<String>,
+    pub entry_class: Option<String>,
+    pub selection_source: EntryProfileSelectionSource,
+    pub selected_profile_name: Option<String>,
+    pub resolution_stage: EntryResolutionStage,
+    pub original_signal_price: Option<f64>,
+    pub level_reference_price: Option<f64>,
+    pub level_resolution: Option<EntryLevelResolution>,
+    pub target_resolution: Option<TargetResolution>,
+    #[serde(default)]
+    pub configured_weights: Vec<f64>,
+    #[serde(default)]
+    pub allocated_target_steps: Vec<u64>,
+    #[serde(default)]
+    pub remainder_steps: u64,
+    pub outcome: ActionDispositionStatus,
+    pub rejection_stage: Option<String>,
+    pub reason: Option<String>,
+}
+
 /// Exact catalog-backed sizing adjustment recorded before one Entry action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +155,12 @@ pub struct ExecutionMetadata {
     pub market_entry_sizing_basis: MarketEntrySizingBasis,
     /// Per-entry sizing audits for successfully executed market entries.
     pub market_entry_sizing: Vec<MarketEntrySizingAudit>,
+    /// Frozen default profile used by direct Entry routing.
+    pub entry_profile_default: Option<ManagementProfile>,
+    /// Frozen exact entry-class routes used by direct Entry routing.
+    pub entry_profile_routes: BTreeMap<String, ManagementProfile>,
+    /// Applied Entry profile selections and resolved initial levels.
+    pub entry_profile_resolutions: Vec<EntryProfileResolutionAudit>,
     /// Quotes older than this at an equity observation are counted as stale.
     pub stale_quote_after_millis: Option<i64>,
     #[serde(default = "default_pnl_epsilon")]
@@ -133,6 +182,9 @@ impl Default for ExecutionMetadata {
             instrument_sizing: Vec::new(),
             market_entry_sizing_basis: MarketEntrySizingBasis::default(),
             market_entry_sizing: Vec::new(),
+            entry_profile_default: None,
+            entry_profile_routes: BTreeMap::new(),
+            entry_profile_resolutions: Vec::new(),
             stale_quote_after_millis: None,
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
