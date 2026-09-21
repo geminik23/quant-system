@@ -1,5 +1,6 @@
 //! Reopenable Parquet market streams for FutureQuote replay.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,6 +36,8 @@ pub(crate) struct MarketSeriesDescription {
     source_partition: Option<String>,
     source_symbol: Option<String>,
     source: MarketSeriesSource,
+    /// One price point for this symbol, used to turn a stored bar spread in points into price units.
+    bar_point_size: Option<f64>,
 }
 
 impl MarketSeriesDescription {
@@ -51,6 +54,7 @@ impl MarketSeriesDescription {
             source_partition: Some(source_partition),
             source_symbol: Some(source_symbol),
             source: MarketSeriesSource::Tick { scan },
+            bar_point_size: None,
         }
     }
 
@@ -67,6 +71,7 @@ impl MarketSeriesDescription {
             source_partition: Some(source_partition),
             source_symbol: Some(source_symbol),
             source: MarketSeriesSource::Bar { scan },
+            bar_point_size: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl MarketSeriesDescription {
                 source: MarketSeriesSource::Unavailable {
                     message: error.to_string(),
                 },
+                bar_point_size: None,
             },
         }
     }
@@ -112,6 +118,7 @@ impl MarketSeriesDescription {
             source_partition: None,
             source_symbol: None,
             source: MarketSeriesSource::Empty,
+            bar_point_size: None,
         }
     }
 
@@ -145,6 +152,7 @@ impl MarketSeriesDescription {
             MarketSeriesSource::Bar { scan } => {
                 let mut cursor = scan.cursor().map_err(map_data_error)?;
                 let canonical_symbol = self.canonical_symbol.clone();
+                let bar_point_size = self.bar_point_size;
                 Box::new(move || {
                     ensure_not_cancelled(&is_cancelled)?;
                     cursor
@@ -156,7 +164,7 @@ impl MarketSeriesDescription {
                         .map(|bar| {
                             bar.map(|scanned| {
                                 SequencedMarketEvent::new(
-                                    bar_to_event(scanned.row, &canonical_symbol),
+                                    bar_to_event(scanned.row, &canonical_symbol, bar_point_size),
                                     scanned.source_row_ordinal,
                                 )
                             })
@@ -275,6 +283,17 @@ impl MarketStreamDescription {
         for series in &mut self.series {
             if shared_symbols.contains(&series.canonical_symbol) {
                 series.roles = SeriesRoles::PRIMARY_AND_CONVERSION;
+            }
+        }
+    }
+
+    /// Attach price point sizes so stored bar spreads become executable quote spreads.
+    ///
+    /// Symbols without an entry keep the historical zero-spread bar approximation.
+    pub(crate) fn apply_bar_point_sizes(&mut self, point_sizes: &BTreeMap<String, f64>) {
+        for series in &mut self.series {
+            if matches!(series.source, MarketSeriesSource::Bar { .. }) {
+                series.bar_point_size = point_sizes.get(&series.canonical_symbol).copied();
             }
         }
     }
@@ -483,7 +502,7 @@ fn primary_bar_edges(
         .next_bar_cancellable(&mut *is_cancelled)
         .map_err(map_data_error)?
     {
-        let event = bar_to_event(bar, canonical_symbol);
+        let event = bar_to_event(bar, canonical_symbol, None);
         if event.to_valid_quote().is_some() {
             first = Some(event.ts());
             break;
@@ -510,7 +529,14 @@ fn tick_to_valid_event(tick: Tick, canonical_symbol: &str) -> Option<MarketEvent
     event.to_valid_quote().map(|_| event)
 }
 
-fn bar_to_event(bar: Bar, canonical_symbol: &str) -> MarketEvent {
+/// Convert one stored bar into a feed event, expressing its recorded spread in price units.
+///
+/// The stored spread is a point count, so it becomes a price only when the caller knows the symbol's price point size. Without one the bar keeps the historical zero-spread approximation.
+fn bar_to_event(bar: Bar, canonical_symbol: &str, point_size: Option<f64>) -> MarketEvent {
+    let spread = point_size
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .map(|size| f64::from(bar.spread.max(0)) * size)
+        .filter(|spread| *spread > 0.0);
     MarketEvent::Bar {
         symbol: canonical_symbol.to_owned(),
         ts: bar.ts,
@@ -519,6 +545,7 @@ fn bar_to_event(bar: Bar, canonical_symbol: &str) -> MarketEvent {
         low: bar.low,
         close: bar.close,
         volume: bar.volume,
+        spread,
     }
 }
 

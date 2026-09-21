@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use chrono::{DateTime, NaiveDateTime};
+use chrono::NaiveDateTime;
 
 use crate::data_feed::{MarketEvent, TimestampBatch};
 
@@ -591,50 +591,25 @@ fn validate_batch(batch: &TimestampBatch) -> Result<(), SeriesError> {
     Ok(())
 }
 
+/// Half-open `[open, close)` bucket containing `timestamp`.
+///
+/// The arithmetic is shared with the stored-bar resampler so that a bar built during replay and the same bar written to storage are identical.
 fn bucket_bounds(
     series_id: &SeriesId,
     timestamp: NaiveDateTime,
     duration: i64,
     offset: i64,
 ) -> Result<(NaiveDateTime, NaiveDateTime), SeriesError> {
-    let timestamp_seconds = i128::from(timestamp.and_utc().timestamp());
-    let duration = i128::from(duration);
-    let offset = i128::from(offset);
-    let bucket_index = (timestamp_seconds - offset).div_euclid(duration);
-    let open_seconds = bucket_index
-        .checked_mul(duration)
-        .and_then(|value| value.checked_add(offset))
-        .ok_or_else(|| SeriesError::BoundaryOverflow {
+    let spec = data_preprocess::resample::BucketSpec::new(duration, offset).ok_or_else(|| {
+        SeriesError::BoundaryOverflow {
             series_id: series_id.clone(),
             timestamp,
-        })?;
-    let close_seconds =
-        open_seconds
-            .checked_add(duration)
-            .ok_or_else(|| SeriesError::BoundaryOverflow {
-                series_id: series_id.clone(),
-                timestamp,
-            })?;
-    let open_seconds = i64::try_from(open_seconds).map_err(|_| SeriesError::BoundaryOverflow {
-        series_id: series_id.clone(),
-        timestamp,
+        }
     })?;
-    let close_seconds =
-        i64::try_from(close_seconds).map_err(|_| SeriesError::BoundaryOverflow {
+    data_preprocess::resample::bucket_bounds(timestamp, spec).ok_or_else(|| {
+        SeriesError::BoundaryOverflow {
             series_id: series_id.clone(),
             timestamp,
-        })?;
-    let open_time = DateTime::from_timestamp(open_seconds, 0)
-        .map(|value| value.naive_utc())
-        .ok_or_else(|| SeriesError::BoundaryOverflow {
-            series_id: series_id.clone(),
-            timestamp,
-        })?;
-    let close_time = DateTime::from_timestamp(close_seconds, 0)
-        .map(|value| value.naive_utc())
-        .ok_or_else(|| SeriesError::BoundaryOverflow {
-            series_id: series_id.clone(),
-            timestamp,
-        })?;
-    Ok((open_time, close_time))
+        }
+    })
 }

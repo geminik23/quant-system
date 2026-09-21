@@ -80,6 +80,7 @@ fn bar(symbol: &str, ts: NaiveDateTime, rank: u32, sequence: u64) -> FeedEvent {
             low: 0.5,
             close: 1.5,
             volume: 10,
+            spread: None,
         },
         EventMetadata::new(SeriesRoles::PRIMARY, rank, sequence),
     )

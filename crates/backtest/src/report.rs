@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
+use qs_core::CostKind;
 use qs_core::types::{CloseReason, GroupId, PositionId, Side};
 
 use crate::artifacts::{
-    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts, NetPnlOutcome,
-    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+    CloseEvent, CompletedPosition, CostEvent, ExecutionMetadata, FutureBacktestArtifacts,
+    NetPnlOutcome, OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
     PendingOrderSnapshot, RecordedFill,
 };
 use crate::evaluation::{
@@ -935,6 +936,18 @@ pub struct BacktestResult {
     pub mtm_max_drawdown_pct: Option<f64>,
     #[serde(default)]
     pub provider_evaluation: Option<EvaluationReport>,
+    /// Total account-currency commission charged across every entry and exit fill.
+    #[serde(default)]
+    pub total_commission: f64,
+    /// Total account-currency swap charged across every rollover.
+    #[serde(default)]
+    pub total_swap: f64,
+    /// Realized profit and loss before commission and swap, present only when a cost was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
+    /// Commission and swap charges in application order.
+    #[serde(default)]
+    pub cost_events: Vec<CostEvent>,
 }
 
 impl BacktestResult {
@@ -1123,6 +1136,10 @@ impl BacktestResult {
             mtm_max_drawdown: None,
             mtm_max_drawdown_pct: None,
             provider_evaluation: None,
+            total_commission: 0.0,
+            total_swap: 0.0,
+            gross_pnl: None,
+            cost_events: Vec::new(),
         }
     }
 
@@ -1140,6 +1157,7 @@ impl BacktestResult {
         let trade_log = future_trade_log(&artifacts);
         let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
         let mut result = Self::from_trade_log(artifacts.execution.initial_balance, trade_log);
+        result.apply_cost_events(&artifacts.cost_events);
         result.replace_position_statistics(&artifacts.completed_positions);
         result.future_format_version = Some(artifacts.format_version);
         result.execution_metadata = Some(artifacts.execution);
@@ -1155,7 +1173,39 @@ impl BacktestResult {
         result.mtm_max_drawdown = artifacts.max_drawdown;
         result.mtm_max_drawdown_pct = artifacts.max_drawdown_pct;
         result.provider_evaluation = Some(provider_evaluation);
+        result.cost_events = artifacts.cost_events;
         result
+    }
+
+    /// Fold commission and swap totals into the realized result.
+    ///
+    /// Exit commission is already inside each trade's profit and loss, so only entry commission and swap still have to be applied to the run totals. The call is a no-op when nothing was charged, which keeps cost-free runs identical to runs produced before costs existed.
+    fn apply_cost_events(&mut self, cost_events: &[CostEvent]) {
+        if cost_events.is_empty() {
+            return;
+        }
+        let mut commission = 0.0;
+        let mut swap = 0.0;
+        let mut outside_trade_log = 0.0;
+        for event in cost_events {
+            match event.kind {
+                CostKind::EntryCommission => {
+                    commission += event.amount;
+                    outside_trade_log += event.amount;
+                }
+                CostKind::ExitCommission => commission += event.amount,
+                CostKind::Swap => {
+                    swap += event.amount;
+                    outside_trade_log += event.amount;
+                }
+            }
+        }
+        self.total_commission = commission;
+        self.total_swap = swap;
+        // Each trade's profit and loss already excludes its exit commission, so only the remaining charges still have to be applied to the run total.
+        self.total_pnl -= outside_trade_log;
+        self.gross_pnl = Some(self.total_pnl + commission + swap);
+        self.final_balance = self.initial_balance + self.total_pnl;
     }
 
     fn replace_position_statistics(&mut self, completed_positions: &[CompletedPosition]) {

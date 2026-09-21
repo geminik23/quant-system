@@ -81,10 +81,47 @@ Global options:
 
 Commands:
   input          Import market data from CSV file(s)
+  resample       Build stored bars from stored ticks
   remove         Remove data by exchange / symbol / type / date range
   stats          Show summary statistics
   view           Query and display stored data
 ```
+
+### `resample`
+
+```
+data-preprocess resample [OPTIONS]
+
+  -e, --exchange <EX>              Exchange name (REQUIRED)
+  -s, --symbol <SYM>               Symbol to resample (REQUIRED)
+  -t, --timeframe <TF>             Target timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (REQUIRED)
+      --price-basis <BASIS>        bid | ask | mid [default: bid]
+      --align-offset-seconds <N>   Bucket alignment offset [default: 0]
+      --digits <N>                 Price decimal digits, used for the spread in points [default: 5]
+      --from <DATETIME>            Inclusive start (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+      --to <DATETIME>              Inclusive end
+      --flush-partial              Also write the final, still-incomplete bucket
+```
+
+Reads stored ticks and writes stored bars using the same bucket arithmetic, quote-acceptance rule, and accumulation the replay engine applies when it builds bars in memory. Bars produced here are therefore identical to the bars a tick-driven replay would derive from the same input, which lets a parameter search run over bars and a confirmation run over ticks without disagreeing.
+
+Each bar records the average bid/ask spread observed while it formed, expressed in points for the given digit count, so bar-driven replay can execute against a realistic two-sided quote instead of a zero spread.
+
+An interval with no accepted tick produces no bar, so market closures simply have no bars. The final incomplete bucket is dropped unless `--flush-partial` is given, because the replay engine never emits an incomplete bar. Monthly bars have no fixed duration and are rejected. Weekly buckets align to the Unix epoch week unless an alignment offset moves them.
+
+```bash
+# Hourly bid bars for one symbol over a date range
+data-preprocess --data-dir /data/forex resample \
+  --exchange icmarkets --symbol EURUSD --timeframe 1h \
+  --price-basis bid --digits 5 --from 2025-01-01 --to 2026-09-04
+
+# Daily bars that close at 22:00 UTC
+data-preprocess --data-dir /data/forex resample \
+  --exchange icmarkets --symbol EURUSD --timeframe 1d \
+  --align-offset-seconds 79200 --digits 5
+```
+
+Resampling reads the Parquet tick store; it is unavailable on the DuckDB backend.
 
 ### `input tick`
 

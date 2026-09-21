@@ -20,6 +20,7 @@
 //! to handle effects for replay, accounting, or other application behavior.
 
 pub mod alert_register;
+pub mod costs;
 pub mod currency;
 pub mod engine;
 pub mod error;
@@ -33,6 +34,10 @@ pub mod types;
 pub mod validation;
 
 pub use alert_register::PriceAlertRegister;
+pub use costs::{
+    CommissionModel, CostBasis, CostCharge, CostKind, CostValidationError, InstrumentCosts,
+    SwapAmount, SwapSchedule, rollover_instants,
+};
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
     ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,

@@ -63,6 +63,25 @@ impl Timeframe {
         }
     }
 
+    /// Length in seconds for timeframes that have a fixed duration.
+    ///
+    /// Monthly bars have no fixed length and return `None`, so a caller that needs deterministic bucket arithmetic must reject them. Weekly buckets are fixed-length but align to the Unix epoch week unless the caller supplies an alignment offset.
+    pub fn fixed_duration_seconds(&self) -> Option<i64> {
+        let seconds = match self {
+            Self::M1 => 60,
+            Self::M3 => 180,
+            Self::M5 => 300,
+            Self::M15 => 900,
+            Self::M30 => 1_800,
+            Self::H1 => 3_600,
+            Self::H4 => 14_400,
+            Self::D1 => 86_400,
+            Self::W1 => 604_800,
+            Self::MN1 => return None,
+        };
+        Some(seconds)
+    }
+
     /// Canonical short label for storage: "1m", "3m", "5m", ...
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -39,6 +39,11 @@ pub enum MarketEvent {
         low: f64,
         close: f64,
         volume: i64,
+        /// Symmetric bid/ask spread in price units observed while the bar formed.
+        ///
+        /// `None` means the spread is unknown, which keeps the historical zero-spread approximation for feeds that cannot supply it.
+        #[serde(default)]
+        spread: Option<f64>,
     },
 }
 
@@ -61,11 +66,15 @@ impl MarketEvent {
 
     /// Convert the event into a [`PriceQuote`] suitable for the trade engine.
     ///
-    /// - For ticks this is straightforward (bid/ask).
-    /// - For bars the close price is used for both bid and ask (zero spread
-    ///   approximation).  A more sophisticated feed could model the spread
-    ///   separately.
+    /// A tick carries its own two-sided quote. A bar is priced at its close, and its recorded spread is applied symmetrically around that close. A bar without a recorded spread keeps the historical zero-spread approximation; use [`MarketEvent::to_quote_with_spread_fallback`] to supply one.
     pub fn to_quote(&self) -> PriceQuote {
+        self.to_quote_with_spread_fallback(None)
+    }
+
+    /// Convert the event into a [`PriceQuote`], applying `fallback` when a bar has no recorded spread.
+    ///
+    /// `fallback` is expressed in price units and applied symmetrically around the bar close. It is ignored for ticks and for bars that already carry a spread.
+    pub fn to_quote_with_spread_fallback(&self, fallback: Option<f64>) -> PriceQuote {
         match self {
             MarketEvent::Tick {
                 symbol,
@@ -79,14 +88,33 @@ impl MarketEvent {
                 ask: *ask,
             },
             MarketEvent::Bar {
-                symbol, ts, close, ..
-            } => PriceQuote {
-                symbol: symbol.clone(),
-                ts: *ts,
-                bid: *close,
-                ask: *close,
-            },
+                symbol,
+                ts,
+                close,
+                spread,
+                ..
+            } => {
+                let half = spread
+                    .or(fallback)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map_or(0.0, |value| value / 2.0);
+                PriceQuote {
+                    symbol: symbol.clone(),
+                    ts: *ts,
+                    bid: *close - half,
+                    ask: *close + half,
+                }
+            }
         }
+    }
+
+    /// Whether this event is a bar that carries no usable spread.
+    pub fn is_zero_spread_bar(&self) -> bool {
+        matches!(
+            self,
+            MarketEvent::Bar { spread, .. }
+                if !spread.is_some_and(|value| value.is_finite() && value > 0.0)
+        )
     }
 
     /// Convert this event into a quote only when its executable bid/ask view is
@@ -720,6 +748,7 @@ pub fn bars_to_feed_with_metadata(
                 low: bar.low,
                 close: bar.close,
                 volume: bar.volume,
+                spread: None,
             };
             FeedEvent::new(
                 event,
@@ -841,6 +870,7 @@ mod tests {
             low: 1.0830,
             close: 1.0855,
             volume: 1000,
+            spread: None,
         };
         let q = event.to_quote();
         // Bar uses close for both bid and ask
@@ -1026,6 +1056,7 @@ mod tests {
                     low: 0.9,
                     close: 1.1,
                     volume: 10,
+                    spread: None,
                 },
                 EventMetadata::new(SeriesRoles::PRIMARY, 0, 1),
             ),
@@ -1103,6 +1134,7 @@ mod tests {
             low: 0.9,
             close: 1.1,
             volume: 10,
+            spread: None,
         }]);
         let conversion = VecFeed::from_feed_events(vec![FeedEvent::new(
             MarketEvent::Tick {
@@ -1179,6 +1211,7 @@ mod tests {
                 low: 0.9,
                 close: 1.1,
                 volume: 10,
+                spread: None,
             },
             MarketEvent::Tick {
                 symbol: "EURUSD".into(),

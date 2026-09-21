@@ -187,6 +187,7 @@ fn sample_run_request() -> BacktestRunSpec {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     }
 }
@@ -323,6 +324,7 @@ fn replay_request() -> RunBacktestRequest {
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+                costs: Default::default(),
             },
         },
         future: FutureQuoteConfigMsg {
@@ -528,6 +530,7 @@ fn active_symbol_request() -> RunBacktestRequest {
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+                costs: Default::default(),
             },
         },
         future: FutureQuoteConfigMsg {
@@ -661,6 +664,7 @@ fn backtest_config_msg_serde_roundtrip() {
         close_on_finish: Some(false),
         fill_model: Some("MidPrice".into()),
         sizing: None,
+        costs: Default::default(),
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: BacktestConfigMsg = serde_json::from_str(&json).unwrap();
@@ -689,6 +693,7 @@ fn run_backtest_request_serde_roundtrip() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -1570,6 +1575,7 @@ fn filtered_entry_and_management_only_run_is_idle_without_market_data() {
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: None,
+                costs: Default::default(),
             },
         },
         future: FutureQuoteConfigMsg {
@@ -1710,6 +1716,7 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+                costs: Default::default(),
             },
         },
         future: FutureQuoteConfigMsg {
@@ -2153,6 +2160,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -2283,6 +2291,7 @@ fn config_msg_defaults() {
         close_on_finish: None,
         fill_model: None,
         sizing: None,
+        costs: Default::default(),
     };
     let registry = qs_symbols::SymbolRegistry::empty();
     let symbols: Vec<String> = vec![];
@@ -2299,6 +2308,7 @@ fn config_msg_overrides() {
         close_on_finish: Some(false),
         fill_model: Some("MidPrice".into()),
         sizing: None,
+        costs: Default::default(),
     };
     let registry = qs_symbols::SymbolRegistry::empty();
     let symbols: Vec<String> = vec![];
@@ -2315,6 +2325,153 @@ fn fill_model_string_parsing() {
     assert_eq!(parse_fill_model(Some("MidPrice")), FillModel::MidPrice);
     assert_eq!(parse_fill_model(Some("unknown")), FillModel::BidAsk);
     assert_eq!(parse_fill_model(None), FillModel::BidAsk);
+}
+
+fn costs_config(
+    costs: std::collections::BTreeMap<String, InstrumentCostsMsg>,
+) -> BacktestConfigMsg {
+    BacktestConfigMsg {
+        initial_balance: None,
+        close_on_finish: None,
+        fill_model: None,
+        sizing: None,
+        costs,
+    }
+}
+
+fn convert_costs(
+    costs: std::collections::BTreeMap<String, InstrumentCostsMsg>,
+) -> backtest_server::error::Result<qs_backtest::runner::BacktestConfig> {
+    config_from_msg(
+        &costs_config(costs),
+        &qs_symbols::SymbolRegistry::empty(),
+        &[],
+    )
+}
+
+#[test]
+fn config_msg_converts_per_symbol_costs() {
+    let costs = std::collections::BTreeMap::from([
+        (
+            "eurusd".to_owned(),
+            InstrumentCostsMsg {
+                commission: Some(CommissionModelMsg::PerLotPerSide {
+                    amount: 3.5,
+                    currency: "usd".into(),
+                }),
+                swap: Some(SwapScheduleMsg {
+                    amount: SwapAmountMsg::Points {
+                        long: -6.1,
+                        short: 1.9,
+                    },
+                    rollover: "22:00:00".into(),
+                    triple_weekday: "Wed".into(),
+                    skipped_weekdays: Vec::new(),
+                }),
+            },
+        ),
+        (
+            "BTCUSD".to_owned(),
+            InstrumentCostsMsg {
+                commission: Some(CommissionModelMsg::NotionalRatePerSide {
+                    buy_rate: 0.005,
+                    sell_rate: 0.005,
+                }),
+                swap: None,
+            },
+        ),
+    ]);
+
+    let cfg = convert_costs(costs).unwrap();
+    assert_eq!(cfg.costs.len(), 2);
+
+    // Symbols are normalized to the canonical upper-case form used elsewhere in the run.
+    let eurusd = &cfg.costs["EURUSD"];
+    assert!(matches!(
+        eurusd.commission,
+        Some(qs_backtest::CommissionModel::PerLotPerSide { amount, ref currency })
+            if amount == 3.5 && currency == "USD"
+    ));
+    let swap = eurusd.swap.as_ref().unwrap();
+    assert_eq!(
+        swap.rollover,
+        chrono::NaiveTime::from_hms_opt(22, 0, 0).unwrap()
+    );
+    assert_eq!(swap.triple_weekday, chrono::Weekday::Wed);
+    // An omitted skip list keeps the weekend default rather than charging every night.
+    assert_eq!(
+        swap.skipped_weekdays,
+        vec![chrono::Weekday::Sat, chrono::Weekday::Sun]
+    );
+
+    assert!(cfg.costs["BTCUSD"].swap.is_none());
+}
+
+#[test]
+fn config_msg_without_costs_charges_nothing() {
+    let cfg = convert_costs(std::collections::BTreeMap::new()).unwrap();
+    assert!(cfg.costs.is_empty());
+}
+
+#[test]
+fn config_msg_rejects_invalid_costs() {
+    let out_of_range = std::collections::BTreeMap::from([(
+        "EURUSD".to_owned(),
+        InstrumentCostsMsg {
+            commission: Some(CommissionModelMsg::NotionalRatePerSide {
+                buy_rate: 0.9,
+                sell_rate: 0.0,
+            }),
+            swap: None,
+        },
+    )]);
+    assert!(convert_costs(out_of_range).is_err());
+
+    let bad_currency = std::collections::BTreeMap::from([(
+        "EURUSD".to_owned(),
+        InstrumentCostsMsg {
+            commission: Some(CommissionModelMsg::PerLotPerSide {
+                amount: 3.5,
+                currency: "DOLLAR".into(),
+            }),
+            swap: None,
+        },
+    )]);
+    assert!(convert_costs(bad_currency).is_err());
+
+    let bad_rollover = std::collections::BTreeMap::from([(
+        "EURUSD".to_owned(),
+        InstrumentCostsMsg {
+            commission: None,
+            swap: Some(SwapScheduleMsg {
+                amount: SwapAmountMsg::Points {
+                    long: -6.1,
+                    short: 1.9,
+                },
+                rollover: "22:00".into(),
+                triple_weekday: "Wed".into(),
+                skipped_weekdays: Vec::new(),
+            }),
+        },
+    )]);
+    assert!(convert_costs(bad_rollover).is_err());
+
+    let bad_weekday = std::collections::BTreeMap::from([(
+        "EURUSD".to_owned(),
+        InstrumentCostsMsg {
+            commission: None,
+            swap: Some(SwapScheduleMsg {
+                amount: SwapAmountMsg::Points {
+                    long: -6.1,
+                    short: 1.9,
+                },
+                rollover: "22:00:00".into(),
+                triple_weekday: "Sat".into(),
+                skipped_weekdays: Vec::new(),
+            }),
+        },
+    )]);
+    assert!(convert_costs(bad_weekday).is_err());
 }
 
 #[test]
@@ -2581,6 +2738,7 @@ fn handler_run_backtest_invalid_data_type() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);
@@ -2611,6 +2769,7 @@ fn handler_run_backtest_bar_without_timeframe() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);
@@ -2639,6 +2798,7 @@ fn handler_run_backtest_empty_signals() {
             close_on_finish: None,
             fill_model: None,
             sizing: None,
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);
@@ -2684,6 +2844,7 @@ fn handler_run_backtest_no_data_returns_error() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);
@@ -2714,6 +2875,7 @@ fn handler_run_backtest_unknown_profile() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_multi_for_test(&state, &req);
@@ -2742,6 +2904,7 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_multi_for_test(&state, &req);
@@ -3213,6 +3376,7 @@ fn run_backtest_request_with_profile_def_serde() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -3257,6 +3421,7 @@ fn inline_profile_validation_error() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);
@@ -3291,6 +3456,7 @@ fn backward_compat_no_profile_def() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+            costs: Default::default(),
         },
     };
     // This will fail at data loading (no data), but should NOT fail at profile validation
@@ -3709,6 +3875,7 @@ fn run_backtest_request_raw_signals_serde() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.02 }),
+            costs: Default::default(),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -3987,6 +4154,7 @@ fn run_backtest_multi_request_raw_signals_serde() {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.02 }),
+            costs: Default::default(),
         },
     };
     let json = serde_json::to_string(&req).unwrap();
@@ -4015,6 +4183,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
             close_on_finish: None,
             fill_model: None,
             sizing: None,
+            costs: Default::default(),
         },
     };
     let resp = run_for_test(&state, &req);

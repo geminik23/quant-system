@@ -50,7 +50,7 @@ Each service replay result can include a typed instrument manifest containing th
 The production service uses deterministic FutureQuote replay.
 
 - Tick replay uses stored bid and ask values.
-- Bar replay converts each bar close into a zero-spread synthetic quote.
+- Bar replay prices each bar at its close and applies the bar's recorded spread symmetrically around it. A bar with no recorded spread uses the per-symbol fallback spread when the run configures one, and otherwise keeps the historical zero-spread approximation. Execution metadata counts every bar quote that executed with a zero spread, so the approximation is never silent.
 - Actions become eligible according to signal timestamp and configured latency.
 - Market entries use the appropriate future quote side and retain that actual fill for position state, P&L, MTM, and actual risk artifacts.
 - Market Entry sizing defaults to the actual fill price. The optional signal-entry basis uses an explicit original `Entry.price` only for quantity calculation and falls back to the fill price when it is absent.
@@ -61,6 +61,34 @@ The production service uses deterministic FutureQuote replay.
 - Limit and Stop Entries remain sized at placement from their required requested price; their quantity stays frozen through later fill, balance, FX, or quote changes.
 
 Close-only bars cannot reconstruct an intrabar price path. Use tick data when exact ordering of stop, target, and management events matters.
+
+## Trading costs
+
+Commission and overnight swap are optional and off by default. A run without a cost specification produces exactly the artifacts it produced before costs existed.
+
+Each symbol may declare:
+
+- commission as a fixed amount per lot per side in the account currency, or as a notional rate per side with separate buy and sell rates for venues that charge asymmetrically;
+- swap as price points per lot per night, or as an account-currency amount per lot per night, together with the rollover instant, the weekday that charges three nights, and the weekdays that charge none.
+
+Commission is charged on every entry, scale-in, and closing fill. Swap is charged once per rollover instant crossed while a position is open, evaluated before any fill or signal at the same timestamp, so a position opened and closed between two rollovers pays none and a weekend gap still charges the instants it skipped.
+
+Point-denominated swap and notional-rate commission are computed in the instrument's native profit-and-loss currency and converted through the run's existing conversion routes; per-lot amounts are already in the account currency and are validated against it. A swap charge that has no causal conversion quote is skipped and counted in execution metadata rather than silently applied.
+
+Reported results are net of costs. Each close event carries the exit commission already subtracted from its profit and loss, each completed position reports commission and swap totals alongside a gross figure, and realized R is computed from the net result. The run reports total commission, total swap, and the full ordered list of charges.
+
+Costs are configured through `BacktestConfig.costs` in the library, through `config.costs` in a service request, or through `tg_backtest --costs-file`. The wire and file forms use the same strict shape, reject unknown fields, and are validated at the request boundary before any data loading. The client reads its cost file before connecting, so an invalid file fails immediately.
+
+```toml
+[EURUSD]
+commission = { type = "PerLotPerSide", amount = 3.5, currency = "USD" }
+swap = { amount = { unit = "Points", long = -6.1, short = 1.9 }, rollover = "22:00:00", triple_weekday = "Wed" }
+
+[BTCUSD]
+commission = { type = "NotionalRatePerSide", buy_rate = 0.005, sell_rate = 0.005 }
+```
+
+Omitting `skipped_weekdays` keeps the weekend default of `Sat` and `Sun`.
 
 ## Management profile routing and generated levels
 
@@ -125,6 +153,8 @@ The client streams retained-job progress by default. Polling and finite synchron
 - emit bounded ordered non-economic journal drafts during ordinary callbacks, including warmup, without changing executable scheduling or decision retention;
 - retain hindsight and journal-only annotations outside decision context and compare two completed strategy results through existing position-level metrics;
 - provide strict timestamped `RawSignal` values for deterministic FutureQuote replay;
+- charge per-symbol commission and overnight swap during replay and read the resulting net figures, charge list, and per-position totals from the result;
+- apply a per-symbol fallback spread to bars that carry none, and read how many bar quotes still executed with a zero spread;
 - supply a `DataFeed` implementation;
 - consume structured reports and artifacts without starting a service.
 

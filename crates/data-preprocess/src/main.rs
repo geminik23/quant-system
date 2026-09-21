@@ -40,6 +40,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Build stored bars from stored ticks using the replay engine's bucket rules
+    Resample {
+        /// Exchange / broker name
+        #[arg(long, short)]
+        exchange: String,
+        /// Symbol to resample
+        #[arg(long, short)]
+        symbol: String,
+        /// Target bar timeframe (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w)
+        #[arg(long, short)]
+        timeframe: String,
+        /// Quote side used to derive each bar price
+        #[arg(long, default_value = "bid")]
+        price_basis: String,
+        /// Bucket alignment offset in seconds, for example 79200 to close daily bars at 22:00
+        #[arg(long, default_value_t = 0)]
+        align_offset_seconds: i64,
+        /// Price decimal digits, used to express the average spread in points
+        #[arg(long, default_value_t = 5)]
+        digits: u32,
+        /// Inclusive start timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+        #[arg(long)]
+        from: Option<String>,
+        /// Inclusive end timestamp (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+        #[arg(long)]
+        to: Option<String>,
+        /// Also write the final, still-incomplete bucket
+        #[arg(long)]
+        flush_partial: bool,
+    },
+
     /// Import market data from CSV file(s)
     Input {
         #[command(subcommand)]
@@ -196,6 +227,31 @@ fn main() -> data_preprocess::Result<()> {
                     handle_stats_parquet(&store, exchange, symbol)?
                 }
                 Commands::View { data_type } => handle_view_parquet(&store, data_type)?,
+                Commands::Resample {
+                    exchange,
+                    symbol,
+                    timeframe,
+                    price_basis,
+                    align_offset_seconds,
+                    digits,
+                    from,
+                    to,
+                    flush_partial,
+                } => handle_resample_parquet(
+                    &store,
+                    &cli.data_dir,
+                    ResampleArgs {
+                        exchange,
+                        symbol,
+                        timeframe,
+                        price_basis,
+                        align_offset_seconds,
+                        digits,
+                        from,
+                        to,
+                        flush_partial,
+                    },
+                )?,
             }
         }
 
@@ -213,6 +269,12 @@ fn main() -> data_preprocess::Result<()> {
                 Commands::Remove { data_type } => handle_remove_duckdb(&db, data_type)?,
                 Commands::Stats { exchange, symbol } => handle_stats_duckdb(&db, exchange, symbol)?,
                 Commands::View { data_type } => handle_view_duckdb(&db, data_type)?,
+                Commands::Resample { .. } => {
+                    eprintln!(
+                        "Error: resample reads the Parquet tick store. Rerun with `--backend parquet`."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -225,6 +287,119 @@ fn main() -> data_preprocess::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Arguments accepted by the tick-to-bar resampler.
+struct ResampleArgs {
+    exchange: String,
+    symbol: String,
+    timeframe: String,
+    price_basis: String,
+    align_offset_seconds: i64,
+    digits: u32,
+    from: Option<String>,
+    to: Option<String>,
+    flush_partial: bool,
+}
+
+/// Rows buffered before one write, keeping memory bounded on multi-year ranges.
+#[cfg(feature = "parquet")]
+const RESAMPLE_WRITE_BATCH: usize = 20_000;
+
+#[cfg(feature = "parquet")]
+fn handle_resample_parquet(
+    store: &data_preprocess::ParquetStore,
+    data_dir: &std::path::Path,
+    args: ResampleArgs,
+) -> data_preprocess::Result<()> {
+    use data_preprocess::error::DataError;
+    use data_preprocess::resample::{BarAggregator, BucketSpec, PriceBasis};
+    use data_preprocess::scanner::{ParquetScanBounds, ParquetTickCursor};
+
+    let start = Instant::now();
+    let exchange = normalize_exchange(&args.exchange);
+    let symbol = args.symbol.to_uppercase();
+    let timeframe = Timeframe::parse(&args.timeframe)?;
+    let duration = timeframe.fixed_duration_seconds().ok_or_else(|| {
+        DataError::InvalidResample(format!(
+            "timeframe {} has no fixed duration and cannot be resampled",
+            timeframe.as_str()
+        ))
+    })?;
+    let spec = BucketSpec::new(duration, args.align_offset_seconds).ok_or_else(|| {
+        DataError::InvalidResample(format!("timeframe {} has no positive duration", timeframe))
+    })?;
+    let basis = PriceBasis::parse(&args.price_basis).ok_or_else(|| {
+        DataError::InvalidResample(format!(
+            "price basis must be bid, ask, or mid, got '{}'",
+            args.price_basis
+        ))
+    })?;
+    if args.digits > 10 {
+        return Err(DataError::InvalidResample(format!(
+            "digits must not exceed 10, got {}",
+            args.digits
+        )));
+    }
+    let point_size = 10f64.powi(-(args.digits as i32));
+    let from = args.from.as_deref().map(parse_datetime_arg).transpose()?;
+    let to = args.to.as_deref().map(parse_datetime_arg).transpose()?;
+
+    let mut cursor = ParquetTickCursor::open(
+        data_dir,
+        &exchange,
+        &symbol,
+        ParquetScanBounds::new(from, to),
+    )?;
+    let mut aggregator = BarAggregator::new(
+        exchange.clone(),
+        symbol.clone(),
+        timeframe,
+        spec,
+        basis,
+        point_size,
+    );
+
+    let mut buffer = Vec::with_capacity(RESAMPLE_WRITE_BATCH);
+    let mut ticks_read = 0usize;
+    let mut bars_built = 0usize;
+    let mut bars_written = 0usize;
+    while let Some(tick) = cursor.next_tick()? {
+        ticks_read += 1;
+        if let Some(bar) = aggregator.push(tick.ts, tick.bid, tick.ask) {
+            buffer.push(bar);
+            bars_built += 1;
+            if buffer.len() >= RESAMPLE_WRITE_BATCH {
+                bars_written += store.insert_bars(&buffer)?;
+                buffer.clear();
+            }
+        }
+    }
+    if args.flush_partial
+        && let Some(bar) = aggregator.flush()
+    {
+        buffer.push(bar);
+        bars_built += 1;
+    }
+    if !buffer.is_empty() {
+        bars_written += store.insert_bars(&buffer)?;
+    }
+
+    print_import_result(&ImportResult {
+        file: format!(
+            "{exchange}/{symbol} ticks -> {} {} bars (offset {}s)",
+            timeframe.as_str(),
+            basis.as_str(),
+            spec.alignment_offset_seconds()
+        ),
+        exchange,
+        symbol,
+        rows_parsed: ticks_read,
+        rows_inserted: bars_written,
+        rows_skipped: bars_built.saturating_sub(bars_written),
+        elapsed: start.elapsed(),
+    });
     Ok(())
 }
 

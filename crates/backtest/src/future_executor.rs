@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::NaiveDateTime;
 
 use qs_core::TradeEngine;
+use qs_core::costs::{CostBasis, CostCharge, CostKind, InstrumentCosts};
 use qs_core::types::{
     CloseReason, Effect, EffectiveStop, FillPurpose, FutureEffect, FutureFill, PriceQuote, Side,
     StopOrigin, position_size_tolerance,
@@ -12,7 +13,7 @@ use qs_core::types::{
 use thiserror::Error;
 
 use crate::artifacts::{
-    CloseEvent, CompletedPosition, OpenPositionSnapshot, PendingOrderLifecycleEvent,
+    CloseEvent, CompletedPosition, CostEvent, OpenPositionSnapshot, PendingOrderLifecycleEvent,
     PendingOrderLifecycleState, RecordedFill, RiskBasisStatus, RiskTranche, deterministic_event_id,
 };
 use crate::currency::{
@@ -91,6 +92,20 @@ struct PositionAccount {
     native_realized_pnl: f64,
     native_currency: Option<String>,
     account_currency: Option<String>,
+    /// Account-currency commission charged on entry and scale-in fills.
+    entry_commission_total: f64,
+    /// Account-currency swap charged while this position was open.
+    swap_total: f64,
+}
+
+/// One trading cost after optional account conversion.
+#[derive(Debug, Clone, Default)]
+struct ResolvedCost {
+    /// Signed account-currency amount, where positive reduces the balance.
+    amount: f64,
+    native_amount: Option<f64>,
+    native_currency: Option<String>,
+    conversion: Option<ConversionResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +159,8 @@ pub struct FutureExecutor {
     initial_balance: f64,
     balance: f64,
     contract_sizes: HashMap<String, f64>,
+    costs: HashMap<String, InstrumentCosts>,
+    point_sizes: HashMap<String, f64>,
     currency_plan: Option<RunCurrencyPlan>,
     accounts: BTreeMap<String, PositionAccount>,
     pending_origins: BTreeMap<String, PendingOrigin>,
@@ -152,12 +169,15 @@ pub struct FutureExecutor {
     pub fills: Vec<RecordedFill>,
     pub pending_order_lifecycle: Vec<PendingOrderLifecycleEvent>,
     pub close_events: Vec<CloseEvent>,
+    pub cost_events: Vec<CostEvent>,
     pub completed_positions: Vec<CompletedPosition>,
     pub trade_log: Vec<TradeResult>,
     fill_sequence: u64,
     close_sequence: u64,
+    cost_sequence: u64,
     pending_lifecycle_sequence: u64,
     pnl_epsilon: f64,
+    last_rollover_ts: Option<NaiveDateTime>,
 }
 
 #[derive(Debug)]
@@ -168,10 +188,12 @@ struct FutureExecutorCheckpoint {
     balance: f64,
     fill_sequence: u64,
     close_sequence: u64,
+    cost_sequence: u64,
     pending_lifecycle_sequence: u64,
     fills_len: usize,
     pending_order_lifecycle_len: usize,
     close_events_len: usize,
+    cost_events_len: usize,
     completed_positions_len: usize,
     trade_log_len: usize,
 }
@@ -266,10 +288,12 @@ impl FutureExecutorCheckpoint {
             balance: executor.balance,
             fill_sequence: executor.fill_sequence,
             close_sequence: executor.close_sequence,
+            cost_sequence: executor.cost_sequence,
             pending_lifecycle_sequence: executor.pending_lifecycle_sequence,
             fills_len: executor.fills.len(),
             pending_order_lifecycle_len: executor.pending_order_lifecycle.len(),
             close_events_len: executor.close_events.len(),
+            cost_events_len: executor.cost_events.len(),
             completed_positions_len: executor.completed_positions.len(),
             trade_log_len: executor.trade_log.len(),
         }
@@ -288,12 +312,14 @@ impl FutureExecutorCheckpoint {
         executor.balance = self.balance;
         executor.fill_sequence = self.fill_sequence;
         executor.close_sequence = self.close_sequence;
+        executor.cost_sequence = self.cost_sequence;
         executor.pending_lifecycle_sequence = self.pending_lifecycle_sequence;
         executor.fills.truncate(self.fills_len);
         executor
             .pending_order_lifecycle
             .truncate(self.pending_order_lifecycle_len);
         executor.close_events.truncate(self.close_events_len);
+        executor.cost_events.truncate(self.cost_events_len);
         executor
             .completed_positions
             .truncate(self.completed_positions_len);
@@ -338,6 +364,8 @@ impl FutureExecutor {
             initial_balance,
             balance: initial_balance,
             contract_sizes,
+            costs: HashMap::new(),
+            point_sizes: HashMap::new(),
             currency_plan: None,
             accounts: BTreeMap::new(),
             pending_origins: BTreeMap::new(),
@@ -346,21 +374,35 @@ impl FutureExecutor {
             fills: Vec::new(),
             pending_order_lifecycle: Vec::new(),
             close_events: Vec::new(),
+            cost_events: Vec::new(),
             completed_positions: Vec::new(),
             trade_log: Vec::new(),
             fill_sequence: 0,
             close_sequence: 0,
+            cost_sequence: 0,
             pending_lifecycle_sequence: 0,
             pnl_epsilon: if pnl_epsilon.is_finite() {
                 pnl_epsilon.abs()
             } else {
                 1.0e-9
             },
+            last_rollover_ts: None,
         }
     }
 
     pub fn with_currency_plan(mut self, currency_plan: Option<RunCurrencyPlan>) -> Self {
         self.currency_plan = currency_plan;
+        self
+    }
+
+    /// Attach per-symbol trading costs and the price point size used by point-denominated swap.
+    pub fn with_costs(
+        mut self,
+        costs: HashMap<String, InstrumentCosts>,
+        point_sizes: HashMap<String, f64>,
+    ) -> Self {
+        self.costs = costs;
+        self.point_sizes = point_sizes;
         self
     }
 
@@ -568,6 +610,7 @@ impl FutureExecutor {
                                     action_id,
                                     signal_ts,
                                     effective_ts,
+                                    &mut portfolio_batch,
                                     conversion_quotes,
                                 )?;
                                 affected.push(id.clone());
@@ -581,6 +624,7 @@ impl FutureExecutor {
                                     action_id,
                                     signal_ts,
                                     effective_ts,
+                                    &mut portfolio_batch,
                                     conversion_quotes,
                                 )?;
                                 affected.push(id.clone());
@@ -823,6 +867,7 @@ impl FutureExecutor {
         action_id: Option<&str>,
         signal_ts: Option<NaiveDateTime>,
         effective_ts: NaiveDateTime,
+        portfolio_batch: &mut PortfolioBatch,
         conversion_quotes: Option<&ConversionQuoteBook>,
     ) -> Result<(), FutureExecutorError> {
         if self.accounts.contains_key(id) {
@@ -897,6 +942,25 @@ impl FutureExecutor {
             ),
             conversion_quotes,
         )?;
+        let symbol_for_cost = symbol.clone();
+        let commission = self.resolve_commission(
+            &symbol,
+            side,
+            size,
+            execution.price,
+            fill.ts,
+            conversion_quotes,
+        )?;
+        let next_balance = self.balance - commission.amount;
+        if !next_balance.is_finite()
+            || (commission.amount != 0.0 && !portfolio_batch.add_realized_pnl(-commission.amount))
+        {
+            return Err(FutureExecutorError::PortfolioRejectedRealizedPnl {
+                position_id: id.to_owned(),
+                pnl: -commission.amount,
+            });
+        }
+        self.balance = next_balance;
         self.fill_sequence += 1;
         self.pending_origins.remove(id);
         self.fills.push(recorded);
@@ -922,10 +986,24 @@ impl FutureExecutor {
                     .map(|plan| plan.account_currency().to_owned()),
                 risk_tranches: vec![risk],
                 close_events: Vec::new(),
-                realized_pnl: 0.0,
+                realized_pnl: -commission.amount,
                 native_realized_pnl: 0.0,
+                entry_commission_total: commission.amount,
+                swap_total: 0.0,
             },
         );
+        if commission.amount != 0.0 {
+            self.push_cost_event(
+                id,
+                &symbol_for_cost,
+                side,
+                fill.ts,
+                CostKind::EntryCommission,
+                &commission,
+                size,
+                None,
+            );
+        }
         if let Some(origin) = origin {
             self.record_pending_terminal(
                 &origin,
@@ -949,6 +1027,7 @@ impl FutureExecutor {
         action_id: Option<&str>,
         signal_ts: Option<NaiveDateTime>,
         effective_ts: NaiveDateTime,
+        portfolio_batch: &mut PortfolioBatch,
         conversion_quotes: Option<&ConversionQuoteBook>,
     ) -> Result<(), FutureExecutorError> {
         let position = engine
@@ -1001,6 +1080,24 @@ impl FutureExecutor {
             ),
             conversion_quotes,
         )?;
+        let commission = self.resolve_commission(
+            &symbol,
+            side,
+            size,
+            execution.price,
+            fill.ts,
+            conversion_quotes,
+        )?;
+        let next_balance = self.balance - commission.amount;
+        if !next_balance.is_finite()
+            || (commission.amount != 0.0 && !portfolio_batch.add_realized_pnl(-commission.amount))
+        {
+            return Err(FutureExecutorError::PortfolioRejectedRealizedPnl {
+                position_id: id.to_owned(),
+                pnl: -commission.amount,
+            });
+        }
+        self.balance = next_balance;
         self.fill_sequence += 1;
         let account = self.accounts.get_mut(id).expect("account checked above");
         account.risk_tranches.push(risk);
@@ -1008,7 +1105,21 @@ impl FutureExecutor {
         account.remaining_size += size;
         account.entry_value += execution.price * size;
         account.open_entry_value += execution.price * size;
+        account.entry_commission_total += commission.amount;
+        account.realized_pnl -= commission.amount;
         self.fills.push(recorded);
+        if commission.amount != 0.0 {
+            self.push_cost_event(
+                id,
+                &symbol,
+                side,
+                fill.ts,
+                CostKind::EntryCommission,
+                &commission,
+                size,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -1084,7 +1195,18 @@ impl FutureExecutor {
             * contract_size;
         let accounted =
             self.convert_native_amount(&account.symbol, native_pnl, fill.ts, conversion_quotes)?;
-        let pnl = accounted.amount;
+        let cost_symbol = account.symbol.clone();
+        // A close trades against the position, so an asymmetric venue charges the opposite side's rate.
+        let cost_side = account.side.opposite();
+        let commission = self.resolve_commission(
+            &cost_symbol,
+            cost_side,
+            close_size,
+            execution.price,
+            fill.ts,
+            conversion_quotes,
+        )?;
+        let pnl = accounted.amount - commission.amount;
         let next_balance = self.balance + pnl;
         if !next_balance.is_finite() || !portfolio_batch.add_realized_pnl(pnl) {
             return Err(FutureExecutorError::PortfolioRejectedRealizedPnl {
@@ -1131,6 +1253,7 @@ impl FutureExecutor {
         event.action_id = action_id.map(str::to_owned);
         event.fill_id = Some(recorded.id.clone());
         event.entry_price = Some(entry_price);
+        event.commission = commission.amount;
         event.native_pnl = Some(native_pnl);
         event.native_currency = accounted.native_currency;
         event.pnl_conversion = accounted.conversion;
@@ -1154,6 +1277,18 @@ impl FutureExecutor {
         self.fills.push(recorded);
         self.close_events.push(event);
         self.trade_log.push(trade);
+        if commission.amount != 0.0 {
+            self.push_cost_event(
+                id,
+                &cost_symbol,
+                cost_side,
+                fill.ts,
+                CostKind::ExitCommission,
+                &commission,
+                close_size,
+                None,
+            );
+        }
 
         if full_close {
             let account = self.accounts.remove(id).expect("completed account exists");
@@ -1177,6 +1312,7 @@ impl FutureExecutor {
             );
             completed.group = account.group;
             completed.trade_id = account.trade_id;
+            completed.charge_position_costs(account.entry_commission_total, account.swap_total);
             let completed_position_index = self.completed_positions.len();
             self.completed_positions.push(completed);
             portfolio_batch.finish_campaign(id.to_owned(), final_net_pnl, completed_position_index);
@@ -1279,6 +1415,198 @@ impl FutureExecutor {
 
     fn contract_size(&self, symbol: &str) -> f64 {
         self.contract_sizes.get(symbol).copied().unwrap_or(1.0)
+    }
+
+    fn point_size(&self, symbol: &str) -> f64 {
+        self.point_sizes.get(symbol).copied().unwrap_or(f64::NAN)
+    }
+
+    /// Convert one computed charge into the account currency without touching the ledger.
+    fn resolve_cost(
+        &self,
+        symbol: &str,
+        operation_ts: NaiveDateTime,
+        charge: CostCharge,
+        conversion_quotes: Option<&ConversionQuoteBook>,
+    ) -> Result<ResolvedCost, FutureExecutorError> {
+        let resolved = match charge.basis {
+            CostBasis::AccountCurrency => ResolvedCost {
+                amount: charge.amount,
+                ..ResolvedCost::default()
+            },
+            CostBasis::InstrumentNative => {
+                let accounted = self.convert_native_amount(
+                    symbol,
+                    charge.amount,
+                    operation_ts,
+                    conversion_quotes,
+                )?;
+                ResolvedCost {
+                    amount: accounted.amount,
+                    native_amount: Some(charge.amount),
+                    native_currency: accounted.native_currency,
+                    conversion: accounted.conversion,
+                }
+            }
+        };
+        if !resolved.amount.is_finite() {
+            return Err(FutureExecutorError::InvalidConvertedAmount {
+                symbol: symbol.to_owned(),
+                kind: "cost",
+                amount: resolved.amount,
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// Commission for one fill, already converted into the account currency.
+    fn resolve_commission(
+        &self,
+        symbol: &str,
+        side: Side,
+        size: f64,
+        fill_price: f64,
+        operation_ts: NaiveDateTime,
+        conversion_quotes: Option<&ConversionQuoteBook>,
+    ) -> Result<ResolvedCost, FutureExecutorError> {
+        let Some(costs) = self.costs.get(symbol) else {
+            return Ok(ResolvedCost::default());
+        };
+        let contract_size = self.contract_size(symbol);
+        let Some(charge) = costs.commission_for_fill(side, size, fill_price, contract_size) else {
+            return Ok(ResolvedCost::default());
+        };
+        self.resolve_cost(symbol, operation_ts, charge, conversion_quotes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_cost_event(
+        &mut self,
+        position_id: &str,
+        symbol: &str,
+        side: Side,
+        ts: NaiveDateTime,
+        kind: CostKind,
+        resolved: &ResolvedCost,
+        size: f64,
+        nights: Option<u32>,
+    ) {
+        let mut event = CostEvent::new(
+            position_id,
+            self.cost_sequence,
+            symbol,
+            side,
+            ts,
+            kind,
+            resolved.amount,
+            size,
+        );
+        event.native_amount = resolved.native_amount;
+        event.native_currency = resolved.native_currency.clone();
+        event.conversion = resolved.conversion.clone();
+        event.nights = nights;
+        self.cost_sequence += 1;
+        self.cost_events.push(event);
+    }
+
+    /// Charge overnight swap for every rollover instant in `(previous, current]`.
+    ///
+    /// The runner calls this once per accepted timestamp batch after all fills at that timestamp are recorded, so a position opened and closed inside one batch is never charged, and a weekend gap still charges every instant it skipped over.
+    ///
+    /// Returns the number of charges that could not be converted into the account currency and were therefore skipped. A skipped charge is never silent: the caller reports the count in the run's execution metadata.
+    pub(crate) fn charge_rollovers(
+        &mut self,
+        current: NaiveDateTime,
+        portfolio: &mut PortfolioRecorder,
+        conversion_quotes: Option<&ConversionQuoteBook>,
+    ) -> u64 {
+        let previous = self.last_rollover_ts.replace(current);
+        if self.costs.is_empty() {
+            return 0;
+        }
+        let open_ids: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|(_, account)| {
+                account.remaining_size > position_size_tolerance(account.entry_size)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if open_ids.is_empty() {
+            return 0;
+        }
+        let mut charged = false;
+        let mut skipped = 0;
+        for id in open_ids {
+            let Some(account) = self.accounts.get(&id) else {
+                continue;
+            };
+            let symbol = account.symbol.clone();
+            let side = account.side;
+            let size = account.remaining_size;
+            let open_ts = account.open_ts;
+            let Some(costs) = self.costs.get(&symbol) else {
+                continue;
+            };
+            let Some(schedule) = costs.swap.as_ref() else {
+                continue;
+            };
+            let rollover = schedule.rollover;
+            let start = match previous {
+                Some(previous) => previous.max(open_ts),
+                None => open_ts,
+            };
+            let instants = qs_core::costs::rollover_instants(Some(start), current, rollover);
+            for instant in instants {
+                let Some(costs) = self.costs.get(&symbol) else {
+                    continue;
+                };
+                let Some(schedule) = costs.swap.as_ref() else {
+                    continue;
+                };
+                let nights = schedule.nights_at(instant);
+                let contract_size = self.contract_size(&symbol);
+                let point_size = self.point_size(&symbol);
+                let Some(charge) =
+                    costs.swap_for_rollover(side, size, contract_size, point_size, nights)
+                else {
+                    continue;
+                };
+                let Ok(resolved) = self.resolve_cost(&symbol, instant, charge, conversion_quotes)
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                if resolved.amount == 0.0 {
+                    continue;
+                }
+                let next_balance = self.balance - resolved.amount;
+                if !next_balance.is_finite() {
+                    skipped += 1;
+                    continue;
+                }
+                self.balance = next_balance;
+                if let Some(account) = self.accounts.get_mut(&id) {
+                    account.realized_pnl -= resolved.amount;
+                    account.swap_total += resolved.amount;
+                }
+                self.push_cost_event(
+                    &id,
+                    &symbol,
+                    side,
+                    instant,
+                    CostKind::Swap,
+                    &resolved,
+                    size,
+                    Some(nights),
+                );
+                charged = true;
+            }
+        }
+        if charged {
+            portfolio.set_realized_pnl(self.realized_pnl());
+        }
+        skipped
     }
 }
 

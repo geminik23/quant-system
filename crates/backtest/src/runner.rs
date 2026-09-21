@@ -871,6 +871,14 @@ pub struct BacktestConfig {
     pub symbol_specs: HashMap<String, qs_symbols::SymbolSpec>,
     /// Optional explicit instrument specifications and stored-series bindings pinned for this run.
     pub instrument_manifest: Option<ReplayInstrumentManifest>,
+    /// Per-symbol symmetric bid/ask spread in price units, applied to bars that carry no recorded spread.
+    ///
+    /// Stored bars normally carry the average spread observed while they formed. This map covers feeds that cannot supply one; without it such bars execute at a zero spread, and the run reports how often that happened.
+    pub bar_spread_fallback: HashMap<String, f64>,
+    /// Per-symbol commission and swap specification.
+    ///
+    /// An empty map charges nothing and reproduces runs made before costs existed. Point-denominated swap additionally requires a matching `symbol_specs` entry, because the price point size comes from its digit count.
+    pub costs: HashMap<String, qs_core::InstrumentCosts>,
 }
 
 impl Default for BacktestConfig {
@@ -883,6 +891,8 @@ impl Default for BacktestConfig {
             sizing: None,
             symbol_specs: HashMap::new(),
             instrument_manifest: None,
+            bar_spread_fallback: HashMap::new(),
+            costs: HashMap::new(),
         }
     }
 }
@@ -2205,7 +2215,11 @@ impl BacktestRunner {
             contract_sizes.clone(),
             future.pnl_epsilon,
         )
-        .with_currency_plan(future.currency_plan.clone());
+        .with_currency_plan(future.currency_plan.clone())
+        .with_costs(
+            self.config.costs.clone(),
+            effective_point_sizes(&self.config),
+        );
         let mut portfolio =
             PortfolioRecorder::new(self.config.initial_balance, contract_sizes.clone())
                 .with_fill_model(self.config.fill_model)
@@ -2225,6 +2239,8 @@ impl BacktestRunner {
             }
         }
         let mut last_quote_ts = BTreeMap::<String, NaiveDateTime>::new();
+        let mut unconverted_cost_events = 0u64;
+        let mut zero_spread_bar_quotes = 0u64;
         let mut last_processed_primary_ts = None;
         let mut effective_terminal_ts = primary_eod;
         let mut terminated_quiescently = false;
@@ -2244,7 +2260,15 @@ impl BacktestRunner {
                 if is_cancelled() {
                     return Err(FutureBatchReplayError::Cancelled);
                 }
-                let quote = feed_event.event.to_quote();
+                let quote = feed_event.event.to_quote_with_spread_fallback(
+                    self.config
+                        .bar_spread_fallback
+                        .get(feed_event.event.symbol())
+                        .copied(),
+                );
+                if matches!(feed_event.event, MarketEvent::Bar { .. }) && quote.bid == quote.ask {
+                    zero_spread_bar_quotes += 1;
+                }
                 if ExecutionPricer::validate_quote(&quote).is_err()
                     || last_quote_ts
                         .get(&quote.symbol)
@@ -2287,6 +2311,13 @@ impl BacktestRunner {
                     invalid_quotes += 1;
                 }
             }
+            // Overnight financing is charged for every rollover instant already crossed, before any fill or signal at this timestamp can change what is open.
+            unconverted_cost_events += future_executor.charge_rollovers(
+                batch_ts,
+                &mut portfolio,
+                Some(&conversion_quotes),
+            );
+
             let valuation_only = accepted
                 .iter()
                 .any(|event| event.0.metadata.roles.conversion)
@@ -2856,6 +2887,9 @@ impl BacktestRunner {
                 entry_profile_default,
                 entry_profile_routes,
                 entry_profile_resolutions: std::mem::take(&mut self.entry_profile_resolutions),
+                costs: self.config.costs.clone().into_iter().collect(),
+                unconverted_cost_events,
+                zero_spread_bar_quotes,
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
@@ -2863,6 +2897,7 @@ impl BacktestRunner {
             },
             fills: future_executor.fills.clone(),
             close_events: future_executor.close_events.clone(),
+            cost_events: future_executor.cost_events.clone(),
             completed_positions: future_executor.completed_positions.clone(),
             open_positions: portfolio.latest_open_positions().to_vec(),
             pending_orders,
@@ -4225,6 +4260,44 @@ fn effective_contract_sizes(config: &BacktestConfig) -> HashMap<String, f64> {
     contract_sizes
 }
 
+/// Reject cost specifications that cannot be applied deterministically to this run.
+fn validate_replay_costs(
+    config: &BacktestConfig,
+    future: Option<&FutureQuoteConfig>,
+) -> Result<(), String> {
+    let account_currency = future
+        .and_then(|future| future.currency_plan.as_ref())
+        .map(|plan| plan.account_currency().to_owned());
+    for (symbol, costs) in &config.costs {
+        if symbol.is_empty() {
+            return Err("cost symbol must not be empty".into());
+        }
+        costs
+            .validate()
+            .map_err(|error| format!("costs for {symbol} are invalid: {error}"))?;
+        if let Some(account_currency) = account_currency.as_deref() {
+            costs
+                .validate_against_account_currency(account_currency)
+                .map_err(|error| format!("costs for {symbol} are invalid: {error}"))?;
+        }
+        if costs.requires_point_size() && !config.symbol_specs.contains_key(symbol) {
+            return Err(format!(
+                "point-denominated swap for {symbol} requires a symbol specification for its digit count"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Price point size per symbol, derived from the digit count used by the symbol registry.
+fn effective_point_sizes(config: &BacktestConfig) -> HashMap<String, f64> {
+    config
+        .symbol_specs
+        .iter()
+        .map(|(symbol, spec)| (symbol.clone(), 10f64.powi(-i32::from(spec.digits))))
+        .collect()
+}
+
 fn is_monetary_sizing(policy: &SizingPolicy) -> bool {
     matches!(
         policy,
@@ -4269,6 +4342,7 @@ fn validate_replay_config(
         }
     }
 
+    validate_replay_costs(config, future)?;
     validate_instrument_manifest(config)?;
     for (symbol, spec) in &config.symbol_specs {
         validate_symbol_spec(symbol, spec)?;

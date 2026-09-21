@@ -90,6 +90,57 @@ pub struct BacktestConfigMsg {
     /// Account sizing policy. Required when the request contains an Entry signal.
     #[serde(default)]
     pub sizing: Option<SizingPolicyMsg>,
+    /// Per-symbol commission and swap, keyed by canonical symbol. Empty charges nothing and reproduces runs made before costs existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub costs: BTreeMap<String, InstrumentCostsMsg>,
+}
+
+/// Wire-safe commission and swap specification for one instrument.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentCostsMsg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commission: Option<CommissionModelMsg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap: Option<SwapScheduleMsg>,
+}
+
+/// Wire-safe commission model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum CommissionModelMsg {
+    /// Fixed amount per lot per side, in the run's account currency.
+    PerLotPerSide { amount: f64, currency: String },
+    /// Fraction of traded notional per side, with separate buy and sell rates.
+    NotionalRatePerSide { buy_rate: f64, sell_rate: f64 },
+}
+
+/// Wire-safe nightly swap magnitude, where a negative value charges and a positive value credits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "unit", deny_unknown_fields)]
+pub enum SwapAmountMsg {
+    /// Price points per lot per night, in the instrument's native currency.
+    Points { long: f64, short: f64 },
+    /// Amount per lot per night, in the run's account currency.
+    Currency {
+        long: f64,
+        short: f64,
+        currency: String,
+    },
+}
+
+/// Wire-safe nightly swap magnitude plus the rollover calendar that charges it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapScheduleMsg {
+    pub amount: SwapAmountMsg,
+    /// Rollover time of day in the replay's timestamp zone, as `HH:MM:SS`.
+    pub rollover: String,
+    /// Weekday whose rollover charges three nights, as `Mon` through `Sun`.
+    pub triple_weekday: String,
+    /// Weekdays whose rollover charges nothing. Defaults to `Sat` and `Sun` when omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_weekdays: Vec<String>,
 }
 
 /// Wire-safe in-place account sizing policy.
@@ -1076,6 +1127,46 @@ enum StrictSizingPolicyMsg {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum StrictCommissionModelMsg {
+    PerLotPerSide { amount: f64, currency: String },
+    NotionalRatePerSide { buy_rate: f64, sell_rate: f64 },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "unit", deny_unknown_fields)]
+enum StrictSwapAmountMsg {
+    Points {
+        long: f64,
+        short: f64,
+    },
+    Currency {
+        long: f64,
+        short: f64,
+        currency: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSwapScheduleMsg {
+    amount: StrictSwapAmountMsg,
+    rollover: String,
+    triple_weekday: String,
+    #[serde(default)]
+    skipped_weekdays: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictInstrumentCostsMsg {
+    #[serde(default)]
+    commission: Option<StrictCommissionModelMsg>,
+    #[serde(default)]
+    swap: Option<StrictSwapScheduleMsg>,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictBacktestConfigMsg {
     initial_balance: Option<f64>,
@@ -1083,6 +1174,8 @@ struct StrictBacktestConfigMsg {
     fill_model: Option<String>,
     #[serde(default)]
     sizing: Option<StrictSizingPolicyMsg>,
+    #[serde(default)]
+    costs: BTreeMap<String, StrictInstrumentCostsMsg>,
 }
 
 #[derive(Serialize, Deserialize)]

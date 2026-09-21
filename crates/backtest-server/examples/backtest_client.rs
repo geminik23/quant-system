@@ -561,6 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 1.0 }),
+                costs: Default::default(),
             },
         };
 

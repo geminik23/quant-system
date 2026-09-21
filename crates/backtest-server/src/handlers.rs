@@ -321,6 +321,21 @@ fn publish_job_status(job_id: &str, job: &BacktestJob) {
     job.updates.send_replace(job_status_response(job_id, job));
 }
 
+/// Price point size per active symbol, used to express stored bar spreads in price units.
+fn bar_point_sizes(
+    registry: &SymbolRegistry,
+    symbols: &[String],
+) -> std::collections::BTreeMap<String, f64> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            registry
+                .spec(symbol)
+                .map(|spec| (symbol.clone(), 10f64.powi(-i32::from(spec.digits))))
+        })
+        .collect()
+}
+
 /// Subscribe to the current and future coalesced snapshots of a retained job.
 pub fn subscribe_backtest_status(
     state: &ServerState,
@@ -799,6 +814,11 @@ fn execute_backtest_with_future_controlled(
                 });
             },
         )?;
+        let mut primary = primary;
+        primary.apply_bar_point_sizes(&bar_point_sizes(
+            &state.symbol_registry,
+            plan.active_symbols(),
+        ));
         progress(BacktestProgress {
             stage: "loading_conversion_data".into(),
             processed_symbols: total_symbols,
@@ -1196,7 +1216,13 @@ fn execute_backtest_multi_with_future(
             &mut never_cancelled,
             &mut |_| {},
         ) {
-            Ok(primary) => primary,
+            Ok(mut primary) => {
+                primary.apply_bar_point_sizes(&bar_point_sizes(
+                    &state.symbol_registry,
+                    plan.active_symbols(),
+                ));
+                primary
+            }
             Err(error) => return profile_error_results(req, error.to_string()),
         };
         let bundle = match describe_future_stream(
@@ -2554,6 +2580,7 @@ mod tests {
                 close_on_finish: None,
                 fill_model: None,
                 sizing: None,
+                costs: Default::default(),
             },
         };
         assert!(validate_request(&req).is_err());
@@ -2591,6 +2618,7 @@ mod tests {
                 close_on_finish: None,
                 fill_model: None,
                 sizing: None,
+                costs: Default::default(),
             },
         };
         assert!(validate_request(&req).is_err());
@@ -2628,6 +2656,7 @@ mod tests {
                 close_on_finish: None,
                 fill_model: None,
                 sizing: None,
+                costs: Default::default(),
             },
         };
         assert!(validate_request(&req).is_err());
@@ -2665,6 +2694,7 @@ mod tests {
                 close_on_finish: None,
                 fill_model: None,
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+                costs: Default::default(),
             },
         };
         assert!(validate_request(&req).is_ok());
@@ -2702,6 +2732,7 @@ mod tests {
                 close_on_finish: None,
                 fill_model: None,
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+                costs: Default::default(),
             },
         };
         req.config.sizing = None;
@@ -3162,6 +3193,7 @@ lot_step_units = 1
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing: Some(SizingPolicyMsg::FixedLot { lots: 0.01 }),
+                costs: Default::default(),
             },
         }
     }
@@ -3405,6 +3437,7 @@ lot_max_steps = 0
             close_on_finish: Some(true),
             fill_model: Some("BidAsk".into()),
             sizing: None,
+            costs: Default::default(),
         };
         let config = config_from_msg(&msg, &registry, &symbols).unwrap();
         assert_eq!(config.contract_sizes.get("xauusd"), Some(&100.0));

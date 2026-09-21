@@ -21,20 +21,24 @@ use qs_backtest::report::{
     StreakStats, SubsetStats, TradeResult,
 };
 use qs_backtest::runner::{BacktestConfig, FutureQuoteConfig};
-use qs_backtest::{MarketEntrySizingBasis, MtmOutputPolicy, MtmOutputSummary};
+use qs_backtest::{
+    CommissionModel, InstrumentCosts, MarketEntrySizingBasis, MtmOutputPolicy, MtmOutputSummary,
+    SwapAmount, SwapSchedule,
+};
 use qs_core::types::{FillModel, OrderType, Side};
 use qs_symbols::{SymbolRegistry, normalize_currency_code};
 
 use crate::error::BacktestServerError;
 use crate::rpc_types::{
     BacktestConfigMsg, BacktestResultMsg, BreakdownDimensionMsg, CloseReasonStatsMsg,
-    DurationStatsMsg, EntryGeometryPolicyMsg, EquityPoint, EvaluationGroupFilterMsg,
-    EvaluationPositionSideMsg, EvaluationSectionMsg, FutureBacktestResultMsg, FutureQuoteConfigMsg,
-    ManagementProfileMsg, MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg,
-    MtmOutputSummaryMsg, PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg,
-    PositionRefMsg, PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
+    CommissionModelMsg, DurationStatsMsg, EntryGeometryPolicyMsg, EquityPoint,
+    EvaluationGroupFilterMsg, EvaluationPositionSideMsg, EvaluationSectionMsg,
+    FutureBacktestResultMsg, FutureQuoteConfigMsg, InstrumentCostsMsg, ManagementProfileMsg,
+    MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg,
+    PendingOrderLifecycleEventMsg, PendingOrderLifecycleStateMsg, PositionRefMsg,
+    PositionSummaryMsg, ProviderEvaluationOptionsMsg, RawSignalMsg, RiskMetricsMsg,
     RuleConfigDefMsg, SizingPolicyMsg, StoplossModeMsg, StreakStatsMsg, SubsetStatsMsg,
-    TargetSelectionMsg, TargetSourceMsg, TradeResultMsg,
+    SwapAmountMsg, SwapScheduleMsg, TargetSelectionMsg, TargetSourceMsg, TradeResultMsg,
 };
 
 // ── Timestamp formatting ────────────────────────────────────────────────────
@@ -75,6 +79,7 @@ pub fn config_from_msg(
         symbol_specs.insert(symbol.clone(), spec.clone());
     }
     let sizing = msg.sizing.as_ref().map(sizing_from_msg).transpose()?;
+    let costs = costs_from_msg(&msg.costs)?;
     Ok(BacktestConfig {
         initial_balance,
         close_on_finish: msg.close_on_finish.unwrap_or(true),
@@ -83,6 +88,113 @@ pub fn config_from_msg(
         sizing,
         symbol_specs,
         instrument_manifest: None,
+        bar_spread_fallback: std::collections::HashMap::new(),
+        costs,
+    })
+}
+
+/// Convert the wire cost specification into validated per-symbol costs.
+///
+/// Values are validated here so an invalid specification is rejected at the request boundary rather than during replay. The run's account currency is not known at this point, so the currency agreement check stays with replay configuration validation.
+fn costs_from_msg(
+    msg: &std::collections::BTreeMap<String, InstrumentCostsMsg>,
+) -> crate::error::Result<std::collections::HashMap<String, InstrumentCosts>> {
+    let mut costs = std::collections::HashMap::with_capacity(msg.len());
+    for (symbol, entry) in msg {
+        if symbol.trim().is_empty() {
+            return Err(BacktestServerError::InvalidRequest(
+                "cost symbol must not be empty".into(),
+            ));
+        }
+        let converted = InstrumentCosts {
+            commission: entry
+                .commission
+                .as_ref()
+                .map(commission_from_msg)
+                .transpose()?,
+            swap: entry.swap.as_ref().map(swap_from_msg).transpose()?,
+        };
+        converted.validate().map_err(|error| {
+            BacktestServerError::InvalidRequest(format!("costs for {symbol} are invalid: {error}"))
+        })?;
+        costs.insert(symbol.to_uppercase(), converted);
+    }
+    Ok(costs)
+}
+
+fn commission_from_msg(msg: &CommissionModelMsg) -> crate::error::Result<CommissionModel> {
+    Ok(match msg {
+        CommissionModelMsg::PerLotPerSide { amount, currency } => {
+            let currency = normalize_currency_code(currency).ok_or_else(|| {
+                BacktestServerError::InvalidRequest(format!(
+                    "commission currency must be 3 ASCII letters, got '{currency}'"
+                ))
+            })?;
+            CommissionModel::PerLotPerSide {
+                amount: *amount,
+                currency,
+            }
+        }
+        CommissionModelMsg::NotionalRatePerSide {
+            buy_rate,
+            sell_rate,
+        } => CommissionModel::NotionalRatePerSide {
+            buy_rate: *buy_rate,
+            sell_rate: *sell_rate,
+        },
+    })
+}
+
+fn swap_from_msg(msg: &SwapScheduleMsg) -> crate::error::Result<SwapSchedule> {
+    let amount = match &msg.amount {
+        SwapAmountMsg::Points { long, short } => SwapAmount::Points {
+            long: *long,
+            short: *short,
+        },
+        SwapAmountMsg::Currency {
+            long,
+            short,
+            currency,
+        } => {
+            let currency = normalize_currency_code(currency).ok_or_else(|| {
+                BacktestServerError::InvalidRequest(format!(
+                    "swap currency must be 3 ASCII letters, got '{currency}'"
+                ))
+            })?;
+            SwapAmount::Currency {
+                long: *long,
+                short: *short,
+                currency,
+            }
+        }
+    };
+    let rollover = chrono::NaiveTime::parse_from_str(&msg.rollover, "%H:%M:%S").map_err(|_| {
+        BacktestServerError::InvalidRequest(format!(
+            "swap rollover must be HH:MM:SS, got '{}'",
+            msg.rollover
+        ))
+    })?;
+    let skipped_weekdays = if msg.skipped_weekdays.is_empty() {
+        vec![chrono::Weekday::Sat, chrono::Weekday::Sun]
+    } else {
+        msg.skipped_weekdays
+            .iter()
+            .map(|value| weekday_from_msg(value))
+            .collect::<crate::error::Result<Vec<_>>>()?
+    };
+    Ok(SwapSchedule {
+        amount,
+        rollover,
+        triple_weekday: weekday_from_msg(&msg.triple_weekday)?,
+        skipped_weekdays,
+    })
+}
+
+fn weekday_from_msg(value: &str) -> crate::error::Result<chrono::Weekday> {
+    value.parse::<chrono::Weekday>().map_err(|_| {
+        BacktestServerError::InvalidRequest(format!(
+            "weekday must be Mon through Sun, got '{value}'"
+        ))
     })
 }
 
@@ -1157,6 +1269,7 @@ mod tests {
             close_on_finish: None,
             fill_model: None,
             sizing: None,
+            costs: Default::default(),
         };
         let registry = qs_symbols::SymbolRegistry::empty();
         let symbols: Vec<String> = vec![];
@@ -1173,6 +1286,7 @@ mod tests {
             close_on_finish: Some(false),
             fill_model: Some("MidPrice".into()),
             sizing: None,
+            costs: Default::default(),
         };
         let registry = qs_symbols::SymbolRegistry::empty();
         let symbols: Vec<String> = vec![];
@@ -1189,6 +1303,7 @@ mod tests {
             close_on_finish: None,
             fill_model: None,
             sizing: Some(SizingPolicyMsg::BalanceRiskPercent { percent: 0.0 }),
+            costs: Default::default(),
         };
         let error = config_from_msg(&msg, &SymbolRegistry::empty(), &[]).unwrap_err();
         assert!(error.to_string().contains("balance risk percent"));

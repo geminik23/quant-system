@@ -1,6 +1,7 @@
 use qs_backtest_api::{
-    BacktestConfigMsg, BacktestRunSpec, EntryProfileRouteMsg, FutureQuoteConfigMsg, PositionRefMsg,
-    ProfileRef, ProviderEvaluationOptionsMsg, RawSignalMsg, ResultDeliveryMsg, RunBacktestRequest,
+    BacktestConfigMsg, BacktestRunSpec, CommissionModelMsg, EntryProfileRouteMsg,
+    FutureQuoteConfigMsg, PositionRefMsg, ProfileRef, ProviderEvaluationOptionsMsg, RawSignalMsg,
+    ResultDeliveryMsg, RunBacktestRequest,
 };
 use serde_json::{Value, json};
 
@@ -120,6 +121,53 @@ fn wrapped_run_requests_reject_unknown_fields_recursively() {
     rule["request"]["raw_signals"][0]["rule"]["unexpected"] = json!(true);
     cases.push(("rule definition", rule));
 
+    let mut costs = request_with_signal(entry());
+    costs["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "commission": {"type": "PerLotPerSide", "amount": 3.5, "currency": "USD"},
+            "unexpected": true
+        }
+    });
+    cases.push(("instrument costs", costs));
+
+    let mut commission = request_with_signal(entry());
+    commission["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "commission": {
+                "type": "NotionalRatePerSide",
+                "buy_rate": 0.005,
+                "sell_rate": 0.005,
+                "unexpected": true
+            }
+        }
+    });
+    cases.push(("commission model", commission));
+
+    let mut swap = request_with_signal(entry());
+    swap["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "swap": {
+                "amount": {"unit": "Points", "long": -6.1, "short": 1.9},
+                "rollover": "22:00:00",
+                "triple_weekday": "Wed",
+                "unexpected": true
+            }
+        }
+    });
+    cases.push(("swap schedule", swap));
+
+    let mut swap_amount = request_with_signal(entry());
+    swap_amount["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "swap": {
+                "amount": {"unit": "Points", "long": -6.1, "short": 1.9, "unexpected": true},
+                "rollover": "22:00:00",
+                "triple_weekday": "Wed"
+            }
+        }
+    });
+    cases.push(("swap amount", swap_amount));
+
     let mut future = request_with_signal(entry());
     future["future"] = json!({"unexpected": true});
     cases.push(("future config", future));
@@ -188,6 +236,7 @@ fn run_requests_support_parser_free_direct_construction() {
                 close_on_finish: Some(true),
                 fill_model: None,
                 sizing: None,
+                costs: Default::default(),
             },
         },
         future: FutureQuoteConfigMsg::default(),
@@ -203,4 +252,49 @@ fn run_requests_support_parser_free_direct_construction() {
         decoded.request.raw_signals[1],
         RawSignalMsg::ScaleIn { size: 0.25, .. }
     ));
+}
+
+#[test]
+fn run_requests_carry_per_symbol_costs() {
+    let mut value = request_with_signal(entry());
+    value["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "commission": {"type": "PerLotPerSide", "amount": 3.5, "currency": "USD"},
+            "swap": {
+                "amount": {"unit": "Points", "long": -6.1, "short": 1.9},
+                "rollover": "22:00:00",
+                "triple_weekday": "Wed"
+            }
+        },
+        "BTCUSD": {
+            "commission": {"type": "NotionalRatePerSide", "buy_rate": 0.005, "sell_rate": 0.005}
+        }
+    });
+
+    let decoded: RunBacktestRequest = serde_json::from_value(value).unwrap();
+    let costs = &decoded.request.config.costs;
+    assert_eq!(costs.len(), 2);
+    assert!(matches!(
+        costs["EURUSD"].commission,
+        Some(CommissionModelMsg::PerLotPerSide { amount, .. }) if amount == 3.5
+    ));
+    let swap = costs["EURUSD"].swap.as_ref().unwrap();
+    assert_eq!(swap.rollover, "22:00:00");
+    assert_eq!(swap.triple_weekday, "Wed");
+    assert!(swap.skipped_weekdays.is_empty());
+    assert!(matches!(
+        costs["BTCUSD"].commission,
+        Some(CommissionModelMsg::NotionalRatePerSide { buy_rate, sell_rate })
+            if buy_rate == 0.005 && sell_rate == 0.005
+    ));
+    assert!(costs["BTCUSD"].swap.is_none());
+}
+
+#[test]
+fn a_request_without_costs_stays_absent_on_the_wire() {
+    let value = request_with_signal(entry());
+    let decoded: RunBacktestRequest = serde_json::from_value(value).unwrap();
+    assert!(decoded.request.config.costs.is_empty());
+    let encoded = serde_json::to_value(&decoded).unwrap();
+    assert!(encoded["request"]["config"].get("costs").is_none());
 }

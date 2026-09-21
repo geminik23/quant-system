@@ -681,6 +681,7 @@ fn tick_requirement_rejects_primary_bars() {
             low: 0.9,
             close: 1.0,
             volume: 1,
+            spread: None,
         },
         EventMetadata::new(SeriesRoles::PRIMARY, 0, 0),
     );

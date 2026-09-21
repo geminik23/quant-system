@@ -39,12 +39,17 @@ pub mod strategy;
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
 pub use artifacts::{
-    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts,
+    CloseEvent, CompletedPosition, CostEvent, ExecutionMetadata, FutureBacktestArtifacts,
     InstrumentSizingArtifact, MarketEntrySizingAudit, MarketEntrySizingBasis, NetPnlOutcome,
     OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
     PendingOrderSnapshot, RecordedFill, ReplayInstrumentArtifact, ReplayInstrumentManifest,
     RiskBasisStatus, RiskTranche,
 };
+pub use qs_core::{
+    CommissionModel, CostBasis, CostCharge, CostKind, CostValidationError, InstrumentCosts,
+    SwapAmount, SwapSchedule,
+};
+
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
     ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,

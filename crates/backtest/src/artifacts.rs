@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use chrono::NaiveDateTime;
 use qs_core::{
-    CloseReason, EffectiveStop, EntryLevelResolution, ExecutionFill, ExecutionModel,
-    ManagementProfile, OrderType, PriceQuote, Side, TargetResolution,
+    CloseReason, CostKind, EffectiveStop, EntryLevelResolution, ExecutionFill, ExecutionModel,
+    InstrumentCosts, ManagementProfile, OrderType, PriceQuote, Side, TargetResolution,
 };
 use qs_instruments::{
     Decimal, GridAdjustment, InstrumentSpec, Money, ResolvedInstrumentRef, StoredSeriesBinding,
@@ -161,6 +161,15 @@ pub struct ExecutionMetadata {
     pub entry_profile_routes: BTreeMap<String, ManagementProfile>,
     /// Applied Entry profile selections and resolved initial levels.
     pub entry_profile_resolutions: Vec<EntryProfileResolutionAudit>,
+    /// Per-symbol commission and swap specification applied during the run.
+    #[serde(default)]
+    pub costs: BTreeMap<String, InstrumentCosts>,
+    /// Swap charges skipped because no causal conversion quote was available.
+    #[serde(default)]
+    pub unconverted_cost_events: u64,
+    /// Bar quotes executed with a zero spread because neither the bar nor a fallback supplied one.
+    #[serde(default)]
+    pub zero_spread_bar_quotes: u64,
     /// Quotes older than this at an equity observation are counted as stale.
     pub stale_quote_after_millis: Option<i64>,
     #[serde(default = "default_pnl_epsilon")]
@@ -185,6 +194,9 @@ impl Default for ExecutionMetadata {
             entry_profile_default: None,
             entry_profile_routes: BTreeMap::new(),
             entry_profile_resolutions: Vec::new(),
+            costs: BTreeMap::new(),
+            unconverted_cost_events: 0,
+            zero_spread_bar_quotes: 0,
             stale_quote_after_millis: None,
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
@@ -305,7 +317,11 @@ pub struct CloseEvent {
     /// Remaining-inventory average cost used to realize this close.
     #[serde(default)]
     pub entry_price: Option<f64>,
+    /// Realized profit and loss for this close, already net of `commission`.
     pub pnl: f64,
+    /// Account-currency exit commission already subtracted from `pnl`.
+    #[serde(default)]
+    pub commission: f64,
     #[serde(default)]
     pub native_pnl: Option<f64>,
     #[serde(default)]
@@ -331,6 +347,7 @@ impl Default for CloseEvent {
             price: 0.0,
             entry_price: None,
             pnl: 0.0,
+            commission: 0.0,
             native_pnl: None,
             native_currency: None,
             pnl_conversion: None,
@@ -366,6 +383,61 @@ impl CloseEvent {
             native_pnl: Some(pnl),
             reason,
             ..Self::default()
+        }
+    }
+}
+
+/// One commission or swap charge applied to the account during replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostEvent {
+    pub id: String,
+    pub position_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub ts: NaiveDateTime,
+    pub kind: CostKind,
+    /// Signed account-currency charge, where positive reduced the balance.
+    pub amount: f64,
+    /// Signed charge before account conversion, when the charge was computed in the instrument's native currency.
+    #[serde(default)]
+    pub native_amount: Option<f64>,
+    #[serde(default)]
+    pub native_currency: Option<String>,
+    #[serde(default)]
+    pub conversion: Option<ConversionResult>,
+    /// Lots the charge was computed on.
+    pub size: f64,
+    /// Number of rollover nights, for swap charges only.
+    #[serde(default)]
+    pub nights: Option<u32>,
+}
+
+impl CostEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        position_id: impl Into<String>,
+        sequence: u64,
+        symbol: impl Into<String>,
+        side: Side,
+        ts: NaiveDateTime,
+        kind: CostKind,
+        amount: f64,
+        size: f64,
+    ) -> Self {
+        let position_id = position_id.into();
+        Self {
+            id: deterministic_event_id(&position_id, kind.as_str(), sequence),
+            position_id,
+            symbol: symbol.into(),
+            side,
+            ts,
+            kind,
+            amount,
+            native_amount: None,
+            native_currency: None,
+            conversion: None,
+            size,
+            nights: None,
         }
     }
 }
@@ -508,7 +580,17 @@ pub struct CompletedPosition {
     pub close_ts: NaiveDateTime,
     pub entry_size: f64,
     pub average_entry_price: f64,
+    /// Realized profit and loss net of every commission and swap charged to this position.
     pub net_pnl: f64,
+    /// Realized profit and loss before any commission or swap, present only when a cost was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
+    /// Total account-currency commission charged on entry and exit fills.
+    #[serde(default)]
+    pub commission_total: f64,
+    /// Total account-currency swap charged while the position was open.
+    #[serde(default)]
+    pub swap_total: f64,
     #[serde(default)]
     pub native_net_pnl: Option<f64>,
     #[serde(default)]
@@ -544,6 +626,9 @@ impl Default for CompletedPosition {
             entry_size: 0.0,
             average_entry_price: 0.0,
             net_pnl: 0.0,
+            gross_pnl: None,
+            commission_total: 0.0,
+            swap_total: 0.0,
             native_net_pnl: None,
             native_currency: None,
             outcome: NetPnlOutcome::Breakeven,
@@ -637,6 +722,26 @@ impl CompletedPosition {
 
     pub fn initial_risk(&self) -> Option<f64> {
         summarize_risk(&self.risk_tranches, self.pnl_epsilon).1
+    }
+
+    /// Fold costs that are not attributable to a single close event into the net result.
+    ///
+    /// Exit commission is already subtracted from each close event's profit and loss, so only entry commission and swap are applied here. The call is a no-op when nothing was charged, which keeps cost-free runs byte-identical to runs produced before costs existed.
+    pub fn charge_position_costs(&mut self, entry_commission: f64, swap: f64) {
+        let exit_commission: f64 = self.close_events.iter().map(|event| event.commission).sum();
+        if entry_commission == 0.0 && swap == 0.0 && exit_commission == 0.0 {
+            return;
+        }
+        self.commission_total = entry_commission + exit_commission;
+        self.swap_total = swap;
+        self.gross_pnl = Some(self.net_pnl + exit_commission);
+        self.net_pnl -= entry_commission + swap;
+        self.outcome = Self::classify(self.net_pnl, self.pnl_epsilon);
+        let epsilon = self.pnl_epsilon;
+        self.realized_r = self
+            .initial_risk()
+            .filter(|risk| *risk > epsilon)
+            .map(|risk| self.net_pnl / risk);
     }
 }
 
@@ -926,6 +1031,9 @@ pub struct FutureBacktestArtifacts {
     pub execution: ExecutionMetadata,
     pub fills: Vec<RecordedFill>,
     pub close_events: Vec<CloseEvent>,
+    /// Commission and swap charges applied during the run, in application order.
+    #[serde(default)]
+    pub cost_events: Vec<CostEvent>,
     pub completed_positions: Vec<CompletedPosition>,
     pub open_positions: Vec<OpenPositionSnapshot>,
     pub pending_orders: Vec<PendingOrderSnapshot>,
@@ -944,6 +1052,7 @@ impl Default for FutureBacktestArtifacts {
             execution: ExecutionMetadata::default(),
             fills: Vec::new(),
             close_events: Vec::new(),
+            cost_events: Vec::new(),
             completed_positions: Vec::new(),
             open_positions: Vec::new(),
             pending_orders: Vec::new(),
