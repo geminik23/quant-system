@@ -380,17 +380,19 @@ pub enum EvaluationSectionMsg {
     RMetrics,
     Excursions,
     Execution,
+    Costs,
     Robustness,
     Breakdowns,
 }
 
 impl EvaluationSectionMsg {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Coverage,
         Self::PositionPerformance,
         Self::RMetrics,
         Self::Excursions,
         Self::Execution,
+        Self::Costs,
         Self::Robustness,
         Self::Breakdowns,
     ];
@@ -661,6 +663,40 @@ pub struct BacktestResultMsg {
     /// Additive FutureQuoteV1 artifacts.
     #[serde(default)]
     pub future: Option<FutureBacktestResultMsg>,
+
+    /// Total account-currency commission charged across every entry and exit fill.
+    #[serde(default)]
+    pub total_commission: f64,
+    /// Total account-currency swap charged across every rollover.
+    #[serde(default)]
+    pub total_swap: f64,
+    /// Realized profit and loss before commission and swap, present only when a cost was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
+    /// Commission and swap charges in application order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost_events: Vec<CostEventMsg>,
+}
+
+/// Wire-safe mirror of one commission or swap charge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostEventMsg {
+    pub id: String,
+    pub position_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub ts: String,
+    /// `entry_commission`, `exit_commission`, or `swap`.
+    pub kind: String,
+    /// Signed account-currency charge, where positive reduced the balance.
+    pub amount: f64,
+    #[serde(default)]
+    pub native_amount: Option<f64>,
+    #[serde(default)]
+    pub native_currency: Option<String>,
+    pub size: f64,
+    #[serde(default)]
+    pub nights: Option<u32>,
 }
 
 /// Wire-safe mark-to-market output counts.
@@ -764,6 +800,12 @@ pub struct SubsetStatsMsg {
     pub expectancy: f64,
     pub largest_win: f64,
     pub largest_loss: f64,
+    /// Exit commission charged across this subset's closes.
+    #[serde(default)]
+    pub exit_commission: f64,
+    /// Subset profit and loss before exit commission, present only when one was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
 }
 
 /// Wire-safe mirror of `StreakStats`.
@@ -850,7 +892,14 @@ pub struct TradeResultMsg {
     pub entry_price: f64,
     pub exit_price: f64,
     pub size: f64,
+    /// Realized profit and loss for this close, already net of `commission`.
     pub pnl: f64,
+    /// Account-currency exit commission already subtracted from `pnl`.
+    #[serde(default)]
+    pub commission: f64,
+    /// Profit and loss before `commission`, present only when a commission was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
     pub open_ts: String,
     pub close_ts: String,
     pub close_reason: String,

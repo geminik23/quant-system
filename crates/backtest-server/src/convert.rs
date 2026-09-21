@@ -31,7 +31,7 @@ use qs_symbols::{SymbolRegistry, normalize_currency_code};
 use crate::error::BacktestServerError;
 use crate::rpc_types::{
     BacktestConfigMsg, BacktestResultMsg, BreakdownDimensionMsg, CloseReasonStatsMsg,
-    CommissionModelMsg, DurationStatsMsg, EntryGeometryPolicyMsg, EquityPoint,
+    CommissionModelMsg, CostEventMsg, DurationStatsMsg, EntryGeometryPolicyMsg, EquityPoint,
     EvaluationGroupFilterMsg, EvaluationPositionSideMsg, EvaluationSectionMsg,
     FutureBacktestResultMsg, FutureQuoteConfigMsg, InstrumentCostsMsg, ManagementProfileMsg,
     MarketEntrySizingBasisMsg, MonthlyReturnMsg, MtmOutputPolicyMsg, MtmOutputSummaryMsg,
@@ -498,6 +498,7 @@ fn section_from_msg(section: EvaluationSectionMsg) -> EvaluationSection {
         EvaluationSectionMsg::RMetrics => EvaluationSection::RMetrics,
         EvaluationSectionMsg::Excursions => EvaluationSection::Excursions,
         EvaluationSectionMsg::Execution => EvaluationSection::Execution,
+        EvaluationSectionMsg::Costs => EvaluationSection::Costs,
         EvaluationSectionMsg::Robustness => EvaluationSection::Robustness,
         EvaluationSectionMsg::Breakdowns => EvaluationSection::Breakdowns,
     }
@@ -825,6 +826,26 @@ pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
                 provider_evaluation: serde_json::to_value(&r.provider_evaluation)
                     .unwrap_or(serde_json::Value::Null),
             }),
+        total_commission: r.total_commission,
+        total_swap: r.total_swap,
+        gross_pnl: r.gross_pnl,
+        cost_events: r.cost_events.iter().map(cost_event_to_msg).collect(),
+    }
+}
+
+fn cost_event_to_msg(event: &qs_backtest::CostEvent) -> CostEventMsg {
+    CostEventMsg {
+        id: event.id.clone(),
+        position_id: event.position_id.clone(),
+        symbol: event.symbol.clone(),
+        side: format!("{:?}", event.side),
+        ts: ndt_to_string(event.ts),
+        kind: event.kind.as_str().to_owned(),
+        amount: event.amount,
+        native_amount: event.native_amount,
+        native_currency: event.native_currency.clone(),
+        size: event.size,
+        nights: event.nights,
     }
 }
 
@@ -879,6 +900,8 @@ fn subset_stats_to_msg(s: &SubsetStats) -> SubsetStatsMsg {
         expectancy: s.expectancy,
         largest_win: s.largest_win,
         largest_loss: s.largest_loss,
+        exit_commission: s.exit_commission,
+        gross_pnl: s.gross_pnl,
     }
 }
 
@@ -941,6 +964,8 @@ fn trade_result_to_msg(t: &TradeResult) -> TradeResultMsg {
         exit_price: t.exit_price,
         size: t.size,
         pnl: t.pnl,
+        commission: t.commission,
+        gross_pnl: t.gross_pnl,
         open_ts: ndt_to_string(t.open_ts),
         close_ts: ndt_to_string(t.close_ts),
         close_reason: format!("{:?}", t.close_reason),
@@ -1405,6 +1430,8 @@ mod tests {
             close_ts: ts(11, 0, 0),
             close_reason: CloseReason::Target,
             group: Some("g1".into()),
+            commission: 0.0,
+            gross_pnl: None,
         };
         let msg = trade_result_to_msg(&tr);
         assert_eq!(msg.position_id, "p1");
@@ -1432,6 +1459,8 @@ mod tests {
             expectancy: 50.0,
             largest_win: 60.0,
             largest_loss: 0.0,
+            exit_commission: 0.0,
+            gross_pnl: None,
         };
         let msg = subset_stats_to_msg(&s);
         assert!((msg.profit_factor - 0.0).abs() < f64::EPSILON);

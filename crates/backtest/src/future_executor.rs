@@ -1271,6 +1271,8 @@ impl FutureExecutor {
             close_ts: fill.ts,
             close_reason: reason,
             group: account.group.clone(),
+            commission: 0.0,
+            gross_pnl: None,
         };
 
         self.balance = next_balance;

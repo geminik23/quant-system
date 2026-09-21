@@ -20,8 +20,8 @@ use crate::artifacts::{
 };
 use crate::evaluation::{
     EvaluationOptions, EvaluationReport, EvaluationRequest, ExcursionInput,
-    ExecutionDiagnosticsInput, LifecycleCounts, OutcomeClassification, PositionDimensions,
-    PositionOutcome, PositionSide, evaluate,
+    ExecutionDiagnosticsInput, LifecycleCounts, OutcomeClassification, PositionCostsInput,
+    PositionDimensions, PositionOutcome, PositionSide, evaluate,
 };
 use crate::ledger::{ActionDisposition, ActionDispositionStatus};
 use crate::mtm::MtmOutputSummary;
@@ -65,7 +65,14 @@ pub struct TradeResult {
     pub entry_price: f64,
     pub exit_price: f64,
     pub size: f64,
+    /// Realized profit and loss for this close, already net of `commission`.
     pub pnl: f64,
+    /// Account-currency exit commission already subtracted from `pnl`.
+    #[serde(default)]
+    pub commission: f64,
+    /// Profit and loss before `commission`, present only when a commission was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
     pub open_ts: NaiveDateTime,
     pub close_ts: NaiveDateTime,
     pub close_reason: CloseReason,
@@ -111,6 +118,14 @@ pub struct SubsetStats {
     pub largest_win: f64,
     /// Largest single losing trade (as positive number).
     pub largest_loss: f64,
+    /// Exit commission charged across this subset's closes.
+    ///
+    /// Entry commission and swap belong to a position rather than to one close event and are not attributed to a subset. Complete cost totals live on the run result and on each completed position.
+    #[serde(default)]
+    pub exit_commission: f64,
+    /// Subset profit and loss before exit commission, present only when one was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
 }
 
 impl SubsetStats {
@@ -182,6 +197,9 @@ impl SubsetStats {
             .map(|t| t.pnl.abs())
             .fold(0.0_f64, f64::max);
 
+        let exit_commission: f64 = trades.iter().map(|t| t.commission).sum();
+        let gross_pnl = (exit_commission != 0.0).then_some(total_pnl + exit_commission);
+
         Self {
             total_trades,
             winning_trades,
@@ -198,6 +216,8 @@ impl SubsetStats {
             expectancy,
             largest_win,
             largest_loss,
+            exit_commission,
+            gross_pnl,
         }
     }
 
@@ -1314,6 +1334,8 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
             exit_price: event.price,
             size: event.size,
             pnl: event.pnl,
+            commission: event.commission,
+            gross_pnl: (event.commission != 0.0).then_some(event.pnl + event.commission),
             open_ts,
             close_ts: event.ts,
             close_reason: event.reason,
@@ -1411,6 +1433,12 @@ fn evaluate_future_positions(
                 r_multiple: position.realized_r,
                 excursions,
                 execution,
+                costs: (position.commission_total != 0.0 || position.swap_total != 0.0).then_some(
+                    PositionCostsInput {
+                        commission: position.commission_total,
+                        swap: position.swap_total,
+                    },
+                ),
             }
         })
         .collect();
@@ -1777,6 +1805,8 @@ mod tests {
                 CloseReason::Manual
             },
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         }
     }
 
@@ -1806,6 +1836,8 @@ mod tests {
             close_ts,
             close_reason: reason,
             group,
+            commission: 0.0,
+            gross_pnl: None,
         }
     }
 
@@ -2582,6 +2614,8 @@ mod tests {
             close_ts: ts(2026, 1, 1, 11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let t2 = TradeResult {
             position_id: "p1".into(),
@@ -2595,6 +2629,8 @@ mod tests {
             close_ts: ts(2026, 1, 1, 14, 0, 0),
             close_reason: CloseReason::Stoploss,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let refs: Vec<&TradeResult> = vec![&t1, &t2];
         let ps = PositionSummary::from_trades(&refs);
@@ -2625,6 +2661,8 @@ mod tests {
             close_ts: ts_hms(11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let close_after_scale_in = TradeResult {
             position_id: "scaled".into(),
@@ -2638,6 +2676,8 @@ mod tests {
             close_ts: ts_hms(12, 0, 0),
             close_reason: CloseReason::Manual,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let trades = [&first_partial_close, &close_after_scale_in];
 
@@ -2661,6 +2701,8 @@ mod tests {
             close_ts: ts_hms(11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let close_after_scale_in = TradeResult {
             position_id: "scaled".into(),
@@ -2674,6 +2716,8 @@ mod tests {
             close_ts: ts_hms(12, 0, 0),
             close_reason: CloseReason::Manual,
             group: None,
+            commission: 0.0,
+            gross_pnl: None,
         };
         let trades = [&first_partial_close, &close_after_scale_in];
 
@@ -2707,6 +2751,8 @@ mod tests {
                 close_ts: ts(2026, 1, 1, 11, 0, 0),
                 close_reason: CloseReason::Target,
                 group: None,
+                commission: 0.0,
+                gross_pnl: None,
             },
             TradeResult {
                 position_id: "p1".into(),
@@ -2720,6 +2766,8 @@ mod tests {
                 close_ts: ts(2026, 1, 1, 14, 0, 0),
                 close_reason: CloseReason::Stoploss,
                 group: None,
+                commission: 0.0,
+                gross_pnl: None,
             },
         ];
         let result = BacktestResult::from_trade_log(10_000.0, trades);

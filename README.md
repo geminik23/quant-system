@@ -11,7 +11,7 @@ It is not a complete automated trading platform. It does not currently execute l
 | Goal | Start here | Readiness |
 |---|---|---|
 | Run a deterministic signal backtest | [Five-minute quick start](docs/getting-started.md) | Available; a synthetic fixture is included |
-| Import and manage historical data | [`qs-data-preprocess` guide](crates/data-preprocess/GUIDE.md) | Available for supported tick and bar exports |
+| Import, resample, and manage historical data | [`qs-data-preprocess` guide](crates/data-preprocess/GUIDE.md) | Available for supported tick and bar exports; stored bars can be built from stored ticks |
 | Embed the pure trade engine or strict raw-signal contracts | [`quant-system-core`](crates/core) | Library-only |
 | Compile and evaluate reusable configured strategy behavior | [`qs-strategy`](crates/strategy) | Library-only; synchronous core |
 | Build an in-process historical strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
@@ -87,7 +87,7 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 
 ## Current boundaries
 
-- Bars are replayed as close-only, zero-spread quotes, so exact intrabar execution is not simulated.
+- Bars are replayed at their close with the spread recorded while the bar formed, or with a configured per-symbol fallback. A bar that supplies neither executes at a zero spread and the run counts how often that happened. Exact intrabar execution is never simulated from bars; use ticks when the ordering of stop, target, and management events matters.
 - Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
 - `qs-strategy` provides a reusable synchronous configured strategy core with recursively strict unversioned configuration, bounded logical bar sources, source-specific input requirements, an explicit immutable material library, typed bounded expressions, deterministic material and finite-state evaluation, total vacant/pending/open trade-slot facts, generic decisions and notes, and validated command-correlated strict `RawSignal` values. It remains library-only and owns no historical feeds, services, live runtime, persistence, or management-profile composition.
 - `qs-backtest` provides validated historical strategy contracts and a configured-strategy adapter over the existing FutureQuote scheduler. The adapter performs complete logical-source binding, exact tick-count volume projection, named-input projection, total trade-slot projection, ordered command provenance and committed feedback, final feedback processing, decision and note mapping, and unprofiled Entry reuse while rejecting supplied management profiles before feed consumption.

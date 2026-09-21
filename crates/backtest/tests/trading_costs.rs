@@ -431,3 +431,82 @@ fn run_signal_window(
         None,
     )
 }
+
+#[test]
+fn trade_rows_carry_their_exit_commission() {
+    let result = flat_run(HashMap::from([(
+        SYMBOL.to_owned(),
+        per_lot_commission(3.5),
+    )]));
+    let trade = &result.trade_log[0];
+    assert_eq!(trade.commission, 3.5);
+    assert!((trade.gross_pnl.unwrap() - (trade.pnl + 3.5)).abs() < 1.0e-9);
+
+    // Entry commission and swap belong to the position, so a trade row never claims them.
+    let summed: f64 = result.trade_log.iter().map(|trade| trade.commission).sum();
+    assert!(summed < result.total_commission);
+}
+
+#[test]
+fn trade_rows_without_costs_report_nothing() {
+    let result = flat_run(HashMap::new());
+    let trade = &result.trade_log[0];
+    assert_eq!(trade.commission, 0.0);
+    assert_eq!(trade.gross_pnl, None);
+    assert_eq!(result.summary.exit_commission, 0.0);
+    assert_eq!(result.summary.gross_pnl, None);
+}
+
+#[test]
+fn subset_statistics_report_exit_commission() {
+    let result = flat_run(HashMap::from([(
+        SYMBOL.to_owned(),
+        per_lot_commission(3.5),
+    )]));
+    let summary = &result.summary;
+    assert_eq!(summary.exit_commission, 3.5);
+    assert!((summary.gross_pnl.unwrap() - (summary.total_pnl + 3.5)).abs() < 1.0e-9);
+
+    let per_symbol = &result.per_symbol[SYMBOL];
+    assert_eq!(per_symbol.exit_commission, 3.5);
+}
+
+#[test]
+fn provider_evaluation_reports_a_cost_section() {
+    let result = flat_run(HashMap::from([(
+        SYMBOL.to_owned(),
+        per_lot_commission(3.5),
+    )]));
+    let costs = result
+        .provider_evaluation
+        .as_ref()
+        .unwrap()
+        .costs
+        .as_ref()
+        .unwrap();
+
+    assert_eq!(costs.positions_with_costs, 1);
+    assert_eq!(costs.total_commission, 7.0);
+    assert_eq!(costs.total_swap, 0.0);
+    assert_eq!(costs.total_cost, 7.0);
+    assert!((costs.gross_outcome - 100.0).abs() < 1.0e-6);
+    assert!((costs.net_outcome - 93.0).abs() < 1.0e-6);
+    assert!((costs.cost_share_of_gross.value.unwrap() - 0.07).abs() < 1.0e-6);
+    assert!((costs.mean_cost_per_position.value.unwrap() - 7.0).abs() < 1.0e-9);
+}
+
+#[test]
+fn a_cost_free_run_reports_an_empty_cost_section() {
+    let result = flat_run(HashMap::new());
+    let costs = result
+        .provider_evaluation
+        .as_ref()
+        .unwrap()
+        .costs
+        .as_ref()
+        .unwrap();
+    assert_eq!(costs.positions_with_costs, 0);
+    assert_eq!(costs.total_cost, 0.0);
+    assert!((costs.gross_outcome - costs.net_outcome).abs() < 1.0e-12);
+    assert!(costs.mean_cost_per_position.value.is_none());
+}

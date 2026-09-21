@@ -250,6 +250,8 @@ impl BacktestExecutor {
             close_ts: quote.ts,
             close_reason: reason,
             group: entry.group.clone(),
+            commission: 0.0,
+            gross_pnl: None,
         });
 
         // If partial, reduce the remaining size for future closes.

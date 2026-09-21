@@ -75,7 +75,9 @@ Commission is charged on every entry, scale-in, and closing fill. Swap is charge
 
 Point-denominated swap and notional-rate commission are computed in the instrument's native profit-and-loss currency and converted through the run's existing conversion routes; per-lot amounts are already in the account currency and are validated against it. A swap charge that has no causal conversion quote is skipped and counted in execution metadata rather than silently applied.
 
-Reported results are net of costs. Each close event carries the exit commission already subtracted from its profit and loss, each completed position reports commission and swap totals alongside a gross figure, and realized R is computed from the net result. The run reports total commission, total swap, and the full ordered list of charges.
+Reported results are net of costs. Each close event and trade row carries the exit commission already subtracted from its profit and loss, each completed position reports commission and swap totals alongside a gross figure, and realized R is computed from the net result. The run reports total commission, total swap, and the full ordered list of charges, and provider evaluation gains a cost section showing the gross and net outcome, the total charged, and the cost share of the gross outcome.
+
+Subset statistics report exit commission only. Entry commission and swap are charged per position rather than per close event, so they are not attributed to an arbitrary subset of trades; complete totals stay on the run result and on each completed position.
 
 Costs are configured through `BacktestConfig.costs` in the library, through `config.costs` in a service request, or through `tg_backtest --costs-file`. The wire and file forms use the same strict shape, reject unknown fields, and are validated at the request boundary before any data loading. The client reads its cost file before connecting, so an invalid file fails immediately.
 

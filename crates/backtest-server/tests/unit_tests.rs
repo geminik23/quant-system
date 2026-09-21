@@ -2501,6 +2501,8 @@ fn result_msg_sanitizes_infinity_profit_factor() {
         expectancy: 50.0,
         largest_win: 60.0,
         largest_loss: 0.0,
+        exit_commission: 0.0,
+        gross_pnl: None,
     };
     let msg = result_to_msg(&BacktestResult {
         summary: stats,
@@ -2932,6 +2934,8 @@ fn subset_stats_msg_serde_roundtrip() {
         expectancy: 15.0,
         largest_win: 80.0,
         largest_loss: 60.0,
+        exit_commission: 0.0,
+        gross_pnl: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: SubsetStatsMsg = serde_json::from_str(&json).unwrap();
@@ -3010,6 +3014,8 @@ fn trade_result_msg_serde_roundtrip() {
         close_ts: "2026-01-15T11:00:00".into(),
         close_reason: "Target".into(),
         group: Some("g1".into()),
+        commission: 0.0,
+        gross_pnl: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let decoded: TradeResultMsg = serde_json::from_str(&json).unwrap();
