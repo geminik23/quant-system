@@ -73,7 +73,9 @@ pub struct ProjectedNamedInput {
 }
 
 /// Pure historical projection for one configured named input.
-pub trait HistoricalNamedInputProjector {
+///
+/// A projector must be movable between threads. It is a deterministic transformation over a borrowed context, so an implementation that could not move holds shared state it has no reason to hold. The bound also keeps one projector implementation usable by both the historical adapter and a later live adapter, which must run inside its own task.
+pub trait HistoricalNamedInputProjector: Send {
     fn output_type(&self) -> ValueType;
 
     fn project(

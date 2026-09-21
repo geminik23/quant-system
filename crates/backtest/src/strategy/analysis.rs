@@ -809,7 +809,9 @@ impl<'a> AnalysisContext<'a> {
 }
 
 /// Synchronous extension point for causal bar analysis.
-pub trait HistoricalAnalyzer {
+///
+/// An analyzer must be movable between threads, for the same reason a named-input projector must: it is a deterministic accumulation over borrowed bars, and the same implementation has to serve a replay running on a worker thread and a live instance running in its own task.
+pub trait HistoricalAnalyzer: Send {
     fn on_bar(
         &mut self,
         bar: &ClosedBar,

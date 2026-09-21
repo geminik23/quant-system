@@ -42,11 +42,11 @@ use crate::convert::{
 use crate::error::{BacktestServerError, Result};
 use crate::fx_loader::describe_future_stream;
 use crate::instrument_catalog::InstrumentDomain;
-use crate::market_loader::{
-    CancellationCheck, MarketStreamDescription, MarketStreamError, describe_primary_market_stream,
-};
 use crate::replay_plan::{ReplayPlan, RequestedSymbolScope};
 use crate::rpc_types::*;
+use qs_market_loader::{
+    CancellationCheck, MarketStreamDescription, MarketStreamError, describe_primary_market_stream,
+};
 
 /// Shared state accessible by all client handlers.
 pub struct ServerState {
@@ -711,7 +711,7 @@ fn map_streaming_replay_error(
         StreamingReplayError::Feed(KWayMergeError::Source {
             error: EventBatchFeedError::Source(error),
             ..
-        }) => error,
+        }) => error.into(),
         StreamingReplayError::Feed(error) => BacktestServerError::MarketStream(error.to_string()),
     }
 }

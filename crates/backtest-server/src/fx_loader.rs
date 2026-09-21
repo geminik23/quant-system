@@ -14,7 +14,7 @@ use qs_core::types::PriceQuote;
 use qs_symbols::SymbolRegistry;
 
 use crate::error::{BacktestServerError, Result};
-use crate::market_loader::{MarketSeriesDescription, MarketStreamDescription};
+use qs_market_loader::{MarketSeriesDescription, MarketStreamDescription};
 
 #[cfg(test)]
 pub(crate) struct LoadedFutureBundle {
@@ -717,7 +717,7 @@ lot_step_units = 1000
             ])
             .unwrap();
         let mut never_cancelled = || false;
-        let primary = crate::market_loader::describe_primary_market_stream(
+        let primary = qs_market_loader::describe_primary_market_stream(
             data_dir.to_str().unwrap(),
             "ctrader",
             &["usdjpy".into()],

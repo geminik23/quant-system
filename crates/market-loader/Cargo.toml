@@ -1,0 +1,24 @@
+[package]
+name = "qs-market-loader"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Reopenable stored-market-data streams for quant-system historical replay"
+keywords = ["backtest", "market-data", "parquet", "trading"]
+categories = ["finance"]
+
+[lib]
+name = "qs_market_loader"
+
+[dependencies]
+qs-backtest = { workspace = true }
+qs-data-preprocess = { workspace = true, features = ["parquet"] }
+
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+qs-instruments = { workspace = true }

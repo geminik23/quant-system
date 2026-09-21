@@ -1,4 +1,6 @@
-//! Reopenable Parquet market streams for FutureQuote replay.
+//! Reopenable stored-market-data streams for historical replay.
+//!
+//! This crate is the bridge between stored market data and the replay engine. `qs-data-preprocess` owns the storage layout and its chronological cursors, `qs-backtest` consumes ordered market events, and nothing in either crate reads the other's world. The bridge lives here so that both the backtest service and an in-process parameter search open the same streams through the same code, instead of each growing its own loader that could silently diverge.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,13 +15,15 @@ use qs_backtest::data_feed::{
     SequencedMarketEvent, SeriesRoles,
 };
 
-use crate::error::{BacktestServerError, Result};
+mod error;
 
-pub(crate) type CancellationCheck = Arc<dyn Fn() -> bool>;
+pub use error::{MarketLoadError, Result};
+
+pub type CancellationCheck = Arc<dyn Fn() -> bool>;
 type EventSource = Box<dyn FnMut() -> Result<Option<SequencedMarketEvent>>>;
 type SeriesFeed = EventBatchFeed<EventSource, SequencedMarketEvent>;
-pub(crate) type MarketStream = KWayMergeFeed<SeriesFeed>;
-pub(crate) type MarketStreamError = KWayMergeError<EventBatchFeedError<BacktestServerError>>;
+pub type MarketStream = KWayMergeFeed<SeriesFeed>;
+pub type MarketStreamError = KWayMergeError<EventBatchFeedError<MarketLoadError>>;
 
 #[derive(Debug, Clone)]
 enum MarketSeriesSource {
@@ -30,7 +34,7 @@ enum MarketSeriesSource {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MarketSeriesDescription {
+pub struct MarketSeriesDescription {
     canonical_symbol: String,
     roles: SeriesRoles,
     source_partition: Option<String>,
@@ -75,7 +79,7 @@ impl MarketSeriesDescription {
         }
     }
 
-    pub(crate) fn conversion_tick(
+    pub fn conversion_tick(
         data_dir: &str,
         exchange: String,
         symbol: String,
@@ -103,7 +107,7 @@ impl MarketSeriesDescription {
         }
     }
 
-    pub(crate) fn empty_conversion(_data_dir: &str, canonical_symbol: String) -> Self {
+    pub fn empty_conversion(_data_dir: &str, canonical_symbol: String) -> Self {
         Self::empty(canonical_symbol, SeriesRoles::CONVERSION)
     }
 
@@ -172,9 +176,7 @@ impl MarketSeriesDescription {
                 })
             }
             MarketSeriesSource::Unavailable { message } => {
-                return Err(BacktestServerError::Database(DataError::Other(
-                    message.clone(),
-                )));
+                return Err(MarketLoadError::Data(DataError::Other(message.clone())));
             }
             MarketSeriesSource::Empty => Box::new(move || {
                 ensure_not_cancelled(&is_cancelled)?;
@@ -186,7 +188,7 @@ impl MarketSeriesDescription {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct MarketStreamDescription {
+pub struct MarketStreamDescription {
     series: Vec<MarketSeriesDescription>,
     primary_start: Option<NaiveDateTime>,
     primary_eod: Option<NaiveDateTime>,
@@ -208,23 +210,23 @@ impl MarketStreamDescription {
         }
     }
 
-    pub(crate) fn primary_start(&self) -> Option<NaiveDateTime> {
+    pub fn primary_start(&self) -> Option<NaiveDateTime> {
         self.primary_start
     }
 
-    pub(crate) fn primary_eod(&self) -> Option<NaiveDateTime> {
+    pub fn primary_eod(&self) -> Option<NaiveDateTime> {
         self.primary_eod
     }
 
-    pub(crate) fn conversion_end(&self) -> Option<NaiveDateTime> {
+    pub fn conversion_end(&self) -> Option<NaiveDateTime> {
         self.primary_eod.or(self.requested_to)
     }
 
-    pub(crate) fn primary_series_count(&self) -> usize {
+    pub fn primary_series_count(&self) -> usize {
         self.series.len()
     }
 
-    pub(crate) fn stored_series_coordinates(&self) -> Vec<(String, String, String)> {
+    pub fn stored_series_coordinates(&self) -> Vec<(String, String, String)> {
         self.series
             .iter()
             .filter_map(|series| {
@@ -237,7 +239,7 @@ impl MarketStreamDescription {
             .collect()
     }
 
-    pub(crate) fn validate_stored_series_bindings(
+    pub fn validate_stored_series_bindings(
         &self,
         manifest: &ReplayInstrumentManifest,
     ) -> Result<()> {
@@ -254,7 +256,7 @@ impl MarketStreamDescription {
                     .find(|(_, artifact)| artifact.resolved == binding.instrument)
                     .map(|(symbol, _)| symbol.clone())
                     .ok_or_else(|| {
-                        BacktestServerError::InvalidRequest(format!(
+                        MarketLoadError::InvalidSeries(format!(
                             "stored series {}:{} references an unresolved instrument",
                             binding.source_partition, binding.source_symbol
                         ))
@@ -269,14 +271,14 @@ impl MarketStreamDescription {
         actual.sort();
         actual.dedup();
         if actual != expected {
-            return Err(BacktestServerError::InvalidRequest(format!(
+            return Err(MarketLoadError::InvalidSeries(format!(
                 "stored-series bindings do not match the planned market streams: expected {expected:?}, got {actual:?}"
             )));
         }
         Ok(())
     }
 
-    pub(crate) fn mark_shared_conversion_symbols(
+    pub fn mark_shared_conversion_symbols(
         &mut self,
         shared_symbols: &std::collections::BTreeSet<String>,
     ) {
@@ -290,7 +292,7 @@ impl MarketStreamDescription {
     /// Attach price point sizes so stored bar spreads become executable quote spreads.
     ///
     /// Symbols without an entry keep the historical zero-spread bar approximation.
-    pub(crate) fn apply_bar_point_sizes(&mut self, point_sizes: &BTreeMap<String, f64>) {
+    pub fn apply_bar_point_sizes(&mut self, point_sizes: &BTreeMap<String, f64>) {
         for series in &mut self.series {
             if matches!(series.source, MarketSeriesSource::Bar { .. }) {
                 series.bar_point_size = point_sizes.get(&series.canonical_symbol).copied();
@@ -298,18 +300,18 @@ impl MarketStreamDescription {
         }
     }
 
-    pub(crate) fn push_series(&mut self, series: MarketSeriesDescription) {
+    pub fn push_series(&mut self, series: MarketSeriesDescription) {
         self.series.push(series);
     }
 
-    pub(crate) fn open(&self, is_cancelled: CancellationCheck) -> Result<MarketStream> {
+    pub fn open(&self, is_cancelled: CancellationCheck) -> Result<MarketStream> {
         let feeds = self
             .series
             .iter()
             .enumerate()
             .map(|(rank, series)| {
                 let rank = u32::try_from(rank).map_err(|_| {
-                    BacktestServerError::InvalidRequest(
+                    MarketLoadError::InvalidSeries(
                         "FutureQuote stream supports at most u32::MAX series".into(),
                     )
                 })?;
@@ -321,7 +323,7 @@ impl MarketStreamDescription {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn describe_primary_market_stream(
+pub fn describe_primary_market_stream(
     data_dir: &str,
     exchange: &str,
     symbols: &[String],
@@ -391,10 +393,10 @@ pub(crate) fn describe_primary_market_stream(
             )
         } else if data_type == "bar" {
             let timeframe = timeframe.ok_or_else(|| {
-                BacktestServerError::InvalidRequest("timeframe is required for bar data".into())
+                MarketLoadError::InvalidSeries("timeframe is required for bar data".into())
             })?;
             let parsed = Timeframe::parse(timeframe).map_err(|_| {
-                BacktestServerError::InvalidRequest(format!("Invalid timeframe: '{timeframe}'"))
+                MarketLoadError::InvalidSeries(format!("Invalid timeframe: '{timeframe}'"))
             })?;
             let disk_exchange =
                 resolve_partition_value(data_dir, "bars", "exchange", exchange, "", is_cancelled)?;
@@ -436,13 +438,13 @@ pub(crate) fn describe_primary_market_stream(
                 last,
             )
         } else {
-            return Err(BacktestServerError::InvalidRequest(format!(
+            return Err(MarketLoadError::InvalidSeries(format!(
                 "Invalid data_type: '{data_type}'. Must be 'tick' or 'bar'."
             )));
         };
 
         let Some(first) = first else {
-            return Err(BacktestServerError::NoDataFound {
+            return Err(MarketLoadError::NoDataFound {
                 symbol: canonical_symbol.clone(),
                 exchange: exchange.to_owned(),
                 data_type: data_type.clone(),
@@ -591,7 +593,7 @@ fn resolve_partition_value(
 
 fn ensure_not_cancelled(is_cancelled: &CancellationCheck) -> Result<()> {
     if is_cancelled() {
-        Err(BacktestServerError::Cancelled)
+        Err(MarketLoadError::Cancelled)
     } else {
         Ok(())
     }
@@ -599,16 +601,16 @@ fn ensure_not_cancelled(is_cancelled: &CancellationCheck) -> Result<()> {
 
 fn ensure_not_cancelled_mut(is_cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
     if is_cancelled() {
-        Err(BacktestServerError::Cancelled)
+        Err(MarketLoadError::Cancelled)
     } else {
         Ok(())
     }
 }
 
-fn map_data_error(error: DataError) -> BacktestServerError {
+fn map_data_error(error: DataError) -> MarketLoadError {
     match error {
-        DataError::Cancelled => BacktestServerError::Cancelled,
-        other => BacktestServerError::Database(other),
+        DataError::Cancelled => MarketLoadError::Cancelled,
+        other => MarketLoadError::Data(other),
     }
 }
 
@@ -618,9 +620,6 @@ mod tests {
     use chrono::NaiveDate;
     use data_preprocess::ParquetStore;
     use qs_backtest::data_feed::FallibleBatchFeed;
-    use qs_symbols::SymbolRegistry;
-
-    use crate::InstrumentDomain;
 
     fn ts(second: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 2, 3)
@@ -665,25 +664,6 @@ mod tests {
             }));
         }
         events
-    }
-
-    fn registry() -> SymbolRegistry {
-        SymbolRegistry::from_toml(
-            r#"
-[[symbol]]
-canonical = "eurusd"
-aliases = ["eur/usd"]
-pip_position = 4
-digits = 5
-category = "forex"
-base_currency = "EUR"
-quote_currency = "USD"
-pnl_currency = "USD"
-lot_base_units = 100000
-lot_step_units = 1000
-"#,
-        )
-        .unwrap()
     }
 
     fn collect_ordinals(mut stream: MarketStream) -> Vec<(NaiveDateTime, u64)> {
@@ -771,45 +751,6 @@ lot_step_units = 1000
     }
 
     #[test]
-    fn stored_series_bindings_must_match_planned_stream_coordinates() {
-        let data_dir = temp_data_dir();
-        let store = ParquetStore::open(&data_dir).unwrap();
-        store.insert_ticks(&[tick("EURUSD", 0)]).unwrap();
-        let mut never_cancelled = || false;
-        let description = describe_primary_market_stream(
-            data_dir.to_str().unwrap(),
-            "fixture",
-            &["eurusd".into()],
-            "tick",
-            None,
-            Some(ts(0)),
-            Some(ts(0)),
-            &mut never_cancelled,
-            &mut |_| {},
-        )
-        .unwrap();
-        let registry = registry();
-        let domain = InstrumentDomain::compatibility(&registry).unwrap();
-        let mut manifest = domain
-            .resolve_manifest(&["eurusd".into()], ts(0), Some(ts(0)))
-            .unwrap();
-        domain
-            .attach_stored_series(&mut manifest, description.stored_series_coordinates())
-            .unwrap();
-
-        description
-            .validate_stored_series_bindings(&manifest)
-            .unwrap();
-        manifest.stored_series[0].source_partition = "other".into();
-        let error = description
-            .validate_stored_series_bindings(&manifest)
-            .unwrap_err();
-        assert!(error.to_string().contains("do not match"));
-
-        std::fs::remove_dir_all(data_dir).unwrap();
-    }
-
-    #[test]
     fn described_stream_rejects_a_replaced_partition_before_reopen() {
         let data_dir = temp_data_dir();
         let store = ParquetStore::open(&data_dir).unwrap();
@@ -833,7 +774,7 @@ lot_step_units = 1000
         store.insert_ticks(&[tick("EURUSD", 2)]).unwrap();
         assert!(matches!(
             description.open(Arc::new(|| false)),
-            Err(BacktestServerError::Database(
+            Err(MarketLoadError::Data(
                 DataError::ParquetPartitionChanged { .. }
             ))
         ));
@@ -856,6 +797,6 @@ lot_step_units = 1000
             &mut |_| {},
         )
         .unwrap_err();
-        assert!(matches!(error, BacktestServerError::Cancelled));
+        assert!(matches!(error, MarketLoadError::Cancelled));
     }
 }

@@ -32,9 +32,11 @@ qs-symbols -----> qs-instruments -----> quant-system-core
                                               |      configured core only
                                               v
                                       qs-backtest -> qs-backtest-server
-                                           ^
-                                           |
-                              qs-data-preprocess
+                                           ^                  ^
+                                           |                  |
+                              qs-data-preprocess -> qs-market-loader
+                                    storage           stored data as
+                                                      replay input
 
 qs-signal-parser -> strict RawSignal compatibility boundary
 ```
@@ -62,6 +64,8 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 ### Data storage
 
 `qs-data-preprocess` owns supported tick/bar import, storage, and tick-to-bar resampling. Its bucket arithmetic and quote-acceptance rule are shared with the replay engine's in-memory bar series, so a stored bar equals the bar a tick-driven replay derives from the same input. Parquet is the default backend. Backtest replay reads bounded chronological cursors instead of requiring complete datasets in memory.
+
+`qs-market-loader` owns the bridge from stored market data to replay input. It reopens Parquet tick and bar cursors as ordered market events, applies stored bar spreads in price units, merges series deterministically, and validates that the coordinates it will read match the instrument manifest pinned for the run. It exists as its own crate so that a service and an in-process parameter search open identical streams through identical code, and so that the replay crate keeps reading no market-data storage of its own.
 
 ### Service contracts and providers
 

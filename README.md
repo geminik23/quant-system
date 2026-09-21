@@ -15,6 +15,7 @@ It is not a complete automated trading platform. It does not currently execute l
 | Embed the pure trade engine or strict raw-signal contracts | [`quant-system-core`](crates/core) | Library-only |
 | Compile and evaluate reusable configured strategy behavior | [`qs-strategy`](crates/strategy) | Library-only; synchronous core |
 | Build an in-process historical strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
+| Replay stored Parquet market data through the engine | [`qs-market-loader`](crates/market-loader) | Library-only |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Compatibility CLI and public adapter library |
 
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |

@@ -3658,6 +3658,7 @@ dependencies = [
  "qs-backtest-api",
  "qs-data-preprocess",
  "qs-instruments",
+ "qs-market-loader",
  "qs-service",
  "qs-service-xrpc",
  "qs-symbols",
@@ -3735,6 +3736,17 @@ dependencies = [
  "qs-service-xrpc",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "qs-market-loader"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "qs-backtest",
+ "qs-data-preprocess",
+ "qs-instruments",
  "thiserror 2.0.18",
 ]
 
