@@ -50,7 +50,7 @@ Each service replay result can include a typed instrument manifest containing th
 The production service uses deterministic FutureQuote replay.
 
 - Tick replay uses stored bid and ask values.
-- Bar replay prices each bar at its close and applies the bar's recorded spread symmetrically around it. A bar with no recorded spread uses the per-symbol fallback spread when the run configures one, and otherwise keeps the historical zero-spread approximation. Execution metadata counts every bar quote that executed with a zero spread, so the approximation is never silent.
+- Bar replay prices each bar at its close and applies the bar's recorded spread symmetrically around it, which treats the close as the midpoint. A bar stored on a bid or ask basis therefore executes against a quote centred half a spread away from the real midpoint; resample on the midpoint basis for execution. A bar with no recorded spread uses the per-symbol fallback spread when the run configures one, and otherwise keeps the historical zero-spread approximation. Execution metadata counts every bar quote that executed with a zero spread, so the approximation is never silent.
 - Actions become eligible according to signal timestamp and configured latency.
 - Market entries use the appropriate future quote side and retain that actual fill for position state, P&L, MTM, and actual risk artifacts.
 - Market Entry sizing defaults to the actual fill price. The optional signal-entry basis uses an explicit original `Entry.price` only for quantity calculation and falls back to the fill price when it is absent.
@@ -75,9 +75,9 @@ Commission is charged on every entry, scale-in, and closing fill. Swap is charge
 
 Point-denominated swap and notional-rate commission are computed in the instrument's native profit-and-loss currency and converted through the run's existing conversion routes; per-lot amounts are already in the account currency and are validated against it. A swap charge that has no causal conversion quote is skipped and counted in execution metadata rather than silently applied.
 
-Reported results are net of costs. Each close event and trade row carries the exit commission already subtracted from its profit and loss, each completed position reports commission and swap totals alongside a gross figure, and realized R is computed from the net result. The run reports total commission, total swap, and the full ordered list of charges, and provider evaluation gains a cost section showing the gross and net outcome, the total charged, and the cost share of the gross outcome.
+Reported results are net of costs on one basis throughout. A close event carries the exit commission subtracted from its own profit and loss. A trade row carries that exit commission too, and the row that fully closes a position additionally settles that position's entry commission and swap, because those belong to the position rather than to any single close. Summing the trade log therefore reproduces the run's net profit and loss, and every figure derived from it — subset statistics, the equity curve, maximum drawdown, and the risk-adjusted ratios — sits on the same fully net basis as the completed positions and the account balance. Each completed position also reports commission and swap totals alongside a gross figure, realized R is computed from the net result, and provider evaluation gains a cost section showing the gross and net outcome, the total charged, and the cost share of the gross outcome.
 
-Subset statistics report exit commission only. Entry commission and swap are charged per position rather than per close event, so they are not attributed to an arbitrary subset of trades; complete totals stay on the run result and on each completed position.
+A position still open when the run ends has no final row to settle against. Its charges are inside the run totals and the closing balance but not inside the trade log, which is the only place the two views differ.
 
 Costs are configured through `BacktestConfig.costs` in the library, through `config.costs` in a service request, or through `tg_backtest --costs-file`. The wire and file forms use the same strict shape, reject unknown fields, and are validated at the request boundary before any data loading. The client reads its cost file before connecting, so an invalid file fails immediately.
 
@@ -90,7 +90,7 @@ swap = { amount = { unit = "Points", long = -6.1, short = 1.9 }, rollover = "22:
 commission = { type = "NotionalRatePerSide", buy_rate = 0.005, sell_rate = 0.005 }
 ```
 
-Omitting `skipped_weekdays` keeps the weekend default of `Sat` and `Sun`.
+Omitting `skipped_weekdays` keeps the weekend default of `Sat` and `Sun`; an explicitly empty list is read the same way, so a schedule that charges every weekday of the week cannot currently be expressed here. Tags also accept the lower-case spelling that a run writes into its own metadata, so a specification read back out of a stored run can be submitted again without rewriting it.
 
 ## Management profile routing and generated levels
 

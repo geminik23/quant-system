@@ -20,7 +20,6 @@ use crate::currency::{
     ConversionError, ConversionQuoteBook, ConversionResult, ConversionRoute, RunCurrencyPlan,
 };
 use crate::portfolio::PortfolioRecorder;
-use crate::report::TradeResult;
 
 #[derive(Debug, Clone)]
 struct PendingOrigin {
@@ -171,7 +170,6 @@ pub struct FutureExecutor {
     pub close_events: Vec<CloseEvent>,
     pub cost_events: Vec<CostEvent>,
     pub completed_positions: Vec<CompletedPosition>,
-    pub trade_log: Vec<TradeResult>,
     fill_sequence: u64,
     close_sequence: u64,
     cost_sequence: u64,
@@ -195,7 +193,6 @@ struct FutureExecutorCheckpoint {
     close_events_len: usize,
     cost_events_len: usize,
     completed_positions_len: usize,
-    trade_log_len: usize,
 }
 
 #[derive(Debug)]
@@ -295,7 +292,6 @@ impl FutureExecutorCheckpoint {
             close_events_len: executor.close_events.len(),
             cost_events_len: executor.cost_events.len(),
             completed_positions_len: executor.completed_positions.len(),
-            trade_log_len: executor.trade_log.len(),
         }
     }
 
@@ -323,7 +319,6 @@ impl FutureExecutorCheckpoint {
         executor
             .completed_positions
             .truncate(self.completed_positions_len);
-        executor.trade_log.truncate(self.trade_log_len);
     }
 }
 
@@ -376,7 +371,6 @@ impl FutureExecutor {
             close_events: Vec::new(),
             cost_events: Vec::new(),
             completed_positions: Vec::new(),
-            trade_log: Vec::new(),
             fill_sequence: 0,
             close_sequence: 0,
             cost_sequence: 0,
@@ -1259,26 +1253,10 @@ impl FutureExecutor {
         event.pnl_conversion = accounted.conversion;
         event.remaining_size = Some(account.remaining_size);
         account.close_events.push(event.clone());
-        let trade = TradeResult {
-            position_id: id.to_owned(),
-            symbol: account.symbol.clone(),
-            side: account.side,
-            entry_price,
-            exit_price: execution.price,
-            size: close_size,
-            pnl,
-            open_ts: account.open_ts,
-            close_ts: fill.ts,
-            close_reason: reason,
-            group: account.group.clone(),
-            commission: 0.0,
-            gross_pnl: None,
-        };
 
         self.balance = next_balance;
         self.fills.push(recorded);
         self.close_events.push(event);
-        self.trade_log.push(trade);
         if commission.amount != 0.0 {
             self.push_cost_event(
                 id,
@@ -1537,73 +1515,85 @@ impl FutureExecutor {
         if open_ids.is_empty() {
             return 0;
         }
+        // Collect every due charge before applying any, so that charges land in rollover order across positions rather than in position order. The balance therefore falls in the same sequence a broker would have applied it.
+        let mut due: Vec<(NaiveDateTime, String)> = Vec::new();
+        for id in open_ids {
+            let Some(account) = self.accounts.get(&id) else {
+                continue;
+            };
+            let symbol = account.symbol.as_str();
+            let open_ts = account.open_ts;
+            let Some(costs) = self.costs.get(symbol) else {
+                continue;
+            };
+            let Some(schedule) = costs.swap.as_ref() else {
+                continue;
+            };
+            let start = match previous {
+                Some(previous) => previous.max(open_ts),
+                None => open_ts,
+            };
+            for instant in
+                qs_core::costs::rollover_instants(Some(start), current, schedule.rollover)
+            {
+                due.push((instant, id.clone()));
+            }
+        }
+        // `accounts` is ordered, so equal instants keep a stable position order.
+        due.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
         let mut charged = false;
         let mut skipped = 0;
-        for id in open_ids {
+        for (instant, id) in due {
             let Some(account) = self.accounts.get(&id) else {
                 continue;
             };
             let symbol = account.symbol.clone();
             let side = account.side;
             let size = account.remaining_size;
-            let open_ts = account.open_ts;
             let Some(costs) = self.costs.get(&symbol) else {
                 continue;
             };
             let Some(schedule) = costs.swap.as_ref() else {
                 continue;
             };
-            let rollover = schedule.rollover;
-            let start = match previous {
-                Some(previous) => previous.max(open_ts),
-                None => open_ts,
+            let nights = schedule.nights_at(instant);
+            let contract_size = self.contract_size(&symbol);
+            let point_size = self.point_size(&symbol);
+            let Some(charge) =
+                costs.swap_for_rollover(side, size, contract_size, point_size, nights)
+            else {
+                continue;
             };
-            let instants = qs_core::costs::rollover_instants(Some(start), current, rollover);
-            for instant in instants {
-                let Some(costs) = self.costs.get(&symbol) else {
-                    continue;
-                };
-                let Some(schedule) = costs.swap.as_ref() else {
-                    continue;
-                };
-                let nights = schedule.nights_at(instant);
-                let contract_size = self.contract_size(&symbol);
-                let point_size = self.point_size(&symbol);
-                let Some(charge) =
-                    costs.swap_for_rollover(side, size, contract_size, point_size, nights)
-                else {
-                    continue;
-                };
-                let Ok(resolved) = self.resolve_cost(&symbol, instant, charge, conversion_quotes)
-                else {
-                    skipped += 1;
-                    continue;
-                };
-                if resolved.amount == 0.0 {
-                    continue;
-                }
-                let next_balance = self.balance - resolved.amount;
-                if !next_balance.is_finite() {
-                    skipped += 1;
-                    continue;
-                }
-                self.balance = next_balance;
-                if let Some(account) = self.accounts.get_mut(&id) {
-                    account.realized_pnl -= resolved.amount;
-                    account.swap_total += resolved.amount;
-                }
-                self.push_cost_event(
-                    &id,
-                    &symbol,
-                    side,
-                    instant,
-                    CostKind::Swap,
-                    &resolved,
-                    size,
-                    Some(nights),
-                );
-                charged = true;
+            let Ok(resolved) = self.resolve_cost(&symbol, instant, charge, conversion_quotes)
+            else {
+                skipped += 1;
+                continue;
+            };
+            if resolved.amount == 0.0 {
+                continue;
             }
+            let next_balance = self.balance - resolved.amount;
+            if !next_balance.is_finite() {
+                skipped += 1;
+                continue;
+            }
+            self.balance = next_balance;
+            if let Some(account) = self.accounts.get_mut(&id) {
+                account.realized_pnl -= resolved.amount;
+                account.swap_total += resolved.amount;
+            }
+            self.push_cost_event(
+                &id,
+                &symbol,
+                side,
+                instant,
+                CostKind::Swap,
+                &resolved,
+                size,
+                Some(nights),
+            );
+            charged = true;
         }
         if charged {
             portfolio.set_realized_pnl(self.realized_pnl());
@@ -1753,7 +1743,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(executor.realized_pnl(), 20.0);
-        assert_eq!(executor.trade_log[0].pnl, 20.0);
         let close = &executor.close_events[0];
         assert_eq!(close.native_pnl, Some(10.0));
         assert_eq!(close.native_currency.as_deref(), Some("EUR"));
@@ -1981,7 +1970,6 @@ mod tests {
         assert_eq!(executor.close_events[1].entry_price, Some(110.0));
         assert_eq!(executor.close_events[1].pnl, 40.0);
         assert_eq!(executor.realized_pnl(), 50.0);
-        assert_eq!(executor.trade_log[1].entry_price, 110.0);
     }
 
     #[test]
@@ -2196,7 +2184,6 @@ mod tests {
         assert_eq!(executor.fills.len(), 1);
         assert!(executor.close_events.is_empty());
         assert!(executor.completed_positions.is_empty());
-        assert!(executor.trade_log.is_empty());
         assert!(executor.accounts.contains_key(&id));
         assert_eq!(executor.fill_sequence, 1);
         assert_eq!(executor.close_sequence, 0);

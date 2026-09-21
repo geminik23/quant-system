@@ -900,7 +900,8 @@ fn subset_stats_to_msg(s: &SubsetStats) -> SubsetStatsMsg {
         expectancy: s.expectancy,
         largest_win: s.largest_win,
         largest_loss: s.largest_loss,
-        exit_commission: s.exit_commission,
+        commission: s.commission,
+        swap: s.swap,
         gross_pnl: s.gross_pnl,
     }
 }
@@ -965,6 +966,7 @@ fn trade_result_to_msg(t: &TradeResult) -> TradeResultMsg {
         size: t.size,
         pnl: t.pnl,
         commission: t.commission,
+        swap: t.swap,
         gross_pnl: t.gross_pnl,
         open_ts: ndt_to_string(t.open_ts),
         close_ts: ndt_to_string(t.close_ts),
@@ -1431,6 +1433,7 @@ mod tests {
             close_reason: CloseReason::Target,
             group: Some("g1".into()),
             commission: 0.0,
+            swap: 0.0,
             gross_pnl: None,
         };
         let msg = trade_result_to_msg(&tr);
@@ -1459,7 +1462,8 @@ mod tests {
             expectancy: 50.0,
             largest_win: 60.0,
             largest_loss: 0.0,
-            exit_commission: 0.0,
+            commission: 0.0,
+            swap: 0.0,
             gross_pnl: None,
         };
         let msg = subset_stats_to_msg(&s);

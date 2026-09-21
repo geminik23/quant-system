@@ -251,6 +251,7 @@ impl BacktestExecutor {
             close_reason: reason,
             group: entry.group.clone(),
             commission: 0.0,
+            swap: 0.0,
             gross_pnl: None,
         });
 

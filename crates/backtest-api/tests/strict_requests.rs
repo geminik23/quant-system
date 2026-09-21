@@ -255,6 +255,28 @@ fn run_requests_support_parser_free_direct_construction() {
 }
 
 #[test]
+fn run_requests_accept_the_stored_metadata_tag_spelling() {
+    // A run records its applied cost specification in `qs-core` spelling; feeding that back must not be rejected.
+    let mut value = request_with_signal(entry());
+    value["request"]["config"]["costs"] = json!({
+        "EURUSD": {
+            "commission": {"type": "per_lot_per_side", "amount": 3.5, "currency": "USD"},
+            "swap": {
+                "amount": {"unit": "points", "long": -6.1, "short": 1.9},
+                "rollover": "22:00:00",
+                "triple_weekday": "Wed"
+            }
+        }
+    });
+
+    let decoded: RunBacktestRequest = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        decoded.request.config.costs["EURUSD"].commission,
+        Some(CommissionModelMsg::PerLotPerSide { amount, .. }) if amount == 3.5
+    ));
+}
+
+#[test]
 fn run_requests_carry_per_symbol_costs() {
     let mut value = request_with_signal(entry());
     value["request"]["config"]["costs"] = json!({

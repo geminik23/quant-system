@@ -550,6 +550,7 @@ fn partial_close_result() -> BacktestResult {
                 close_reason: CloseReason::Target,
                 group: None,
                 commission: 0.0,
+                swap: 0.0,
                 gross_pnl: None,
             },
             TradeResult {
@@ -565,6 +566,7 @@ fn partial_close_result() -> BacktestResult {
                 close_reason: CloseReason::Target,
                 group: None,
                 commission: 0.0,
+                swap: 0.0,
                 gross_pnl: None,
             },
         ],

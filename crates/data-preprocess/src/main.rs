@@ -51,8 +51,8 @@ enum Commands {
         /// Target bar timeframe (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w)
         #[arg(long, short)]
         timeframe: String,
-        /// Quote side used to derive each bar price
-        #[arg(long, default_value = "bid")]
+        /// Quote side used to derive each bar price. Replay reconstructs a two-sided quote around the stored close, so `mid` is the basis that executes without a half-spread offset
+        #[arg(long, default_value = "mid")]
         price_basis: String,
         /// Bucket alignment offset in seconds, for example 79200 to close daily bars at 22:00
         #[arg(long, default_value_t = 0)]
@@ -384,6 +384,13 @@ fn handle_resample_parquet(
     }
     if !buffer.is_empty() {
         bars_written += store.insert_bars(&buffer)?;
+    }
+
+    let out_of_order = aggregator.rejected_out_of_order();
+    if out_of_order > 0 {
+        eprintln!(
+            "warning: dropped {out_of_order} tick(s) that arrived after their bucket had closed; the tick source is not chronological"
+        );
     }
 
     print_import_result(&ImportResult {

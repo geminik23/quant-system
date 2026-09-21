@@ -95,7 +95,7 @@ data-preprocess resample [OPTIONS]
   -e, --exchange <EX>              Exchange name (REQUIRED)
   -s, --symbol <SYM>               Symbol to resample (REQUIRED)
   -t, --timeframe <TF>             Target timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (REQUIRED)
-      --price-basis <BASIS>        bid | ask | mid [default: bid]
+      --price-basis <BASIS>        bid | ask | mid [default: mid]
       --align-offset-seconds <N>   Bucket alignment offset [default: 0]
       --digits <N>                 Price decimal digits, used for the spread in points [default: 5]
       --from <DATETIME>            Inclusive start (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
@@ -107,13 +107,17 @@ Reads stored ticks and writes stored bars using the same bucket arithmetic, quot
 
 Each bar records the average bid/ask spread observed while it formed, expressed in points for the given digit count, so bar-driven replay can execute against a realistic two-sided quote instead of a zero spread.
 
+Replay treats a bar's close as the midpoint and rebuilds the quote as `close ± spread / 2`. Bars stored on the `mid` basis therefore reconstruct the original two-sided quote; bars stored on `bid` or `ask` reconstruct a quote whose centre sits half a spread away from the real midpoint, which shifts every stop, target, and pending-order trigger by that amount. Use `bid` or `ask` only to match a strategy series that analyses that side, and confirm on ticks.
+
+Bars count accepted ticks in `tick_vol` and leave `volume` at zero, matching the tick-count volume the replay engine projects. Ticks must arrive in chronological order; any tick belonging to an already-closed bucket is dropped and reported at the end of the run.
+
 An interval with no accepted tick produces no bar, so market closures simply have no bars. The final incomplete bucket is dropped unless `--flush-partial` is given, because the replay engine never emits an incomplete bar. Monthly bars have no fixed duration and are rejected. Weekly buckets align to the Unix epoch week unless an alignment offset moves them.
 
 ```bash
-# Hourly bid bars for one symbol over a date range
+# Hourly bars for one symbol over a date range
 data-preprocess --data-dir /data/forex resample \
   --exchange icmarkets --symbol EURUSD --timeframe 1h \
-  --price-basis bid --digits 5 --from 2025-01-01 --to 2026-09-04
+  --digits 5 --from 2025-01-01 --to 2026-09-04
 
 # Daily bars that close at 22:00 UTC
 data-preprocess --data-dir /data/forex resample \

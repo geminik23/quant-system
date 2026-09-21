@@ -154,6 +154,10 @@ impl OpenBar {
 /// Accumulates ticks into fixed-duration bars using the replay engine's bucket rules.
 ///
 /// A tick is accepted only when the selected price basis is available, finite, positive, and not crossed, which matches the validity rule the replay feed applies before a quote reaches the engine. An interval with no accepted tick produces no bar, so a weekend gap simply has no bars rather than empty ones.
+///
+/// Input must be chronological. A tick belonging to an already-finished bucket is dropped and counted by [`BarAggregator::rejected_out_of_order`] rather than reopening that bucket.
+///
+/// Bars record `tick_vol`, the number of accepted ticks, and leave `volume` at zero. The replay engine projects tick counts, not traded size, so a bar carries the same volume fact whether it was built here or in memory.
 #[derive(Debug, Clone)]
 pub struct BarAggregator {
     spec: BucketSpec,
@@ -163,6 +167,7 @@ pub struct BarAggregator {
     timeframe: Timeframe,
     point_size: f64,
     open: Option<OpenBar>,
+    rejected_out_of_order: u64,
 }
 
 impl BarAggregator {
@@ -182,7 +187,15 @@ impl BarAggregator {
             timeframe,
             point_size,
             open: None,
+            rejected_out_of_order: 0,
         }
+    }
+
+    /// Ticks dropped because they belonged to an earlier bucket than the one already open.
+    ///
+    /// A chronological source reports zero. A non-zero count means the input was not ordered, which would otherwise reopen a finished bucket and emit bars out of order.
+    pub fn rejected_out_of_order(&self) -> u64 {
+        self.rejected_out_of_order
     }
 
     /// Feed one tick, returning the bar that the tick just completed.
@@ -206,6 +219,10 @@ impl BarAggregator {
         if open_time == current.open_time {
             current.update(price);
             current.observe_spread(bid, ask, self.point_size);
+            return None;
+        }
+        if open_time < current.open_time {
+            self.rejected_out_of_order = self.rejected_out_of_order.saturating_add(1);
             return None;
         }
 
@@ -246,6 +263,33 @@ pub fn is_executable_quote(bid: f64, ask: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tick_from_a_finished_bucket_is_dropped_and_counted() {
+        let mut aggregator = hourly();
+        assert!(aggregator.push(ts(9, 0), Some(1.1), Some(1.2)).is_none());
+        let completed = aggregator.push(ts(10, 0), Some(1.3), Some(1.4)).unwrap();
+        assert_eq!(completed.ts, ts(9, 0));
+
+        // A late tick from the bucket that already closed must not reopen it.
+        assert!(aggregator.push(ts(9, 30), Some(9.9), Some(9.9)).is_none());
+        assert_eq!(aggregator.rejected_out_of_order(), 1);
+
+        let still_open = aggregator.flush().unwrap();
+        assert_eq!(still_open.ts, ts(10, 0));
+        assert_eq!(still_open.high, 1.3);
+        assert_eq!(still_open.tick_vol, 1);
+    }
+
+    #[test]
+    fn bars_report_tick_counts_and_leave_traded_volume_at_zero() {
+        let mut aggregator = hourly();
+        aggregator.push(ts(9, 0), Some(1.1), Some(1.2));
+        aggregator.push(ts(9, 30), Some(1.15), Some(1.25));
+        let bar = aggregator.flush().unwrap();
+        assert_eq!(bar.tick_vol, 2);
+        assert_eq!(bar.volume, 0);
+    }
+
     use super::*;
     use chrono::NaiveDate;
 

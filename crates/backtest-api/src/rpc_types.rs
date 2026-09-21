@@ -106,12 +106,16 @@ pub struct InstrumentCostsMsg {
 }
 
 /// Wire-safe commission model.
+///
+/// The tag also accepts the snake_case spelling that `qs-core` writes into run metadata, so a stored specification round-trips back into a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum CommissionModelMsg {
     /// Fixed amount per lot per side, in the run's account currency.
+    #[serde(alias = "per_lot_per_side")]
     PerLotPerSide { amount: f64, currency: String },
     /// Fraction of traded notional per side, with separate buy and sell rates.
+    #[serde(alias = "notional_rate_per_side")]
     NotionalRatePerSide { buy_rate: f64, sell_rate: f64 },
 }
 
@@ -120,8 +124,10 @@ pub enum CommissionModelMsg {
 #[serde(tag = "unit", deny_unknown_fields)]
 pub enum SwapAmountMsg {
     /// Price points per lot per night, in the instrument's native currency.
+    #[serde(alias = "points")]
     Points { long: f64, short: f64 },
     /// Amount per lot per night, in the run's account currency.
+    #[serde(alias = "currency")]
     Currency {
         long: f64,
         short: f64,
@@ -800,10 +806,13 @@ pub struct SubsetStatsMsg {
     pub expectancy: f64,
     pub largest_win: f64,
     pub largest_loss: f64,
-    /// Exit commission charged across this subset's closes.
+    /// Commission settled on this subset's rows.
     #[serde(default)]
-    pub exit_commission: f64,
-    /// Subset profit and loss before exit commission, present only when one was charged.
+    pub commission: f64,
+    /// Swap settled on this subset's rows.
+    #[serde(default)]
+    pub swap: f64,
+    /// Subset profit and loss before `commission` and `swap`, present only when either was settled.
     #[serde(default)]
     pub gross_pnl: Option<f64>,
 }
@@ -892,12 +901,17 @@ pub struct TradeResultMsg {
     pub entry_price: f64,
     pub exit_price: f64,
     pub size: f64,
-    /// Realized profit and loss for this close, already net of `commission`.
+    /// Realized profit and loss for this close, already net of `commission` and `swap`.
     pub pnl: f64,
-    /// Account-currency exit commission already subtracted from `pnl`.
+    /// Account-currency commission settled on this row and already subtracted from `pnl`.
+    ///
+    /// The row that fully closes a position also settles that position's entry commission, because entry commission belongs to the position rather than to any one close.
     #[serde(default)]
     pub commission: f64,
-    /// Profit and loss before `commission`, present only when a commission was charged.
+    /// Account-currency swap settled on this row, which is non-zero only on the row that fully closes a position.
+    #[serde(default)]
+    pub swap: f64,
+    /// Profit and loss before `commission` and `swap`, present only when either was settled.
     #[serde(default)]
     pub gross_pnl: Option<f64>,
     pub open_ts: String,
@@ -1178,17 +1192,18 @@ enum StrictSizingPolicyMsg {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum StrictCommissionModelMsg {
+    #[serde(alias = "per_lot_per_side")]
     PerLotPerSide { amount: f64, currency: String },
+    #[serde(alias = "notional_rate_per_side")]
     NotionalRatePerSide { buy_rate: f64, sell_rate: f64 },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "unit", deny_unknown_fields)]
 enum StrictSwapAmountMsg {
-    Points {
-        long: f64,
-        short: f64,
-    },
+    #[serde(alias = "points")]
+    Points { long: f64, short: f64 },
+    #[serde(alias = "currency")]
     Currency {
         long: f64,
         short: f64,

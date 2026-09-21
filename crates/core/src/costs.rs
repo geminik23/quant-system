@@ -78,12 +78,16 @@ impl CostCharge {
 }
 
 /// How commission is charged for one instrument.
+///
+/// The tag accepts both the snake_case spelling this type writes and the PascalCase spelling the service request and cost file use, so a specification read back out of a stored run can be fed straight into a new request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommissionModel {
     /// Fixed amount per 1.0 lot per side, already expressed in the account currency. The declared currency is validated against the run's account currency when one is known.
+    #[serde(alias = "PerLotPerSide")]
     PerLotPerSide { amount: f64, currency: String },
     /// Fraction of traded notional per side, charged in the instrument's native profit-and-loss currency. Buy and sell rates are separate because some venues charge asymmetrically; use equal values for a symmetric venue.
+    #[serde(alias = "NotionalRatePerSide")]
     NotionalRatePerSide { buy_rate: f64, sell_rate: f64 },
 }
 
@@ -142,8 +146,10 @@ impl CommissionModel {
 #[serde(tag = "unit", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SwapAmount {
     /// Price points per 1.0 lot per night, applied in the instrument's native profit-and-loss currency.
+    #[serde(alias = "Points")]
     Points { long: f64, short: f64 },
     /// Amount per 1.0 lot per night, already expressed in the account currency.
+    #[serde(alias = "Currency")]
     Currency {
         long: f64,
         short: f64,
@@ -418,6 +424,24 @@ pub enum CostValidationError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cost_specification_decodes_from_either_tag_spelling() {
+        let snake = r#"{"commission":{"type":"per_lot_per_side","amount":3.5,"currency":"USD"},
+                        "swap":{"amount":{"unit":"points","long":-6.1,"short":1.9},
+                                "rollover":"22:00:00","triple_weekday":"Wed","skipped_weekdays":["Sat","Sun"]}}"#;
+        let pascal = r#"{"commission":{"type":"PerLotPerSide","amount":3.5,"currency":"USD"},
+                         "swap":{"amount":{"unit":"Points","long":-6.1,"short":1.9},
+                                 "rollover":"22:00:00","triple_weekday":"Wed","skipped_weekdays":["Sat","Sun"]}}"#;
+        let from_snake: InstrumentCosts = serde_json::from_str(snake).unwrap();
+        let from_pascal: InstrumentCosts = serde_json::from_str(pascal).unwrap();
+        assert_eq!(from_snake, from_pascal);
+
+        // A specification written by this type decodes again, which is what a stored run's metadata round-trips through.
+        let written = serde_json::to_string(&from_snake).unwrap();
+        let reread: InstrumentCosts = serde_json::from_str(&written).unwrap();
+        assert_eq!(reread, from_snake);
+    }
+
     use super::*;
     use chrono::NaiveDate;
 

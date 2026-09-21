@@ -143,6 +143,38 @@ fn run_with(costs: HashMap<String, InstrumentCosts>, events: Vec<MarketEvent>) -
     )
 }
 
+/// A run whose position closes half at a target and the rest on a later close signal.
+fn partial_then_full_close_run(costs: HashMap<String, InstrumentCosts>) -> BacktestResult {
+    let config = BacktestConfig {
+        close_on_finish: true,
+        sizing: Some(SizingPolicy::FixedLot { lots: 1.0 }),
+        symbol_specs: HashMap::from([(SYMBOL.to_owned(), symbol_spec())]),
+        contract_sizes: HashMap::from([(SYMBOL.to_owned(), 100_000.0)]),
+        costs,
+        ..BacktestConfig::default()
+    };
+    let future = FutureQuoteConfig {
+        currency_plan: Some(currency_plan()),
+        ..FutureQuoteConfig::default()
+    };
+    let mut entry_signal = entry(ts(0));
+    if let RawSignal::Entry { targets, .. } = &mut entry_signal {
+        // Two targets split the position, so the second close is the final one.
+        targets.extend([1.1005, 1.1010]);
+    }
+    let mut feed = VecFeed::new(vec![
+        tick(ts(0), 1.1000),
+        tick(ts(1), 1.1005),
+        tick(ts(2), 1.1010),
+        tick(ts(3), 1.1010),
+    ]);
+    BacktestRunner::new_future(config, future).run_raw_signals_future(
+        &mut feed,
+        vec![entry_signal],
+        None,
+    )
+}
+
 fn flat_run(costs: HashMap<String, InstrumentCosts>) -> BacktestResult {
     run_with(
         costs,
@@ -433,18 +465,24 @@ fn run_signal_window(
 }
 
 #[test]
-fn trade_rows_carry_their_exit_commission() {
+fn a_final_trade_row_settles_the_whole_position_cost() {
     let result = flat_run(HashMap::from([(
         SYMBOL.to_owned(),
         per_lot_commission(3.5),
     )]));
     let trade = &result.trade_log[0];
-    assert_eq!(trade.commission, 3.5);
-    assert!((trade.gross_pnl.unwrap() - (trade.pnl + 3.5)).abs() < 1.0e-9);
+    // The single close is also the final close, so it settles entry and exit commission together.
+    assert_eq!(trade.commission, 7.0);
+    assert_eq!(trade.swap, 0.0);
+    assert!((trade.gross_pnl.unwrap() - (trade.pnl + 7.0)).abs() < 1.0e-9);
 
-    // Entry commission and swap belong to the position, so a trade row never claims them.
-    let summed: f64 = result.trade_log.iter().map(|trade| trade.commission).sum();
-    assert!(summed < result.total_commission);
+    let position = &result.completed_positions[0];
+    let settled: f64 = result
+        .trade_log
+        .iter()
+        .map(|trade| trade.commission + trade.swap)
+        .sum();
+    assert!((settled - (position.commission_total + position.swap_total)).abs() < 1.0e-9);
 }
 
 #[test]
@@ -452,23 +490,65 @@ fn trade_rows_without_costs_report_nothing() {
     let result = flat_run(HashMap::new());
     let trade = &result.trade_log[0];
     assert_eq!(trade.commission, 0.0);
+    assert_eq!(trade.swap, 0.0);
     assert_eq!(trade.gross_pnl, None);
-    assert_eq!(result.summary.exit_commission, 0.0);
+    assert_eq!(result.summary.commission, 0.0);
+    assert_eq!(result.summary.swap, 0.0);
     assert_eq!(result.summary.gross_pnl, None);
 }
 
 #[test]
-fn subset_statistics_report_exit_commission() {
+fn subset_statistics_report_settled_costs() {
     let result = flat_run(HashMap::from([(
         SYMBOL.to_owned(),
         per_lot_commission(3.5),
     )]));
     let summary = &result.summary;
-    assert_eq!(summary.exit_commission, 3.5);
-    assert!((summary.gross_pnl.unwrap() - (summary.total_pnl + 3.5)).abs() < 1.0e-9);
+    assert_eq!(summary.commission, 7.0);
+    assert_eq!(summary.swap, 0.0);
+    assert!((summary.gross_pnl.unwrap() - (summary.total_pnl + 7.0)).abs() < 1.0e-9);
 
     let per_symbol = &result.per_symbol[SYMBOL];
-    assert_eq!(per_symbol.exit_commission, 3.5);
+    assert_eq!(per_symbol.commission, 7.0);
+}
+
+#[test]
+fn headline_statistics_use_the_same_net_basis_as_the_run_total() {
+    let result = flat_run(HashMap::from([(
+        SYMBOL.to_owned(),
+        per_lot_commission(3.5),
+    )]));
+    // Every derived figure must sit on the fully net basis, not on a partly costed one.
+    assert!((result.summary.total_pnl - result.total_pnl).abs() < 1.0e-9);
+    let (_, last_equity) = *result.equity_curve.last().unwrap();
+    assert!((last_equity - result.final_balance).abs() < 1.0e-9);
+    let position_net: f64 = result
+        .completed_positions
+        .iter()
+        .map(|position| position.net_pnl)
+        .sum();
+    assert!((result.summary.total_pnl - position_net).abs() < 1.0e-9);
+}
+
+#[test]
+fn a_partial_close_keeps_position_costs_on_the_final_row() {
+    let costs = HashMap::from([(SYMBOL.to_owned(), per_lot_commission(3.5))]);
+    let result = partial_then_full_close_run(costs);
+    assert_eq!(result.trade_log.len(), 2);
+
+    // The first row carries only its own exit commission; the final row also settles the entry commission.
+    assert_eq!(result.trade_log[0].swap, 0.0);
+    assert!(result.trade_log[0].commission < result.trade_log[1].commission);
+
+    let position = &result.completed_positions[0];
+    let settled: f64 = result
+        .trade_log
+        .iter()
+        .map(|trade| trade.commission + trade.swap)
+        .sum();
+    assert!((settled - position.commission_total).abs() < 1.0e-9);
+    let rows_net: f64 = result.trade_log.iter().map(|trade| trade.pnl).sum();
+    assert!((rows_net - position.net_pnl).abs() < 1.0e-9);
 }
 
 #[test]
