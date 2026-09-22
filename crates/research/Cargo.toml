@@ -1,0 +1,29 @@
+[package]
+name = "qs-research"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Parameter-family search, data windows, and comparison tables over quant-system historical replay"
+keywords = ["backtest", "research", "optimization", "trading"]
+categories = ["finance"]
+
+[lib]
+name = "qs_research"
+
+[dependencies]
+qs-backtest = { workspace = true }
+qs-strategy = { workspace = true }
+qs-market-loader = { workspace = true }
+qs-core = { workspace = true }
+
+chrono = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+qs-data-preprocess = { workspace = true, features = ["parquet"] }
+qs-symbols = { workspace = true }

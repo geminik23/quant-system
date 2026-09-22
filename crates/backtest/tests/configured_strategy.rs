@@ -22,7 +22,7 @@ use qs_core::{OrderType, Side};
 use qs_strategy::{
     ActionTemplate, CompletedBarRequirement, ConfiguredActionKind, DecisionKind, DecisionTemplate,
     Expr, Literal, MATERIAL_BAR_FIELD, MATERIAL_CANCELLATION_APPLIED, MATERIAL_EMA,
-    MATERIAL_POSITION_PENDING, MaterialBuild, MaterialConfig, MaterialEvalContext,
+    MATERIAL_POSITION_PENDING, MaterialArgs, MaterialBuild, MaterialConfig, MaterialEvalContext,
     MaterialEvaluator, MaterialFactory, MaterialLibrary, MaterialLookback, MaterialParams,
     MaterialUpdateTrigger, NamedExpr, NoteKind, NoteTemplate, ScalarType, SourceId, StateConfig,
     StrategyConfig, TransitionConfig, Value, ValueType,
@@ -62,13 +62,14 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
             params: MaterialParams::BarField {
                 source: source(),
                 field: qs_strategy::BarField::Close,
-            },
+            }
+            .into(),
         });
         materials.push(MaterialConfig {
             id: "ema".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "close".into() }],
-            params: MaterialParams::Ema { period },
+            params: MaterialParams::Ema { period }.into(),
         });
         Expr::Gt {
             left: Box::new(Expr::Bar {
@@ -125,6 +126,7 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
     StrategyConfig {
         strategy_id: "alpha".into(),
         title: "Neutral configured strategy".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -266,6 +268,7 @@ fn named_input_strategy() -> qs_strategy::ConfiguredStrategy {
     let config = StrategyConfig {
         strategy_id: "named".into(),
         title: "Named input".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -348,6 +351,7 @@ fn pending_adapter(
     let config = StrategyConfig {
         strategy_id: strategy_id.into(),
         title: "Pending management".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -426,6 +430,7 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "pending_causal".into(),
         title: "Causal pending cancellation".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -436,7 +441,8 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                 inputs: vec![],
                 params: MaterialParams::Position {
                     slot: "primary".into(),
-                },
+                }
+                .into(),
             },
             MaterialConfig {
                 id: "cancelled".into(),
@@ -445,7 +451,8 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                 params: MaterialParams::Feedback {
                     slot: "primary".into(),
                     action: ConfiguredActionKind::CancelPending,
-                },
+                }
+                .into(),
             },
         ],
         variables: vec![],
@@ -766,10 +773,10 @@ struct AlwaysTrueFactory;
 impl MaterialFactory for AlwaysTrueFactory {
     fn build(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         input_types: &[ValueType],
     ) -> Result<MaterialBuild, String> {
-        if *params != MaterialParams::None || !input_types.is_empty() {
+        if !params.is_empty() || !input_types.is_empty() {
             return Err("always_true accepts no parameters or inputs".into());
         }
         Ok(MaterialBuild {
@@ -808,10 +815,10 @@ struct CausalCountingFactory {
 impl MaterialFactory for CausalCountingFactory {
     fn build(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         input_types: &[ValueType],
     ) -> Result<MaterialBuild, String> {
-        if *params != MaterialParams::None || !input_types.is_empty() {
+        if !params.is_empty() || !input_types.is_empty() {
             return Err("causal_counter accepts no parameters or inputs".into());
         }
         Ok(MaterialBuild {
@@ -829,7 +836,7 @@ impl MaterialFactory for CausalCountingFactory {
 
     fn update_trigger(
         &self,
-        _params: &MaterialParams,
+        _params: &MaterialArgs,
         _input_types: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
         Ok(MaterialUpdateTrigger::Source(source()))
@@ -840,6 +847,7 @@ fn custom_strategy_config(id: &str) -> StrategyConfig {
     StrategyConfig {
         strategy_id: id.into(),
         title: format!("Custom material {id}"),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -847,7 +855,7 @@ fn custom_strategy_config(id: &str) -> StrategyConfig {
             id: "always".into(),
             key: "always_true".into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         }],
         variables: vec![],
         states: vec![
@@ -1289,7 +1297,7 @@ fn no_op_updates_causal_material_and_repeats_deterministically() {
             id: "causal_count".into(),
             key: "causal_counter".into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         });
         let configured =
             qs_strategy::ConfiguredStrategy::compile(strategy, &library, "instance_a", SYMBOL)

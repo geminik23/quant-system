@@ -174,8 +174,13 @@ pub struct ExecutionMetadata {
     pub stale_quote_after_millis: Option<i64>,
     #[serde(default = "default_pnl_epsilon")]
     pub pnl_epsilon: f64,
-    /// Application-defined, deterministically ordered metadata.
+    /// Engine-produced diagnostics for this run, deterministically ordered.
     pub tags: BTreeMap<String, String>,
+    /// Caller-supplied labels for this run, copied onto every completed position's evaluation dimensions.
+    ///
+    /// These are separate from `tags` so that a caller cannot overwrite an engine diagnostic and an engine diagnostic cannot become a breakdown dimension.
+    #[serde(default)]
+    pub run_tags: BTreeMap<String, String>,
 }
 
 impl Default for ExecutionMetadata {
@@ -200,6 +205,7 @@ impl Default for ExecutionMetadata {
             stale_quote_after_millis: None,
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
+            run_tags: BTreeMap::new(),
         }
     }
 }

@@ -42,6 +42,7 @@ pub fn adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "alpha".into(),
         title: "Neutral configured strategy".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -192,7 +193,7 @@ fn material(id: &str, key: &str, inputs: Vec<Expr>, params: MaterialParams) -> M
         id: id.into(),
         key: key.into(),
         inputs,
-        params,
+        params: params.into(),
     }
 }
 
@@ -332,6 +333,7 @@ pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "crossover".into(),
         title: "EMA crossover".into(),
+        parameters: vec![],
         initial_state: "flat".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -394,6 +396,7 @@ pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "lifecycle".into(),
         title: "EMA ATR lifecycle".into(),
+        parameters: vec![],
         initial_state: "flat".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],

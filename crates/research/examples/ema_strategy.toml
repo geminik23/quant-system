@@ -1,0 +1,302 @@
+strategy_id = "ema_research"
+title = "EMA research family"
+initial_state = "flat"
+sources = ["primary"]
+trade_slots = ["primary"]
+variables = []
+
+[[parameters]]
+id = "ema_fast"
+
+[parameters.kind]
+type = "integer"
+
+[[parameters]]
+id = "ema_slow"
+
+[parameters.kind]
+type = "integer"
+
+[[parameters]]
+id = "atr_stop"
+
+[parameters.kind]
+type = "number"
+
+[[parameters]]
+id = "entry"
+
+[parameters.kind]
+type = "choice"
+options = ["cross", "price_above_fast", "rsi_above_fifty"]
+
+[[materials]]
+id = "close"
+key = "completed_bar_field"
+inputs = []
+
+[materials.params.field]
+type = "bar_field"
+value = "close"
+
+[materials.params.source]
+type = "source"
+value = "primary"
+
+[[materials]]
+id = "fast"
+key = "ema"
+
+[[materials.inputs]]
+op = "material"
+id = "close"
+
+[materials.params.period]
+type = "param"
+value = "ema_fast"
+
+[[materials]]
+id = "slow"
+key = "ema"
+
+[[materials.inputs]]
+op = "material"
+id = "close"
+
+[materials.params.period]
+type = "param"
+value = "ema_slow"
+
+[[materials]]
+id = "atr"
+key = "atr"
+inputs = []
+
+[materials.params.period]
+type = "integer"
+value = 14
+
+[materials.params.source]
+type = "source"
+value = "primary"
+
+[[materials]]
+id = "cross_up"
+key = "cross_above"
+
+[[materials.inputs]]
+op = "material"
+id = "fast"
+
+[[materials.inputs]]
+op = "material"
+id = "slow"
+
+[materials.params]
+
+[[materials]]
+id = "position_open"
+key = "position_open"
+inputs = []
+
+[materials.params.slot]
+type = "slot"
+value = "primary"
+
+[[materials]]
+id = "entry_rejected"
+key = "entry_rejected"
+inputs = []
+
+[materials.params.action]
+type = "action_kind"
+value = "entry"
+
+[materials.params.slot]
+type = "slot"
+value = "primary"
+
+[[materials]]
+id = "cross_down"
+key = "cross_below"
+
+[[materials.inputs]]
+op = "material"
+id = "fast"
+
+[[materials.inputs]]
+op = "material"
+id = "slow"
+
+[materials.params]
+
+[[materials]]
+id = "rsi"
+key = "rsi"
+
+[[materials.inputs]]
+op = "material"
+id = "close"
+
+[materials.params.period]
+type = "integer"
+value = 14
+
+[[states]]
+id = "flat"
+
+[[states.transitions]]
+priority = 1
+target = "entering"
+assignments = []
+notes = []
+
+[states.transitions.when]
+op = "select"
+param = "entry"
+
+[states.transitions.when.cases.cross]
+op = "material"
+id = "cross_up"
+
+[states.transitions.when.cases.price_above_fast]
+op = "gt"
+
+[states.transitions.when.cases.price_above_fast.left]
+op = "material"
+id = "close"
+
+[states.transitions.when.cases.price_above_fast.right]
+op = "material"
+id = "fast"
+
+[states.transitions.when.cases.rsi_above_fifty]
+op = "gt"
+
+[states.transitions.when.cases.rsi_above_fifty.left]
+op = "material"
+id = "rsi"
+
+[states.transitions.when.cases.rsi_above_fifty.right]
+op = "literal"
+
+[states.transitions.when.cases.rsi_above_fifty.right.value]
+type = "number"
+value = 50.0
+
+[states.transitions.decision]
+kind = "entry"
+reason = "selected entry condition became true"
+trade_slot = "primary"
+values = []
+
+[[states.transitions.actions]]
+action = "entry"
+slot = "primary"
+order_type = "Market"
+targets = []
+
+[states.transitions.actions.side]
+op = "literal"
+
+[states.transitions.actions.side.value]
+type = "side"
+value = "Buy"
+
+[states.transitions.actions.price]
+op = "literal"
+
+[states.transitions.actions.price.value]
+type = "missing"
+value = "price"
+
+[states.transitions.actions.risk]
+op = "literal"
+
+[states.transitions.actions.risk.value]
+type = "number"
+value = 1.0
+
+[states.transitions.actions.stoploss]
+op = "sub"
+
+[states.transitions.actions.stoploss.left]
+op = "bar"
+source = "primary"
+field = "close"
+
+[states.transitions.actions.stoploss.right]
+op = "mul"
+
+[states.transitions.actions.stoploss.right.left]
+op = "material"
+id = "atr"
+
+[states.transitions.actions.stoploss.right.right]
+op = "param"
+id = "atr_stop"
+
+[[states]]
+id = "entering"
+
+[[states.transitions]]
+priority = 1
+target = "long"
+assignments = []
+actions = []
+notes = []
+
+[states.transitions.when]
+op = "material"
+id = "position_open"
+
+[[states.transitions]]
+priority = 2
+target = "flat"
+assignments = []
+actions = []
+notes = []
+
+[states.transitions.when]
+op = "material"
+id = "entry_rejected"
+
+[[states]]
+id = "long"
+
+[[states.transitions]]
+priority = 1
+target = "closing"
+assignments = []
+notes = []
+
+[states.transitions.when]
+op = "material"
+id = "cross_down"
+
+[states.transitions.decision]
+kind = "exit"
+reason = "fast average crossed below slow"
+trade_slot = "primary"
+values = []
+
+[[states.transitions.actions]]
+action = "close"
+slot = "primary"
+
+[[states]]
+id = "closing"
+
+[[states.transitions]]
+priority = 1
+target = "flat"
+assignments = []
+actions = []
+notes = []
+
+[states.transitions.when]
+op = "not"
+
+[states.transitions.when.value]
+op = "material"
+id = "position_open"

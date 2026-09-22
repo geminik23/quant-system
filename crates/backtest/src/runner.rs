@@ -875,6 +875,10 @@ pub struct BacktestConfig {
     ///
     /// Stored bars normally carry the average spread observed while they formed. This map covers feeds that cannot supply one; without it such bars execute at a zero spread, and the run reports how often that happened.
     pub bar_spread_fallback: HashMap<String, f64>,
+    /// Caller-supplied labels recorded with the run and attached to every completed position.
+    ///
+    /// A batch of runs uses these to say what distinguishes one run from another, such as the parameter values or the data window, so that evaluation can break results down by them afterwards. They are inert: the engine never reads a tag to decide anything. Keys and values are bounded and validated before replay starts, and they are kept separate from the engine's own diagnostic tags so neither can overwrite the other.
+    pub run_tags: BTreeMap<String, String>,
     /// Per-symbol commission and swap specification.
     ///
     /// An empty map charges nothing and reproduces runs made before costs existed. Point-denominated swap additionally requires a matching `symbol_specs` entry, because the price point size comes from its digit count.
@@ -892,6 +896,7 @@ impl Default for BacktestConfig {
             symbol_specs: HashMap::new(),
             instrument_manifest: None,
             bar_spread_fallback: HashMap::new(),
+            run_tags: BTreeMap::new(),
             costs: HashMap::new(),
         }
     }
@@ -2893,6 +2898,7 @@ impl BacktestRunner {
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
+                run_tags: self.config.run_tags.clone(),
                 ..ExecutionMetadata::default()
             },
             fills: future_executor.fills.clone(),
@@ -4320,6 +4326,46 @@ fn accept_legacy_quote(
     true
 }
 
+/// Largest number of run tags one replay may carry.
+pub const MAX_RUN_TAGS: usize = 32;
+/// Largest byte length of one run-tag key or value.
+pub const MAX_RUN_TAG_BYTES: usize = 64;
+
+fn validate_run_tags(tags: &BTreeMap<String, String>) -> Result<(), String> {
+    if tags.len() > MAX_RUN_TAGS {
+        return Err(format!(
+            "run tags must not exceed {MAX_RUN_TAGS} entries, got {}",
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        if key.is_empty() || key.len() > MAX_RUN_TAG_BYTES {
+            return Err(format!(
+                "run tag key must be 1 to {MAX_RUN_TAG_BYTES} bytes, got '{key}'"
+            ));
+        }
+        if !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "run tag key must be ASCII alphanumeric, underscore, or hyphen, got '{key}'"
+            ));
+        }
+        if value.len() > MAX_RUN_TAG_BYTES {
+            return Err(format!(
+                "run tag value for '{key}' must not exceed {MAX_RUN_TAG_BYTES} bytes"
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!(
+                "run tag value for '{key}' must not contain control characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_replay_config(
     config: &BacktestConfig,
     future: Option<&FutureQuoteConfig>,
@@ -4342,6 +4388,7 @@ fn validate_replay_config(
         }
     }
 
+    validate_run_tags(&config.run_tags)?;
     validate_replay_costs(config, future)?;
     validate_instrument_manifest(config)?;
     for (symbol, spec) in &config.symbol_specs {

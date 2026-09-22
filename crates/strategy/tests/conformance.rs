@@ -95,6 +95,7 @@ fn base(states: Vec<StateConfig>) -> StrategyConfig {
     StrategyConfig {
         strategy_id: "alpha".into(),
         title: "Neutral strategy".into(),
+        parameters: vec![],
         initial_state: states[0].id.clone(),
         sources: vec![source("fast"), source("slow")],
         trade_slots: vec!["primary".into(), "secondary".into()],
@@ -156,12 +157,14 @@ fn strict_schema_rejects_versions_parameter_bags_and_unknown_fields() {
     let mut versioned = valid.clone();
     versioned["schema_version"] = json!(1);
     assert!(serde_json::from_value::<StrategyConfig>(versioned).is_err());
-    assert!(
-        serde_json::from_value::<MaterialParams>(json!({
-            "type":"custom", "values":[]
-        }))
-        .is_err()
-    );
+    let mut undeclared = base(vec![state("idle", vec![])]);
+    undeclared.materials.push(MaterialConfig {
+        id: "time".into(),
+        key: MATERIAL_INPUT_TIME.into(),
+        inputs: vec![],
+        params: MaterialArgs::new([("unknown", MaterialArg::Integer(1))]),
+    });
+    assert!(compile(undeclared).is_err());
     assert!(SourceId::new(" bad ").is_err());
 }
 
@@ -173,13 +176,13 @@ fn graph_type_cycle_state_and_priority_validation_remain_strict() {
             id: "x".into(),
             key: MATERIAL_INPUT_TIME.into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         },
         MaterialConfig {
             id: "x".into(),
             key: MATERIAL_READINESS.into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         },
     ];
     assert!(matches!(
@@ -193,13 +196,13 @@ fn graph_type_cycle_state_and_priority_validation_remain_strict() {
             id: "a".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "b".into() }],
-            params: MaterialParams::Ema { period: 2 },
+            params: MaterialParams::Ema { period: 2 }.into(),
         },
         MaterialConfig {
             id: "b".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "a".into() }],
-            params: MaterialParams::Ema { period: 2 },
+            params: MaterialParams::Ema { period: 2 }.into(),
         },
     ];
     assert!(matches!(
@@ -239,7 +242,8 @@ fn requirements_are_ordered_source_specific_and_propagate_lookback() {
             params: MaterialParams::BarField {
                 source: source("fast"),
                 field: BarField::Close,
-            },
+            }
+            .into(),
         },
         MaterialConfig {
             id: "fast_ema".into(),
@@ -247,7 +251,7 @@ fn requirements_are_ordered_source_specific_and_propagate_lookback() {
             inputs: vec![Expr::Material {
                 id: "fast_close".into(),
             }],
-            params: MaterialParams::Ema { period: 5 },
+            params: MaterialParams::Ema { period: 5 }.into(),
         },
         MaterialConfig {
             id: "slow_atr".into(),
@@ -256,7 +260,8 @@ fn requirements_are_ordered_source_specific_and_propagate_lookback() {
             params: MaterialParams::Atr {
                 source: source("slow"),
                 period: 3,
-            },
+            }
+            .into(),
         },
         MaterialConfig {
             id: "cross".into(),
@@ -269,7 +274,7 @@ fn requirements_are_ordered_source_specific_and_propagate_lookback() {
                     id: "fast_ema".into(),
                 },
             ],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         },
     ];
     config.states[0].transitions = vec![];
@@ -302,13 +307,14 @@ fn two_sources_update_once_per_boundary_and_unrelated_source_is_isolated() {
             params: MaterialParams::BarField {
                 source: source("fast"),
                 field: BarField::Close,
-            },
+            }
+            .into(),
         },
         MaterialConfig {
             id: "ema".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "close".into() }],
-            params: MaterialParams::Ema { period: 3 },
+            params: MaterialParams::Ema { period: 3 }.into(),
         },
         MaterialConfig {
             id: "cross".into(),
@@ -317,7 +323,7 @@ fn two_sources_update_once_per_boundary_and_unrelated_source_is_isolated() {
                 Expr::Material { id: "close".into() },
                 Expr::Material { id: "ema".into() },
             ],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         },
         MaterialConfig {
             id: "slow".into(),
@@ -326,7 +332,8 @@ fn two_sources_update_once_per_boundary_and_unrelated_source_is_isolated() {
             params: MaterialParams::BarField {
                 source: source("slow"),
                 field: BarField::Close,
-            },
+            }
+            .into(),
         },
     ];
     let mut strategy = compile(config).unwrap();
@@ -370,7 +377,8 @@ fn completed_bar_updates_reject_duplicate_unknown_unrequired_and_invalid() {
         params: MaterialParams::BarField {
             source: source("fast"),
             field: BarField::Close,
-        },
+        }
+        .into(),
     }];
     let mut duplicate = compile(config.clone()).unwrap();
     let mut snapshot = input(0, true);
@@ -421,11 +429,7 @@ struct PassFactory {
     lookback: MaterialLookback,
 }
 impl MaterialFactory for PassFactory {
-    fn build(
-        &self,
-        _: &MaterialParams,
-        input_types: &[ValueType],
-    ) -> Result<MaterialBuild, String> {
+    fn build(&self, _: &MaterialArgs, input_types: &[ValueType]) -> Result<MaterialBuild, String> {
         if input_types.len() != 1 {
             return Err("one input required".into());
         }
@@ -438,7 +442,7 @@ impl MaterialFactory for PassFactory {
     }
     fn update_trigger(
         &self,
-        _: &MaterialParams,
+        _: &MaterialArgs,
         _: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
         Ok(self.trigger.clone())
@@ -498,7 +502,7 @@ fn named_input_schema_conflicts_and_updated_provenance_are_enforced() {
             field: "level".into(),
             value_type: ValueType::required(ScalarType::Number),
         }],
-        params: MaterialParams::None,
+        params: MaterialParams::None.into(),
     }];
     let mut strategy = ConfiguredStrategy::compile(config, &library, "i", "EURUSD").unwrap();
     assert_eq!(
@@ -570,7 +574,7 @@ fn named_input_runtime_rejects_missing_unknown_duplicate_and_wrong_type() {
 fn impossible_dependency_trigger_and_unprovenanced_lookback_reject() {
     struct NoInputFactory;
     impl MaterialFactory for NoInputFactory {
-        fn build(&self, _: &MaterialParams, _: &[ValueType]) -> Result<MaterialBuild, String> {
+        fn build(&self, _: &MaterialArgs, _: &[ValueType]) -> Result<MaterialBuild, String> {
             Ok(MaterialBuild {
                 output_type: ValueType::required(ScalarType::Bool),
                 lookback: MaterialLookback::InheritInputs { minimum: 2 },
@@ -580,7 +584,7 @@ fn impossible_dependency_trigger_and_unprovenanced_lookback_reject() {
         }
         fn update_trigger(
             &self,
-            _: &MaterialParams,
+            _: &MaterialArgs,
             _: &[ValueType],
         ) -> Result<MaterialUpdateTrigger, String> {
             Ok(MaterialUpdateTrigger::AllInputs)
@@ -594,7 +598,7 @@ fn impossible_dependency_trigger_and_unprovenanced_lookback_reject() {
         id: "bad".into(),
         key: "bad".into(),
         inputs: vec![],
-        params: MaterialParams::None,
+        params: MaterialParams::None.into(),
     });
     assert!(ConfiguredStrategy::compile(config, &library, "i", "EURUSD").is_err());
 }
@@ -677,13 +681,14 @@ fn readiness_advances_materials_but_state_evaluates_once_when_ready() {
             params: MaterialParams::BarField {
                 source: source("fast"),
                 field: BarField::Close,
-            },
+            }
+            .into(),
         },
         MaterialConfig {
             id: "ema".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "close".into() }],
-            params: MaterialParams::Ema { period: 3 },
+            params: MaterialParams::Ema { period: 3 }.into(),
         },
     ];
     let mut strategy = compile(config).unwrap();
@@ -888,7 +893,7 @@ impl MaterialEvaluator for RejectionCountEvaluator {
 struct RejectionCountFactory;
 
 impl MaterialFactory for RejectionCountFactory {
-    fn build(&self, _: &MaterialParams, _: &[ValueType]) -> Result<MaterialBuild, String> {
+    fn build(&self, _: &MaterialArgs, _: &[ValueType]) -> Result<MaterialBuild, String> {
         Ok(MaterialBuild {
             output_type: ValueType::required(ScalarType::Integer),
             lookback: MaterialLookback::None,
@@ -899,7 +904,7 @@ impl MaterialFactory for RejectionCountFactory {
 
     fn update_trigger(
         &self,
-        _: &MaterialParams,
+        _: &MaterialArgs,
         _: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
         Ok(MaterialUpdateTrigger::FeedbackPulse)
@@ -972,7 +977,7 @@ fn custom_feedback_material_updates_once_across_false_readiness() {
         id: "rejections".into(),
         key: "rejection_count".into(),
         inputs: vec![],
-        params: MaterialParams::None,
+        params: MaterialParams::None.into(),
     });
     let mut strategy = ConfiguredStrategy::compile(config, &library, "i", "EURUSD").unwrap();
     assert!(strategy.input_requirements().needs_command_feedback);
@@ -1111,6 +1116,58 @@ fn close_and_cancel_wait_for_facts_and_release_slots() {
 }
 
 #[test]
+fn a_skipped_close_releases_the_slot_so_the_strategy_can_trade_again() {
+    // A protective stop closes a position without the strategy asking. The strategy's own close then
+    // finds nothing to close and terminates as skipped. Holding the reservation in that case would
+    // strand the slot for the rest of the run, so any strategy that uses a stop could trade only once.
+    let mut strategy = command_strategy(ActionTemplate::Close {
+        slot: "primary".into(),
+    });
+    let entry = strategy.evaluate(&input(0, true)).unwrap().commands[0]
+        .command_id
+        .clone();
+    let mut filled = input(1, true);
+    filled.feedback.push(fact(&entry, CommandFact::EntryFilled));
+    let close = strategy.evaluate(&filled).unwrap().commands[0]
+        .command_id
+        .clone();
+    assert!(strategy.trade_id_for_slot("primary").is_some());
+
+    let mut skipped = input(2, true);
+    skipped
+        .feedback
+        .push(terminal(&close, CommandTerminalStatus::Skipped));
+    strategy.evaluate(&skipped).unwrap();
+    assert!(
+        strategy.trade_id_for_slot("primary").is_none(),
+        "a close with nothing left to close must free its slot"
+    );
+}
+
+#[test]
+fn a_rejected_close_keeps_the_slot_reserved() {
+    // A rejected close did not happen, so the position may still be open and the slot is still spoken for.
+    let mut strategy = command_strategy(ActionTemplate::Close {
+        slot: "primary".into(),
+    });
+    let entry = strategy.evaluate(&input(0, true)).unwrap().commands[0]
+        .command_id
+        .clone();
+    let mut filled = input(1, true);
+    filled.feedback.push(fact(&entry, CommandFact::EntryFilled));
+    let close = strategy.evaluate(&filled).unwrap().commands[0]
+        .command_id
+        .clone();
+
+    let mut rejected = input(2, true);
+    rejected
+        .feedback
+        .push(terminal(&close, CommandTerminalStatus::Rejected));
+    strategy.evaluate(&rejected).unwrap();
+    assert!(strategy.trade_id_for_slot("primary").is_some());
+}
+
+#[test]
 fn repeated_immediate_management_does_not_exhaust_correlations() {
     let mut enter = transition(1, "a", boolean(true));
     enter.decision = Some(decision(Some("primary")));
@@ -1169,7 +1226,7 @@ impl MaterialEvaluator for CounterEvaluator {
 }
 struct CounterFactory;
 impl MaterialFactory for CounterFactory {
-    fn build(&self, _: &MaterialParams, _: &[ValueType]) -> Result<MaterialBuild, String> {
+    fn build(&self, _: &MaterialArgs, _: &[ValueType]) -> Result<MaterialBuild, String> {
         Ok(MaterialBuild {
             output_type: ValueType::required(ScalarType::Integer),
             lookback: MaterialLookback::None,
@@ -1200,10 +1257,10 @@ fn custom_factory_instances_are_independent_and_output_failure_is_atomic() {
         id: "counter".into(),
         key: "counter".into(),
         inputs: vec![],
-        params: MaterialParams::None,
+        params: MaterialParams::None.into(),
     });
     let mut parameterized = config.clone();
-    parameterized.materials[0].params = MaterialParams::Ema { period: 2 };
+    parameterized.materials[0].params = MaterialParams::Ema { period: 2 }.into();
     assert!(ConfiguredStrategy::compile(parameterized, &library, "bad", "EURUSD").is_err());
     let mut first = ConfiguredStrategy::compile(config.clone(), &library, "a", "EURUSD").unwrap();
     let mut second = ConfiguredStrategy::compile(config, &library, "b", "EURUSD").unwrap();
@@ -1219,14 +1276,8 @@ fn custom_factory_instances_are_independent_and_output_failure_is_atomic() {
         trade_slot: Some("primary".into()),
         values: vec![],
     });
-    let mut config = base(vec![state("idle", vec![fail]), state("done", vec![])]);
-    config.materials.push(MaterialConfig {
-        id: "counter".into(),
-        key: "counter".into(),
-        inputs: vec![],
-        params: MaterialParams::None,
-    });
-    let mut strategy = ConfiguredStrategy::compile(config, &library, "c", "EURUSD").unwrap();
+    let config = base(vec![state("idle", vec![fail]), state("done", vec![])]);
+    let mut strategy = ConfiguredStrategy::compile(config, &library, "i1", "EURUSD").unwrap();
     assert!(strategy.evaluate(&input(0, true)).is_err());
     assert_eq!(strategy.state_id(), "idle");
 }

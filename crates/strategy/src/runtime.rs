@@ -10,10 +10,11 @@ use crate::material::FeedbackObservation;
 use crate::{
     ActionTemplate, AssignmentConfig, CommandFact, CommandFeedback, CommandTerminalStatus,
     CompileError, CompletedBarRequirement, ConfiguredActionKind, ConfiguredStrategyRequirements,
-    DecisionKind, DecisionTemplate, EvaluationError, Expr, FeedbackField, MaterialConfig,
-    MaterialEvalContext, MaterialEvaluator, MaterialLibrary, MaterialLookback, MaterialParams,
-    MaterialUpdateTrigger, NamedExpr, NamedInputRequirement, NoteKind, NoteTemplate, ScalarType,
-    SourceId, StrategyConfig, StrategyInput, TradeSlotState, TransitionConfig, Value, ValueType,
+    DecisionKind, DecisionTemplate, EvaluationError, Expr, FeedbackField, MaterialArg,
+    MaterialArgs, MaterialConfig, MaterialEvalContext, MaterialEvaluator, MaterialLibrary,
+    MaterialLookback, MaterialUpdateTrigger, NamedExpr, NamedInputRequirement, NoteKind,
+    NoteTemplate, ParamKind, ScalarType, SourceId, StrategyConfig, StrategyInput, TradeSlotState,
+    TransitionConfig, Value, ValueType,
 };
 
 type TypedIndexMap = BTreeMap<String, (usize, ValueType)>;
@@ -284,6 +285,12 @@ impl ConfiguredStrategy {
         primary_symbol: impl Into<String>,
     ) -> Result<Self, CompileError> {
         validate_config_bounds(&config)?;
+        if !config.parameters.is_empty() {
+            return Err(CompileError::InvalidConfig {
+                path: "parameters".into(),
+                reason: "strategy parameters must be bound before compilation".into(),
+            });
+        }
         validate_id_at(&config.strategy_id, "strategy_id")?;
         crate::validate_text(&config.title, crate::MAX_TEXT_BYTES).map_err(|reason| {
             CompileError::InvalidConfig {
@@ -503,6 +510,7 @@ impl ConfiguredStrategy {
                 MaterialUpdateTrigger::AllInputs => {
                     !input_updates.is_empty() && input_updates.iter().all(|updated| *updated)
                 }
+                MaterialUpdateTrigger::AnyInput => input_updates.iter().any(|updated| *updated),
             };
             if !triggered {
                 if self.materials[index].clear_pulse_when_idle {
@@ -700,26 +708,6 @@ fn collect_requirements(
                 sources,
                 &mut collector,
             )?;
-        }
-        match &material.params {
-            MaterialParams::BarField { source, .. } => {
-                require_source(
-                    sources,
-                    source,
-                    &format!("materials[{index}].params.source"),
-                )?;
-                collector.add_source(source, 1);
-            }
-            MaterialParams::Atr { source, period } => {
-                require_source(
-                    sources,
-                    source,
-                    &format!("materials[{index}].params.source"),
-                )?;
-                collector.add_source(source, usize::from(*period) + 1);
-            }
-            MaterialParams::Feedback { .. } => collector.needs_feedback = true,
-            _ => {}
         }
     }
     for (state_index, state) in config.states.iter().enumerate() {
@@ -940,7 +928,14 @@ fn compile_materials(
     let mut aggregate = BTreeMap::new();
     for original in order {
         let material = &configs[original];
-        validate_material_params(&material.params, trade_slots, sources, original)?;
+        let factory = library.factory(&material.key).unwrap();
+        validate_material_args(
+            &material.params,
+            factory.params(),
+            trade_slots,
+            sources,
+            original,
+        )?;
         let scope = ExprScope {
             variables,
             materials: &map,
@@ -962,25 +957,7 @@ fn compile_materials(
             .iter()
             .map(CompiledExpr::provenance)
             .collect::<Vec<_>>();
-        if matches!(
-            material.key.as_str(),
-            crate::MATERIAL_CROSS_ABOVE | crate::MATERIAL_CROSS_BELOW
-        ) && inputs
-            .iter()
-            .any(|input| input.direct_material_index().is_none())
-        {
-            return Err(CompileError::InvalidConfig {
-                path: format!("materials[{original}].inputs"),
-                reason: "crossing inputs must be direct material references".into(),
-            });
-        }
-        if library.is_custom(&material.key) && !matches!(&material.params, MaterialParams::None) {
-            return Err(CompileError::InvalidConfig {
-                path: format!("materials[{original}].params"),
-                reason: "custom material factories are parameterless".into(),
-            });
-        }
-        let factory = library.factory(&material.key).unwrap();
+
         let trigger = factory
             .update_trigger(&material.params, &input_types)
             .map_err(|reason| CompileError::MaterialFactory {
@@ -1034,17 +1011,26 @@ fn validate_trigger(
     provenance: &[CompiledInputProvenance],
     index: usize,
 ) -> Result<(), CompileError> {
-    if matches!(trigger, MaterialUpdateTrigger::AllInputs) {
-        if provenance.is_empty() {
+    if matches!(
+        trigger,
+        MaterialUpdateTrigger::AllInputs | MaterialUpdateTrigger::AnyInput
+    ) {
+        if provenance.is_empty()
+            || !provenance.iter().any(|item| {
+                !item.material_indexes.is_empty()
+                    || !item.sources.is_empty()
+                    || !item.named_inputs.is_empty()
+            })
+        {
             return Err(CompileError::InvalidConfig {
                 path: format!("materials[{index}].update_trigger"),
-                reason: "AllInputs requires at least one input".into(),
+                reason: "input-driven material requires at least one causal input leaf".into(),
             });
         }
         if provenance.iter().any(|item| item.dynamic) {
             return Err(CompileError::InvalidConfig {
                 path: format!("materials[{index}].update_trigger"),
-                reason: "AllInputs cannot use dynamic position, feedback, time, readiness, or variable dependencies".into(),
+                reason: "input-driven material cannot use dynamic position, feedback, time, readiness, or variable dependencies".into(),
             });
         }
     }
@@ -1099,36 +1085,81 @@ fn apply_lookback_contract(
                             .into(),
                 });
             }
-            for value in upstream.values_mut() {
-                *value = (*value).max(minimum);
+            if minimum > 0 {
+                for value in upstream.values_mut() {
+                    *value = value.checked_add(minimum - 1).ok_or_else(|| {
+                        CompileError::InvalidConfig {
+                            path: format!("materials[{index}].lookback"),
+                            reason: "composed material lookback overflowed".into(),
+                        }
+                    })?;
+                    check_bound(
+                        &format!("materials[{index}].lookback"),
+                        *value,
+                        crate::MAX_MATERIAL_LOOKBACK,
+                    )?;
+                }
             }
         }
     }
     Ok(upstream)
 }
 
-fn validate_material_params(
-    params: &MaterialParams,
+fn validate_material_args(
+    args: &MaterialArgs,
+    schema: &[crate::ParamSpec],
     trade_slots: &BTreeSet<String>,
     sources: &BTreeSet<SourceId>,
     index: usize,
 ) -> Result<(), CompileError> {
-    match params {
-        MaterialParams::BarField { source, .. } | MaterialParams::Atr { source, .. } => {
-            require_source(
-                sources,
-                source,
-                &format!("materials[{index}].params.source"),
-            )?;
+    let path = format!("materials[{index}].params");
+    check_bound(&path, args.len(), crate::MAX_MATERIAL_ARGS)?;
+    for (name, value) in args.iter() {
+        let Some(spec) = schema.iter().find(|spec| spec.name == name) else {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{name}"),
+                reason: "material argument is not declared by the factory".into(),
+            });
+        };
+        let valid = match (spec.kind, value) {
+            (ParamKind::Integer { min, max }, MaterialArg::Integer(value)) => {
+                *value >= min && *value <= max
+            }
+            (ParamKind::Number { min, max }, MaterialArg::Number(value)) => {
+                value.is_finite() && *value >= min && *value <= max
+            }
+            (ParamKind::Source, MaterialArg::Source(source)) => {
+                require_source(sources, source, &format!("{path}.{name}"))?;
+                true
+            }
+            (ParamKind::Slot, MaterialArg::Slot(slot)) => {
+                require_trade_slot(trade_slots, slot, &format!("{path}.{name}"))?;
+                true
+            }
+            (ParamKind::BarField, MaterialArg::BarField(_))
+            | (ParamKind::ActionKind, MaterialArg::ActionKind(_)) => true,
+            (_, MaterialArg::Param(_)) => {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("{path}.{name}"),
+                    reason: "material parameter reference must be bound before compilation".into(),
+                });
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{name}"),
+                reason: "material argument does not match the factory schema or bounds".into(),
+            });
         }
-        MaterialParams::Position { slot } | MaterialParams::Feedback { slot, .. } => {
-            require_trade_slot(
-                trade_slots,
-                slot,
-                &format!("materials[{index}].params.slot"),
-            )?;
+    }
+    for spec in schema {
+        if spec.required && args.get(spec.name).is_none() {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{}", spec.name),
+                reason: "required material argument is missing".into(),
+            });
         }
-        _ => {}
     }
     Ok(())
 }
@@ -1675,15 +1706,16 @@ fn process_feedback(
 
         let completed = command_completed(&identity.commands[index]);
         if completed {
-            let successful =
-                identity.commands[index].terminal == Some(CommandTerminalStatus::Applied);
-            let release_slot = if successful {
-                matches!(
-                    binding.action,
-                    ConfiguredActionKind::Close | ConfiguredActionKind::CancelPending
-                )
-            } else {
-                binding.action == ConfiguredActionKind::Entry
+            let terminal = identity.commands[index].terminal;
+            let successful = terminal == Some(CommandTerminalStatus::Applied);
+            let release_slot = match binding.action {
+                // A close or cancellation that was skipped had nothing left to act on, which means the slot's position or order is already gone. Treating that as still reserved would strand the slot for the rest of the run, so a strategy whose protective stop fired could never trade again.
+                ConfiguredActionKind::Close | ConfiguredActionKind::CancelPending => {
+                    successful || terminal == Some(CommandTerminalStatus::Skipped)
+                }
+                // A failed entry never reserved anything the strategy can act on.
+                ConfiguredActionKind::Entry => !successful,
+                _ => false,
             };
             if release_slot {
                 release_trade_slot(identity, &binding.slot);
@@ -2092,6 +2124,7 @@ fn validate_reachable(states: &[CompiledState], initial: usize) -> Result<(), Co
 }
 
 fn validate_config_bounds(config: &StrategyConfig) -> Result<(), CompileError> {
+    check_bound("parameters", config.parameters.len(), crate::MAX_PARAMETERS)?;
     check_bound("sources", config.sources.len(), crate::MAX_SOURCES)?;
     check_bound("trade_slots", config.trade_slots.len(), crate::MAX_LEGS)?;
     check_bound("materials", config.materials.len(), crate::MAX_MATERIALS)?;
@@ -2102,6 +2135,11 @@ fn validate_config_bounds(config: &StrategyConfig) -> Result<(), CompileError> {
             &format!("materials[{index}].inputs"),
             material.inputs.len(),
             crate::MAX_MATERIAL_INPUTS,
+        )?;
+        check_bound(
+            &format!("materials[{index}].params"),
+            material.params.len(),
+            crate::MAX_MATERIAL_ARGS,
         )?;
     }
     for (state_index, state) in config.states.iter().enumerate() {

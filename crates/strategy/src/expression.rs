@@ -112,6 +112,10 @@ fn compile_inner(
                 path: path.into(),
                 reference: id.clone(),
             }),
+        Expr::Param { .. } | Expr::Select { .. } => Err(CompileError::InvalidConfig {
+            path: path.into(),
+            reason: "strategy parameter expressions must be bound before compilation".into(),
+        }),
         Expr::Input { field, value_type } => {
             crate::validate_id(field).map_err(|reason| CompileError::InvalidIdentifier {
                 path: format!("{path}.field"),
@@ -406,14 +410,6 @@ pub(crate) struct CompiledInputProvenance {
 }
 
 impl CompiledExpr {
-    pub(crate) fn direct_material_index(&self) -> Option<usize> {
-        if let Self::Material(index) = self {
-            Some(*index)
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn provenance(&self) -> CompiledInputProvenance {
         let mut provenance = CompiledInputProvenance::default();
         self.collect_provenance(&mut provenance);
@@ -737,6 +733,11 @@ fn collect_material_refs_inner(
     };
     match expr {
         Expr::Material { id } => refs.push(id.clone()),
+        Expr::Select { cases, .. } => {
+            for (name, case) in cases {
+                visit(case, &format!("cases.{name}"))?;
+            }
+        }
         Expr::Not { value }
         | Expr::Abs { value }
         | Expr::IsPresent { value }

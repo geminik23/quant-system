@@ -89,6 +89,8 @@ pub fn config_from_msg(
         symbol_specs,
         instrument_manifest: None,
         bar_spread_fallback: std::collections::HashMap::new(),
+        // Run tags label the members of an in-process batch. The service runs one backtest per request and has no remote consumer for them, so they stay off the wire.
+        run_tags: std::collections::BTreeMap::new(),
         costs,
     })
 }

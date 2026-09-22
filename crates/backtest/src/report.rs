@@ -968,6 +968,9 @@ pub struct BacktestResult {
     pub mtm_max_drawdown_pct: Option<f64>,
     #[serde(default)]
     pub provider_evaluation: Option<EvaluationReport>,
+    /// Unfiltered normalized outcomes used to build provider evaluation.
+    #[serde(default)]
+    pub provider_positions: Vec<PositionOutcome>,
     /// Total account-currency commission charged across every entry and exit fill.
     #[serde(default)]
     pub total_commission: f64,
@@ -1168,6 +1171,7 @@ impl BacktestResult {
             mtm_max_drawdown: None,
             mtm_max_drawdown_pct: None,
             provider_evaluation: None,
+            provider_positions: Vec::new(),
             total_commission: 0.0,
             total_swap: 0.0,
             gross_pnl: None,
@@ -1187,7 +1191,8 @@ impl BacktestResult {
         evaluation_options: EvaluationOptions,
     ) -> Self {
         let trade_log = future_trade_log(&artifacts);
-        let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
+        let (provider_evaluation, provider_positions) =
+            evaluate_future_positions(&artifacts, evaluation_options);
         let settled: BTreeSet<&str> = artifacts
             .completed_positions
             .iter()
@@ -1211,6 +1216,7 @@ impl BacktestResult {
         result.mtm_max_drawdown = artifacts.max_drawdown;
         result.mtm_max_drawdown_pct = artifacts.max_drawdown_pct;
         result.provider_evaluation = Some(provider_evaluation);
+        result.provider_positions = provider_positions;
         result.cost_events = artifacts.cost_events;
         result
     }
@@ -1428,8 +1434,8 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
 fn evaluate_future_positions(
     artifacts: &FutureBacktestArtifacts,
     options: EvaluationOptions,
-) -> EvaluationReport {
-    let positions = artifacts
+) -> (EvaluationReport, Vec<PositionOutcome>) {
+    let positions: Vec<PositionOutcome> = artifacts
         .completed_positions
         .iter()
         .map(|position| {
@@ -1490,7 +1496,8 @@ fn evaluate_future_positions(
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    tags: std::collections::BTreeMap::new(),
+                    // Every position of a run shares the run's labels, which is what lets a breakdown group positions across runs by parameter or window.
+                    tags: artifacts.execution.run_tags.clone(),
                 },
                 outcome: position.net_pnl,
                 outcome_classification: Some(match position.outcome {
@@ -1549,11 +1556,12 @@ fn evaluate_future_positions(
             .count() as u64,
         open_at_end: artifacts.open_positions.len() as u64,
     };
-    evaluate(&EvaluationRequest {
-        positions,
+    let report = evaluate(&EvaluationRequest {
+        positions: positions.clone(),
         lifecycle: Some(lifecycle),
         options,
-    })
+    });
+    (report, positions)
 }
 
 fn position_fill_ratio(

@@ -1,0 +1,25 @@
+family_id = "ema_cross"
+
+[parameters.ema_fast]
+range = { from = 3, to = 6, step = 1 }
+
+[parameters.ema_slow]
+values = [8, 10]
+
+[parameters.atr_stop]
+values = [1.0, 1.5]
+
+[parameters.entry]
+all = true
+
+[[constraints]]
+op = "lt"
+left = { op = "param", id = "ema_fast" }
+right = { op = "param", id = "ema_slow" }
+
+[[series]]
+source = "primary"
+symbol = { plan_symbol = true }
+timeframe_seconds = 60
+price_basis = "mid"
+alignment_offset_seconds = 0

@@ -3751,6 +3751,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-research"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "qs-backtest",
+ "qs-data-preprocess",
+ "qs-market-loader",
+ "qs-strategy",
+ "qs-symbols",
+ "quant-system-core",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "qs-service"
 version = "0.3.2"
 dependencies = [

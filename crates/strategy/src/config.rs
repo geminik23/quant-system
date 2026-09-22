@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use qs_core::OrderType;
@@ -9,6 +10,9 @@ pub const MAX_SOURCES: usize = 32;
 pub const MAX_COMPLETED_BARS: usize = 32;
 pub const MAX_MATERIALS: usize = 128;
 pub const MAX_MATERIAL_INPUTS: usize = 16;
+pub const MAX_MATERIAL_ARGS: usize = 32;
+pub const MAX_PARAMETERS: usize = 64;
+pub const MAX_PARAMETER_OPTIONS: usize = 64;
 pub const MAX_MATERIAL_LOOKBACK: usize = 4096;
 pub const MAX_MATERIAL_STATE_BYTES: usize = 65_536;
 pub const MAX_STATES: usize = 64;
@@ -66,6 +70,8 @@ impl<'de> Deserialize<'de> for SourceId {
 pub struct StrategyConfig {
     pub strategy_id: String,
     pub title: String,
+    #[serde(default)]
+    pub parameters: Vec<ParameterConfig>,
     pub initial_state: String,
     pub sources: Vec<SourceId>,
     pub trade_slots: Vec<String>,
@@ -84,12 +90,61 @@ pub struct MaterialConfig {
     #[serde(default)]
     pub inputs: Vec<Expr>,
     #[serde(default)]
-    pub params: MaterialParams,
+    pub params: MaterialArgs,
 }
 
-/// Strict built-in material parameters. Custom factories are parameterless.
+/// One typed material argument or a reference substituted while binding a template.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MaterialArg {
+    Integer(i64),
+    Number(f64),
+    Source(SourceId),
+    Slot(String),
+    BarField(BarField),
+    ActionKind(ConfiguredActionKind),
+    Param(String),
+}
+
+/// Strict named arguments accepted by a material factory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(transparent)]
+pub struct MaterialArgs(pub BTreeMap<String, MaterialArg>);
+
+impl MaterialArgs {
+    pub fn new(values: impl IntoIterator<Item = (impl Into<String>, MaterialArg)>) -> Self {
+        Self(
+            values
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+        )
+    }
+
+    pub fn get(&self, name: &str) -> Option<&MaterialArg> {
+        self.0.get(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &MaterialArg)> {
+        self.0.iter()
+    }
+}
+
+/// Compatibility builder for Rust callers migrating from the original closed parameter enum.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum MaterialParams {
     #[default]
     None,
@@ -111,6 +166,81 @@ pub enum MaterialParams {
         slot: String,
         action: ConfiguredActionKind,
     },
+}
+
+impl From<MaterialParams> for MaterialArgs {
+    fn from(value: MaterialParams) -> Self {
+        match value {
+            MaterialParams::None => Self::default(),
+            MaterialParams::BarField { source, field } => Self::new([
+                ("source", MaterialArg::Source(source)),
+                ("field", MaterialArg::BarField(field)),
+            ]),
+            MaterialParams::Ema { period } => {
+                Self::new([("period", MaterialArg::Integer(i64::from(period)))])
+            }
+            MaterialParams::Atr { source, period } => Self::new([
+                ("source", MaterialArg::Source(source)),
+                ("period", MaterialArg::Integer(i64::from(period))),
+            ]),
+            MaterialParams::Position { slot } => Self::new([("slot", MaterialArg::Slot(slot))]),
+            MaterialParams::Feedback { slot, action } => Self::new([
+                ("slot", MaterialArg::Slot(slot)),
+                ("action", MaterialArg::ActionKind(action)),
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ParameterKind {
+    Integer,
+    Number,
+    Choice { options: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParameterConfig {
+    pub id: String,
+    pub kind: ParameterKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ParameterValue {
+    Integer(i64),
+    Number(f64),
+    Choice(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(transparent)]
+pub struct ParameterBinding(pub BTreeMap<String, ParameterValue>);
+
+impl ParameterBinding {
+    pub fn new(values: impl IntoIterator<Item = (impl Into<String>, ParameterValue)>) -> Self {
+        Self(
+            values
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+        )
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ParameterValue> {
+        self.0.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ParameterValue)> {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +380,13 @@ pub enum Expr {
     },
     Material {
         id: String,
+    },
+    Param {
+        id: String,
+    },
+    Select {
+        param: String,
+        cases: BTreeMap<String, Expr>,
     },
     Input {
         field: String,

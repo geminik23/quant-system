@@ -1,11 +1,12 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
 use qs_core::Side;
 
 use crate::{
-    BarField, CompileError, ConfiguredActionKind, EvaluationError, FeedbackField, MaterialParams,
-    PositionField, ScalarType, SourceId, Value, ValueType,
+    BarField, CompileError, ConfiguredActionKind, EvaluationError, FeedbackField, MaterialArg,
+    MaterialArgs, PositionField, ScalarType, SourceId, Value, ValueType,
 };
 
 pub const MATERIAL_BAR_FIELD: &str = "completed_bar_field";
@@ -13,6 +14,12 @@ pub const MATERIAL_INPUT_TIME: &str = "input_time";
 pub const MATERIAL_READINESS: &str = "readiness";
 pub const MATERIAL_EMA: &str = "ema";
 pub const MATERIAL_ATR: &str = "atr";
+pub const MATERIAL_SMA: &str = "sma";
+pub const MATERIAL_STDDEV: &str = "stddev";
+pub const MATERIAL_ROLLING_MIN: &str = "rolling_min";
+pub const MATERIAL_ROLLING_MAX: &str = "rolling_max";
+pub const MATERIAL_LAG: &str = "lag";
+pub const MATERIAL_RSI: &str = "rsi";
 pub const MATERIAL_CROSS_ABOVE: &str = "cross_above";
 pub const MATERIAL_CROSS_BELOW: &str = "cross_below";
 pub const MATERIAL_POSITION_EXISTS: &str = "position_exists";
@@ -219,7 +226,27 @@ pub enum MaterialUpdateTrigger {
     EveryInput,
     Source(SourceId),
     FeedbackPulse,
+    /// Evaluate when every input expression updated at this boundary.
     AllInputs,
+    /// Evaluate when any causal leaf of any input expression updated at this boundary.
+    AnyInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ParamKind {
+    Integer { min: i64, max: i64 },
+    Number { min: f64, max: f64 },
+    Source,
+    Slot,
+    BarField,
+    ActionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParamSpec {
+    pub name: &'static str,
+    pub kind: ParamKind,
+    pub required: bool,
 }
 
 /// Result of constructing one material evaluator.
@@ -233,15 +260,19 @@ pub struct MaterialBuild {
 }
 
 pub trait MaterialFactory: Send + Sync {
+    fn params(&self) -> &[ParamSpec] {
+        &[]
+    }
+
     fn build(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         input_types: &[ValueType],
     ) -> Result<MaterialBuild, String>;
 
     fn update_trigger(
         &self,
-        _params: &MaterialParams,
+        _params: &MaterialArgs,
         _input_types: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
         Ok(MaterialUpdateTrigger::EveryInput)
@@ -252,7 +283,6 @@ pub trait MaterialFactory: Send + Sync {
 struct Registration {
     key: String,
     factory: Arc<dyn MaterialFactory>,
-    custom: bool,
 }
 
 #[derive(Clone)]
@@ -268,6 +298,12 @@ impl MaterialLibrary {
             MATERIAL_READINESS,
             MATERIAL_EMA,
             MATERIAL_ATR,
+            MATERIAL_SMA,
+            MATERIAL_STDDEV,
+            MATERIAL_ROLLING_MIN,
+            MATERIAL_ROLLING_MAX,
+            MATERIAL_LAG,
+            MATERIAL_RSI,
             MATERIAL_CROSS_ABOVE,
             MATERIAL_CROSS_BELOW,
             MATERIAL_POSITION_EXISTS,
@@ -289,7 +325,6 @@ impl MaterialLibrary {
                 .map(|key| Registration {
                     key: key.into(),
                     factory: Arc::new(BuiltinFactory { key }),
-                    custom: false,
                 })
                 .collect(),
         }
@@ -311,11 +346,7 @@ impl MaterialLibrary {
                 id: key,
             });
         }
-        self.registrations.push(Registration {
-            key,
-            factory,
-            custom: true,
-        });
+        self.registrations.push(Registration { key, factory });
         Ok(self)
     }
 
@@ -323,8 +354,8 @@ impl MaterialLibrary {
         self.registration(key).map(|item| &item.factory)
     }
 
-    pub(crate) fn is_custom(&self, key: &str) -> bool {
-        self.registration(key).is_some_and(|item| item.custom)
+    pub fn parameter_schema(&self, key: &str) -> Option<&[ParamSpec]> {
+        self.registration(key).map(|item| item.factory.params())
     }
 
     fn registration(&self, key: &str) -> Option<&Registration> {
@@ -336,15 +367,88 @@ struct BuiltinFactory {
     key: &'static str,
 }
 
+const PERIOD_SCHEMA: [ParamSpec; 1] = [ParamSpec {
+    name: "period",
+    kind: ParamKind::Integer {
+        min: 1,
+        max: crate::MAX_MATERIAL_LOOKBACK as i64,
+    },
+    required: true,
+}];
+const SOURCE_FIELD_SCHEMA: [ParamSpec; 2] = [
+    ParamSpec {
+        name: "source",
+        kind: ParamKind::Source,
+        required: true,
+    },
+    ParamSpec {
+        name: "field",
+        kind: ParamKind::BarField,
+        required: true,
+    },
+];
+const SOURCE_PERIOD_SCHEMA: [ParamSpec; 2] = [
+    ParamSpec {
+        name: "source",
+        kind: ParamKind::Source,
+        required: true,
+    },
+    ParamSpec {
+        name: "period",
+        kind: ParamKind::Integer {
+            min: 1,
+            max: crate::MAX_MATERIAL_LOOKBACK as i64 - 1,
+        },
+        required: true,
+    },
+];
+const SLOT_SCHEMA: [ParamSpec; 1] = [ParamSpec {
+    name: "slot",
+    kind: ParamKind::Slot,
+    required: true,
+}];
+const FEEDBACK_SCHEMA: [ParamSpec; 2] = [
+    ParamSpec {
+        name: "slot",
+        kind: ParamKind::Slot,
+        required: true,
+    },
+    ParamSpec {
+        name: "action",
+        kind: ParamKind::ActionKind,
+        required: true,
+    },
+];
+
 impl MaterialFactory for BuiltinFactory {
-    fn build(
-        &self,
-        params: &MaterialParams,
-        inputs: &[ValueType],
-    ) -> Result<MaterialBuild, String> {
+    fn params(&self) -> &[ParamSpec] {
+        match self.key {
+            MATERIAL_BAR_FIELD => &SOURCE_FIELD_SCHEMA,
+            MATERIAL_EMA | MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN
+            | MATERIAL_ROLLING_MAX | MATERIAL_LAG | MATERIAL_RSI => &PERIOD_SCHEMA,
+            MATERIAL_ATR => &SOURCE_PERIOD_SCHEMA,
+            MATERIAL_POSITION_EXISTS
+            | MATERIAL_POSITION_PENDING
+            | MATERIAL_POSITION_OPEN
+            | MATERIAL_POSITION_ENTRY_PRICE
+            | MATERIAL_POSITION_SIDE
+            | MATERIAL_POSITION_REMAINING_SIZE
+            | MATERIAL_POSITION_STOPLOSS => &SLOT_SCHEMA,
+            MATERIAL_ENTRY_FILLED
+            | MATERIAL_ENTRY_REJECTED
+            | MATERIAL_POSITION_CLOSED
+            | MATERIAL_CANCELLATION_APPLIED
+            | MATERIAL_CANCELLATION_REJECTED => &FEEDBACK_SCHEMA,
+            _ => &[],
+        }
+    }
+
+    fn build(&self, params: &MaterialArgs, inputs: &[ValueType]) -> Result<MaterialBuild, String> {
         let state_bytes = match self.key {
-            MATERIAL_EMA => 32,
+            MATERIAL_EMA | MATERIAL_RSI => 64,
             MATERIAL_ATR | MATERIAL_CROSS_ABOVE | MATERIAL_CROSS_BELOW => 48,
+            MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN | MATERIAL_ROLLING_MAX
+            | MATERIAL_LAG => checked_period(params)? * std::mem::size_of::<f64>() + 64,
             _ => crate::MAX_GENERATED_ID_BYTES + 64,
         };
         let build = |output_type, lookback, evaluator: Box<dyn MaterialEvaluator>| {
@@ -358,16 +462,12 @@ impl MaterialFactory for BuiltinFactory {
         match self.key {
             MATERIAL_BAR_FIELD => {
                 require_inputs(inputs, &[])?;
-                let MaterialParams::BarField { source, field } = params else {
-                    return Err("bar field parameters are required".into());
-                };
+                let source = source_arg(params, "source")?;
+                let field = bar_field_arg(params, "field")?;
                 build(
-                    crate::bar_field_type(*field),
+                    crate::bar_field_type(field),
                     source_lookback(source.clone(), 1),
-                    Box::new(BarFieldEvaluator {
-                        source: source.clone(),
-                        field: *field,
-                    }),
+                    Box::new(BarFieldEvaluator { source, field }),
                 )
             }
             MATERIAL_INPUT_TIME => {
@@ -389,10 +489,7 @@ impl MaterialFactory for BuiltinFactory {
                 )
             }
             MATERIAL_EMA => {
-                let MaterialParams::Ema { period } = params else {
-                    return Err("EMA parameters are required".into());
-                };
-                let period = checked_period(*period)?;
+                let period = checked_period(params)?;
                 require_one_numeric(inputs)?;
                 build(
                     ValueType::optional(inputs[0].scalar),
@@ -405,19 +502,72 @@ impl MaterialFactory for BuiltinFactory {
                 )
             }
             MATERIAL_ATR => {
-                let MaterialParams::Atr { source, period } = params else {
-                    return Err("ATR parameters are required".into());
-                };
-                let period = checked_period(*period)?;
+                let source = source_arg(params, "source")?;
+                let period = checked_period(params)?;
                 require_inputs(inputs, &[])?;
                 build(
                     ValueType::optional(ScalarType::Price),
                     source_lookback(source.clone(), period + 1),
                     Box::new(AtrEvaluator {
-                        source: source.clone(),
+                        source,
                         alpha: 1.0 / period as f64,
                         previous_close: None,
                         value: None,
+                    }),
+                )
+            }
+            MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN | MATERIAL_ROLLING_MAX => {
+                let period = checked_period(params)?;
+                require_one_numeric(inputs)?;
+                let kind = match self.key {
+                    MATERIAL_SMA => RollingKind::Mean,
+                    MATERIAL_STDDEV => RollingKind::PopulationStdDev,
+                    MATERIAL_ROLLING_MIN => RollingKind::Min,
+                    MATERIAL_ROLLING_MAX => RollingKind::Max,
+                    _ => unreachable!(),
+                };
+                build(
+                    ValueType::optional(inputs[0].scalar),
+                    MaterialLookback::InheritInputs { minimum: period },
+                    Box::new(RollingEvaluator {
+                        period,
+                        values: VecDeque::with_capacity(period),
+                        scalar: inputs[0].scalar,
+                        kind,
+                    }),
+                )
+            }
+            MATERIAL_LAG => {
+                let period = checked_period(params)?;
+                require_one_numeric(inputs)?;
+                build(
+                    ValueType::optional(inputs[0].scalar),
+                    MaterialLookback::InheritInputs {
+                        minimum: period + 1,
+                    },
+                    Box::new(LagEvaluator {
+                        period,
+                        values: VecDeque::with_capacity(period + 1),
+                        scalar: inputs[0].scalar,
+                    }),
+                )
+            }
+            MATERIAL_RSI => {
+                let period = checked_period(params)?;
+                require_one_numeric(inputs)?;
+                build(
+                    ValueType::optional(ScalarType::Number),
+                    MaterialLookback::InheritInputs {
+                        minimum: period + 1,
+                    },
+                    Box::new(RsiEvaluator {
+                        period,
+                        previous: None,
+                        seed_gains: 0.0,
+                        seed_losses: 0.0,
+                        seed_changes: 0,
+                        average_gain: None,
+                        average_loss: None,
                     }),
                 )
             }
@@ -461,25 +611,21 @@ impl MaterialFactory for BuiltinFactory {
 
     fn update_trigger(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         _inputs: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
-        Ok(match (self.key, params) {
-            (MATERIAL_BAR_FIELD, MaterialParams::BarField { source, .. })
-            | (MATERIAL_ATR, MaterialParams::Atr { source, .. }) => {
-                MaterialUpdateTrigger::Source(source.clone())
+        Ok(match self.key {
+            MATERIAL_BAR_FIELD | MATERIAL_ATR => {
+                MaterialUpdateTrigger::Source(source_arg(params, "source")?)
             }
-            (MATERIAL_EMA | MATERIAL_CROSS_ABOVE | MATERIAL_CROSS_BELOW, _) => {
-                MaterialUpdateTrigger::AllInputs
-            }
-            (
-                MATERIAL_ENTRY_FILLED
-                | MATERIAL_ENTRY_REJECTED
-                | MATERIAL_POSITION_CLOSED
-                | MATERIAL_CANCELLATION_APPLIED
-                | MATERIAL_CANCELLATION_REJECTED,
-                _,
-            ) => MaterialUpdateTrigger::FeedbackPulse,
+            MATERIAL_EMA | MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN
+            | MATERIAL_ROLLING_MAX | MATERIAL_LAG | MATERIAL_RSI | MATERIAL_CROSS_ABOVE
+            | MATERIAL_CROSS_BELOW => MaterialUpdateTrigger::AnyInput,
+            MATERIAL_ENTRY_FILLED
+            | MATERIAL_ENTRY_REJECTED
+            | MATERIAL_POSITION_CLOSED
+            | MATERIAL_CANCELLATION_APPLIED
+            | MATERIAL_CANCELLATION_REJECTED => MaterialUpdateTrigger::FeedbackPulse,
             _ => MaterialUpdateTrigger::EveryInput,
         })
     }
@@ -492,17 +638,50 @@ fn source_lookback(source: SourceId, required_lookback: usize) -> MaterialLookba
     }])
 }
 
-fn checked_period(period: u16) -> Result<usize, String> {
-    let period = usize::from(period);
-    if period == 0 || period > crate::MAX_MATERIAL_LOOKBACK {
-        Err("period is outside the supported lookback bound".into())
-    } else {
-        Ok(period)
+fn checked_period(params: &MaterialArgs) -> Result<usize, String> {
+    let value = integer_arg(params, "period")?;
+    usize::try_from(value).map_err(|_| "period is outside the supported lookback bound".into())
+}
+
+fn integer_arg(params: &MaterialArgs, name: &str) -> Result<i64, String> {
+    match params.get(name) {
+        Some(MaterialArg::Integer(value)) => Ok(*value),
+        _ => Err(format!("integer material argument '{name}' is required")),
     }
 }
 
-fn require_none(params: &MaterialParams) -> Result<(), String> {
-    if matches!(params, MaterialParams::None) {
+fn source_arg(params: &MaterialArgs, name: &str) -> Result<SourceId, String> {
+    match params.get(name) {
+        Some(MaterialArg::Source(value)) => Ok(value.clone()),
+        _ => Err(format!("source material argument '{name}' is required")),
+    }
+}
+
+fn slot_arg(params: &MaterialArgs, name: &str) -> Result<String, String> {
+    match params.get(name) {
+        Some(MaterialArg::Slot(value)) => Ok(value.clone()),
+        _ => Err(format!("slot material argument '{name}' is required")),
+    }
+}
+
+fn bar_field_arg(params: &MaterialArgs, name: &str) -> Result<BarField, String> {
+    match params.get(name) {
+        Some(MaterialArg::BarField(value)) => Ok(*value),
+        _ => Err(format!("bar-field material argument '{name}' is required")),
+    }
+}
+
+fn action_kind_arg(params: &MaterialArgs, name: &str) -> Result<ConfiguredActionKind, String> {
+    match params.get(name) {
+        Some(MaterialArg::ActionKind(value)) => Ok(*value),
+        _ => Err(format!(
+            "action-kind material argument '{name}' is required"
+        )),
+    }
+}
+
+fn require_none(params: &MaterialArgs) -> Result<(), String> {
+    if params.is_empty() {
         Ok(())
     } else {
         Err("material takes no parameters".into())
@@ -540,44 +719,38 @@ fn require_cross(inputs: &[ValueType]) -> Result<(), String> {
 }
 
 fn position_build(
-    params: &MaterialParams,
+    params: &MaterialArgs,
     inputs: &[ValueType],
     field: PositionField,
 ) -> Result<MaterialBuild, String> {
     require_inputs(inputs, &[])?;
-    let MaterialParams::Position { slot } = params else {
-        return Err("position parameters are required".into());
-    };
-    crate::validate_id(slot)?;
+    let slot = slot_arg(params, "slot")?;
+    crate::validate_id(&slot)?;
     let output_type = position_field_type(field);
     Ok(MaterialBuild {
         output_type,
         lookback: MaterialLookback::None,
         max_state_bytes: crate::MAX_ID_BYTES + 64,
-        evaluator: Box::new(PositionEvaluator {
-            slot: slot.clone(),
-            field,
-        }),
+        evaluator: Box::new(PositionEvaluator { slot, field }),
     })
 }
 
 fn feedback_build(
-    params: &MaterialParams,
+    params: &MaterialArgs,
     inputs: &[ValueType],
     field: FeedbackField,
 ) -> Result<MaterialBuild, String> {
     require_inputs(inputs, &[])?;
-    let MaterialParams::Feedback { slot, action } = params else {
-        return Err("feedback parameters are required".into());
-    };
-    crate::validate_id(slot)?;
+    let slot = slot_arg(params, "slot")?;
+    let action = action_kind_arg(params, "action")?;
+    crate::validate_id(&slot)?;
     Ok(MaterialBuild {
         output_type: ValueType::required(ScalarType::Bool),
         lookback: MaterialLookback::None,
         max_state_bytes: 0,
         evaluator: Box::new(FeedbackEvaluator {
-            slot: slot.clone(),
-            action: *action,
+            slot,
+            action,
             field,
         }),
     })
@@ -671,6 +844,139 @@ impl MaterialEvaluator for EmaEvaluator {
             .value
             .map(|value| numeric(self.scalar, value))
             .unwrap_or(Value::Missing(self.scalar)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RollingKind {
+    Mean,
+    PopulationStdDev,
+    Min,
+    Max,
+}
+
+#[derive(Clone)]
+struct RollingEvaluator {
+    period: usize,
+    values: VecDeque<f64>,
+    scalar: ScalarType,
+    kind: RollingKind,
+}
+
+impl MaterialEvaluator for RollingEvaluator {
+    clone_eval!(Self);
+    fn evaluate(&mut self, inputs: &[Value], _: &MaterialEvalContext<'_>) -> Result<Value, String> {
+        if let Some(value) = numeric_value(&inputs[0])? {
+            self.values.push_back(value);
+            if self.values.len() > self.period {
+                self.values.pop_front();
+            }
+        }
+        if self.values.len() < self.period {
+            return Ok(Value::Missing(self.scalar));
+        }
+        let value = match self.kind {
+            RollingKind::Mean => self.values.iter().sum::<f64>() / self.period as f64,
+            RollingKind::PopulationStdDev => {
+                let mean = self.values.iter().sum::<f64>() / self.period as f64;
+                (self
+                    .values
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / self.period as f64)
+                    .sqrt()
+            }
+            RollingKind::Min => self.values.iter().copied().fold(f64::INFINITY, f64::min),
+            RollingKind::Max => self
+                .values
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
+        Ok(numeric(self.scalar, value))
+    }
+}
+
+#[derive(Clone)]
+struct LagEvaluator {
+    period: usize,
+    values: VecDeque<f64>,
+    scalar: ScalarType,
+}
+
+impl MaterialEvaluator for LagEvaluator {
+    clone_eval!(Self);
+    fn evaluate(&mut self, inputs: &[Value], _: &MaterialEvalContext<'_>) -> Result<Value, String> {
+        let Some(value) = numeric_value(&inputs[0])? else {
+            return Ok(Value::Missing(self.scalar));
+        };
+        self.values.push_back(value);
+        if self.values.len() <= self.period {
+            return Ok(Value::Missing(self.scalar));
+        }
+        let lagged = self
+            .values
+            .pop_front()
+            .expect("a lagged value is available");
+        Ok(numeric(self.scalar, lagged))
+    }
+}
+
+#[derive(Clone)]
+struct RsiEvaluator {
+    period: usize,
+    previous: Option<f64>,
+    seed_gains: f64,
+    seed_losses: f64,
+    seed_changes: usize,
+    average_gain: Option<f64>,
+    average_loss: Option<f64>,
+}
+
+impl MaterialEvaluator for RsiEvaluator {
+    clone_eval!(Self);
+    fn evaluate(&mut self, inputs: &[Value], _: &MaterialEvalContext<'_>) -> Result<Value, String> {
+        let Some(current) = numeric_value(&inputs[0])? else {
+            return Ok(Value::Missing(ScalarType::Number));
+        };
+        let Some(previous) = self.previous.replace(current) else {
+            return Ok(Value::Missing(ScalarType::Number));
+        };
+        let change = current - previous;
+        let gain = change.max(0.0);
+        let loss = (-change).max(0.0);
+        let (average_gain, average_loss) = match (self.average_gain, self.average_loss) {
+            (Some(average_gain), Some(average_loss)) => {
+                let divisor = self.period as f64;
+                (
+                    (average_gain * (divisor - 1.0) + gain) / divisor,
+                    (average_loss * (divisor - 1.0) + loss) / divisor,
+                )
+            }
+            _ => {
+                self.seed_gains += gain;
+                self.seed_losses += loss;
+                self.seed_changes += 1;
+                if self.seed_changes < self.period {
+                    return Ok(Value::Missing(ScalarType::Number));
+                }
+                (
+                    self.seed_gains / self.period as f64,
+                    self.seed_losses / self.period as f64,
+                )
+            }
+        };
+        self.average_gain = Some(average_gain);
+        self.average_loss = Some(average_loss);
+        let value = if average_loss == 0.0 {
+            if average_gain == 0.0 { 50.0 } else { 100.0 }
+        } else if average_gain == 0.0 {
+            0.0
+        } else {
+            100.0 - 100.0 / (1.0 + average_gain / average_loss)
+        };
+        Ok(Value::Number(value))
     }
 }
 
@@ -838,5 +1144,186 @@ pub(crate) fn material_error(id: &str, reason: String) -> EvaluationError {
     EvaluationError::Material {
         material: id.into(),
         reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> StrategyInput {
+        StrategyInput {
+            time: NaiveDateTime::default(),
+            ready: true,
+            completed_bars: vec![],
+            values: vec![],
+            trade_slots: vec![],
+            feedback: vec![],
+        }
+    }
+
+    fn evaluate_values(evaluator: &mut dyn MaterialEvaluator, values: &[f64]) -> Vec<Value> {
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+        values
+            .iter()
+            .map(|value| {
+                evaluator
+                    .evaluate(&[Value::Number(*value)], &context)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn final_number(values: Vec<Value>) -> f64 {
+        match values.last().unwrap() {
+            Value::Number(value) | Value::Price(value) => *value,
+            value => panic!("unexpected material output {value:?}"),
+        }
+    }
+
+    #[test]
+    fn ema_matches_a_known_recursive_update() {
+        let mut ema = EmaEvaluator {
+            alpha: 0.5,
+            value: None,
+            scalar: ScalarType::Number,
+        };
+        assert!((final_number(evaluate_values(&mut ema, &[1.0, 2.0, 3.0])) - 2.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rolling_indicators_evict_the_oldest_sample() {
+        let mut sma = RollingEvaluator {
+            period: 3,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+            kind: RollingKind::Mean,
+        };
+        assert_eq!(
+            final_number(evaluate_values(&mut sma, &[1.0, 2.0, 3.0, 4.0])),
+            3.0
+        );
+
+        let mut stddev = RollingEvaluator {
+            period: 3,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+            kind: RollingKind::PopulationStdDev,
+        };
+        assert!(
+            (final_number(evaluate_values(&mut stddev, &[1.0, 2.0, 3.0, 7.0]))
+                - (14.0_f64 / 3.0).sqrt())
+            .abs()
+                < 1e-12
+        );
+
+        let mut minimum = RollingEvaluator {
+            period: 3,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+            kind: RollingKind::Min,
+        };
+        assert_eq!(
+            final_number(evaluate_values(&mut minimum, &[0.0, 3.0, 1.0, 2.0])),
+            1.0
+        );
+
+        let mut maximum = RollingEvaluator {
+            period: 3,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+            kind: RollingKind::Max,
+        };
+        assert_eq!(
+            final_number(evaluate_values(&mut maximum, &[9.0, 1.0, 3.0, 2.0])),
+            3.0
+        );
+    }
+
+    #[test]
+    fn lag_evicts_values_after_the_requested_distance() {
+        let mut lag = LagEvaluator {
+            period: 2,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+        };
+        assert_eq!(
+            final_number(evaluate_values(&mut lag, &[1.0, 2.0, 3.0, 4.0])),
+            2.0
+        );
+    }
+
+    #[test]
+    fn rsi_applies_wilder_smoothing_after_its_seed_window() {
+        let mut rsi = RsiEvaluator {
+            period: 2,
+            previous: None,
+            seed_gains: 0.0,
+            seed_losses: 0.0,
+            seed_changes: 0,
+            average_gain: None,
+            average_loss: None,
+        };
+        let values = evaluate_values(&mut rsi, &[1.0, 2.0, 1.0, 3.0]);
+        assert_eq!(values[2], Value::Number(50.0));
+        assert!((final_number(values) - 83.333_333_333_333_33).abs() < 1e-12);
+        assert_eq!(rsi.average_gain, Some(1.25));
+        assert_eq!(rsi.average_loss, Some(0.25));
+    }
+
+    #[test]
+    fn atr_matches_a_hand_computed_wilder_update() {
+        let source = SourceId::new("primary").unwrap();
+        let mut atr = AtrEvaluator {
+            source: source.clone(),
+            alpha: 0.5,
+            previous_close: None,
+            value: None,
+        };
+        let first = StrategyInput {
+            completed_bars: vec![CompletedBarUpdate {
+                source: source.clone(),
+                bar: CompletedBar {
+                    open: 10.0,
+                    high: 10.0,
+                    low: 10.0,
+                    close: 10.0,
+                    volume: 1.0,
+                },
+            }],
+            ..input()
+        };
+        let second = StrategyInput {
+            completed_bars: vec![CompletedBarUpdate {
+                source,
+                bar: CompletedBar {
+                    open: 11.0,
+                    high: 13.0,
+                    low: 9.0,
+                    close: 12.0,
+                    volume: 1.0,
+                },
+            }],
+            ..input()
+        };
+        for item in [&first, &second] {
+            atr.evaluate(
+                &[],
+                &MaterialEvalContext {
+                    input: item,
+                    input_updates: &[],
+                    feedback: &[],
+                    retained_feedback: &[],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(atr.value, Some(2.0));
     }
 }

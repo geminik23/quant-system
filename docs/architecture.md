@@ -34,9 +34,9 @@ qs-symbols -----> qs-instruments -----> quant-system-core
                                       qs-backtest -> qs-backtest-server
                                            ^                  ^
                                            |                  |
-                              qs-data-preprocess -> qs-market-loader
-                                    storage           stored data as
-                                                      replay input
+                              qs-data-preprocess -> qs-market-loader -> qs-research
+                                    storage           stored data as      parameter
+                                                      replay input        family search
 
 qs-signal-parser -> strict RawSignal compatibility boundary
 ```
@@ -51,7 +51,7 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 
 `quant-system-core` owns the synchronous engine, strict `RawSignal`, position management, pure profile resolution, sizing, currency conversion, and commission and swap arithmetic. Its catalog-aware sizing path uses explicit quantity rules and contract multipliers. It performs no networking, storage, configuration IO, parsing, state lookup, or broker calls.
 
-`qs-strategy` owns the reusable synchronous configured strategy core. It compiles recursively strict unversioned configuration against bounded logical source IDs and an explicit immutable material library, derives source-specific lookback and named-input requirements, evaluates ordered source updates, total trade-slot facts, bounded typed expressions, and causal materials, commits deterministic finite-state transitions atomically, and emits generic decisions and notes plus ordered commands carrying strict `RawSignal` values with deterministic correlation IDs. Command feedback rejects unknown, mismatched, duplicate, or replayed events, retains successful correlations until the action-specific committed fact and terminal disposition are both observed, and supports an adapter-owned final feedback boundary without evaluating another market transition. The crate is library-only and does not own logical-source binding, historical history or feeds, FutureQuote adaptation, service or RPC execution, live runtime orchestration, persistence, or management-profile composition.
+`qs-strategy` owns the reusable synchronous configured strategy core. It validates typed parameter templates against explicit immutable material-factory schemas, substitutes one complete binding, prunes unused material branches, and compiles the resulting strict unversioned configuration against bounded logical source IDs. It derives compositional source lookback and named-input requirements, evaluates ordered source updates, total trade-slot facts, bounded typed expressions, causal indicator primitives, and deterministic finite-state transitions, and emits generic decisions and notes plus ordered commands carrying strict `RawSignal` values with deterministic correlation IDs. Command feedback rejects unknown, mismatched, duplicate, or replayed events, retains successful correlations until the action-specific committed fact and terminal disposition are both observed, and supports an adapter-owned final feedback boundary without evaluating another market transition. The crate is library-only and does not own logical-source binding, historical history or feeds, FutureQuote adaptation, service or RPC execution, live runtime orchestration, persistence, or management-profile composition.
 
 `qs-symbols` remains the compatibility facade for current canonical symbols, aliases, precision, lot, and currency metadata. Supported FX, metal, commodity, and index rows can be translated through the guarded compatibility economics result into an immutable instrument snapshot. Registry-backed cryptocurrency and unknown rows are not promoted into executable instruments.
 
@@ -64,6 +64,8 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 ### Data storage
 
 `qs-data-preprocess` owns supported tick/bar import, storage, and tick-to-bar resampling. Its bucket arithmetic and quote-acceptance rule are shared with the replay engine's in-memory bar series, so a stored bar equals the bar a tick-driven replay derives from the same input. Parquet is the default backend. Backtest replay reads bounded chronological cursors instead of requiring complete datasets in memory.
+
+`qs-research` owns declared parameter-space search over replay. It loads an explicit TOML strategy template and TOML space document, enumerates typed values in declaration order, applies parameter-only constraints, binds parameterized series geometry, and derives warmup from the compiled strategy requirements. A batch retains every run's normalized outcomes and bound document, exposing a deterministic comparison table and pooled provider evaluation with run-scoped position identity. Caller-written Rust families remain an escape hatch. The crate produces no score, rank, or rating and owns no execution, accounting, or storage of its own. Only tick-driven search is available, because a configured strategy derives its analysis bars from the tick stream and the replay driver rejects bar events.
 
 `qs-market-loader` owns the bridge from stored market data to replay input. It reopens Parquet tick and bar cursors as ordered market events, applies stored bar spreads in price units, merges series deterministically, and validates that the coordinates it will read match the instrument manifest pinned for the run. It exists as its own crate so that a service and an in-process parameter search open identical streams through identical code, and so that the replay crate keeps reading no market-data storage of its own.
 
