@@ -60,6 +60,16 @@ retention_secs = 3600
 # Bound total retained artifact storage to 1 GiB.
 max_total_bytes = 1073741824
 
+[strategies]
+# Largest accepted strategy, template, or space document, measured as JSON.
+max_document_bytes = 262144
+# Largest total retained history one configured run may bind across its sources, in bars.
+max_retained_bars = 200000
+# Most worker threads one parameter search may use; requests asking for more are capped.
+max_search_workers = 4
+# Most runs, points times symbols times windows, one search may schedule.
+max_search_runs = 20000
+
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error"
 level = "info"

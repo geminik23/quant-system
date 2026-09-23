@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use qs_backtest::evaluation::EvaluationOptions;
 use qs_backtest::runner::BacktestConfig;
-use qs_backtest::{FutureQuoteConfig, StrategyRetentionLimits};
+use qs_backtest::{FutureQuoteConfig, PreparedEntryProfiles, StrategyRetentionLimits};
 
 use crate::error::ResearchError;
 use crate::window::WindowPlan;
@@ -30,6 +30,8 @@ pub struct ResearchPlan {
     pub decision_latency_ms: u64,
     /// Worker threads used to evaluate points. One means sequential.
     pub workers: usize,
+    /// Management profiles every run selects from, exactly as raw-signal replay does; `None` runs unprofiled.
+    pub entry_profiles: Option<PreparedEntryProfiles>,
 }
 
 impl ResearchPlan {
@@ -43,7 +45,13 @@ impl ResearchPlan {
             retention: StrategyRetentionLimits::default(),
             decision_latency_ms: 0,
             workers: 1,
+            entry_profiles: None,
         }
+    }
+
+    pub fn with_entry_profiles(mut self, profiles: PreparedEntryProfiles) -> Self {
+        self.entry_profiles = Some(profiles);
+        self
     }
 
     pub fn with_workers(mut self, workers: usize) -> Self {

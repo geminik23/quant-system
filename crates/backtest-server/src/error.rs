@@ -33,6 +33,9 @@ pub enum BacktestServerError {
     #[error("Backtest cancelled")]
     Cancelled,
 
+    #[error("Configured strategy replay failed: {0}")]
+    Strategy(String),
+
     #[error("Market-data stream error: {0}")]
     MarketStream(String),
 

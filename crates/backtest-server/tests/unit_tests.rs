@@ -137,6 +137,7 @@ fn empty_state() -> ServerState {
     let instrument_domain =
         backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     ServerState {
+        strategies: Default::default(),
         symbol_registry,
         instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -247,6 +248,7 @@ fn replay_path_fixture() -> ReplayPathFixture {
             let instrument_domain =
                 backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
             ServerState {
+                strategies: Default::default(),
                 symbol_registry,
                 instrument_domain,
                 profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -468,6 +470,7 @@ fn active_symbol_fixture() -> ReplayPathFixture {
             let instrument_domain =
                 backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
             ServerState {
+                strategies: Default::default(),
                 symbol_registry,
                 instrument_domain,
                 profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -1065,6 +1068,7 @@ fn inline_mode_returns_a_compact_error_when_result_exceeds_the_limit() {
     let instrument_domain =
         backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
+        strategies: Default::default(),
         symbol_registry,
         instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -1675,6 +1679,7 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
     let instrument_domain =
         backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
+        strategies: Default::default(),
         symbol_registry,
         instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),
@@ -1790,6 +1795,7 @@ fn cancelled_job_remains_cancelled_and_never_stores_a_result() {
 #[test]
 fn cancelled_active_worker_remains_capacity_accounted_until_it_releases_ownership() {
     let state = Arc::new(ServerState {
+        strategies: Default::default(),
         max_retained_jobs: 1,
         ..empty_state()
     });
@@ -1818,6 +1824,7 @@ fn cancelled_active_worker_remains_capacity_accounted_until_it_releases_ownershi
 #[test]
 fn async_job_store_is_bounded_and_cleanup_removes_terminal_jobs() {
     let state = ServerState {
+        strategies: Default::default(),
         max_retained_jobs: 2,
         ..empty_state()
     };
@@ -1877,6 +1884,7 @@ fn async_job_store_is_bounded_and_cleanup_removes_terminal_jobs() {
 #[test]
 fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
     let state = ServerState {
+        strategies: Default::default(),
         max_retained_jobs: 1,
         ..empty_state()
     };
@@ -1885,6 +1893,8 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
         state.jobs.lock().unwrap().insert(
             job_id.into(),
             BacktestJob {
+                kind: backtest_server::handlers::JobKind::Backtest,
+                search: None,
                 status: JobStatus::Completed,
                 submitted_at: Instant::now(),
                 completed_at: Some(Instant::now()),
@@ -2701,6 +2711,7 @@ fn handler_list_symbols_parses_actual_bar_timeframe_format() {
     }];
     assert_eq!(store.insert_bars(&bars).unwrap(), 1);
     let state = ServerState {
+        strategies: Default::default(),
         data_dir: data_dir.to_string_lossy().into_owned(),
         ..empty_state()
     };
@@ -2819,6 +2830,7 @@ fn handler_run_backtest_no_data_returns_error() {
     let instrument_domain =
         backtest_server::InstrumentDomain::compatibility(&symbol_registry).unwrap();
     let state = ServerState {
+        strategies: Default::default(),
         symbol_registry,
         instrument_domain,
         profile_registry: RwLock::new(ProfileRegistry::empty()),

@@ -628,11 +628,219 @@ pub struct RunBacktestMultiRequest {
     pub result_delivery: ResultDeliveryMsg,
 }
 
+// ── Configured Strategy Runs ────────────────────────────────────────────────
+
+/// Price basis the bars of a configured logical source are built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceBasisMsg {
+    Bid,
+    Ask,
+    Mid,
+}
+
+/// Historical series geometry for one configured logical source; the source always reads the request symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBindingMsg {
+    pub source: String,
+    pub timeframe_seconds: u32,
+    pub price_basis: PriceBasisMsg,
+    #[serde(default)]
+    pub alignment_offset_seconds: i32,
+}
+
+/// One fully bound configured strategy document and the series backing its sources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredStrategyRunMsg {
+    /// Canonical strategy document as a JSON value; the server decodes it strictly and rejects unknown fields.
+    pub document: serde_json::Value,
+    pub sources: Vec<SourceBindingMsg>,
+    /// Instance identifier used in generated campaign, trade, and command IDs; the server uses `instance` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Decision latency in milliseconds applied to generated signals.
+    #[serde(default)]
+    pub decision_latency_ms: u64,
+}
+
+/// Execution scope for one configured strategy run over one symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredStrategyRunSpec {
+    pub symbol: String,
+    pub exchange: String,
+    /// `tick`, or `bar` together with `timeframe`.
+    pub data_type: String,
+    #[serde(default)]
+    pub timeframe: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub strategy: ConfiguredStrategyRunMsg,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profile_def: Option<ManagementProfileMsg>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_profile_routes: Vec<EntryProfileRouteMsg>,
+    pub config: BacktestConfigMsg,
+}
+
+/// Synchronous configured strategy run.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunConfiguredStrategyRequest {
+    pub request: ConfiguredStrategyRunSpec,
+    #[serde(default)]
+    pub future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    pub evaluation: ProviderEvaluationOptionsMsg,
+    #[serde(default)]
+    pub result_delivery: ResultDeliveryMsg,
+}
+
+/// Asynchronous configured strategy submission retained as a job.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitConfiguredStrategyRequest {
+    pub request: RunConfiguredStrategyRequest,
+}
+
+/// Strategy output returned with a configured run's economic result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfiguredStrategyOutputMsg {
+    /// The document the run compiled, as decoded.
+    pub document: serde_json::Value,
+    pub sources: Vec<SourceBindingMsg>,
+    /// Compiled requirements the run was bound with: per-source completed-bar lookback, trade slots, Entry slots and classes, and stop-managed slots.
+    pub requirements: serde_json::Value,
+    /// `ticks` or `bars`; a bar run fills and settles stops at bar-close quotes.
+    pub data_mode: String,
+    /// Retained configured decisions with the signals each emitted.
+    pub decisions: serde_json::Value,
+    /// Configured notes and research-only output.
+    pub research: serde_json::Value,
+}
+
+// ── Parameter Search ────────────────────────────────────────────────────────
+
+/// One labelled half-open evaluation window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchWindowMsg {
+    pub label: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Evaluation windows of a parameter search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SearchWindowsMsg {
+    Fixed {
+        in_sample: SearchWindowMsg,
+        out_of_sample: SearchWindowMsg,
+    },
+    RollingWalkForward {
+        start: String,
+        end: String,
+        train_seconds: i64,
+        test_seconds: i64,
+        step_seconds: i64,
+    },
+}
+
+/// Execution scope of a server-side parameter search over a strategy template and a space document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchRunSpec {
+    /// Strategy template document as a JSON value.
+    pub template: serde_json::Value,
+    /// Space document as a JSON value.
+    pub space: serde_json::Value,
+    pub symbols: Vec<String>,
+    pub exchange: String,
+    /// `tick`, or `bar` together with `timeframe`.
+    pub data_type: String,
+    #[serde(default)]
+    pub timeframe: Option<String>,
+    pub windows: SearchWindowsMsg,
+    pub config: BacktestConfigMsg,
+    /// Registered run default profile; inline profiles are not accepted for a search.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Entry-class routes to registered profiles only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_profile_routes: Vec<EntryProfileRouteMsg>,
+    /// Requested worker threads, capped by the server's configured maximum.
+    #[serde(default)]
+    pub workers: Option<usize>,
+    #[serde(default)]
+    pub decision_latency_ms: u64,
+}
+
+/// Asynchronous search submission retained as a job.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitSearchRequest {
+    pub request: SearchRunSpec,
+    #[serde(default)]
+    pub future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    pub evaluation: ProviderEvaluationOptionsMsg,
+}
+
+/// Request for the output of a completed search job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetSearchResultRequest {
+    pub job_id: String,
+}
+
+/// Counts that describe a completed search without its full output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSummaryMsg {
+    pub points_total: usize,
+    pub rows: usize,
+    pub completed_rows: usize,
+    pub failed_rows: usize,
+    /// `ticks` or `bars`.
+    pub data_mode: String,
+}
+
+/// Complete search output, always delivered as the job's result artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResultMsg {
+    pub summary: SearchSummaryMsg,
+    /// Comparison table in the research CSV format, one row per run, ordered by parameter rather than result.
+    pub table_csv: String,
+    /// Pooled provider evaluation over every run's completed positions.
+    pub evaluation: serde_json::Value,
+    /// Bound strategy document of every point, in point order.
+    pub bound_documents: Vec<serde_json::Value>,
+}
+
+/// Response carrying a search summary and the artifact holding its complete output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSearchResultResponse {
+    pub success: bool,
+    pub job_id: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub summary: Option<SearchSummaryMsg>,
+    #[serde(default)]
+    pub artifact: Option<ResultArtifactRefMsg>,
+}
+
 // ── Backtest Result Message ─────────────────────────────────────────────────
 
 /// Serializable mirror of `BacktestResult` for wire transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResultMsg {
+    /// Strategy document, sources, decisions, and notes when the run executed a configured strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<ConfiguredStrategyOutputMsg>,
     pub initial_balance: f64,
     pub final_balance: f64,
     pub total_pnl: f64,
@@ -1535,6 +1743,119 @@ impl<'de> Deserialize<'de> for RunBacktestMultiRequest {
             future: strict.future,
             evaluation: strict.evaluation,
             result_delivery: strict.result_delivery,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictConfiguredStrategyRunSpec {
+    symbol: String,
+    exchange: String,
+    data_type: String,
+    #[serde(default)]
+    timeframe: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    strategy: ConfiguredStrategyRunMsg,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    profile_def: Option<StrictManagementProfileMsg>,
+    #[serde(default)]
+    entry_profile_routes: Vec<StrictEntryProfileRouteMsg>,
+    config: StrictBacktestConfigMsg,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRunConfiguredStrategyRequest {
+    request: StrictConfiguredStrategyRunSpec,
+    #[serde(default)]
+    future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    evaluation: ProviderEvaluationOptionsMsg,
+    #[serde(default)]
+    result_delivery: ResultDeliveryMsg,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSubmitConfiguredStrategyRequest {
+    request: RunConfiguredStrategyRequest,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSearchRunSpec {
+    template: serde_json::Value,
+    space: serde_json::Value,
+    symbols: Vec<String>,
+    exchange: String,
+    data_type: String,
+    #[serde(default)]
+    timeframe: Option<String>,
+    windows: SearchWindowsMsg,
+    config: StrictBacktestConfigMsg,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    entry_profile_routes: Vec<StrictEntryProfileRouteMsg>,
+    #[serde(default)]
+    workers: Option<usize>,
+    #[serde(default)]
+    decision_latency_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSubmitSearchRequest {
+    request: StrictSearchRunSpec,
+    #[serde(default)]
+    future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    evaluation: ProviderEvaluationOptionsMsg,
+}
+
+impl<'de> Deserialize<'de> for RunConfiguredStrategyRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let strict = StrictRunConfiguredStrategyRequest::deserialize(deserializer)?;
+        Ok(Self {
+            request: strict_into_wire(strict.request).map_err(serde::de::Error::custom)?,
+            future: strict.future,
+            evaluation: strict.evaluation,
+            result_delivery: strict.result_delivery,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitConfiguredStrategyRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let strict = StrictSubmitConfiguredStrategyRequest::deserialize(deserializer)?;
+        Ok(Self {
+            request: strict.request,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitSearchRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let strict = StrictSubmitSearchRequest::deserialize(deserializer)?;
+        Ok(Self {
+            request: strict_into_wire(strict.request).map_err(serde::de::Error::custom)?,
+            future: strict.future,
+            evaluation: strict.evaluation,
         })
     }
 }

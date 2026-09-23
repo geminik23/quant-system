@@ -3,7 +3,7 @@ use qs_strategy::{
     ConfiguredStrategyRequirements, MaterialLibrary, ParameterBinding, StrategyConfig,
 };
 
-use crate::geometry::{SeriesGeometry, bindings_from_geometry};
+use crate::geometry::SeriesGeometry;
 
 /// A parameterized family of configured strategies.
 ///
@@ -27,7 +27,8 @@ pub trait StrategyFamily: Sync {
         point: &Self::Params,
         requirements: &ConfiguredStrategyRequirements,
     ) -> Result<ConfiguredHistoricalBindings, String> {
-        bindings_from_geometry(self.geometry(symbol, point), requirements)
+        ConfiguredHistoricalBindings::from_geometry(self.geometry(symbol, point), requirements)
+            .map_err(|error| error.to_string())
     }
 
     fn library(&self) -> MaterialLibrary {

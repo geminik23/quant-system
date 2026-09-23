@@ -160,4 +160,4 @@ The implementation now allows a developer to:
 8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
 9. continue implementing direct Rust strategies without framework regression.
 
-The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. See [Backtesting](backtesting.md) for current replay behavior and limitations.
+The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. The backtest service now also runs configured strategy documents and parameter searches received at runtime, reusing the same adapter and research batch. See [Backtesting](backtesting.md) for current replay behavior and limitations.

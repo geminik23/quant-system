@@ -13,6 +13,7 @@ pub mod handlers;
 mod instrument_catalog;
 mod replay_plan;
 pub mod rpc_types;
+pub mod strategy_client;
 
 pub use artifact_store::ArtifactStore;
 pub use config::ServerConfig;

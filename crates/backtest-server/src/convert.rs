@@ -744,6 +744,7 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
 /// Convert the full backtest result into its wire-safe message form.
 pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
     BacktestResultMsg {
+        strategy: None,
         initial_balance: r.initial_balance,
         final_balance: r.final_balance,
         total_pnl: r.total_pnl,

@@ -13,6 +13,8 @@ use super::{
 pub enum StrategyReplayError<FeedError, StrategyError> {
     #[error("market-data stream failed: {0}")]
     Feed(FeedError),
+    #[error("strategy replay was cancelled")]
+    Cancelled,
     #[error("strategy replay input is invalid: {0}")]
     Input(#[from] StrategyReplayInputError),
     #[error("historical series failed: {0}")]

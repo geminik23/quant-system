@@ -88,6 +88,27 @@ pub fn run_batch<F>(
 where
     F: StrategyFamily,
 {
+    run_batch_controlled(plan, family, events, &|| false, &|_| {})
+}
+
+/// Runs completed so far out of the batch's total, reported after each run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchProgress {
+    pub completed_runs: usize,
+    pub total_runs: usize,
+}
+
+/// Run a batch that checks `is_cancelled` before starting each run and reports progress after each completed run, so a long search can be stopped and observed without losing determinism.
+pub fn run_batch_controlled<F>(
+    plan: &ResearchPlan,
+    family: &F,
+    events: &BTreeMap<String, SymbolEvents>,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+    on_progress: &(dyn Fn(BatchProgress) + Sync),
+) -> Result<ResearchBatch, ResearchError>
+where
+    F: StrategyFamily,
+{
     plan.validate()?;
     let pairs = plan.window_plan.pairs()?;
     if pairs.is_empty() {
@@ -148,14 +169,36 @@ where
     }
 
     let workers = plan.workers.min(specs.len()).max(1);
-    let mut records = if workers == 1 {
-        specs
-            .iter()
-            .map(|spec| evaluate_run(plan, family, spec, events, points_total))
-            .collect()
-    } else {
-        run_in_parallel(plan, family, &specs, events, points_total, workers)
+    let control = RunControl {
+        is_cancelled,
+        on_progress,
+        completed: std::sync::atomic::AtomicUsize::new(0),
+        total: specs.len(),
     };
+    let mut records = if workers == 1 {
+        let mut records = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            if is_cancelled() {
+                return Err(ResearchError::Cancelled);
+            }
+            records.push(evaluate_run(plan, family, spec, events, points_total));
+            control.completed_one();
+        }
+        records
+    } else {
+        run_in_parallel(
+            plan,
+            family,
+            &specs,
+            events,
+            points_total,
+            workers,
+            &control,
+        )
+    };
+    if records.len() < specs.len() {
+        return Err(ResearchError::Cancelled);
+    }
     records.sort_by_key(|record| record.run_index);
 
     let mut positions = Vec::new();
@@ -176,6 +219,75 @@ where
         positions,
         bound_documents,
     })
+}
+
+/// Check everything about a batch that does not need market data, the same checks a batch runs before its first replay, and return how many runs it would schedule.
+pub fn validate_batch<F>(plan: &ResearchPlan, family: &F) -> Result<usize, ResearchError>
+where
+    F: StrategyFamily,
+{
+    plan.validate()?;
+    let pairs = plan.window_plan.pairs()?;
+    if pairs.is_empty() {
+        return Err(ResearchError::InvalidWindow(
+            "the window plan produced no evaluation periods".into(),
+        ));
+    }
+    let points = family.points();
+    if points.is_empty() {
+        return Err(ResearchError::InvalidPlan(
+            "the family produced no parameter points".into(),
+        ));
+    }
+    let bindings: Vec<ParameterBinding> = points
+        .iter()
+        .map(|point| family.parameter_binding(point))
+        .collect();
+    validate_parameter_labels(family.family_id(), &bindings, &plan.config.run_tags)?;
+    Ok(plan.symbols.len() * pairs.len() * 2 * points.len())
+}
+
+/// The span of stored data a batch reads: the earliest warmup start any point needs for any window on any symbol, through the latest window end.
+///
+/// A caller that loads market data itself, such as a service, loads exactly this range so every run has its full derived warmup. `None` means the plan or family produces no runs.
+pub fn batch_data_range<F>(
+    plan: &ResearchPlan,
+    family: &F,
+) -> Result<Option<(NaiveDateTime, NaiveDateTime)>, ResearchError>
+where
+    F: StrategyFamily,
+{
+    plan.validate()?;
+    let pairs = plan.window_plan.pairs()?;
+    let windows = pairs
+        .iter()
+        .flat_map(|pair| [&pair.in_sample, &pair.out_of_sample])
+        .collect::<Vec<_>>();
+    let Some(end) = windows.iter().map(|window| window.to()).max() else {
+        return Ok(None);
+    };
+    let mut start: Option<NaiveDateTime> = None;
+    for point in family.points() {
+        for symbol in &plan.symbols {
+            let strategy = ConfiguredStrategy::compile(
+                family.config(&point),
+                &family.library(),
+                "range",
+                symbol.as_str(),
+            )
+            .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
+            let bindings = family
+                .bindings(symbol, &point, strategy.input_requirements())
+                .map_err(ResearchError::InvalidDocument)?;
+            for window in &windows {
+                let window_start = bindings
+                    .warmup_start(window.from())
+                    .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                start = Some(start.map_or(window_start, |current| current.min(window_start)));
+            }
+        }
+    }
+    Ok(start.map(|start| (start, end)))
 }
 
 fn validate_parameter_labels(
@@ -220,6 +332,27 @@ fn binding_labels(binding: &ParameterBinding) -> BTreeMap<String, String> {
         .collect()
 }
 
+struct RunControl<'a> {
+    is_cancelled: &'a (dyn Fn() -> bool + Sync),
+    on_progress: &'a (dyn Fn(BatchProgress) + Sync),
+    completed: std::sync::atomic::AtomicUsize,
+    total: usize,
+}
+
+impl RunControl<'_> {
+    fn completed_one(&self) {
+        let completed = self
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        (self.on_progress)(BatchProgress {
+            completed_runs: completed,
+            total_runs: self.total,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_in_parallel<F>(
     plan: &ResearchPlan,
     family: &F,
@@ -227,6 +360,7 @@ fn run_in_parallel<F>(
     events: &BTreeMap<String, SymbolEvents>,
     points_total: usize,
     workers: usize,
+    control: &RunControl<'_>,
 ) -> Vec<RunRecord>
 where
     F: StrategyFamily,
@@ -238,6 +372,9 @@ where
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
+                    if (control.is_cancelled)() {
+                        break;
+                    }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(spec) = specs.get(index) else {
                         break;
@@ -247,6 +384,7 @@ where
                         .lock()
                         .expect("a worker panicked while holding the result lock")
                         .push(record);
+                    control.completed_one();
                 }
             });
         }
@@ -410,8 +548,12 @@ where
     )
     .map_err(|error| RunFailure::Bind(error.to_string()))?;
 
-    BacktestRunner::new_future(config, plan.future.clone())
-        .with_evaluation_options(plan.evaluation.clone())
+    let mut runner = BacktestRunner::new_future(config, plan.future.clone())
+        .with_evaluation_options(plan.evaluation.clone());
+    if let Some(profiles) = plan.entry_profiles.clone() {
+        runner = runner.with_entry_profiles(profiles);
+    }
+    runner
         .run_configured_strategy_future(&mut feed, &mut adapter, analysis, plan.retention, None)
         .map(|result| result.replay)
         .map_err(|error| RunFailure::Replay(error.to_string()))
@@ -421,37 +563,9 @@ fn warmup_start(
     bindings: &qs_backtest::ConfiguredHistoricalBindings,
     from: NaiveDateTime,
 ) -> Result<NaiveDateTime, RunFailure> {
-    let from_seconds = from.and_utc().timestamp();
-    let mut start = from;
-    for binding in bindings.sources() {
-        let series = binding.series();
-        let requirement = series.requirement();
-        let bars = i64::try_from(requirement.warmup().required_bars())
-            .map_err(|_| RunFailure::Bind("warmup bars do not fit i64".into()))?;
-        if bars == 0 {
-            continue;
-        }
-        let duration = i64::try_from(requirement.timeframe().duration_seconds())
-            .map_err(|_| RunFailure::Bind("timeframe duration does not fit i64".into()))?;
-        let offset = series.alignment_offset_seconds();
-        let bucket_open = (from_seconds - offset).div_euclid(duration) * duration + offset;
-        let preceding_intervals = if bucket_open == from_seconds {
-            bars
-        } else {
-            bars - 1
-        };
-        let source_start = bucket_open
-            .checked_sub(
-                duration
-                    .checked_mul(preceding_intervals)
-                    .ok_or_else(|| RunFailure::Bind("warmup span overflowed".into()))?,
-            )
-            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
-            .map(|value| value.naive_utc())
-            .ok_or_else(|| RunFailure::Bind("warmup start is outside timestamp bounds".into()))?;
-        start = start.min(source_start);
-    }
-    Ok(start)
+    bindings
+        .warmup_start(from)
+        .map_err(|error| RunFailure::Bind(error.to_string()))
 }
 
 fn slice_events(

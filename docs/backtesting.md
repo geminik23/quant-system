@@ -176,6 +176,41 @@ An open trade slot reports the entry fill time, the campaign's favorable and adv
 
 Neutral conformance covers no-op, EMA crossover, EMA/ATR lifecycle, pending cancellation, custom materials, routed and run-default profile parity with direct signals, profile preflight rejection, stored-bar and tick parity of completed bars and decisions, open-position time, excursion, and initial-risk rules at exact boundaries, calendar and session inputs, final feedback, direct-signal economic parity, aligned-EOD materialized/streaming full-result parity, and strict research serde. Server or RPC execution, live runtime orchestration, and persisted configured state remain unavailable.
 
+## Configured strategies through the service
+
+The backtest service accepts configured strategies at runtime, so a new strategy runs without rebuilding or restarting the server. Four methods sit beside the raw-signal methods and share their retained-job workflow, status, watch, cancellation, results, and artifacts:
+
+- `run_configured_strategy` and `submit_configured_strategy` run one bound strategy document over one symbol;
+- `submit_search` runs a parameter search over a strategy template and a space document;
+- `get_search_result` returns a completed search's summary and the artifact holding its complete output.
+
+A configured request carries the document as a JSON value together with the geometry of each logical source (timeframe, price basis, and alignment), the data scope, and the same `profile`, `profile_def`, and `entry_profile_routes` fields a raw-signal request uses. The service decodes the document strictly, compiles it with the built-in material library, binds its sources, derives warmup from the compiled requirements, checks profile routing and sizing, and only then admits a job; an unknown field, an unknown material, an unresolved parameter, or an unrouted entry class is reported with its location before any data is read. Loading starts at the source-aligned warmup start, the run goes through the same stream, conversion, instrument, and FutureQuote path as a raw-signal run, and the result carries the decoded document, the source geometry, the compiled requirements, the data mode, the configured decisions, and the notes. A request with `data_type = "bar"` runs over stored bars of the declared timeframe under the bar-feed convention described above.
+
+A search request carries a template and a space document as JSON values, one or more symbols, fixed or rolling windows, sizing, and profiles referenced by registered name only. The whole search is validated without loading data, including every parameter point, the run count against the server limit, and the stored-data range the batch reads. A search replays primary events without conversion quotes, so every searched symbol must settle in the account currency. Only one search holds its data in memory at a time; others wait. The worker count a request asks for is capped by the server, cancellation takes effect after the current run, and progress is reported after each run.
+
+`strategy_backtest --run run.toml --out result.json` submits either kind of request from a TOML run file and waits for it. A run file names `strategy`, or `template` and `space`, by path relative to itself; documents stay in their TOML authoring form and are converted to JSON when the request is built.
+
+```toml
+strategy = "strategy.toml"
+exchange = "demo"
+symbol = "EURUSD"
+data_type = "tick"
+from = "2026-01-05T02:00:00"
+to = "2026-01-05T15:00:00"
+account_currency = "USD"
+
+[config]
+initial_balance = 10000.0
+sizing = { type = "FixedLot", lots = 0.1 }
+
+[[series]]
+source = "primary"
+timeframe_seconds = 60
+price_basis = "mid"
+```
+
+A search run file replaces `strategy` and `[[series]]` with `template`, `space`, optional `symbols` and `workers`, and a `[windows]` table such as `type = "fixed"` with `in_sample` and `out_of_sample` entries; its series geometry comes from the space document. The `[strategies]` section of the server configuration bounds document size, retained history per run, search workers, and search runs.
+
 ## Operational boundaries
 
 - Signal symbols and timestamps must overlap imported data.

@@ -1624,7 +1624,7 @@ impl BacktestRunner {
     /// Run a configured strategy from complete ordered timestamp batches.
     #[allow(clippy::too_many_arguments)]
     pub fn run_configured_strategy_future_streaming<F>(
-        mut self,
+        self,
         feed: &mut F,
         primary_eod: Option<NaiveDateTime>,
         adapter: &mut BacktestConfiguredStrategyAdapter,
@@ -1634,6 +1634,36 @@ impl BacktestRunner {
     ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, ConfiguredStrategyAdapterError>>
     where
         F: FallibleBatchFeed,
+    {
+        self.run_configured_strategy_future_streaming_controlled(
+            feed,
+            primary_eod,
+            adapter,
+            analysis,
+            retention,
+            profile,
+            || false,
+            |_| {},
+        )
+    }
+
+    /// Run a configured strategy from complete ordered timestamp batches with cooperative cancellation and replay progress, as the retained-job service does for raw-signal replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_configured_strategy_future_streaming_controlled<F, C, P>(
+        mut self,
+        feed: &mut F,
+        primary_eod: Option<NaiveDateTime>,
+        adapter: &mut BacktestConfiguredStrategyAdapter,
+        analysis: AnalysisPipeline,
+        retention: StrategyRetentionLimits,
+        profile: Option<&ManagementProfile>,
+        mut is_cancelled: C,
+        mut on_progress: P,
+    ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, ConfiguredStrategyAdapterError>>
+    where
+        F: FallibleBatchFeed,
+        C: FnMut() -> bool,
+        P: FnMut(ReplayProgress),
     {
         self.preflight_configured_entry_profiles(adapter, profile)?;
         adapter
@@ -1654,8 +1684,6 @@ impl BacktestRunner {
             retention,
             self.strategy_research_limits,
         );
-        let mut is_cancelled = || false;
-        let mut on_progress = |_| {};
         let replay = match self.run_raw_signals_future_batches(
             feed,
             primary_eod,
@@ -1673,9 +1701,7 @@ impl BacktestRunner {
             Err(FutureBatchReplayError::Feed(error)) => {
                 return Err(StrategyReplayError::Feed(error));
             }
-            Err(FutureBatchReplayError::Cancelled) => {
-                unreachable!("configured strategy replay is not cancellable")
-            }
+            Err(FutureBatchReplayError::Cancelled) => return Err(StrategyReplayError::Cancelled),
             Err(FutureBatchReplayError::Dynamic) => {
                 let error = hook.finish().expect_err("dynamic failure stores its cause");
                 return Err(map_strategy_driver_error(error));

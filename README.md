@@ -16,7 +16,8 @@ It is not a complete automated trading platform. It does not currently execute l
 | Compile and evaluate reusable configured strategy behavior | [`qs-strategy`](crates/strategy) | Library-only; synchronous core |
 | Build an in-process historical strategy simulation | [`qs-backtest`](crates/backtest) | Library-only |
 | Replay stored Parquet market data through the engine | [`qs-market-loader`](crates/market-loader) | Library-only |
-| Search a strategy's parameter space and compare in and out of sample | [`qs-research` guide](docs/research.md) | Library-only; tick-driven or stored-bar search |
+| Search a strategy's parameter space and compare in and out of sample | [`qs-research` guide](docs/research.md) | Library or service; tick-driven or stored-bar search |
+| Run a configured strategy or a search through the running service | [Backtesting guide](docs/backtesting.md#configured-strategies-through-the-service) | Available through `strategy_backtest` and the typed client |
 | Parse Telegram message exports | [Signal ingestion guide](docs/signal-ingestion.md) | Compatibility CLI and public adapter library |
 
 | Operate a CTrader quote service | [Market-data guide](docs/market-data.md) | Requires CTrader FIX credentials |
@@ -96,7 +97,7 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 - Configured historical execution is available through materialized and streaming in-process library APIs. Current conformance verifies neutral no-op, EMA crossover, EMA/ATR lifecycle, declared parameter binding, parameterized custom materials, compositional rolling indicators, pending cancellation, direct-signal economic parity, aligned-EOD materialized/streaming parity, final feedback handling, and strict research-output deserialization.
 - FutureQuote Market Entry sizing can use the actual fill price or an explicit signal Entry price, with fill-price default and fallback. The option changes quantity calculation only; profile resolution, actual fills, P&L, MTM, and actual risk remain execution-price based, while pending order quantity remains fixed at placement.
 - Direct RawSignal replay can map optional exact Entry classes to immutable per-run management-profile snapshots. Profiles can scale the directional signal-stop distance and generate targets from multiples of the final grid-adjusted stop distance; pending levels and quantity remain frozen at placement.
-- Current backtest service endpoints accept strict `RawSignal`; configured-strategy server or RPC execution is not included. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
+- The backtest service accepts strict `RawSignal` runs, configured strategy runs, and parameter searches as retained jobs; strategies and profiles load at runtime by request, and only server-registered materials are available to a remote strategy. No portfolio supervisor, execution gateway, live venue implementation, or automatic committed-batch trading bridge is included.
 - Live order execution, restart-safe strategy state, and broker order adapters are not included.
 - The instrument catalog can describe cryptocurrency assets and model identifiers, but replay does not implement cryptocurrency spot, derivative, fee, funding, margin, or liquidation economics. Registry-backed cryptocurrency rows remain rejected before data access.
 - Shipped backtest clients use provider-neutral retained-job, artifact, synchronous-execution, and discovery capabilities through the typed xrpc facade; RPC method names and provider error mapping remain inside the API provider module.

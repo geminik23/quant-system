@@ -21,6 +21,10 @@ path = "src/bin/backtest_server.rs"
 name = "tg_backtest"
 path = "src/bin/tg_backtest.rs"
 
+[[bin]]
+name = "strategy_backtest"
+path = "src/bin/strategy_backtest.rs"
+
 [dependencies]
 qs-core = { workspace = true }
 qs-instruments = { workspace = true }
@@ -28,9 +32,11 @@ qs-backtest = { workspace = true }
 qs-backtest-api = { workspace = true, features = ["xrpc"] }
 qs-data-preprocess = { workspace = true, features = ["parquet"] }
 qs-market-loader = { workspace = true }
+qs-research = { workspace = true }
 qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true }
 qs-symbols = { workspace = true }
+qs-strategy = { workspace = true }
 
 tokio = { workspace = true }
 futures = { workspace = true }

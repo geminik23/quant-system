@@ -5,6 +5,13 @@
 //! returns a response message. Errors are captured in the response rather
 //! than crashing the server.
 
+mod strategy;
+
+pub use strategy::{
+    handle_get_search_result, handle_run_configured_strategy, handle_submit_configured_strategy,
+    handle_submit_search,
+};
+
 use std::collections::{BTreeSet, HashMap};
 #[cfg(test)]
 use std::path::Path;
@@ -68,12 +75,47 @@ pub struct ServerState {
     pub max_retained_jobs: usize,
     /// Filesystem storage for complete large result JSON payloads.
     pub artifact_store: ArtifactStore,
+    /// Limits for configured strategy runs and the gate that runs one search at a time.
+    pub strategies: StrategyServiceState,
+}
+
+/// Configured strategy limits plus the gate that lets only one parameter search hold its market data in memory at a time.
+#[derive(Debug, Default)]
+pub struct StrategyServiceState {
+    pub limits: crate::config::StrategiesSection,
+    search_gate: Mutex<()>,
+}
+
+impl StrategyServiceState {
+    pub fn new(limits: crate::config::StrategiesSection) -> Self {
+        Self {
+            limits,
+            search_gate: Mutex::new(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AcceptedBacktestJobInput {
     request: RunBacktestRequest,
     profiles: PreparedEntryProfiles,
+}
+
+/// Validated input a retained job runs once its worker starts.
+#[derive(Debug, Clone)]
+pub enum AcceptedJobInput {
+    Backtest(Box<AcceptedBacktestJobInput>),
+    ConfiguredStrategy(Box<strategy::AcceptedConfiguredRun>),
+    Search(Box<strategy::AcceptedSearch>),
+}
+
+/// What a retained job produces, which decides the endpoint that returns its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    /// A backtest result, returned by `get_backtest_result`.
+    Backtest,
+    /// A search output, returned by `get_search_result`.
+    Search,
 }
 
 /// Internal representation of an async backtest job.
@@ -104,7 +146,11 @@ pub struct BacktestJob {
     /// Coalesced current status published to server-streaming subscribers.
     pub updates: watch::Sender<BacktestStatusResponse>,
     /// Accepted request and immutable profile snapshot until the worker starts.
-    pub accepted: Option<AcceptedBacktestJobInput>,
+    pub accepted: Option<AcceptedJobInput>,
+    /// Which result endpoint serves this job.
+    pub kind: JobKind,
+    /// Summary of a completed search; its complete output is the job artifact.
+    pub search: Option<SearchSummaryMsg>,
 }
 
 /// Lightweight per-job cancellation token without an additional runtime dependency.
@@ -1511,14 +1557,33 @@ fn resolve_prepared_entry_profiles(
     req: &BacktestRunSpec,
     signals: &[RawSignal],
 ) -> Result<PreparedEntryProfiles> {
+    let prepared = resolve_entry_profiles(
+        state,
+        req.profile.as_ref(),
+        req.profile_def.as_ref(),
+        &req.entry_profile_routes,
+    )?;
+    prepared.validate_signals(signals).map_err(|error| {
+        BacktestServerError::InvalidRequest(format!("Invalid entry profile routing: {error}"))
+    })?;
+    Ok(prepared)
+}
+
+/// Resolve a run default profile and entry-class routes from the request fields every run shape shares.
+fn resolve_entry_profiles(
+    state: &ServerState,
+    profile: Option<&String>,
+    profile_def: Option<&ManagementProfileMsg>,
+    routes: &[EntryProfileRouteMsg],
+) -> Result<PreparedEntryProfiles> {
     let registry = state.profile_registry.read().unwrap();
-    let default = if let Some(message) = req.profile_def.as_ref() {
+    let default = if let Some(message) = profile_def {
         let profile = profile_from_msg(message)?;
         profile.validate().map_err(|error| {
             BacktestServerError::InvalidRequest(format!("Invalid inline profile: {error}"))
         })?;
         Some(profile)
-    } else if let Some(name) = req.profile.as_ref() {
+    } else if let Some(name) = profile {
         Some(
             registry
                 .get(name)
@@ -1528,8 +1593,7 @@ fn resolve_prepared_entry_profiles(
     } else {
         None
     };
-    let routes = req
-        .entry_profile_routes
+    let routes = routes
         .iter()
         .map(|route| {
             resolve_profile_ref(&registry, &route.profile)
@@ -1537,13 +1601,9 @@ fn resolve_prepared_entry_profiles(
         })
         .collect::<Result<Vec<_>>>()?;
     drop(registry);
-    let prepared = PreparedEntryProfiles::try_new(default, routes).map_err(|error| {
+    PreparedEntryProfiles::try_new(default, routes).map_err(|error| {
         BacktestServerError::InvalidRequest(format!("Invalid entry profile routing: {error}"))
-    })?;
-    prepared.validate_signals(signals).map_err(|error| {
-        BacktestServerError::InvalidRequest(format!("Invalid entry profile routing: {error}"))
-    })?;
-    Ok(prepared)
+    })
 }
 
 // ── Data Loading ────────────────────────────────────────────────────────────
@@ -1915,6 +1975,18 @@ fn admit_backtest_job(
     state: &ServerState,
     accepted: AcceptedBacktestJobInput,
 ) -> SubmitBacktestResponse {
+    admit_job(
+        state,
+        JobKind::Backtest,
+        AcceptedJobInput::Backtest(Box::new(accepted)),
+    )
+}
+
+fn admit_job(
+    state: &ServerState,
+    kind: JobKind,
+    accepted: AcceptedJobInput,
+) -> SubmitBacktestResponse {
     let job_id = format!("job-{}", uuid_v4_simple());
     let initial_progress = BacktestProgress {
         stage: "queued".into(),
@@ -1942,6 +2014,8 @@ fn admit_backtest_job(
         worker_active: true,
         updates,
         accepted: Some(accepted),
+        kind,
+        search: None,
     };
     if state.max_retained_jobs == 0 {
         return SubmitBacktestResponse {
@@ -2065,6 +2139,15 @@ pub fn handle_get_backtest_result(
 ) -> GetBacktestResultResponse {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(&req.job_id) {
+        Some(job) if job.kind == JobKind::Search => GetBacktestResultResponse {
+            success: false,
+            job_id: req.job_id.clone(),
+            result: None,
+            error: Some("Job is a parameter search; use get_search_result".into()),
+            artifact: None,
+            inline_complete: true,
+            artifact_consumed: false,
+        },
         Some(job) if job.status == JobStatus::Completed && job.artifact_consumed => {
             GetBacktestResultResponse {
                 success: false,
@@ -2228,10 +2311,18 @@ pub fn run_job_and_store(state: Arc<ServerState>, job_id: String) {
         };
         job.accepted.take()
     };
-    let Some(accepted) = accepted else {
-        return;
-    };
-    run_job_and_store_inner(state, job_id, accepted);
+    match accepted {
+        Some(AcceptedJobInput::Backtest(accepted)) => {
+            run_job_and_store_inner(state, job_id, *accepted)
+        }
+        Some(AcceptedJobInput::ConfiguredStrategy(accepted)) => {
+            strategy::run_configured_job(state, job_id, *accepted)
+        }
+        Some(AcceptedJobInput::Search(accepted)) => {
+            strategy::run_search_job(state, job_id, *accepted)
+        }
+        None => {}
+    }
 }
 
 fn run_job_and_store_inner(
@@ -2246,42 +2337,41 @@ fn run_job_and_store_inner(
         evaluation,
         result_delivery: delivery,
     } = request;
-    let cancellation = {
-        let mut jobs = state.jobs.lock().unwrap();
-        let Some(job) = jobs.get_mut(&job_id) else {
-            return;
-        };
-        if job.status == JobStatus::Cancelled || job.cancellation.is_cancelled() {
-            job.worker_active = false;
-            return;
-        }
-        job.status = JobStatus::LoadingData;
-        job.progress.stage = "loading_data".into();
-        publish_job_status(&job_id, job);
-        job.cancellation.clone()
+    run_result_job(state, job_id, delivery, |state, job_id, cancellation| {
+        execute_backtest_with_future_controlled(
+            state,
+            &req,
+            &future,
+            &evaluation,
+            Some(&profiles),
+            Some(cancellation),
+            &mut |progress| update_job_progress(state, job_id, progress),
+        )
+        .map(|result| result_to_msg(&result))
+    });
+}
+
+/// Run one retained job that produces a backtest result, then store it inline or as an artifact exactly as every result job does.
+fn run_result_job(
+    state: Arc<ServerState>,
+    job_id: String,
+    delivery: ResultDeliveryMsg,
+    execute: impl FnOnce(&ServerState, &str, &JobCancellationToken) -> Result<BacktestResultMsg>,
+) {
+    let Some(cancellation) = start_job(&state, &job_id) else {
+        return;
     };
 
-    let result = execute_backtest_with_future_controlled(
-        &state,
-        &req,
-        &future,
-        &evaluation,
-        Some(&profiles),
-        Some(&cancellation),
-        &mut |progress| update_job_progress(&state, &job_id, progress),
-    );
+    let result = execute(&state, &job_id, &cancellation);
 
     let execution_cancelled = matches!(&result, Err(BacktestServerError::Cancelled));
     let prepared = if execution_cancelled {
         None
     } else {
         Some(match result {
-            Ok(backtest_result) => prepare_result(
-                &state,
-                result_to_msg(&backtest_result),
-                Some(delivery),
-                compact_result_for_console,
-            ),
+            Ok(message) => {
+                prepare_result(&state, message, Some(delivery), compact_result_for_console)
+            }
             Err(error) => Err(error.to_string()),
         })
     };
@@ -2295,16 +2385,7 @@ fn run_job_and_store_inner(
         if let Some(Ok(PreparedResult::Artifact { reference, .. })) = prepared.as_ref() {
             let _ = state.artifact_store.delete(&reference.artifact_id);
         }
-        job.cancellation.cancel();
-        job.status = JobStatus::Cancelled;
-        job.result = None;
-        job.artifact = None;
-        job.inline_complete = true;
-        job.artifact_consumed = false;
-        job.error = None;
-        job.progress.stage = "cancelled".into();
-        job.completed_at.get_or_insert_with(Instant::now);
-        publish_job_status(&job_id, job);
+        mark_job_cancelled(&job_id, job);
         return;
     }
 
@@ -2331,18 +2412,47 @@ fn run_job_and_store_inner(
             job.completed_at = Some(Instant::now());
             publish_job_status(&job_id, job);
         }
-        Err(error) => {
-            job.status = JobStatus::Failed;
-            job.result = None;
-            job.artifact = None;
-            job.inline_complete = true;
-            job.artifact_consumed = false;
-            job.error = Some(error);
-            job.progress.stage = "failed".into();
-            job.completed_at = Some(Instant::now());
-            publish_job_status(&job_id, job);
-        }
+        Err(error) => mark_job_failed(&job_id, job, error),
     }
+}
+
+/// Move a queued job to loading and return its cancellation token, or `None` when it was cancelled before its worker started.
+fn start_job(state: &ServerState, job_id: &str) -> Option<JobCancellationToken> {
+    let mut jobs = state.jobs.lock().unwrap();
+    let job = jobs.get_mut(job_id)?;
+    if job.status == JobStatus::Cancelled || job.cancellation.is_cancelled() {
+        job.worker_active = false;
+        return None;
+    }
+    job.status = JobStatus::LoadingData;
+    job.progress.stage = "loading_data".into();
+    publish_job_status(job_id, job);
+    Some(job.cancellation.clone())
+}
+
+fn mark_job_cancelled(job_id: &str, job: &mut BacktestJob) {
+    job.cancellation.cancel();
+    job.status = JobStatus::Cancelled;
+    job.result = None;
+    job.artifact = None;
+    job.inline_complete = true;
+    job.artifact_consumed = false;
+    job.error = None;
+    job.progress.stage = "cancelled".into();
+    job.completed_at.get_or_insert_with(Instant::now);
+    publish_job_status(job_id, job);
+}
+
+fn mark_job_failed(job_id: &str, job: &mut BacktestJob, error: String) {
+    job.status = JobStatus::Failed;
+    job.result = None;
+    job.artifact = None;
+    job.inline_complete = true;
+    job.artifact_consumed = false;
+    job.error = Some(error);
+    job.progress.stage = "failed".into();
+    job.completed_at = Some(Instant::now());
+    publish_job_status(job_id, job);
 }
 
 /// Generate a simple unique ID without external dependencies.
@@ -2396,6 +2506,7 @@ mod tests {
             std::process::id()
         ));
         ServerState {
+            strategies: Default::default(),
             symbol_registry: SymbolRegistry::empty(),
             instrument_domain: InstrumentDomain::compatibility(&SymbolRegistry::empty()).unwrap(),
             profile_registry: RwLock::new(ProfileRegistry::empty()),

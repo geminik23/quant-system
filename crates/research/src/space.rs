@@ -60,6 +60,20 @@ impl DeclaredSpace {
         Self::build(StrategyTemplate::new(document), space, library)
     }
 
+    /// Build from an already decoded strategy template and a space document read from any serde source, such as a JSON value a service received, with the built-in material library.
+    pub fn from_documents<'de, S>(template: StrategyConfig, space: S) -> Result<Self, ResearchError>
+    where
+        S: serde::Deserializer<'de>,
+    {
+        let space = SpaceDocument::deserialize(space)
+            .map_err(|error| ResearchError::InvalidDocument(format!("space document: {error}")))?;
+        Self::build(
+            StrategyTemplate::new(template),
+            space,
+            MaterialLibrary::builtins(),
+        )
+    }
+
     fn build(
         template: StrategyTemplate,
         space: SpaceDocument,
@@ -258,11 +272,6 @@ fn enumerate_bindings(
     strategy: &StrategyConfig,
     space: &SpaceDocument,
 ) -> Result<Vec<ParameterBinding>, ResearchError> {
-    if strategy.parameters.len() != space.parameters.len() {
-        return Err(ResearchError::InvalidPlan(
-            "every strategy parameter must have exactly one space binding".into(),
-        ));
-    }
     let mut dimensions = Vec::new();
     for parameter in &strategy.parameters {
         let binding = space.parameters.get(&parameter.id).ok_or_else(|| {

@@ -55,6 +55,10 @@ pub enum ResearchError {
     #[error("invalid window: {0}")]
     InvalidWindow(String),
 
+    /// The caller cancelled the batch before every run finished.
+    #[error("research batch was cancelled")]
+    Cancelled,
+
     /// Stored market data could not be loaded.
     #[error(transparent)]
     Load(#[from] qs_market_loader::MarketLoadError),

@@ -10,6 +10,7 @@ pub mod context;
 pub mod domain;
 pub mod experiment;
 pub mod feedback;
+pub mod geometry;
 pub mod journal;
 pub mod replay;
 pub mod runtime;
@@ -54,6 +55,7 @@ pub use experiment::{
     StrategyExperimentError,
 };
 pub use feedback::{StrategyFeedback, StrategyFeedbackEvent};
+pub use geometry::{SeriesGeometry, SeriesGeometryError};
 pub use journal::{
     JournalKind, MAX_CHART_REF_BYTES, MAX_EXPERIMENT_LABEL_BYTES, MAX_JOURNAL_PER_CALLBACK,
     MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,

@@ -21,7 +21,10 @@ pub use family::StrategyFamily;
 pub use geometry::SeriesGeometry;
 pub use loader::{load_symbol_bars, load_symbol_ticks};
 pub use plan::ResearchPlan;
-pub use runner::{ResearchBatch, SymbolEvents, run_batch};
+pub use runner::{
+    BatchProgress, ResearchBatch, SymbolEvents, batch_data_range, run_batch, run_batch_controlled,
+    validate_batch,
+};
 pub use space::DeclaredSpace;
 pub use table::{PairedRow, ResearchRow, ResearchTable, RunStatus};
 pub use window::{DataWindow, WindowPair, WindowPlan};

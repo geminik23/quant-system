@@ -299,3 +299,134 @@ fn stored_bars_load_from_a_store_and_drive_a_batch() {
     .unwrap();
     assert_eq!(from_store.table(), in_memory.table());
 }
+
+#[test]
+fn a_controlled_batch_reports_each_run_and_stops_when_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let reported = AtomicUsize::new(0);
+    let total = AtomicUsize::new(0);
+    let batch =
+        qs_research::run_batch_controlled(&plan(1), &declared, &events(), &|| false, &|progress| {
+            assert_eq!(
+                progress.completed_runs,
+                reported.fetch_add(1, Ordering::SeqCst) + 1
+            );
+            total.store(progress.total_runs, Ordering::SeqCst);
+        })
+        .unwrap();
+    assert_eq!(reported.load(Ordering::SeqCst), batch.table().len());
+    assert_eq!(total.load(Ordering::SeqCst), batch.table().len());
+
+    for workers in [1, 3] {
+        let completed = AtomicUsize::new(0);
+        let error = qs_research::run_batch_controlled(
+            &plan(workers),
+            &declared,
+            &events(),
+            &|| completed.load(Ordering::SeqCst) >= 2,
+            &|_| {
+                completed.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, qs_research::ResearchError::Cancelled));
+        assert!(completed.load(Ordering::SeqCst) < 12);
+    }
+}
+
+#[test]
+fn documents_from_any_serde_source_build_the_same_space() {
+    let template: StrategyConfig = toml::from_str(strategy_toml()).unwrap();
+    let space: toml::Value = toml::from_str(space_toml()).unwrap();
+    let from_documents = DeclaredSpace::from_documents(template, space).unwrap();
+    let from_toml = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    assert_eq!(
+        run_batch(&plan(1), &from_documents, &events())
+            .unwrap()
+            .table(),
+        run_batch(&plan(1), &from_toml, &events()).unwrap().table()
+    );
+
+    let mut unknown: toml::Value = toml::from_str(space_toml()).unwrap();
+    unknown["parameters"].as_table_mut().unwrap().insert(
+        "unknown".into(),
+        toml::Value::try_from(BTreeMap::from([("values", vec![1])])).unwrap(),
+    );
+    let error = DeclaredSpace::from_documents(toml::from_str(strategy_toml()).unwrap(), unknown)
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("unknown parameter 'unknown'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn validation_and_data_range_need_no_market_data() {
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    assert_eq!(
+        qs_research::validate_batch(&plan(1), &declared).unwrap(),
+        24
+    );
+    let (start, end) = qs_research::batch_data_range(&plan(1), &declared)
+        .unwrap()
+        .unwrap();
+    assert_eq!(end, at(900));
+    assert!(
+        start < at(200),
+        "the range includes the warmup before the first window"
+    );
+
+    let sliced: Vec<_> = support::synthetic_ticks(960)
+        .iter()
+        .filter(|event| event.event.ts() >= start && event.event.ts() <= end)
+        .cloned()
+        .collect();
+    let narrow = BTreeMap::from([(SYMBOL.to_owned(), sliced.into())]);
+    assert_eq!(
+        run_batch(&plan(1), &declared, &narrow).unwrap().table(),
+        run_batch(&plan(1), &declared, &events()).unwrap().table(),
+        "loading exactly the data range changes nothing"
+    );
+}
+
+#[test]
+fn a_plan_with_profiles_routes_classified_entries_in_every_run() {
+    use qs_backtest::profile::{
+        ManagementProfile, PreparedEntryProfiles, RuleConfigDef, StoplossMode,
+    };
+
+    let classified = strategy_toml().replacen(
+        "action = \"entry\"\n",
+        "action = \"entry\"\nentry_class = \"trend\"\n",
+        1,
+    );
+    let declared = DeclaredSpace::from_toml(&classified, space_toml()).unwrap();
+    let trailing = ManagementProfile {
+        name: "trail".into(),
+        target_selection: None,
+        use_targets: vec![],
+        close_ratios: vec![],
+        target_source: qs_backtest::TargetSource::FromSignal,
+        stoploss_mode: StoplossMode::FromSignal,
+        rules: vec![RuleConfigDef::TrailingStop { distance: 0.0005 }],
+        group_override: None,
+        let_remainder_run: false,
+        entry_geometry: qs_backtest::EntryGeometryPolicy::Strict,
+    };
+    let plan = plan(1).with_entry_profiles(
+        PreparedEntryProfiles::try_new(None, [("trend".to_owned(), trailing)]).unwrap(),
+    );
+    let batch = run_batch(&plan, &declared, &events()).unwrap();
+    assert!(
+        batch
+            .table()
+            .rows()
+            .iter()
+            .all(|row| row.status.is_completed())
+    );
+    assert!(batch.table().rows().iter().any(|row| row.positions > 0));
+}
