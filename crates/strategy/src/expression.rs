@@ -142,16 +142,7 @@ fn compile_inner(
                     reference: slot.clone(),
                 });
             }
-            let ty = match field {
-                PositionField::Exists | PositionField::IsPending | PositionField::IsOpen => {
-                    ValueType::required(ScalarType::Bool)
-                }
-                PositionField::EntryPrice | PositionField::Stoploss => {
-                    ValueType::optional(ScalarType::Price)
-                }
-                PositionField::Side => ValueType::optional(ScalarType::Side),
-                PositionField::RemainingSize => ValueType::optional(ScalarType::Number),
-            };
+            let ty = crate::material::position_field_type(*field);
             Ok((CompiledExpr::Position(slot.clone(), *field), ty))
         }
         Expr::Feedback {

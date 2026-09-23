@@ -185,3 +185,117 @@ fn invalid_space_bindings_and_runtime_constraints_are_rejected() {
     );
     assert!(DeclaredSpace::from_toml(strategy, &runtime_constraint).is_err());
 }
+
+#[test]
+fn classified_entry_fails_every_run_because_a_batch_supplies_no_profile_route() {
+    let classified = strategy_toml().replacen(
+        "action = \"entry\"\n",
+        "action = \"entry\"\nentry_class = \"trend\"\n",
+        1,
+    );
+    assert_ne!(classified, strategy_toml());
+    let declared = DeclaredSpace::from_toml(&classified, space_toml()).unwrap();
+    let batch = run_batch(&plan(1), &declared, &events()).unwrap();
+    assert!(!batch.table().rows().is_empty());
+    for row in batch.table().rows() {
+        match &row.status {
+            qs_research::RunStatus::Failed { message, .. } => assert!(
+                message.contains("entry class `trend`"),
+                "unexpected failure: {message}"
+            ),
+            qs_research::RunStatus::Completed => panic!("a classified entry must not run unrouted"),
+        }
+    }
+}
+
+#[test]
+fn declared_space_runs_over_stored_bars_and_records_the_bar_mode() {
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let bars = BTreeMap::from([(SYMBOL.to_owned(), support::synthetic_bars(960))]);
+    let batch = run_batch(&plan(2), &declared, &bars).unwrap();
+    let rows = batch.table().rows();
+    assert_eq!(rows.len(), 24);
+    assert!(rows.iter().all(|row| row.status.is_completed()));
+    assert!(rows.iter().all(|row| row.data_mode == "bars"));
+    assert!(rows.iter().any(|row| row.positions > 0));
+    assert!(batch.position_outcomes().iter().all(|position| {
+        position
+            .dimensions
+            .tags
+            .get("data_mode")
+            .map(String::as_str)
+            == Some("bars")
+    }));
+
+    let ticks = run_batch(&plan(2), &declared, &events()).unwrap();
+    assert!(
+        ticks
+            .table()
+            .rows()
+            .iter()
+            .all(|row| row.data_mode == "ticks")
+    );
+}
+
+#[test]
+fn a_symbol_mixing_ticks_and_stored_bars_is_rejected() {
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let mut mixed = support::synthetic_ticks(10).to_vec();
+    mixed.extend(support::synthetic_bars(10).iter().cloned());
+    mixed.sort_by_key(|event| event.event.ts());
+    let events = BTreeMap::from([(SYMBOL.to_owned(), mixed.into())]);
+    let error = run_batch(&plan(1), &declared, &events).err().unwrap();
+    assert!(
+        error.to_string().contains("mix ticks and stored bars"),
+        "{error}"
+    );
+}
+
+#[test]
+fn stored_bars_load_from_a_store_and_drive_a_batch() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "qs-research-stored-bars-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let store = data_preprocess::ParquetStore::open(&data_dir).unwrap();
+    store
+        .insert_bars(&support::synthetic_stored_bars(960))
+        .unwrap();
+
+    let events = qs_research::load_symbol_bars(
+        data_dir.to_str().unwrap(),
+        "demo",
+        SYMBOL,
+        "1m",
+        Some(at(0)),
+        Some(at(960)),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&data_dir).unwrap();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| matches!(
+        event.event,
+        qs_backtest::data_feed::MarketEvent::Bar {
+            timeframe_seconds: Some(60),
+            tick_count: Some(_),
+            ..
+        }
+    )));
+
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let from_store = run_batch(
+        &plan(1),
+        &declared,
+        &BTreeMap::from([(SYMBOL.to_owned(), events)]),
+    )
+    .unwrap();
+    let in_memory = run_batch(
+        &plan(1),
+        &declared,
+        &BTreeMap::from([(SYMBOL.to_owned(), support::synthetic_bars(960))]),
+    )
+    .unwrap();
+    assert_eq!(from_store.table(), in_memory.table());
+}

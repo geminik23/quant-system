@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
+use chrono::{Datelike, NaiveDateTime, Timelike};
 use qs_core::Side;
 
 use crate::{
@@ -12,6 +12,10 @@ use crate::{
 pub const MATERIAL_BAR_FIELD: &str = "completed_bar_field";
 pub const MATERIAL_INPUT_TIME: &str = "input_time";
 pub const MATERIAL_READINESS: &str = "readiness";
+/// ISO weekday of the authoritative input time, Monday = 1 through Sunday = 7.
+pub const MATERIAL_WEEKDAY: &str = "weekday";
+/// Seconds elapsed since midnight of the authoritative input time, 0 through 86399.
+pub const MATERIAL_SECONDS_OF_DAY: &str = "seconds_of_day";
 pub const MATERIAL_EMA: &str = "ema";
 pub const MATERIAL_ATR: &str = "atr";
 pub const MATERIAL_SMA: &str = "sma";
@@ -29,6 +33,11 @@ pub const MATERIAL_POSITION_ENTRY_PRICE: &str = "position_entry_price";
 pub const MATERIAL_POSITION_SIDE: &str = "position_side";
 pub const MATERIAL_POSITION_REMAINING_SIZE: &str = "position_remaining_size";
 pub const MATERIAL_POSITION_STOPLOSS: &str = "position_stoploss";
+pub const MATERIAL_POSITION_OPENED_AT: &str = "position_opened_at";
+pub const MATERIAL_POSITION_FAVORABLE_EXCURSION: &str = "position_favorable_excursion";
+pub const MATERIAL_POSITION_ADVERSE_EXCURSION: &str = "position_adverse_excursion";
+pub const MATERIAL_POSITION_INITIAL_RISK: &str = "position_initial_risk";
+pub const MATERIAL_BARS_SINCE_OPEN: &str = "bars_since_open";
 pub const MATERIAL_ENTRY_FILLED: &str = "entry_filled";
 pub const MATERIAL_ENTRY_REJECTED: &str = "entry_rejected";
 pub const MATERIAL_POSITION_CLOSED: &str = "position_closed";
@@ -70,6 +79,14 @@ pub enum TradeSlotState {
         entry_price: f64,
         remaining_size: f64,
         stoploss: Option<f64>,
+        /// Authoritative time of the committed entry fill.
+        opened_at: NaiveDateTime,
+        /// Best campaign profit and loss since entry in the adapter's account currency, never below zero, or missing when the adapter cannot price the position yet.
+        favorable_excursion: Option<f64>,
+        /// Worst campaign profit and loss since entry in the adapter's account currency, never above zero, or missing when the adapter cannot price the position yet.
+        adverse_excursion: Option<f64>,
+        /// Positive initial risk amount in account currency for R normalization, or missing when the entry has no usable protective stop.
+        initial_risk: Option<f64>,
     },
 }
 
@@ -145,6 +162,17 @@ pub struct ConfiguredStrategyRequirements {
     pub named_inputs: Vec<NamedInputRequirement>,
     pub trade_slots: Vec<String>,
     pub needs_command_feedback: bool,
+    /// Every distinct trade slot and routing class an Entry action can emit, in sorted order.
+    pub entries: Vec<EntryRequirement>,
+    /// Trade slots whose stoploss the strategy moves itself through `ModifyStoploss` or `MoveStoplossToEntry`, in sorted order.
+    pub stop_managed_slots: Vec<String>,
+}
+
+/// One trade slot an Entry action reserves and the class it carries, where `None` is an unclassified entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryRequirement {
+    pub slot: String,
+    pub entry_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +324,8 @@ impl MaterialLibrary {
             MATERIAL_BAR_FIELD,
             MATERIAL_INPUT_TIME,
             MATERIAL_READINESS,
+            MATERIAL_WEEKDAY,
+            MATERIAL_SECONDS_OF_DAY,
             MATERIAL_EMA,
             MATERIAL_ATR,
             MATERIAL_SMA,
@@ -313,6 +343,11 @@ impl MaterialLibrary {
             MATERIAL_POSITION_SIDE,
             MATERIAL_POSITION_REMAINING_SIZE,
             MATERIAL_POSITION_STOPLOSS,
+            MATERIAL_POSITION_OPENED_AT,
+            MATERIAL_POSITION_FAVORABLE_EXCURSION,
+            MATERIAL_POSITION_ADVERSE_EXCURSION,
+            MATERIAL_POSITION_INITIAL_RISK,
+            MATERIAL_BARS_SINCE_OPEN,
             MATERIAL_ENTRY_FILLED,
             MATERIAL_ENTRY_REJECTED,
             MATERIAL_POSITION_CLOSED,
@@ -407,6 +442,18 @@ const SLOT_SCHEMA: [ParamSpec; 1] = [ParamSpec {
     kind: ParamKind::Slot,
     required: true,
 }];
+const SLOT_SOURCE_SCHEMA: [ParamSpec; 2] = [
+    ParamSpec {
+        name: "slot",
+        kind: ParamKind::Slot,
+        required: true,
+    },
+    ParamSpec {
+        name: "source",
+        kind: ParamKind::Source,
+        required: true,
+    },
+];
 const FEEDBACK_SCHEMA: [ParamSpec; 2] = [
     ParamSpec {
         name: "slot",
@@ -433,7 +480,12 @@ impl MaterialFactory for BuiltinFactory {
             | MATERIAL_POSITION_ENTRY_PRICE
             | MATERIAL_POSITION_SIDE
             | MATERIAL_POSITION_REMAINING_SIZE
-            | MATERIAL_POSITION_STOPLOSS => &SLOT_SCHEMA,
+            | MATERIAL_POSITION_STOPLOSS
+            | MATERIAL_POSITION_OPENED_AT
+            | MATERIAL_POSITION_FAVORABLE_EXCURSION
+            | MATERIAL_POSITION_ADVERSE_EXCURSION
+            | MATERIAL_POSITION_INITIAL_RISK => &SLOT_SCHEMA,
+            MATERIAL_BARS_SINCE_OPEN => &SLOT_SOURCE_SCHEMA,
             MATERIAL_ENTRY_FILLED
             | MATERIAL_ENTRY_REJECTED
             | MATERIAL_POSITION_CLOSED
@@ -477,6 +529,17 @@ impl MaterialFactory for BuiltinFactory {
                     ValueType::required(ScalarType::Timestamp),
                     MaterialLookback::None,
                     Box::new(InputTimeEvaluator),
+                )
+            }
+            MATERIAL_WEEKDAY | MATERIAL_SECONDS_OF_DAY => {
+                require_none(params)?;
+                require_inputs(inputs, &[])?;
+                build(
+                    ValueType::required(ScalarType::Integer),
+                    MaterialLookback::None,
+                    Box::new(CalendarEvaluator {
+                        weekday: self.key == MATERIAL_WEEKDAY,
+                    }),
                 )
             }
             MATERIAL_READINESS => {
@@ -594,6 +657,32 @@ impl MaterialFactory for BuiltinFactory {
                 position_build(params, inputs, PositionField::RemainingSize)
             }
             MATERIAL_POSITION_STOPLOSS => position_build(params, inputs, PositionField::Stoploss),
+            MATERIAL_POSITION_OPENED_AT => position_build(params, inputs, PositionField::OpenedAt),
+            MATERIAL_POSITION_FAVORABLE_EXCURSION => {
+                position_build(params, inputs, PositionField::FavorableExcursion)
+            }
+            MATERIAL_POSITION_ADVERSE_EXCURSION => {
+                position_build(params, inputs, PositionField::AdverseExcursion)
+            }
+            MATERIAL_POSITION_INITIAL_RISK => {
+                position_build(params, inputs, PositionField::InitialRisk)
+            }
+            MATERIAL_BARS_SINCE_OPEN => {
+                require_inputs(inputs, &[])?;
+                let slot = slot_arg(params, "slot")?;
+                crate::validate_id(&slot)?;
+                let source = source_arg(params, "source")?;
+                build(
+                    ValueType::optional(ScalarType::Integer),
+                    source_lookback(source.clone(), 1),
+                    Box::new(BarsSinceOpenEvaluator {
+                        slot,
+                        source,
+                        opened_at: None,
+                        count: 0,
+                    }),
+                )
+            }
             MATERIAL_ENTRY_FILLED => feedback_build(params, inputs, FeedbackField::EntryFilled),
             MATERIAL_ENTRY_REJECTED => feedback_build(params, inputs, FeedbackField::EntryRejected),
             MATERIAL_POSITION_CLOSED => {
@@ -765,7 +854,11 @@ pub(crate) fn position_field_type(field: PositionField) -> ValueType {
             ValueType::optional(ScalarType::Price)
         }
         PositionField::Side => ValueType::optional(ScalarType::Side),
-        PositionField::RemainingSize => ValueType::optional(ScalarType::Number),
+        PositionField::RemainingSize
+        | PositionField::FavorableExcursion
+        | PositionField::AdverseExcursion
+        | PositionField::InitialRisk => ValueType::optional(ScalarType::Number),
+        PositionField::OpenedAt => ValueType::optional(ScalarType::Timestamp),
     }
 }
 
@@ -809,6 +902,27 @@ impl MaterialEvaluator for InputTimeEvaluator {
         context: &MaterialEvalContext<'_>,
     ) -> Result<Value, String> {
         Ok(Value::Timestamp(context.input.time))
+    }
+}
+
+/// A pure function of the authoritative input time, so every adapter supplies it identically.
+#[derive(Clone)]
+struct CalendarEvaluator {
+    weekday: bool,
+}
+impl MaterialEvaluator for CalendarEvaluator {
+    clone_eval!(Self);
+    fn evaluate(
+        &mut self,
+        _: &[Value],
+        context: &MaterialEvalContext<'_>,
+    ) -> Result<Value, String> {
+        let time = context.input.time;
+        Ok(Value::Integer(if self.weekday {
+            i64::from(time.weekday().number_from_monday())
+        } else {
+            i64::from(time.num_seconds_from_midnight())
+        }))
     }
 }
 
@@ -1061,6 +1175,54 @@ impl MaterialEvaluator for PositionEvaluator {
     }
 }
 
+/// Count completed bars of one source that arrive after the slot's entry fill, restarting whenever the slot holds a different position.
+#[derive(Clone)]
+struct BarsSinceOpenEvaluator {
+    slot: String,
+    source: SourceId,
+    opened_at: Option<NaiveDateTime>,
+    count: i64,
+}
+impl MaterialEvaluator for BarsSinceOpenEvaluator {
+    clone_eval!(Self);
+    fn evaluate(
+        &mut self,
+        _: &[Value],
+        context: &MaterialEvalContext<'_>,
+    ) -> Result<Value, String> {
+        let facts = context
+            .input
+            .trade_slots
+            .iter()
+            .find(|item| item.slot == self.slot)
+            .ok_or_else(|| "declared trade slot facts are missing".to_string())?;
+        let TradeSlotState::Open { opened_at, .. } = facts.state else {
+            self.opened_at = None;
+            self.count = 0;
+            return Ok(Value::Missing(ScalarType::Integer));
+        };
+        if self.opened_at != Some(opened_at) {
+            self.opened_at = Some(opened_at);
+            self.count = 0;
+        }
+        if context.input.time > opened_at {
+            let arrived = context
+                .input
+                .completed_bars
+                .iter()
+                .filter(|update| update.source == self.source)
+                .count();
+            self.count = self
+                .count
+                .checked_add(
+                    i64::try_from(arrived).map_err(|_| "bar count overflowed".to_string())?,
+                )
+                .ok_or_else(|| "bar count overflowed".to_string())?;
+        }
+        Ok(Value::Integer(self.count))
+    }
+}
+
 #[derive(Clone)]
 struct FeedbackEvaluator {
     slot: String,
@@ -1119,6 +1281,31 @@ pub(crate) fn trade_slot_value(state: &TradeSlotState, field: PositionField) -> 
             }
             TradeSlotState::Vacant => Value::Missing(ScalarType::Price),
         },
+        PositionField::OpenedAt => match state {
+            TradeSlotState::Open { opened_at, .. } => Value::Timestamp(*opened_at),
+            _ => Value::Missing(ScalarType::Timestamp),
+        },
+        PositionField::FavorableExcursion => open_number(state, |facts| facts.0),
+        PositionField::AdverseExcursion => open_number(state, |facts| facts.1),
+        PositionField::InitialRisk => open_number(state, |facts| facts.2),
+    }
+}
+
+/// Read one optional open-position economic fact as a number, missing unless the slot is open and the adapter supplied it.
+fn open_number(
+    state: &TradeSlotState,
+    select: impl Fn((Option<f64>, Option<f64>, Option<f64>)) -> Option<f64>,
+) -> Value {
+    match state {
+        TradeSlotState::Open {
+            favorable_excursion,
+            adverse_excursion,
+            initial_risk,
+            ..
+        } => select((*favorable_excursion, *adverse_excursion, *initial_risk))
+            .map(Value::Number)
+            .unwrap_or(Value::Missing(ScalarType::Number)),
+        _ => Value::Missing(ScalarType::Number),
     }
 }
 

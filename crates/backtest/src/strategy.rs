@@ -14,6 +14,7 @@ pub mod journal;
 pub mod replay;
 pub mod runtime;
 pub mod series;
+pub mod session;
 
 pub use analysis::{
     AnalysisBoundary, AnalysisBoundaryOutput, AnalysisContext, AnalysisError, AnalysisPipeline,
@@ -34,11 +35,11 @@ pub use config::{
     WarmupRequirement,
 };
 pub use configured::{
-    BacktestConfiguredStrategyAdapter, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
-    ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
-    ConfiguredStrategyAdapterPreflightError, HistoricalNamedInputProjector,
-    HistoricalVolumeProjection, NamedInputProjectionContext, NamedInputProjectionError,
-    ProjectedNamedInput,
+    BacktestConfiguredStrategyAdapter, ConfiguredEntryProfileError, ConfiguredHistoricalBindings,
+    ConfiguredNamedInputBinding, ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError,
+    ConfiguredStrategyAdapterError, ConfiguredStrategyAdapterPreflightError,
+    HistoricalNamedInputProjector, HistoricalVolumeProjection, NamedInputProjectionContext,
+    NamedInputProjectionError, ProjectedNamedInput,
 };
 pub use context::StrategyContext;
 pub use domain::{
@@ -67,6 +68,7 @@ pub use series::{
     BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_RETAINED_BARS,
     MissingIntervalPolicy, MultiTimeframeSeries, SeriesError, SeriesViewError, SeriesWarmupState,
 };
+pub use session::{FixedUtcSessionError, FixedUtcSessionProjector, MAX_SESSION_WINDOWS};
 
 use qs_core::types::Action;
 

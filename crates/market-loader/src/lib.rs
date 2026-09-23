@@ -548,6 +548,11 @@ fn bar_to_event(bar: Bar, canonical_symbol: &str, point_size: Option<f64>) -> Ma
         close: bar.close,
         volume: bar.volume,
         spread,
+        timeframe_seconds: bar
+            .timeframe
+            .fixed_duration_seconds()
+            .and_then(|seconds| u64::try_from(seconds).ok()),
+        tick_count: u64::try_from(bar.tick_vol).ok().filter(|count| *count > 0),
     }
 }
 
@@ -677,6 +682,45 @@ mod tests {
             );
         }
         events
+    }
+
+    #[test]
+    fn stored_bars_carry_their_timeframe_and_tick_count_into_feed_events() {
+        let bar = Bar {
+            exchange: "Fixture".into(),
+            symbol: "eurusd".into(),
+            timeframe: data_preprocess::models::Timeframe::M5,
+            ts: ts(0),
+            open: 1.1,
+            high: 1.3,
+            low: 1.0,
+            close: 1.2,
+            tick_vol: 42,
+            volume: 0,
+            spread: 3,
+        };
+        let MarketEvent::Bar {
+            timeframe_seconds,
+            tick_count,
+            spread,
+            ..
+        } = bar_to_event(bar.clone(), "EURUSD", Some(1.0e-5))
+        else {
+            panic!("a stored bar becomes a bar event");
+        };
+        assert_eq!(timeframe_seconds, Some(300));
+        assert_eq!(tick_count, Some(42));
+        assert!(spread.is_some_and(|value| (value - 3.0e-5).abs() < 1e-12));
+
+        let without_ticks = Bar { tick_vol: 0, ..bar };
+        let MarketEvent::Bar { tick_count, .. } = bar_to_event(without_ticks, "EURUSD", None)
+        else {
+            panic!("a stored bar becomes a bar event");
+        };
+        assert_eq!(
+            tick_count, None,
+            "a zero tick count is unknown, not an empty bar"
+        );
     }
 
     #[test]

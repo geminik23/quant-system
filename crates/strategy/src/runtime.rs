@@ -10,11 +10,11 @@ use crate::material::FeedbackObservation;
 use crate::{
     ActionTemplate, AssignmentConfig, CommandFact, CommandFeedback, CommandTerminalStatus,
     CompileError, CompletedBarRequirement, ConfiguredActionKind, ConfiguredStrategyRequirements,
-    DecisionKind, DecisionTemplate, EvaluationError, Expr, FeedbackField, MaterialArg,
-    MaterialArgs, MaterialConfig, MaterialEvalContext, MaterialEvaluator, MaterialLibrary,
-    MaterialLookback, MaterialUpdateTrigger, NamedExpr, NamedInputRequirement, NoteKind,
-    NoteTemplate, ParamKind, ScalarType, SourceId, StrategyConfig, StrategyInput, TradeSlotState,
-    TransitionConfig, Value, ValueType,
+    DecisionKind, DecisionTemplate, EntryRequirement, EvaluationError, Expr, FeedbackField,
+    MaterialArg, MaterialArgs, MaterialConfig, MaterialEvalContext, MaterialEvaluator,
+    MaterialLibrary, MaterialLookback, MaterialUpdateTrigger, NamedExpr, NamedInputRequirement,
+    NoteKind, NoteTemplate, ParamKind, ScalarType, SourceId, StrategyConfig, StrategyInput,
+    TradeSlotState, TransitionConfig, Value, ValueType,
 };
 
 type TypedIndexMap = BTreeMap<String, (usize, ValueType)>;
@@ -130,6 +130,7 @@ enum CompiledAction {
         risk: CompiledExpr,
         stoploss: CompiledExpr,
         targets: Vec<CompiledExpr>,
+        entry_class: Option<String>,
     },
     Close {
         slot: String,
@@ -343,6 +344,7 @@ impl ConfiguredStrategy {
             .iter()
             .map(|material| Value::Missing(material.output_type.scalar))
             .collect();
+        let (entries, stop_managed_slots) = collect_action_requirements(&config);
         let requirements = ConfiguredStrategyRequirements {
             completed_bars: config
                 .sources
@@ -367,6 +369,8 @@ impl ConfiguredStrategy {
                 .collect(),
             trade_slots: config.trade_slots.clone(),
             needs_command_feedback: collected.needs_feedback,
+            entries,
+            stop_managed_slots,
         };
         Ok(Self {
             strategy_id: config.strategy_id,
@@ -804,6 +808,37 @@ fn collect_expr_requirements(
         _ => {}
     }
     Ok(())
+}
+
+fn collect_action_requirements(config: &StrategyConfig) -> (Vec<EntryRequirement>, Vec<String>) {
+    let mut entries = BTreeSet::new();
+    let mut stop_managed_slots = BTreeSet::new();
+    for action in config
+        .states
+        .iter()
+        .flat_map(|state| &state.transitions)
+        .flat_map(|transition| &transition.actions)
+    {
+        match action {
+            ActionTemplate::Entry {
+                slot, entry_class, ..
+            } => {
+                entries.insert(EntryRequirement {
+                    slot: slot.clone(),
+                    entry_class: entry_class.clone(),
+                });
+            }
+            ActionTemplate::ModifyStoploss { slot, .. }
+            | ActionTemplate::MoveStoplossToEntry { slot } => {
+                stop_managed_slots.insert(slot.clone());
+            }
+            _ => {}
+        }
+    }
+    (
+        entries.into_iter().collect(),
+        stop_managed_slots.into_iter().collect(),
+    )
 }
 
 fn action_expressions(action: &ActionTemplate) -> Vec<&Expr> {
@@ -1432,8 +1467,17 @@ fn compile_action(
             risk,
             stoploss,
             targets,
+            entry_class,
         } => {
             require_trade_slot(scope.trade_slots, slot, &format!("{path}.slot"))?;
+            if let Some(entry_class) = entry_class {
+                qs_core::validate_entry_class(entry_class).map_err(|error| {
+                    CompileError::InvalidIdentifier {
+                        path: format!("{path}.entry_class"),
+                        reason: error.to_string(),
+                    }
+                })?;
+            }
             let targets = targets
                 .iter()
                 .enumerate()
@@ -1449,6 +1493,7 @@ fn compile_action(
                 risk: required(risk, ScalarType::Number, "risk")?,
                 stoploss: optional(stoploss, ScalarType::Price, "stoploss")?,
                 targets,
+                entry_class: entry_class.clone(),
             }
         }
         ActionTemplate::Close { slot } => {
@@ -1498,6 +1543,7 @@ fn lower_action(
             risk,
             stoploss,
             targets,
+            entry_class,
         } => {
             if identity.slots.iter().any(|item| item.slot == *slot) {
                 return Err(EvaluationError::InvalidAction {
@@ -1559,7 +1605,7 @@ fn lower_action(
                     targets,
                     group: identity.campaign_id.clone(),
                     trade_id: Some(trade_id),
-                    entry_class: None,
+                    entry_class: entry_class.clone(),
                 },
                 slot.clone(),
             )
@@ -2010,7 +2056,7 @@ fn validate_input(
                 reason: format!("duplicate trade slot {}", facts.slot),
             });
         }
-        validate_trade_slot_state(&facts.state)?;
+        validate_trade_slot_state(&facts.state, input.time)?;
     }
     for slot in &requirements.trade_slots {
         if !input.trade_slots.iter().any(|item| item.slot == *slot) {
@@ -2043,7 +2089,10 @@ fn validate_bar(bar: &crate::CompletedBar) -> Result<(), EvaluationError> {
     Ok(())
 }
 
-fn validate_trade_slot_state(state: &TradeSlotState) -> Result<(), EvaluationError> {
+fn validate_trade_slot_state(
+    state: &TradeSlotState,
+    input_time: chrono::NaiveDateTime,
+) -> Result<(), EvaluationError> {
     let positive = |value: f64| value.is_finite() && value > 0.0;
     match state {
         TradeSlotState::Vacant => Ok(()),
@@ -2073,11 +2122,19 @@ fn validate_trade_slot_state(state: &TradeSlotState) -> Result<(), EvaluationErr
             entry_price,
             remaining_size,
             stoploss,
+            opened_at,
+            favorable_excursion,
+            adverse_excursion,
+            initial_risk,
             ..
         } => {
             if !positive(*entry_price)
                 || !positive(*remaining_size)
                 || stoploss.is_some_and(|value| !positive(value))
+                || *opened_at > input_time
+                || favorable_excursion.is_some_and(|value| !value.is_finite() || value < 0.0)
+                || adverse_excursion.is_some_and(|value| !value.is_finite() || value > 0.0)
+                || initial_risk.is_some_and(|value| !positive(value))
             {
                 Err(EvaluationError::Material {
                     material: "trade_slots".into(),

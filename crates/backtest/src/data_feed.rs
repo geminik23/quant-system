@@ -44,6 +44,12 @@ pub enum MarketEvent {
         /// `None` means the spread is unknown, which keeps the historical zero-spread approximation for feeds that cannot supply it.
         #[serde(default)]
         spread: Option<f64>,
+        /// Length of the bar's bucket in seconds when the source knows it; a strategy series accepts a stored bar only when this matches its timeframe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeframe_seconds: Option<u64>,
+        /// Number of ticks the bar aggregated when the source recorded it, which a strategy series reports as the bar's tick count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick_count: Option<u64>,
     },
 }
 
@@ -749,6 +755,11 @@ pub fn bars_to_feed_with_metadata(
                 close: bar.close,
                 volume: bar.volume,
                 spread: None,
+                timeframe_seconds: bar
+                    .timeframe
+                    .fixed_duration_seconds()
+                    .and_then(|seconds| u64::try_from(seconds).ok()),
+                tick_count: u64::try_from(bar.tick_vol).ok().filter(|count| *count > 0),
             };
             FeedEvent::new(
                 event,
@@ -871,6 +882,8 @@ mod tests {
             close: 1.0855,
             volume: 1000,
             spread: None,
+            timeframe_seconds: None,
+            tick_count: None,
         };
         let q = event.to_quote();
         // Bar uses close for both bid and ask
@@ -1057,6 +1070,8 @@ mod tests {
                     close: 1.1,
                     volume: 10,
                     spread: None,
+                    timeframe_seconds: None,
+                    tick_count: None,
                 },
                 EventMetadata::new(SeriesRoles::PRIMARY, 0, 1),
             ),
@@ -1135,6 +1150,8 @@ mod tests {
             close: 1.1,
             volume: 10,
             spread: None,
+            timeframe_seconds: None,
+            tick_count: None,
         }]);
         let conversion = VecFeed::from_feed_events(vec![FeedEvent::new(
             MarketEvent::Tick {
@@ -1212,6 +1229,8 @@ mod tests {
                 close: 1.1,
                 volume: 10,
                 spread: None,
+                timeframe_seconds: None,
+                tick_count: None,
             },
             MarketEvent::Tick {
                 symbol: "EURUSD".into(),

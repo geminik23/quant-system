@@ -769,7 +769,10 @@ fn distinct_close_reasons(events: &[CloseEvent]) -> Vec<CloseReason> {
     reasons
 }
 
-fn summarize_risk(tranches: &[RiskTranche], epsilon: f64) -> (RiskBasisStatus, Option<f64>) {
+pub(crate) fn summarize_risk(
+    tranches: &[RiskTranche],
+    epsilon: f64,
+) -> (RiskBasisStatus, Option<f64>) {
     if tranches.is_empty() {
         return (RiskBasisStatus::MissingStop, None);
     }

@@ -76,6 +76,7 @@ pub fn adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.9)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -330,6 +331,13 @@ pub fn historical_adapter(
 }
 
 pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
+    crossover_adapter_with_class(None, 0)
+}
+
+pub fn crossover_adapter_with_class(
+    entry_class: Option<&str>,
+    latency_ms: u64,
+) -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "crossover".into(),
         title: "EMA crossover".into(),
@@ -356,6 +364,7 @@ pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.5)),
                         targets: vec![],
+                        entry_class: entry_class.map(Into::into),
                     },
                     vec![],
                 )],
@@ -380,7 +389,13 @@ pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
             },
         ],
     };
-    historical_adapter(config, &MaterialLibrary::builtins(), "instance_a", 3, 0)
+    historical_adapter(
+        config,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        3,
+        latency_ms,
+    )
 }
 
 pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
@@ -426,6 +441,7 @@ pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.5)),
                         targets: vec![],
+                        entry_class: None,
                     },
                     vec![note(NoteKind::Risk, "ATR observed at entry")],
                 )],

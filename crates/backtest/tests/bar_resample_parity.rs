@@ -224,6 +224,8 @@ fn a_stored_spread_becomes_a_two_sided_bar_quote() {
         close: 1.1,
         volume: 0,
         spread: Some(0.00002),
+        timeframe_seconds: None,
+        tick_count: None,
     };
     let quote = bar.to_quote();
     assert!((quote.bid - 1.09999).abs() < 1.0e-12);
@@ -242,6 +244,8 @@ fn a_bar_without_a_spread_uses_the_fallback_and_is_reported() {
         close: 1.1,
         volume: 0,
         spread: None,
+        timeframe_seconds: None,
+        tick_count: None,
     };
     assert!(bar.is_zero_spread_bar());
 
@@ -265,4 +269,74 @@ fn bucket_geometry_is_shared_between_both_paths() {
     let mut offsets = BTreeMap::new();
     offsets.insert("reduced", BucketSpec::new(3_600, 7_200).unwrap());
     assert_eq!(offsets["reduced"].alignment_offset_seconds(), 0);
+}
+
+/// Replay stored bars through a strategy series and record each completed bar with the batch time at which it became visible.
+fn replayed_bars(
+    timeframe: Timeframe,
+    basis: PriceBasis,
+    alignment_offset_seconds: i32,
+    stored: Vec<data_preprocess::models::Bar>,
+) -> Vec<(NaiveDateTime, ClosedBar)> {
+    let requirement = SeriesRequirement::new(
+        SeriesId::new("series").unwrap(),
+        SYMBOL,
+        timeframe,
+        basis,
+        WarmupRequirement::bars(1).unwrap(),
+    )
+    .unwrap();
+    let spec = qs_backtest::BarSeriesSpec::new(
+        requirement,
+        1_000,
+        alignment_offset_seconds,
+        MissingIntervalPolicy::Skip,
+    )
+    .unwrap();
+    let mut series = MultiTimeframeSeries::new(vec![spec]).unwrap();
+    let mut feed =
+        qs_backtest::data_feed::bars_to_feed_with_metadata(stored, SeriesRoles::PRIMARY, 0);
+    let mut visible = Vec::new();
+    while let Some(event) = feed.next_feed_event() {
+        let ts = event.event.ts();
+        let batch = TimestampBatch {
+            ts,
+            events: vec![event],
+        };
+        for bar in series.on_batch(&batch).unwrap() {
+            visible.push((ts, bar));
+        }
+    }
+    visible
+}
+
+#[test]
+fn stored_bars_replay_as_the_same_completed_bars_and_never_early() {
+    let rows = ticks();
+    let cases: Vec<(&str, Timeframe, StoredTimeframe, i32)> = vec![
+        ("1m", Timeframe::minutes(1).unwrap(), StoredTimeframe::M1, 0),
+        ("1h", Timeframe::hours(1).unwrap(), StoredTimeframe::H1, 0),
+        (
+            "1d at 22:00",
+            Timeframe::days(1).unwrap(),
+            StoredTimeframe::D1,
+            79_200,
+        ),
+    ];
+    for (label, engine_tf, stored_tf, offset) in cases {
+        let engine = engine_bars(engine_tf, PriceBasis::Mid, offset, &rows);
+        let stored = stored_bars(stored_tf, StoredPriceBasis::Mid, i64::from(offset), &rows);
+        let replayed = replayed_bars(engine_tf, PriceBasis::Mid, offset, stored);
+
+        // The last stored bar has no later bucket to complete it, exactly like the last tick-built bucket.
+        assert_eq!(replayed.len() + 1, engine.len(), "{label}: bar count");
+        for ((visible_at, bar), expected) in replayed.iter().zip(&engine) {
+            assert_eq!(bar, expected, "{label}: replayed bar differs");
+            assert!(
+                *visible_at >= bar.close_time(),
+                "{label}: bar closing at {} became visible at {visible_at}",
+                bar.close_time()
+            );
+        }
+    }
 }

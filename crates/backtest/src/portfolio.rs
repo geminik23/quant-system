@@ -521,6 +521,11 @@ impl PortfolioRecorder {
         (Some(drawdown), drawdown_pct)
     }
 
+    /// Copy the excursion of every open campaign, so a caller can read values as of a moment before later quotes are recorded.
+    pub(crate) fn open_campaign_excursions(&self) -> BTreeMap<String, CampaignExcursion> {
+        self.campaigns.clone()
+    }
+
     pub fn campaign_excursion(&self, position_id: &str) -> Option<CampaignExcursion> {
         self.campaigns.get(position_id).copied()
     }

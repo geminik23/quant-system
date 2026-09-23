@@ -1,6 +1,5 @@
 mod support;
 
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,8 +14,8 @@ use qs_backtest::{
     HistoricalVolumeProjection, ManagementProfile, MarketEvent, MissingIntervalPolicy,
     NamedInputProjectionContext, NamedInputProjectionError, ObservationStoreLimits,
     PendingOrderLifecycleState, PriceBasis, ProjectedNamedInput, SeriesId, SeriesRequirement,
-    StoplossMode, StrategyDescriptor, StrategyId, StrategyReplayError, StrategyReplayInputError,
-    StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
+    StoplossMode, StrategyDescriptor, StrategyId, StrategyReplayError, StrategyRetentionLimits,
+    Timeframe, VecFeed, WarmupRequirement,
 };
 use qs_core::{OrderType, Side};
 use qs_strategy::{
@@ -107,6 +106,7 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
                 risk: expr_literal(Literal::Number(1.0)),
                 stoploss: expr_literal(Literal::Price(0.9)),
                 targets: vec![],
+                entry_class: None,
             }],
             notes: vec![],
         }]
@@ -379,6 +379,7 @@ fn pending_adapter(
                         risk: expr_literal(Literal::Number(1.0)),
                         stoploss: expr_literal(Literal::Price(0.4)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -484,6 +485,7 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: expr_literal(Literal::Number(1.0)),
                         stoploss: expr_literal(Literal::Price(0.4)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -1540,31 +1542,10 @@ fn named_projector_bindings_reject_missing_duplicate_mismatch_and_undeclared_nam
     ));
 }
 
-struct PollTrackingFeed {
-    inner: VecFeed,
-    polls: Cell<usize>,
-}
-
-impl qs_backtest::DataFeed for PollTrackingFeed {
-    fn next_event(&mut self) -> Option<MarketEvent> {
-        self.polls.set(self.polls.get() + 1);
-        self.inner.next_event()
-    }
-
-    fn peek(&self) -> Option<&MarketEvent> {
-        self.inner.peek()
-    }
-}
-
 #[test]
-fn management_profile_is_rejected_before_feed_polling() {
-    let mut first_adapter = adapter(false, None, spec(1, 32)).unwrap();
-    let mut first_feed = PollTrackingFeed {
-        inner: feed(),
-        polls: Cell::new(0),
-    };
+fn supplied_management_profiles_no_longer_block_a_configured_run() {
     let profile = ManagementProfile {
-        name: "unsupported".into(),
+        name: "plain".into(),
         target_selection: None,
         use_targets: vec![],
         close_ratios: vec![],
@@ -1575,48 +1556,31 @@ fn management_profile_is_rejected_before_feed_polling() {
         let_remainder_run: false,
         entry_geometry: EntryGeometryPolicy::Strict,
     };
-    let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+    let mut default_adapter = adapter(true, None, spec(1, 32)).unwrap();
+    BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .run_configured_strategy_future(
-            &mut first_feed,
-            &mut first_adapter,
+            &mut feed(),
+            &mut default_adapter,
             analysis(),
             StrategyRetentionLimits::default(),
             Some(&profile),
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StrategyReplayError::Input(
-            StrategyReplayInputError::ConfiguredManagementProfileUnsupported
-        )
-    ));
-    assert_eq!(first_feed.polls.get(), 0);
+        .unwrap();
 
-    let mut adapter = adapter(false, None, spec(1, 32)).unwrap();
-    let mut feed = PollTrackingFeed {
-        inner: feed(),
-        polls: Cell::new(0),
-    };
+    let mut prepared_adapter = adapter(true, None, spec(1, 32)).unwrap();
     let prepared = qs_backtest::PreparedEntryProfiles::try_new(
         Some(profile),
         Vec::<(String, ManagementProfile)>::new(),
     )
     .unwrap();
-    let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+    BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .with_entry_profiles(prepared)
         .run_configured_strategy_future(
-            &mut feed,
-            &mut adapter,
+            &mut feed(),
+            &mut prepared_adapter,
             analysis(),
             StrategyRetentionLimits::default(),
             None,
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StrategyReplayError::Input(
-            StrategyReplayInputError::ConfiguredManagementProfileUnsupported
-        )
-    ));
-    assert_eq!(feed.polls.get(), 0);
+        .unwrap();
 }

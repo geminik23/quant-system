@@ -79,7 +79,7 @@ The configured core now provides:
 - neutral conformance coverage and a custom material extension seam;
 - no content hash, digest, fingerprint, or content-derived strategy identity.
 
-The historical adapter binds complete logical source specifications to historical series, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, rejects supplied management profiles, and reuses unprofiled Entry plus the existing FutureQuote economic path. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles remain unavailable.
+The historical adapter binds complete logical source specifications to historical series built from ticks or accepted from stored bars of the declared timeframe, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts including open-position time, excursion, and initial risk, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, and routes configured entries to management profiles through the same selection raw-signal replay uses, by entry class or run default, rejecting an unrouted class or a stop-ownership conflict before the run. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, and configured-state persistence remain unavailable.
 
 Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
 
@@ -108,7 +108,7 @@ The historical adapter reuses:
 - causal series, observations, annotations, and analyzers;
 - strict `RawSignal` validation;
 - replay instrument specifications;
-- unprofiled Entry resolution for the initial configured path;
+- Entry profile selection and resolution, shared with raw-signal replay;
 - FutureQuote slippage, pending, stop, target, scale-in, and close behavior;
 - account-currency sizing and conversion;
 - fills, lifecycle, MTM, drawdown, and `BacktestResult`;

@@ -70,20 +70,57 @@ fn tick(
     )
 }
 
-fn bar(symbol: &str, ts: NaiveDateTime, rank: u32, sequence: u64) -> FeedEvent {
+/// One stored bar stamped at its bucket open, as the resampler writes it.
+fn stored_bar(
+    symbol: &str,
+    ts: NaiveDateTime,
+    ohlc: [f64; 4],
+    timeframe_seconds: Option<u64>,
+    tick_count: Option<u64>,
+) -> FeedEvent {
     FeedEvent::new(
         MarketEvent::Bar {
             symbol: symbol.to_string(),
             ts,
-            open: 1.0,
-            high: 2.0,
-            low: 0.5,
-            close: 1.5,
-            volume: 10,
+            open: ohlc[0],
+            high: ohlc[1],
+            low: ohlc[2],
+            close: ohlc[3],
+            volume: 0,
             spread: None,
+            timeframe_seconds,
+            tick_count,
         },
-        EventMetadata::new(SeriesRoles::PRIMARY, rank, sequence),
+        EventMetadata::new(SeriesRoles::PRIMARY, 0, 0),
     )
+}
+
+fn m5_bar(minute: i64, close: f64) -> TimestampBatch {
+    let ts = base_ts() + Duration::minutes(minute);
+    batch(
+        ts,
+        vec![stored_bar(
+            "EURUSD",
+            ts,
+            [close - 0.1, close + 0.2, close - 0.2, close],
+            Some(300),
+            Some(7),
+        )],
+    )
+}
+
+fn m5_series(missing: MissingIntervalPolicy) -> MultiTimeframeSeries {
+    MultiTimeframeSeries::new(vec![spec(
+        "m5",
+        "EURUSD",
+        Timeframe::minutes(5).unwrap(),
+        PriceBasis::Mid,
+        0,
+        8,
+        0,
+        missing,
+    )])
+    .unwrap()
 }
 
 fn batch(ts: NaiveDateTime, events: Vec<FeedEvent>) -> TimestampBatch {
@@ -417,7 +454,7 @@ fn one_tick_updates_all_matching_timeframes_and_output_order_is_stable() {
 }
 
 #[test]
-fn selects_primary_ticks_once_and_ignores_conversion_and_native_bars() {
+fn selects_primary_ticks_once_and_ignores_conversion_ticks() {
     let mut series = MultiTimeframeSeries::new(vec![spec(
         "m5",
         "EURUSD",
@@ -435,7 +472,6 @@ fn selects_primary_ticks_once_and_ignores_conversion_and_native_bars() {
             start,
             vec![
                 tick("EURUSD", start, 9.0, 9.1, SeriesRoles::CONVERSION, 0, 0),
-                bar("EURUSD", start, 1, 1),
                 tick(
                     "EURUSD",
                     start,
@@ -871,4 +907,168 @@ fn delayed_reveal_keeps_scheduled_close_and_never_rewrites_history() {
         .unwrap();
     assert_eq!(series.latest_bar(&id).unwrap().unwrap(), &snapshot);
     assert_eq!(snapshot.close_time().nanosecond(), 0);
+}
+
+#[test]
+fn stored_bar_becomes_visible_only_when_a_later_bucket_arrives() {
+    let mut series = m5_series(MissingIntervalPolicy::Skip);
+    assert!(series.on_batch(&m5_bar(0, 1.5)).unwrap().is_empty());
+    let id = SeriesId::new("m5").unwrap();
+    assert!(series.latest_bar(&id).unwrap().is_none());
+
+    let closed = series.on_batch(&m5_bar(5, 1.7)).unwrap();
+    assert_eq!(closed.len(), 1);
+    let bar = &closed[0];
+    assert_eq!(bar.open_time(), base_ts());
+    assert_eq!(bar.close_time(), base_ts() + Duration::minutes(5));
+    assert_eq!(
+        (bar.open(), bar.high(), bar.low(), bar.close()),
+        (1.4, 1.7, 1.3, 1.5)
+    );
+    assert_eq!(bar.tick_count(), 7);
+    assert_eq!(series.warmup(&id).unwrap().available_bars(), 1);
+}
+
+#[test]
+fn stored_bars_route_only_to_series_with_their_timeframe() {
+    let mut series = MultiTimeframeSeries::new(vec![
+        spec(
+            "m1",
+            "EURUSD",
+            Timeframe::minutes(1).unwrap(),
+            PriceBasis::Mid,
+            0,
+            8,
+            0,
+            MissingIntervalPolicy::Skip,
+        ),
+        spec(
+            "m5",
+            "EURUSD",
+            Timeframe::minutes(5).unwrap(),
+            PriceBasis::Mid,
+            0,
+            8,
+            0,
+            MissingIntervalPolicy::Skip,
+        ),
+    ])
+    .unwrap();
+    series.on_batch(&m5_bar(0, 1.5)).unwrap();
+    let closed = series.on_batch(&m5_bar(5, 1.6)).unwrap();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].series_id().as_str(), "m5");
+    assert!(
+        series
+            .latest_bar(&SeriesId::new("m1").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn stored_bars_with_unknown_or_mismatched_geometry_are_rejected() {
+    let start = base_ts();
+    let reject = |event: FeedEvent| {
+        let mut series = m5_series(MissingIntervalPolicy::Skip);
+        let ts = event.event.ts();
+        series.on_batch(&batch(ts, vec![event])).unwrap_err()
+    };
+    let ohlc = [1.0, 1.2, 0.9, 1.1];
+
+    assert!(matches!(
+        reject(stored_bar("EURUSD", start, ohlc, None, Some(1))),
+        SeriesError::StoredBarWithoutTimeframe { .. }
+    ));
+    assert!(matches!(
+        reject(stored_bar("EURUSD", start, ohlc, Some(60), Some(1))),
+        SeriesError::StoredBarUnmatched {
+            timeframe_seconds: 60,
+            ..
+        }
+    ));
+    let misaligned = start + Duration::minutes(2);
+    assert_eq!(
+        reject(stored_bar("EURUSD", misaligned, ohlc, Some(300), Some(1))),
+        SeriesError::StoredBarMisaligned {
+            series_id: SeriesId::new("m5").unwrap(),
+            timestamp: misaligned,
+            bucket_open: start,
+        }
+    );
+    assert!(matches!(
+        reject(stored_bar("EURUSD", start, ohlc, Some(300), None)),
+        SeriesError::InvalidStoredBar { .. }
+    ));
+    assert!(matches!(
+        reject(stored_bar(
+            "EURUSD",
+            start,
+            [1.0, 1.05, 0.9, 1.1],
+            Some(300),
+            Some(1)
+        )),
+        SeriesError::InvalidStoredBar { .. }
+    ));
+    assert!(matches!(
+        reject(stored_bar(
+            "EURUSD",
+            start,
+            [f64::NAN, 1.2, 0.9, 1.1],
+            Some(300),
+            Some(1)
+        )),
+        SeriesError::InvalidStoredBar { .. }
+    ));
+
+    let mut unrelated = m5_series(MissingIntervalPolicy::Skip);
+    unrelated
+        .on_batch(&batch(
+            start,
+            vec![stored_bar("GBPUSD", start, ohlc, None, None)],
+        ))
+        .unwrap();
+}
+
+#[test]
+fn duplicate_stored_bars_mixed_input_and_gaps_are_rejected() {
+    let mut series = m5_series(MissingIntervalPolicy::Skip);
+    series.on_batch(&m5_bar(0, 1.5)).unwrap();
+    let start = base_ts();
+    let duplicate = batch(
+        start,
+        vec![stored_bar(
+            "EURUSD",
+            start,
+            [1.0, 1.2, 0.9, 1.1],
+            Some(300),
+            Some(1),
+        )],
+    );
+    assert!(matches!(
+        series.on_batch(&duplicate).unwrap_err(),
+        SeriesError::DuplicateStoredBar { .. }
+    ));
+
+    let mut mixed = m5_series(MissingIntervalPolicy::Skip);
+    mixed.on_batch(&m5_bar(0, 1.5)).unwrap();
+    let error = mixed
+        .on_batch(&primary_tick(
+            "EURUSD",
+            start + Duration::minutes(6),
+            1.0,
+            1.1,
+        ))
+        .unwrap_err();
+    assert!(matches!(error, SeriesError::MixedSeriesInput { .. }));
+
+    let mut strict = m5_series(MissingIntervalPolicy::Reject);
+    strict.on_batch(&m5_bar(0, 1.5)).unwrap();
+    assert!(matches!(
+        strict.on_batch(&m5_bar(15, 1.6)).unwrap_err(),
+        SeriesError::MissingInterval { .. }
+    ));
+    let mut skipping = m5_series(MissingIntervalPolicy::Skip);
+    skipping.on_batch(&m5_bar(0, 1.5)).unwrap();
+    assert_eq!(skipping.on_batch(&m5_bar(15, 1.6)).unwrap().len(), 1);
 }

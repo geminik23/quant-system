@@ -53,6 +53,7 @@ use crate::profile::{
 };
 use crate::report::BacktestResult;
 use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
+use crate::strategy::configured::BoundaryPositionFacts;
 use crate::strategy::{
     AnalysisBoundary, AnalysisPipeline, BacktestConfiguredStrategyAdapter, BarSeriesSpec,
     ConfiguredStrategyAdapterError, HistoricalStrategy, MultiTimeframeSeries, Strategy,
@@ -247,11 +248,15 @@ trait FutureReplayHook {
     fn output_ready(&self) -> bool;
     fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool;
     fn reject_generated_configuration(&mut self, reason: String);
+    /// Whether the boundary reads open-position economics, which makes the replay snapshot campaign excursion at the start of every batch.
+    fn observes_position_economics(&self) -> bool;
+    #[allow(clippy::too_many_arguments)]
     fn on_boundary(
         &mut self,
         batch: &TimestampBatch,
         engine: &TradeEngine,
         lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>>;
@@ -265,6 +270,10 @@ trait FutureReplayHook {
 struct StaticReplayHook;
 
 impl FutureReplayHook for StaticReplayHook {
+    fn observes_position_economics(&self) -> bool {
+        false
+    }
+
     fn is_active(&self) -> bool {
         false
     }
@@ -286,6 +295,7 @@ impl FutureReplayHook for StaticReplayHook {
         _batch: &TimestampBatch,
         _engine: &TradeEngine,
         _lifecycle: &LifecycleLedger,
+        _positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -372,6 +382,10 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
 }
 
 impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
+    fn observes_position_economics(&self) -> bool {
+        false
+    }
+
     fn is_active(&self) -> bool {
         true
     }
@@ -407,6 +421,7 @@ impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
         batch: &TimestampBatch,
         engine: &TradeEngine,
         lifecycle: &LifecycleLedger,
+        _positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -610,6 +625,10 @@ impl<'a> ConfiguredStrategyReplayDriver<'a> {
 }
 
 impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
+    fn observes_position_economics(&self) -> bool {
+        true
+    }
+
     fn is_active(&self) -> bool {
         true
     }
@@ -618,17 +637,8 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
         self.warmup_complete
     }
 
-    fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool {
-        if let Some(event) = events
-            .iter()
-            .find(|event| matches!(event.event, MarketEvent::Bar { .. }))
-        {
-            self.failure = Some(StrategyDriverError::TickExecutionRequired {
-                symbol: event.event.symbol().to_owned(),
-                timestamp: event.event.ts(),
-            });
-            return false;
-        }
+    /// Configured strategies accept stored bars as completed bars; the series validates their geometry and rejects anything it cannot place.
+    fn preflight_primary_events(&mut self, _events: &[FeedEvent]) -> bool {
         true
     }
 
@@ -644,6 +654,7 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
         batch: &TimestampBatch,
         engine: &TradeEngine,
         _lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -668,6 +679,7 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
             &self.series,
             self.analysis.observations(),
             engine,
+            positions,
             pending_events,
             self.limits,
             self.research_limits,
@@ -1561,14 +1573,7 @@ impl BacktestRunner {
     where
         F: DataFeed,
     {
-        if profile.is_some()
-            || self
-                .entry_profiles
-                .as_ref()
-                .is_some_and(|profiles| !profiles.is_empty())
-        {
-            return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
-        }
+        self.preflight_configured_entry_profiles(adapter, profile)?;
         adapter
             .preflight(retention, self.strategy_research_limits)
             .map_err(StrategyReplayInputError::ConfiguredAdapter)?;
@@ -1612,7 +1617,7 @@ impl BacktestRunner {
             adapter,
             analysis,
             retention,
-            None,
+            profile,
         )
     }
 
@@ -1630,14 +1635,7 @@ impl BacktestRunner {
     where
         F: FallibleBatchFeed,
     {
-        if profile.is_some()
-            || self
-                .entry_profiles
-                .as_ref()
-                .is_some_and(|profiles| !profiles.is_empty())
-        {
-            return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
-        }
+        self.preflight_configured_entry_profiles(adapter, profile)?;
         adapter
             .preflight(retention, self.strategy_research_limits)
             .map_err(StrategyReplayInputError::ConfiguredAdapter)?;
@@ -1662,7 +1660,7 @@ impl BacktestRunner {
             feed,
             primary_eod,
             Vec::new(),
-            None,
+            profile,
             future,
             None,
             0,
@@ -1690,6 +1688,29 @@ impl BacktestRunner {
             decisions,
             research,
         })
+    }
+
+    /// Validate a supplied run default profile and check the configured strategy's entries against the profiles replay will select, so an unrouted class or a stop-owner conflict fails before any feed is read.
+    fn preflight_configured_entry_profiles(
+        &self,
+        adapter: &BacktestConfiguredStrategyAdapter,
+        profile: Option<&ManagementProfile>,
+    ) -> Result<(), StrategyReplayInputError> {
+        if let Some(profile) = profile {
+            profile
+                .validate()
+                .map_err(|error| StrategyReplayInputError::ManagementProfile(error.to_string()))?;
+        }
+        let run_default;
+        let profiles = match self.entry_profiles.as_ref() {
+            Some(profiles) => profiles,
+            None => {
+                run_default = PreparedEntryProfiles::default_only(profile.cloned());
+                &run_default
+            }
+        };
+        adapter.preflight_entry_profiles(profiles)?;
+        Ok(())
     }
 
     fn validate_entry_profile_routes(&self, signals: &[RawSignal]) -> Result<(), String> {
@@ -2260,6 +2281,11 @@ impl BacktestRunner {
             batch
                 .events
                 .sort_by_key(|event| (event.metadata.series_rank, event.metadata.row_sequence));
+            let boundary_excursions = if hook.observes_position_economics() {
+                portfolio.open_campaign_excursions()
+            } else {
+                BTreeMap::new()
+            };
             let mut accepted = Vec::new();
             for feed_event in batch.events {
                 if is_cancelled() {
@@ -2537,11 +2563,13 @@ impl BacktestRunner {
                 ts: batch_ts,
                 events: primary_events,
             };
+            let positions = BoundaryPositionFacts::new(&boundary_excursions, &future_executor);
             let generated = hook
                 .on_boundary(
                     &strategy_batch,
                     &self.engine,
                     &lifecycle,
+                    &positions,
                     &mut self.committed_feedback,
                     &mut self.committed_feedback_events,
                 )

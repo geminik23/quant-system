@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
-use qs_backtest::data_feed::FeedEvent;
+use qs_backtest::data_feed::{FeedEvent, MarketEvent};
 use qs_backtest::evaluation::{
     EvaluationOptions, EvaluationReport, EvaluationRequest, PositionOutcome,
 };
@@ -21,7 +21,8 @@ use crate::plan::ResearchPlan;
 use crate::table::{ResearchRow, ResearchTable, RunStatus};
 use crate::window::DataWindow;
 
-const DATA_MODE: &str = "ticks";
+/// Data mode recorded for a symbol that supplied no primary events.
+const DEFAULT_DATA_MODE: &str = "ticks";
 const RESERVED_TAGS: [&str; 3] = ["window", "symbol", "data_mode"];
 
 pub type SymbolEvents = Arc<[FeedEvent]>;
@@ -32,6 +33,7 @@ struct RunSpec<'a, P> {
     point_index: usize,
     symbol: &'a str,
     window: &'a DataWindow,
+    data_mode: &'static str,
 }
 
 struct RunRecord {
@@ -108,6 +110,7 @@ where
         .collect();
     validate_parameter_labels(family.family_id(), &bindings, &plan.config.run_tags)?;
 
+    let mut data_modes = BTreeMap::new();
     for symbol in &plan.symbols {
         let Some(symbol_events) = events.get(symbol.as_str()) else {
             continue;
@@ -120,6 +123,7 @@ where
                 "events for '{symbol}' are not in ascending timestamp order"
             )));
         }
+        data_modes.insert(symbol.as_str(), data_mode(symbol, symbol_events)?);
     }
 
     let mut specs = Vec::new();
@@ -133,6 +137,10 @@ where
                         point_index,
                         symbol: symbol.as_str(),
                         window,
+                        data_mode: data_modes
+                            .get(symbol.as_str())
+                            .copied()
+                            .unwrap_or(DEFAULT_DATA_MODE),
                     });
                 }
             }
@@ -268,7 +276,7 @@ where
         params: params.clone(),
         window: spec.window.label().to_owned(),
         status,
-        data_mode: DATA_MODE.to_owned(),
+        data_mode: spec.data_mode.to_owned(),
         positions: 0,
         win_rate: None,
         net_pnl: 0.0,
@@ -315,6 +323,25 @@ where
     }
 }
 
+/// Name how a symbol's primary events were recorded, because a table built from stored bars and one built from ticks do not mean the same thing.
+fn data_mode(symbol: &str, events: &SymbolEvents) -> Result<&'static str, ResearchError> {
+    let mut ticks = false;
+    let mut bars = false;
+    for event in events.iter().filter(|event| event.metadata.roles.primary) {
+        match event.event {
+            MarketEvent::Tick { .. } => ticks = true,
+            MarketEvent::Bar { .. } => bars = true,
+        }
+    }
+    match (ticks, bars) {
+        (true, true) => Err(ResearchError::InvalidPlan(format!(
+            "events for '{symbol}' mix ticks and stored bars"
+        ))),
+        (false, true) => Ok("bars"),
+        _ => Ok(DEFAULT_DATA_MODE),
+    }
+}
+
 fn run_tags<P>(
     plan: &ResearchPlan,
     params: &BTreeMap<String, String>,
@@ -324,7 +351,7 @@ fn run_tags<P>(
     tags.extend(params.clone());
     tags.insert("window".into(), spec.window.label().to_owned());
     tags.insert("symbol".into(), spec.symbol.to_owned());
-    tags.insert("data_mode".into(), DATA_MODE.to_owned());
+    tags.insert("data_mode".into(), spec.data_mode.to_owned());
     tags
 }
 
@@ -531,6 +558,7 @@ mod tests {
             point_index: 0,
             symbol: "EURUSD",
             window: &window,
+            data_mode: DEFAULT_DATA_MODE,
         };
         let params = binding_labels(&family.parameter_binding(&point));
 

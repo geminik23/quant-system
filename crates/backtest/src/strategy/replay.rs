@@ -3,8 +3,9 @@
 use chrono::NaiveDateTime;
 
 use super::{
-    AnalysisError, BarSeriesSpec, ConfiguredStrategyAdapterPreflightError, SeriesError,
-    SeriesViewError, StrategyRequirements, StrategyRuntimeError,
+    AnalysisError, BarSeriesSpec, ConfiguredEntryProfileError,
+    ConfiguredStrategyAdapterPreflightError, SeriesError, SeriesViewError, StrategyRequirements,
+    StrategyRuntimeError,
 };
 
 /// Errors returned while running a historical strategy through FutureQuote.
@@ -44,8 +45,8 @@ pub enum StrategyReplayInputError {
     FutureQuote(String),
     #[error("management profile is invalid: {0}")]
     ManagementProfile(String),
-    #[error("configured historical strategies do not support ManagementProfile")]
-    ConfiguredManagementProfileUnsupported,
+    #[error("configured strategy entry cannot be routed to a management profile: {0}")]
+    ConfiguredEntryProfile(#[from] ConfiguredEntryProfileError),
     #[error("configured historical adapter is incompatible with replay limits: {0}")]
     ConfiguredAdapter(#[from] ConfiguredStrategyAdapterPreflightError),
     #[error("series '{series_id}' is required but was not supplied")]

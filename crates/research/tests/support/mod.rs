@@ -71,3 +71,40 @@ pub fn config() -> BacktestConfig {
         ..BacktestConfig::default()
     }
 }
+
+/// The synthetic ticks resampled into one-minute mid bars through the stored-bar aggregator, as a resample run would write them.
+pub fn synthetic_stored_bars(minutes: i64) -> Vec<data_preprocess::models::Bar> {
+    use data_preprocess::models::Timeframe as StoredTimeframe;
+    use data_preprocess::resample::{BarAggregator, BucketSpec, PriceBasis as StoredPriceBasis};
+
+    let mut aggregator = BarAggregator::new(
+        "demo",
+        SYMBOL,
+        StoredTimeframe::M1,
+        BucketSpec::new(60, 0).unwrap(),
+        StoredPriceBasis::Mid,
+        POINT_SIZE,
+    );
+    let mut bars = Vec::new();
+    for event in synthetic_ticks(minutes).iter() {
+        let MarketEvent::Tick { ts, bid, ask, .. } = &event.event else {
+            unreachable!("synthetic ticks are ticks");
+        };
+        bars.extend(aggregator.push(*ts, Some(*bid), Some(*ask)));
+    }
+    bars
+}
+
+/// The synthetic stored bars converted to feed events, stamped at their bucket open.
+pub fn synthetic_bars(minutes: i64) -> SymbolEvents {
+    let mut feed = qs_backtest::data_feed::bars_to_feed_with_metadata(
+        synthetic_stored_bars(minutes),
+        SeriesRoles::PRIMARY,
+        0,
+    );
+    let mut events = Vec::new();
+    while let Some(event) = feed.next_feed_event() {
+        events.push(event);
+    }
+    events.into()
+}

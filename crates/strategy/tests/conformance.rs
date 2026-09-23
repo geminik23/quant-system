@@ -132,6 +132,7 @@ fn entry_action(slot: &str) -> ActionTemplate {
         risk: number(1.0),
         stoploss: missing(ScalarType::Price),
         targets: vec![],
+        entry_class: None,
     }
 }
 
@@ -644,6 +645,10 @@ fn trade_slot_snapshots_are_total_and_pending_is_not_open() {
             entry_price: 10.0,
             remaining_size: 1.0,
             stoploss: Some(stoploss),
+            opened_at: time(0),
+            favorable_excursion: None,
+            adverse_excursion: None,
+            initial_risk: None,
         };
         compile(config.clone()).unwrap().evaluate(&managed).unwrap();
     }
@@ -653,6 +658,10 @@ fn trade_slot_snapshots_are_total_and_pending_is_not_open() {
         entry_price: 10.0,
         remaining_size: 0.0,
         stoploss: Some(10.0),
+        opened_at: time(0),
+        favorable_excursion: None,
+        adverse_excursion: None,
+        initial_risk: None,
     };
     assert!(compile(config).unwrap().evaluate(&invalid).is_err());
 }
@@ -1322,4 +1331,480 @@ fn checked_arithmetic_missing_and_priority_selection_remain_deterministic() {
         strategy.evaluate(&input(0, true)),
         Err(EvaluationError::DivisionByZero { .. })
     ));
+}
+
+fn classified_entry(slot: &str, entry_class: &str) -> ActionTemplate {
+    let mut action = entry_action(slot);
+    if let ActionTemplate::Entry {
+        entry_class: class, ..
+    } = &mut action
+    {
+        *class = Some(entry_class.into());
+    }
+    action
+}
+
+fn action_transition(target: &str, slot: &str, action: ActionTemplate) -> TransitionConfig {
+    let mut transition = transition(1, target, boolean(true));
+    transition.decision = Some(decision(Some(slot)));
+    transition.actions = vec![action];
+    transition
+}
+
+#[test]
+fn entry_class_is_validated_and_lowered_into_the_entry_signal() {
+    let classified = |entry_class: &str| {
+        base(vec![
+            state(
+                "idle",
+                vec![action_transition(
+                    "done",
+                    "primary",
+                    classified_entry("primary", entry_class),
+                )],
+            ),
+            state("done", vec![]),
+        ])
+    };
+
+    let mut strategy = compile(classified("trend")).unwrap();
+    let output = strategy.evaluate(&input(0, true)).unwrap();
+    assert!(matches!(
+        &output.commands[0].signal,
+        RawSignal::Entry { entry_class: Some(class), .. } if class == "trend"
+    ));
+
+    for invalid in ["", " trend", "trend\n"] {
+        let error = compile(classified(invalid)).err().unwrap();
+        assert!(
+            matches!(&error, CompileError::InvalidIdentifier { path, .. } if path.ends_with(".entry_class")),
+            "{invalid:?} produced {error:?}"
+        );
+    }
+}
+
+#[test]
+fn requirements_list_entry_classes_and_stop_managed_slots() {
+    let strategy = compile(base(vec![
+        state(
+            "idle",
+            vec![action_transition(
+                "second",
+                "primary",
+                classified_entry("primary", "trend"),
+            )],
+        ),
+        state(
+            "second",
+            vec![action_transition(
+                "breakeven",
+                "secondary",
+                entry_action("secondary"),
+            )],
+        ),
+        state(
+            "breakeven",
+            vec![action_transition(
+                "modify",
+                "secondary",
+                ActionTemplate::MoveStoplossToEntry {
+                    slot: "secondary".into(),
+                },
+            )],
+        ),
+        state(
+            "modify",
+            vec![action_transition(
+                "again",
+                "secondary",
+                ActionTemplate::ModifyStoploss {
+                    slot: "secondary".into(),
+                    price: price(1.0),
+                },
+            )],
+        ),
+        state(
+            "again",
+            vec![action_transition(
+                "done",
+                "primary",
+                classified_entry("primary", "trend"),
+            )],
+        ),
+        state("done", vec![]),
+    ]))
+    .unwrap();
+    let requirements = strategy.input_requirements();
+    assert_eq!(
+        requirements.entries,
+        vec![
+            EntryRequirement {
+                slot: "primary".into(),
+                entry_class: Some("trend".into()),
+            },
+            EntryRequirement {
+                slot: "secondary".into(),
+                entry_class: None,
+            },
+        ]
+    );
+    assert_eq!(
+        requirements.stop_managed_slots,
+        vec!["secondary".to_owned()]
+    );
+}
+
+#[test]
+fn entry_class_is_optional_in_documents_and_survives_binding() {
+    let unclassified = serde_json::to_value(entry_action("primary")).unwrap();
+    assert!(unclassified.get("entry_class").is_none());
+    assert_eq!(
+        serde_json::from_value::<ActionTemplate>(unclassified).unwrap(),
+        entry_action("primary")
+    );
+
+    let classified = serde_json::to_value(classified_entry("primary", "trend")).unwrap();
+    assert_eq!(classified["entry_class"], json!("trend"));
+
+    let document = base(vec![
+        state(
+            "idle",
+            vec![action_transition(
+                "done",
+                "primary",
+                classified_entry("primary", "trend"),
+            )],
+        ),
+        state("done", vec![]),
+    ]);
+    let bound = StrategyTemplate::new(document.clone())
+        .bind(&ParameterBinding::default(), &MaterialLibrary::builtins())
+        .unwrap();
+    assert_eq!(bound, document);
+}
+
+fn open_primary(
+    opened_at: NaiveDateTime,
+    excursion: Option<(f64, f64)>,
+    initial_risk: Option<f64>,
+) -> TradeSlotFacts {
+    TradeSlotFacts {
+        slot: "primary".into(),
+        state: TradeSlotState::Open {
+            side: Side::Buy,
+            entry_price: 10.0,
+            remaining_size: 1.0,
+            stoploss: Some(9.0),
+            opened_at,
+            favorable_excursion: excursion.map(|(favorable, _)| favorable),
+            adverse_excursion: excursion.map(|(_, adverse)| adverse),
+            initial_risk,
+        },
+    }
+}
+
+fn input_with(second: u32, primary: TradeSlotFacts, bars: &[&str]) -> StrategyInput {
+    let mut value = input(second, true);
+    value.trade_slots[0] = primary;
+    value.completed_bars = bars
+        .iter()
+        .map(|name| CompletedBarUpdate {
+            source: source(name),
+            bar: bar(10.0),
+        })
+        .collect();
+    value
+}
+
+fn position(field: PositionField) -> Expr {
+    Expr::Position {
+        slot: "primary".into(),
+        field,
+    }
+}
+
+#[test]
+fn open_position_facts_are_validated_against_input_time_and_sign() {
+    let config = base(vec![state("idle", vec![])]);
+    let evaluate = |facts: TradeSlotFacts| {
+        compile(config.clone())
+            .unwrap()
+            .evaluate(&input_with(5, facts, &[]))
+    };
+    evaluate(open_primary(time(0), Some((3.0, -2.0)), Some(4.0))).unwrap();
+    evaluate(open_primary(time(5), None, None)).unwrap();
+    for invalid in [
+        open_primary(time(6), None, None),
+        open_primary(time(0), Some((-1.0, -2.0)), None),
+        open_primary(time(0), Some((3.0, 1.0)), None),
+        open_primary(time(0), Some((f64::NAN, -2.0)), None),
+        open_primary(time(0), None, Some(0.0)),
+        open_primary(time(0), None, Some(f64::INFINITY)),
+    ] {
+        assert!(evaluate(invalid).is_err());
+    }
+}
+
+#[test]
+fn elapsed_time_and_favorable_r_rule_fires_at_the_exact_boundary() {
+    let stale = Expr::All {
+        items: vec![
+            Expr::Gt {
+                left: Box::new(Expr::Sub {
+                    left: Box::new(Expr::InputTime),
+                    right: Box::new(position(PositionField::OpenedAt)),
+                }),
+                right: Box::new(literal(Literal::DurationMillis(8_000))),
+            },
+            Expr::Lt {
+                left: Box::new(Expr::Div {
+                    left: Box::new(position(PositionField::FavorableExcursion)),
+                    right: Box::new(position(PositionField::InitialRisk)),
+                }),
+                right: Box::new(number(0.2)),
+            },
+        ],
+    };
+    let config = base(vec![
+        state("open", vec![transition(1, "timed_out", stale)]),
+        state("timed_out", vec![]),
+    ]);
+    let first_firing = |excursion: Option<(f64, f64)>| {
+        let mut strategy = compile(config.clone()).unwrap();
+        (0..=12).find(|second| {
+            strategy
+                .evaluate(&input_with(
+                    *second,
+                    open_primary(time(0), excursion, Some(10.0)),
+                    &[],
+                ))
+                .unwrap();
+            strategy.state_id() == "timed_out"
+        })
+    };
+    assert_eq!(first_firing(Some((0.5, -1.0))), Some(9));
+    assert_eq!(first_firing(Some((3.0, -1.0))), None);
+    assert_eq!(
+        first_firing(None),
+        None,
+        "missing excursion never compares true"
+    );
+}
+
+#[test]
+fn position_materials_expose_open_facts_and_are_missing_otherwise() {
+    let slot = || MaterialArgs::new([("slot", MaterialArg::Slot("primary".into()))]);
+    let mut config = base(vec![
+        state(
+            "idle",
+            vec![transition(
+                1,
+                "seen",
+                Expr::All {
+                    items: vec![
+                        Expr::Eq {
+                            left: Box::new(Expr::Material {
+                                id: "opened_at".into(),
+                            }),
+                            right: Box::new(literal(Literal::Timestamp(time(1)))),
+                        },
+                        Expr::Eq {
+                            left: Box::new(Expr::Material {
+                                id: "favorable".into(),
+                            }),
+                            right: Box::new(number(3.0)),
+                        },
+                        Expr::Eq {
+                            left: Box::new(Expr::Material {
+                                id: "adverse".into(),
+                            }),
+                            right: Box::new(number(-2.0)),
+                        },
+                        Expr::Eq {
+                            left: Box::new(Expr::Material { id: "risk".into() }),
+                            right: Box::new(number(4.0)),
+                        },
+                    ],
+                },
+            )],
+        ),
+        state("seen", vec![]),
+    ]);
+    for (id, key) in [
+        ("opened_at", MATERIAL_POSITION_OPENED_AT),
+        ("favorable", MATERIAL_POSITION_FAVORABLE_EXCURSION),
+        ("adverse", MATERIAL_POSITION_ADVERSE_EXCURSION),
+        ("risk", MATERIAL_POSITION_INITIAL_RISK),
+    ] {
+        config.materials.push(MaterialConfig {
+            id: id.into(),
+            key: key.into(),
+            inputs: vec![],
+            params: slot(),
+        });
+    }
+    let mut strategy = compile(config).unwrap();
+    strategy.evaluate(&input(2, true)).unwrap();
+    assert_eq!(
+        strategy.state_id(),
+        "idle",
+        "a vacant slot has no open facts"
+    );
+    strategy
+        .evaluate(&input_with(
+            3,
+            open_primary(time(1), Some((3.0, -2.0)), Some(4.0)),
+            &[],
+        ))
+        .unwrap();
+    assert_eq!(strategy.state_id(), "seen");
+}
+
+/// Whether `check` holds at the last input, observed through a transition that can fire only at that input's time.
+fn holds_at_last_input(mut config: StrategyConfig, inputs: &[StrategyInput], check: Expr) -> bool {
+    let last = inputs.last().unwrap().time;
+    config.states = vec![
+        state(
+            "idle",
+            vec![transition(
+                1,
+                "matched",
+                Expr::All {
+                    items: vec![
+                        Expr::Eq {
+                            left: Box::new(Expr::InputTime),
+                            right: Box::new(literal(Literal::Timestamp(last))),
+                        },
+                        check,
+                    ],
+                },
+            )],
+        ),
+        state("matched", vec![]),
+    ];
+    config.initial_state = "idle".into();
+    let mut strategy = compile(config).unwrap();
+    for input in inputs {
+        strategy.evaluate(input).unwrap();
+    }
+    strategy.state_id() == "matched"
+}
+
+fn material_equals(id: &str, value: Literal) -> Expr {
+    Expr::Eq {
+        left: Box::new(Expr::Material { id: id.into() }),
+        right: Box::new(literal(value)),
+    }
+}
+
+#[test]
+fn bars_since_open_counts_only_its_source_after_entry_and_restarts_per_position() {
+    let mut config = base(vec![state("idle", vec![])]);
+    config.materials.push(MaterialConfig {
+        id: "bars".into(),
+        key: MATERIAL_BARS_SINCE_OPEN.into(),
+        inputs: vec![],
+        params: MaterialArgs::new([
+            ("slot", MaterialArg::Slot("primary".into())),
+            ("source", MaterialArg::Source(source("fast"))),
+        ]),
+    });
+    config.materials.push(MaterialConfig {
+        id: "slow_close".into(),
+        key: MATERIAL_BAR_FIELD.into(),
+        inputs: vec![],
+        params: MaterialParams::BarField {
+            source: source("slow"),
+            field: BarField::Close,
+        }
+        .into(),
+    });
+    let requirements = compile(config.clone())
+        .unwrap()
+        .input_requirements()
+        .completed_bars
+        .clone();
+    assert!(
+        requirements
+            .iter()
+            .any(|item| item.source == source("fast"))
+    );
+
+    let first = time(10);
+    let second = time(14);
+    let sequence = [
+        input_with(10, open_primary(first, None, None), &["fast"]),
+        input_with(11, open_primary(first, None, None), &["slow"]),
+        input_with(12, open_primary(first, None, None), &["fast", "slow"]),
+        input_with(13, vacant("primary"), &["fast"]),
+        input_with(15, open_primary(second, None, None), &["fast"]),
+    ];
+    let count_after = |steps: usize, expected: Literal| {
+        holds_at_last_input(
+            config.clone(),
+            &sequence[..steps],
+            material_equals("bars", expected),
+        )
+    };
+    assert!(
+        count_after(1, Literal::Integer(0)),
+        "a bar completing at the entry boundary closed before the position existed"
+    );
+    assert!(
+        count_after(2, Literal::Integer(0)),
+        "another source is not counted"
+    );
+    assert!(count_after(3, Literal::Integer(1)));
+    assert!(holds_at_last_input(
+        config.clone(),
+        &sequence[..4],
+        Expr::IsMissing {
+            value: Box::new(Expr::Material { id: "bars".into() }),
+        },
+    ));
+    assert!(
+        count_after(5, Literal::Integer(1)),
+        "a new position restarts the count"
+    );
+}
+
+#[test]
+fn calendar_materials_follow_input_time_across_a_utc_day_boundary() {
+    let mut config = base(vec![state("idle", vec![])]);
+    for (id, key) in [
+        ("weekday", MATERIAL_WEEKDAY),
+        ("seconds", MATERIAL_SECONDS_OF_DAY),
+    ] {
+        config.materials.push(MaterialConfig {
+            id: id.into(),
+            key: key.into(),
+            inputs: vec![],
+            params: MaterialArgs::default(),
+        });
+    }
+    let at = |day: u32, hour: u32, minute: u32, second: u32| {
+        let mut value = input(0, true);
+        value.time = NaiveDate::from_ymd_opt(2026, 1, day)
+            .unwrap()
+            .and_hms_opt(hour, minute, second)
+            .unwrap();
+        value
+    };
+    // 2026-01-04 is a Sunday and 2026-01-05 a Monday.
+    for (input, weekday, seconds) in [
+        (at(4, 23, 59, 59), 7, 86_399),
+        (at(5, 0, 0, 0), 1, 0),
+        (at(5, 13, 30, 5), 1, 48_605),
+    ] {
+        assert!(holds_at_last_input(
+            config.clone(),
+            &[input],
+            Expr::All {
+                items: vec![
+                    material_equals("weekday", Literal::Integer(weekday)),
+                    material_equals("seconds", Literal::Integer(seconds)),
+                ],
+            },
+        ));
+    }
 }

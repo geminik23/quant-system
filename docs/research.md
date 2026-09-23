@@ -13,6 +13,8 @@ The runnable example uses [`ema_strategy.toml`](../crates/research/examples/ema_
 
 A parameter is fixed for one run and is substituted before compilation. It is different from an `input`, which an adapter supplies at every evaluation, and from a variable, which strategy state may change during a run. Binding produces a complete ordinary `StrategyConfig`; unresolved parameters never reach the runtime.
 
+A research batch runs without management profiles, so every Entry uses its own signal stop and targets. If a document's Entry declares an `entry_class`, every run fails before replay with an unrouted-class error and is recorded as a failed row, because the batch supplies no route for that class.
+
 A strategy and space are loaded explicitly:
 
 ```rust
@@ -74,7 +76,7 @@ Each logical source has declared geometry: source ID, symbol, timeframe, price b
 
 Warmup and retained history are derived from the bound strategy's compiled `CompletedBarRequirement`. A family does not restate indicator lookback. Chained rolling materials compose their lookbacks, and branch pruning occurs before requirements are derived.
 
-Only tick-driven search is currently available. A configured strategy derives its analysis bars from ticks while replay proceeds; stored bars do not yet drive configured replay.
+A search runs over ticks or over stored bars. `load_symbol_ticks` and `load_symbol_bars` each read one symbol's range into memory once, and every row and position records the input as its `data_mode`, `ticks` or `bars`; a symbol whose events mix the two is rejected. A stored bar feeds only a source declared with the same timeframe, and it becomes visible to the strategy only after its bucket closes, so a bar search sees the same completed bars as a tick search over the ticks those bars were resampled from. Execution differs: a bar run fills and settles stops at bar-close quotes and cannot reproduce the order of events inside a bar, so a candidate found over bars should be confirmed over ticks.
 
 ## Windows
 

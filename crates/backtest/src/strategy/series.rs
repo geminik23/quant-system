@@ -1,4 +1,6 @@
-//! Causal fixed-duration closed bars derived from historical tick batches.
+//! Causal fixed-duration closed bars built from historical tick batches or accepted from stored bars.
+//!
+//! A series is fed by one kind of primary input. Ticks accumulate into the bucket that contains them. A stored bar is stamped at its bucket's open time, as the resampler writes it, and is held as that bucket's complete contents; like a tick-built bucket, it becomes visible only when a later bucket for the same symbol arrives, so a strategy never sees a bar before its close.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -239,6 +241,42 @@ pub enum SeriesError {
     TickCountOverflow { series_id: SeriesId },
     #[error("series '{series_id}' completed-bar count overflowed")]
     CompletedBarCountOverflow { series_id: SeriesId },
+    #[error("series '{series_id}' received both ticks and stored bars")]
+    MixedSeriesInput { series_id: SeriesId },
+    #[error("stored bar for '{symbol}' at {timestamp} does not declare its timeframe")]
+    StoredBarWithoutTimeframe {
+        symbol: String,
+        timestamp: NaiveDateTime,
+    },
+    #[error(
+        "stored {timeframe_seconds}s bar for '{symbol}' at {timestamp} matches no declared series"
+    )]
+    StoredBarUnmatched {
+        symbol: String,
+        timeframe_seconds: u64,
+        timestamp: NaiveDateTime,
+    },
+    #[error(
+        "stored bar for series '{series_id}' at {timestamp} does not start on a bucket boundary; the bucket opens at {bucket_open}"
+    )]
+    StoredBarMisaligned {
+        series_id: SeriesId,
+        timestamp: NaiveDateTime,
+        bucket_open: NaiveDateTime,
+    },
+    #[error("stored bar for series '{series_id}' at {timestamp} is invalid: {reason}")]
+    InvalidStoredBar {
+        series_id: SeriesId,
+        timestamp: NaiveDateTime,
+        reason: &'static str,
+    },
+    #[error(
+        "series '{series_id}' received a second stored bar for the bucket opening at {timestamp}"
+    )]
+    DuplicateStoredBar {
+        series_id: SeriesId,
+        timestamp: NaiveDateTime,
+    },
 }
 
 /// Errors returned by read-only series lookup.
@@ -286,12 +324,20 @@ impl OpenBar {
     }
 }
 
+/// The one kind of primary input a series has accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeriesInput {
+    Ticks,
+    StoredBars,
+}
+
 #[derive(Debug, Clone)]
 struct SeriesState {
     spec: BarSeriesSpec,
     open: Option<OpenBar>,
     closed: VecDeque<ClosedBar>,
     completed_bars: usize,
+    input: Option<SeriesInput>,
 }
 
 impl SeriesState {
@@ -301,6 +347,7 @@ impl SeriesState {
             spec,
             open: None,
             completed_bars: 0,
+            input: None,
         }
     }
 
@@ -315,6 +362,7 @@ struct BatchSeriesState {
     open: Option<OpenBar>,
     completed_bars: usize,
     emitted: Vec<ClosedBar>,
+    input: Option<SeriesInput>,
 }
 
 impl BatchSeriesState {
@@ -323,6 +371,23 @@ impl BatchSeriesState {
             open: state.open.clone(),
             completed_bars: state.completed_bars,
             emitted: Vec::new(),
+            input: state.input,
+        }
+    }
+
+    fn accept_input(
+        &mut self,
+        spec: &BarSeriesSpec,
+        input: SeriesInput,
+    ) -> Result<(), SeriesError> {
+        match self.input {
+            Some(existing) if existing != input => Err(SeriesError::MixedSeriesInput {
+                series_id: spec.requirement.id().clone(),
+            }),
+            _ => {
+                self.input = Some(input);
+                Ok(())
+            }
         }
     }
 
@@ -356,19 +421,87 @@ impl BatchSeriesState {
             return Ok(());
         }
 
-        if spec.missing_interval == MissingIntervalPolicy::Reject && open_time > current.close_time
+        self.close_open_bar(spec, open_time)?;
+        self.open = Some(OpenBar::new(open_time, close_time, price));
+        Ok(())
+    }
+
+    /// Hold one stored bar as the complete contents of its bucket, completing the previously held bar first.
+    fn apply_stored_bar(
+        &mut self,
+        spec: &BarSeriesSpec,
+        bar: StoredBar,
+    ) -> Result<(), SeriesError> {
+        let series_id = spec.requirement.id();
+        let duration = i64::try_from(spec.requirement.timeframe().duration_seconds())
+            .expect("fixed timeframe duration always fits i64");
+        let (open_time, close_time) =
+            bucket_bounds(series_id, bar.ts, duration, spec.alignment_offset_seconds)?;
+        if open_time != bar.ts {
+            return Err(SeriesError::StoredBarMisaligned {
+                series_id: series_id.clone(),
+                timestamp: bar.ts,
+                bucket_open: open_time,
+            });
+        }
+        let invalid = |reason| SeriesError::InvalidStoredBar {
+            series_id: series_id.clone(),
+            timestamp: bar.ts,
+            reason,
+        };
+        if ![bar.open, bar.high, bar.low, bar.close]
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(invalid("prices must be finite"));
+        }
+        if bar.low > bar.open.min(bar.close) || bar.high < bar.open.max(bar.close) {
+            return Err(invalid("open and close must lie within low and high"));
+        }
+        let tick_count = bar
+            .tick_count
+            .filter(|count| *count > 0)
+            .ok_or_else(|| invalid("a positive tick count is required"))?;
+        if let Some(current) = self.open.as_ref() {
+            if current.open_time == open_time {
+                return Err(SeriesError::DuplicateStoredBar {
+                    series_id: series_id.clone(),
+                    timestamp: bar.ts,
+                });
+            }
+            self.close_open_bar(spec, open_time)?;
+        }
+        self.open = Some(OpenBar {
+            open_time,
+            close_time,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            tick_count,
+        });
+        Ok(())
+    }
+
+    /// Complete the held bar because a later bucket opening at `next_open` has arrived.
+    fn close_open_bar(
+        &mut self,
+        spec: &BarSeriesSpec,
+        next_open: NaiveDateTime,
+    ) -> Result<(), SeriesError> {
+        let current = self
+            .open
+            .as_ref()
+            .expect("a held bar exists when a later bucket arrives");
+        if spec.missing_interval == MissingIntervalPolicy::Reject && next_open > current.close_time
         {
             return Err(SeriesError::MissingInterval {
                 series_id: spec.requirement.id().clone(),
                 previous_close: current.close_time,
-                next_open: open_time,
+                next_open,
             });
         }
-
-        let completed = self
-            .open
-            .take()
-            .expect("open bar exists after transition validation");
+        let completed = self.open.take().expect("held bar checked above");
         self.completed_bars = self.completed_bars.checked_add(1).ok_or_else(|| {
             SeriesError::CompletedBarCountOverflow {
                 series_id: spec.requirement.id().clone(),
@@ -385,9 +518,19 @@ impl BatchSeriesState {
             close: completed.close,
             tick_count: completed.tick_count,
         });
-        self.open = Some(OpenBar::new(open_time, close_time, price));
         Ok(())
     }
+}
+
+/// Fields of one primary stored-bar event, as the series reads them.
+#[derive(Debug, Clone, Copy)]
+struct StoredBar {
+    ts: NaiveDateTime,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    tick_count: Option<u64>,
 }
 
 /// Bounded causal closed-bar state for several symbols and timeframes.
@@ -430,6 +573,7 @@ impl MultiTimeframeSeries {
                 .expect("staged series originates from committed state");
             state.open = staged.open;
             state.completed_bars = staged.completed_bars;
+            state.input = staged.input;
             for closed in staged.emitted.drain(..) {
                 if state.closed.len() == state.spec.retained_bars {
                     state.closed.pop_front();
@@ -488,38 +632,87 @@ impl MultiTimeframeSeries {
             if !feed_event.metadata.roles.primary {
                 continue;
             }
-            let MarketEvent::Tick {
-                symbol,
-                ts,
-                bid,
-                ask,
-            } = &feed_event.event
-            else {
-                continue;
-            };
+            let symbol = feed_event.event.symbol();
+            let ts = feed_event.event.ts();
             if let Some(previous) = staged_source_ts.get(symbol)
-                && *ts < *previous
+                && ts < *previous
             {
                 return Err(SeriesError::TimestampRegression {
-                    symbol: symbol.clone(),
+                    symbol: symbol.to_owned(),
                     previous: *previous,
-                    current: *ts,
+                    current: ts,
                 });
             }
-            staged_source_ts.insert(symbol.clone(), *ts);
+            staged_source_ts.insert(symbol.to_owned(), ts);
 
-            if feed_event.event.to_valid_quote().is_none() {
-                continue;
-            }
-            for (id, state) in self
-                .series
-                .iter()
-                .filter(|(_, state)| state.spec.requirement.symbol() == symbol)
-            {
-                staged_series
-                    .get_mut(id)
-                    .expect("staged series originates from committed state")
-                    .apply_tick(&state.spec, *ts, *bid, *ask)?;
+            match &feed_event.event {
+                MarketEvent::Tick { bid, ask, .. } => {
+                    if feed_event.event.to_valid_quote().is_none() {
+                        continue;
+                    }
+                    for (id, state) in self
+                        .series
+                        .iter()
+                        .filter(|(_, state)| state.spec.requirement.symbol() == symbol)
+                    {
+                        let staged = staged_series
+                            .get_mut(id)
+                            .expect("staged series originates from committed state");
+                        staged.accept_input(&state.spec, SeriesInput::Ticks)?;
+                        staged.apply_tick(&state.spec, ts, *bid, *ask)?;
+                    }
+                }
+                MarketEvent::Bar {
+                    open,
+                    high,
+                    low,
+                    close,
+                    timeframe_seconds,
+                    tick_count,
+                    ..
+                } => {
+                    if !self
+                        .series
+                        .values()
+                        .any(|state| state.spec.requirement.symbol() == symbol)
+                    {
+                        continue;
+                    }
+                    let timeframe_seconds = timeframe_seconds.ok_or_else(|| {
+                        SeriesError::StoredBarWithoutTimeframe {
+                            symbol: symbol.to_owned(),
+                            timestamp: ts,
+                        }
+                    })?;
+                    let bar = StoredBar {
+                        ts,
+                        open: *open,
+                        high: *high,
+                        low: *low,
+                        close: *close,
+                        tick_count: *tick_count,
+                    };
+                    let mut matched = false;
+                    for (id, state) in self.series.iter().filter(|(_, state)| {
+                        state.spec.requirement.symbol() == symbol
+                            && state.spec.requirement.timeframe().duration_seconds()
+                                == timeframe_seconds
+                    }) {
+                        matched = true;
+                        let staged = staged_series
+                            .get_mut(id)
+                            .expect("staged series originates from committed state");
+                        staged.accept_input(&state.spec, SeriesInput::StoredBars)?;
+                        staged.apply_stored_bar(&state.spec, bar)?;
+                    }
+                    if !matched {
+                        return Err(SeriesError::StoredBarUnmatched {
+                            symbol: symbol.to_owned(),
+                            timeframe_seconds,
+                            timestamp: ts,
+                        });
+                    }
+                }
             }
         }
         Ok(())

@@ -443,6 +443,14 @@ impl FutureExecutor {
         })
     }
 
+    /// Positive initial risk of an open position on the same basis a completed position reports for R normalization, or `None` when that basis is unavailable.
+    pub(crate) fn open_initial_risk(&self, position_id: &str) -> Option<f64> {
+        let account = self.accounts.get(position_id)?;
+        crate::artifacts::summarize_risk(&account.risk_tranches, self.pnl_epsilon)
+            .1
+            .filter(|risk| risk.is_finite() && *risk > 0.0)
+    }
+
     pub fn open_snapshots(&self) -> Vec<OpenPositionSnapshot> {
         self.accounts
             .values()

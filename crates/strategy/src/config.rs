@@ -263,6 +263,10 @@ pub enum PositionField {
     Side,
     RemainingSize,
     Stoploss,
+    OpenedAt,
+    FavorableExcursion,
+    AdverseExcursion,
+    InitialRisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +491,9 @@ pub enum ActionTemplate {
         stoploss: Expr,
         #[serde(default)]
         targets: Vec<Expr>,
+        /// Optional exact class the consuming adapter uses to route the entry to a management profile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_class: Option<String>,
     },
     Close {
         slot: String,

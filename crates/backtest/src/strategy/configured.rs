@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDateTime;
-use qs_core::TradeEngine;
 use qs_core::types::{Effect, PositionStatus};
+use qs_core::{ManagementProfile, RuleConfigDef, StoplossMode, TradeEngine};
 use qs_strategy::{
     CommandFact, CommandFeedback, CommandTerminalStatus, ConfiguredActionKind, ConfiguredCommand,
     ConfiguredStrategy, ConfiguredStrategyRequirements, DecisionKind, MAX_GENERATED_ID_BYTES,
@@ -13,7 +13,10 @@ use qs_strategy::{
     Value, ValueType,
 };
 
+use crate::future_executor::FutureExecutor;
 use crate::ledger::ActionDispositionStatus;
+use crate::portfolio::CampaignExcursion;
+use crate::profile::PreparedEntryProfiles;
 
 use super::{
     BarSeriesSpec, ClosedBar, HistoricalObservationView, HistoricalSeriesView, JournalKind,
@@ -227,6 +230,21 @@ pub enum ConfiguredStrategyAdapterPreflightError {
     TradeIdentityCapacity { actual: usize, required: usize },
 }
 
+/// Management-profile routing failure for a configured strategy, detected before feed polling.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfiguredEntryProfileError {
+    #[error("entry class `{entry_class}` on trade slot `{slot}` has no management-profile route")]
+    UnroutedEntryClass { entry_class: String, slot: String },
+    #[error(
+        "management profile `{profile}` manages the stoploss of trade slot `{slot}`, which the strategy also moves"
+    )]
+    StoplossOwnerConflict {
+        profile: String,
+        slot: String,
+        entry_class: Option<String>,
+    },
+}
+
 /// Runtime historical projection or configured evaluation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfiguredStrategyAdapterError {
@@ -270,6 +288,37 @@ pub(crate) struct ConfiguredBoundaryOutput {
     pub decision: Option<StrategyDecisionDraft>,
     pub journal: Vec<StrategyJournalDraft>,
     pub commands: Vec<ConfiguredCommand>,
+}
+
+/// Open-position economics a configured boundary may observe.
+///
+/// Excursion is the campaign's extreme as of the start of the boundary's batch, before that batch's own quotes are marked, so a stored bar's close cannot reach the strategy before the bar closes. Initial risk is the basis completed positions report for R normalization.
+pub(crate) struct BoundaryPositionFacts<'a> {
+    excursions: &'a BTreeMap<String, CampaignExcursion>,
+    executor: &'a FutureExecutor,
+}
+
+impl<'a> BoundaryPositionFacts<'a> {
+    pub(crate) fn new(
+        excursions: &'a BTreeMap<String, CampaignExcursion>,
+        executor: &'a FutureExecutor,
+    ) -> Self {
+        Self {
+            excursions,
+            executor,
+        }
+    }
+
+    fn excursion(&self, position_id: &str) -> Option<CampaignExcursion> {
+        self.excursions
+            .get(position_id)
+            .copied()
+            .filter(|excursion| excursion.observations > 0)
+    }
+
+    fn initial_risk(&self, position_id: &str) -> Option<f64> {
+        self.executor.open_initial_risk(position_id)
+    }
 }
 
 /// Historical runtime adapter for one reusable configured strategy instance.
@@ -348,6 +397,36 @@ impl BacktestConfiguredStrategyAdapter {
         self.strategy
     }
 
+    /// Check that every Entry the strategy can emit resolves to a profile the same way replay will select it, and that no selected profile manages a stop the strategy also moves.
+    pub fn preflight_entry_profiles(
+        &self,
+        profiles: &PreparedEntryProfiles,
+    ) -> Result<(), ConfiguredEntryProfileError> {
+        let requirements = self.strategy.input_requirements();
+        for entry in &requirements.entries {
+            let profile = match entry.entry_class.as_ref() {
+                Some(entry_class) => Some(profiles.routes().get(entry_class).ok_or_else(|| {
+                    ConfiguredEntryProfileError::UnroutedEntryClass {
+                        entry_class: entry_class.clone(),
+                        slot: entry.slot.clone(),
+                    }
+                })?),
+                None => profiles.default_profile(),
+            };
+            if let Some(profile) = profile
+                && profile_manages_stoploss(profile)
+                && requirements.stop_managed_slots.contains(&entry.slot)
+            {
+                return Err(ConfiguredEntryProfileError::StoplossOwnerConflict {
+                    profile: profile.name.clone(),
+                    slot: entry.slot.clone(),
+                    entry_class: entry.entry_class.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn preflight(
         &self,
         retention: StrategyRetentionLimits,
@@ -420,6 +499,7 @@ impl BacktestConfiguredStrategyAdapter {
         series: &dyn HistoricalSeriesView,
         observation_history: &dyn HistoricalObservationView,
         engine: &TradeEngine,
+        positions: &BoundaryPositionFacts<'_>,
         feedback_events: &[StrategyFeedbackEvent],
         retention: StrategyRetentionLimits,
         research: StrategyResearchLimits,
@@ -436,7 +516,7 @@ impl BacktestConfiguredStrategyAdapter {
                 series,
                 observation_history,
             })?,
-            trade_slots: self.project_trade_slots(engine)?,
+            trade_slots: self.project_trade_slots(engine, positions)?,
             feedback,
         };
         let output = self.strategy.evaluate(&input)?;
@@ -563,34 +643,54 @@ impl BacktestConfiguredStrategyAdapter {
     fn project_trade_slots(
         &self,
         engine: &TradeEngine,
+        positions: &BoundaryPositionFacts<'_>,
     ) -> Result<Vec<TradeSlotFacts>, ConfiguredStrategyAdapterError> {
         self.strategy
             .input_requirements()
             .trade_slots
             .iter()
             .map(|slot| {
-                let state = self
+                let position = self
                     .strategy
                     .trade_id_for_slot(slot)
                     .and_then(|trade_id| engine.manager.id_by_trade_id(trade_id))
-                    .and_then(|position_id| engine.get_position(&position_id))
-                    .map(|position| match position.data.status {
+                    .and_then(|position_id| {
+                        engine
+                            .get_position(&position_id)
+                            .map(|position| (position_id, position))
+                    });
+                let state = match position {
+                    None => TradeSlotState::Vacant,
+                    Some((position_id, position)) => match position.data.status {
                         PositionStatus::Pending => TradeSlotState::Pending {
                             side: position.data.side,
                             requested_price: position.data.pending_price,
                             stoploss: position.current_stoploss(),
                         },
-                        PositionStatus::Open => TradeSlotState::Open {
-                            side: position.data.side,
-                            entry_price: position.data.average_entry(),
-                            remaining_size: position.data.remaining_size(),
-                            stoploss: position.current_stoploss(),
-                        },
+                        PositionStatus::Open => {
+                            let opened_at = position.data.open_ts.ok_or_else(|| {
+                                ConfiguredStrategyAdapterError::TradeSlot {
+                                    slot: slot.clone(),
+                                    reason: "open position has no entry fill time".into(),
+                                }
+                            })?;
+                            let excursion = positions.excursion(&position_id);
+                            TradeSlotState::Open {
+                                side: position.data.side,
+                                entry_price: position.data.average_entry(),
+                                remaining_size: position.data.remaining_size(),
+                                stoploss: position.current_stoploss(),
+                                opened_at,
+                                favorable_excursion: excursion.map(|excursion| excursion.mfe),
+                                adverse_excursion: excursion.map(|excursion| excursion.mae),
+                                initial_risk: positions.initial_risk(&position_id),
+                            }
+                        }
                         PositionStatus::Closed | PositionStatus::Cancelled => {
                             TradeSlotState::Vacant
                         }
-                    })
-                    .unwrap_or(TradeSlotState::Vacant);
+                    },
+                };
                 Ok(TradeSlotFacts {
                     slot: slot.clone(),
                     state,
@@ -804,6 +904,21 @@ fn value_matches_type(value: &Value, expected: ValueType) -> bool {
         Value::Text(value) => !value.is_empty() && value.len() <= MAX_TEXT_BYTES,
         _ => true,
     }
+}
+
+/// A profile owns the stop when it replaces the signal stop or attaches a rule that moves the stop while the position is open.
+fn profile_manages_stoploss(profile: &ManagementProfile) -> bool {
+    !matches!(profile.stoploss_mode, StoplossMode::FromSignal)
+        || profile.rules.iter().any(|rule| {
+            matches!(
+                rule,
+                RuleConfigDef::FixedStoploss { .. }
+                    | RuleConfigDef::TrailingStop { .. }
+                    | RuleConfigDef::BreakevenWhen { .. }
+                    | RuleConfigDef::BreakevenWhenOffset { .. }
+                    | RuleConfigDef::BreakevenAfterTargets { .. }
+            )
+        })
 }
 
 fn map_effect(action: ConfiguredActionKind, effect: &Effect) -> Result<Option<CommandFact>, ()> {

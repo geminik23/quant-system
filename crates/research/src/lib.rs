@@ -19,7 +19,7 @@ pub mod families;
 pub use error::{ResearchError, RunFailure};
 pub use family::StrategyFamily;
 pub use geometry::SeriesGeometry;
-pub use loader::load_symbol_ticks;
+pub use loader::{load_symbol_bars, load_symbol_ticks};
 pub use plan::ResearchPlan;
 pub use runner::{ResearchBatch, SymbolEvents, run_batch};
 pub use space::DeclaredSpace;

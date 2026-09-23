@@ -281,6 +281,7 @@ impl StrategyFamily for EmaCrossFamily {
                             },
                             stoploss,
                             targets: vec![],
+                            entry_class: None,
                         }],
                         notes: vec![],
                     }],
