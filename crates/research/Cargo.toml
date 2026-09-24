@@ -18,6 +18,7 @@ qs-backtest = { workspace = true }
 qs-strategy = { workspace = true }
 qs-market-loader = { workspace = true }
 qs-core = { workspace = true }
+qs-risk = { workspace = true }
 
 chrono = { workspace = true }
 serde = { workspace = true }

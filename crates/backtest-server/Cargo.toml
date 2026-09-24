@@ -33,6 +33,7 @@ qs-backtest-api = { workspace = true, features = ["xrpc"] }
 qs-data-preprocess = { workspace = true, features = ["parquet"] }
 qs-market-loader = { workspace = true }
 qs-research = { workspace = true }
+qs-risk = { workspace = true }
 qs-service = { workspace = true }
 qs-service-xrpc = { workspace = true }
 qs-symbols = { workspace = true }

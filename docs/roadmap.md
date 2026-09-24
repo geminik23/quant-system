@@ -1,6 +1,6 @@
 # Roadmap
 
-The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and an in-process historical adapter that connects configured behavior to that replay path.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and a historical adapter that connects configured behavior to that replay path, both in process and through the backtest service, which accepts configured strategy documents, management profiles, and parameter searches by request.
 
 > This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
 
@@ -134,9 +134,9 @@ Concrete private strategy configurations may be added later when there is a real
 - global mutable component registries;
 - dynamic plugins or behavior discovery;
 - deployment compilers or content-addressed strategy artifacts;
-- strategy configuration over RPC;
+- strategy code, custom materials, or analyzers received over RPC; a remotely submitted strategy document may use only materials registered in the server build;
 - ingestion-to-trading bridges;
-- multi-strategy portfolio allocation;
+- multi-strategy portfolio allocation or optimization; portfolio supervision approves or rejects each instance's requests but never allocates capital between strategies;
 - paper or live execution gateways;
 - restart-safe configured or live strategy state;
 - broker and exchange order adapters;
@@ -160,4 +160,4 @@ The implementation now allows a developer to:
 8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
 9. continue implementing direct Rust strategies without framework regression.
 
-The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. The backtest service now also runs configured strategy documents and parameter searches received at runtime, reusing the same adapter and research batch. See [Backtesting](backtesting.md) for current replay behavior and limitations.
+The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. The backtest service now also runs configured strategy documents, portfolios of configured instances under optional portfolio policies, and parameter searches received at runtime, reusing the same adapter, portfolio replay, and research batch. See [Backtesting](backtesting.md) for current replay behavior and limitations.

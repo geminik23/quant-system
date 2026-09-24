@@ -1,4 +1,4 @@
-//! Submit a configured strategy run or a parameter search described by a TOML run file to the backtest service, wait for it, and write its complete output as JSON.
+//! Submit a configured strategy run, a portfolio run, or a parameter search described by a TOML run file to the backtest service, wait for it, and write its complete output as JSON.
 //!
 //! Run it with `strategy_backtest --run run.toml --out result.json`. A search also writes its comparison table next to the output with a `.csv` extension.
 
@@ -19,10 +19,10 @@ use qs_service_xrpc::XrpcTransportConfig;
 #[derive(Parser, Debug)]
 #[command(
     name = "strategy_backtest",
-    about = "Run a configured strategy or a parameter search through the backtest service"
+    about = "Run a configured strategy, a portfolio, or a parameter search through the backtest service"
 )]
 struct Args {
-    /// TOML run file naming the strategy document, or the template and space documents, and the data scope.
+    /// TOML run file naming the strategy document, the `[[instances]]` of a portfolio, or the template and space documents, and the data scope.
     #[arg(long)]
     run: PathBuf,
 
@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search = matches!(request, StrategyClientRequest::Search(_));
     let submitted = match request {
         StrategyClientRequest::Run(request) => client.submit_configured_strategy(request).await?,
+        StrategyClientRequest::Portfolio(request) => client.submit_portfolio(request).await?,
         StrategyClientRequest::Search(request) => client.submit_search(request).await?,
     };
     let job_id = submitted.job_id.ok_or_else(|| {
@@ -142,6 +143,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "total pnl {} over {} trades",
             result["total_pnl"], result["total_trades"]
         );
+        if let Some(portfolio) = result.get("portfolio") {
+            let instances = portfolio["instances"].as_array().map_or(0, Vec::len);
+            let rejected = portfolio["supervisor"]["events"]
+                .as_array()
+                .map_or(0, |events| {
+                    events
+                        .iter()
+                        .filter(|event| event["verdict"]["verdict"] == "reject")
+                        .count()
+                });
+            println!("{instances} instances, {rejected} entries rejected by the supervisor");
+        }
         if let Some(out) = &args.out {
             std::fs::write(out, &bytes)?;
             println!("wrote {}", out.display());

@@ -1,20 +1,22 @@
-//! Configured strategy runs and server-side parameter searches.
+//! Configured strategy runs, portfolio runs, and server-side parameter searches.
 //!
-//! Both reuse the retained-job workflow of raw-signal backtests: one job map, status, watch, cancellation, and artifact store. A configured run loads its one symbol through the same stream, conversion, and instrument path a raw-signal run uses, starting at the warmup its compiled strategy derives. A search loads each symbol once into memory and runs through `qs-research` behind a gate that admits one search at a time, because a search holds each symbol's whole range in memory.
+//! All reuse the retained-job workflow of raw-signal backtests: one job map, status, watch, cancellation, and artifact store. A configured run loads its one symbol through the same stream, conversion, and instrument path a raw-signal run uses, starting at the warmup its compiled strategy derives. A portfolio run loads the symbols of all its instances through that path into one feed, starting at the earliest warmup, and replays every instance against one account under the policies it carries. A search loads each symbol once into memory and runs through `qs-research` behind a gate that admits one search at a time, because a search holds each symbol's whole range in memory.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter,
-    ConfiguredHistoricalBindings, ConfiguredStrategyAdapterError, ObservationStoreLimits,
-    PriceBasis, RunCurrencyPlan, SeriesGeometry, StrategyDescriptor, StrategyId,
-    StrategyReplayError, StrategyRetentionLimits, Timeframe as SeriesTimeframe,
+    ConfiguredHistoricalBindings, ConfiguredInstance, ConfiguredStrategyAdapterError,
+    MAX_PORTFOLIO_INSTANCES, ObservationStoreLimits, PortfolioReplayError, PriceBasis,
+    RunCurrencyPlan, SeriesGeometry, StrategyDescriptor, StrategyId, StrategyReplayError,
+    StrategyRetentionLimits, Timeframe as SeriesTimeframe,
 };
 use qs_market_loader::MarketStreamError;
 use qs_research::{
     DataWindow, DeclaredSpace, ResearchError, ResearchPlan, WindowPlan, batch_data_range,
     load_symbol_bars, load_symbol_ticks, run_batch_controlled, validate_batch,
 };
+use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
 use qs_strategy::{ConfiguredStrategy, MaterialLibrary, SourceId, StrategyConfig};
 
 use super::*;
@@ -427,9 +429,9 @@ fn attach_configured_metadata(
     if run.data_type == "bar" {
         tags.insert(
             "data.bar_quote_convention".into(),
-            "close_with_spread".into(),
+            "open_range_close".into(),
         );
-        tags.insert("data.intrabar_simulation".into(), "false".into());
+        tags.insert("data.intrabar_order".into(), "adverse_extreme_first".into());
     }
     tags.insert("strategy.id".into(), run.document.strategy_id.clone());
     tags.insert("strategy.instance".into(), run.instance_id.clone());
@@ -446,6 +448,589 @@ fn attach_configured_metadata(
     tags.insert(
         "profile.entry_routes".into(),
         serde_json::to_string(run.profiles.routes()).unwrap_or_else(|_| "unavailable".into()),
+    );
+}
+
+// ── Portfolio runs ──────────────────────────────────────────────────────────
+
+/// One validated instance of a portfolio run.
+#[derive(Debug, Clone)]
+struct AcceptedPortfolioInstance {
+    document: StrategyConfig,
+    document_value: serde_json::Value,
+    sources: Vec<SourceBindingMsg>,
+    geometry: Vec<SeriesGeometry>,
+    symbol: String,
+    instance_id: String,
+    decision_latency_ms: u64,
+    profiles: PreparedEntryProfiles,
+}
+
+/// A validated portfolio run, kept until its worker starts.
+#[derive(Debug, Clone)]
+pub struct AcceptedPortfolioRun {
+    instances: Vec<AcceptedPortfolioInstance>,
+    symbols: Vec<String>,
+    exchange: String,
+    data_type: String,
+    timeframe: Option<String>,
+    requested_from: Option<String>,
+    requested_to: Option<String>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    config: BacktestConfigMsg,
+    future: FutureQuoteConfigMsg,
+    evaluation: ProviderEvaluationOptionsMsg,
+    policies: Vec<RiskPolicy>,
+    groups: Vec<CorrelationGroup>,
+    delivery: ResultDeliveryMsg,
+}
+
+/// Handle `run_portfolio`: validate, run, and return the shared result synchronously.
+pub fn handle_run_portfolio(state: &ServerState, req: &RunPortfolioRequest) -> RunBacktestResponse {
+    let start = Instant::now();
+    let outcome = prepare_portfolio_run(state, req).and_then(|run| {
+        execute_portfolio_run(state, &run, &JobCancellationToken::default(), &mut |_| {})
+    });
+    match outcome {
+        Ok(message) => {
+            single_response_from_result(state, message, start, Some(req.result_delivery))
+        }
+        Err(error) => RunBacktestResponse {
+            success: false,
+            error: Some(error.to_string()),
+            result: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            artifact: None,
+            inline_complete: true,
+        },
+    }
+}
+
+/// Handle `submit_portfolio`: validate every instance and policy, then admit a retained job.
+pub fn handle_submit_portfolio(
+    state: &ServerState,
+    req: &SubmitPortfolioRequest,
+) -> SubmitBacktestResponse {
+    match prepare_portfolio_run(state, &req.request) {
+        Ok(run) => admit_job(
+            state,
+            JobKind::Backtest,
+            AcceptedJobInput::Portfolio(Box::new(run)),
+        ),
+        Err(error) => SubmitBacktestResponse {
+            success: false,
+            job_id: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+pub(super) fn run_portfolio_job(
+    state: Arc<ServerState>,
+    job_id: String,
+    run: AcceptedPortfolioRun,
+) {
+    let delivery = run.delivery;
+    run_result_job(
+        state,
+        job_id,
+        delivery,
+        move |state, job_id, cancellation| {
+            execute_portfolio_run(state, &run, cancellation, &mut |progress| {
+                update_job_progress(state, job_id, progress)
+            })
+        },
+    );
+}
+
+/// Decode the policies and groups strictly and build the supervisor they describe, or `None` when the request carries no policy.
+fn decode_supervisor(
+    policies: Option<&serde_json::Value>,
+    groups: Option<&serde_json::Value>,
+) -> Result<(Vec<RiskPolicy>, Vec<CorrelationGroup>)> {
+    let policies: Vec<RiskPolicy> = match policies {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| invalid(format!("invalid policies: {error}")))?,
+    };
+    let groups: Vec<CorrelationGroup> = match groups {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| invalid(format!("invalid groups: {error}")))?,
+    };
+    if policies.is_empty() && !groups.is_empty() {
+        return Err(invalid(
+            "correlation groups were supplied without any policy that uses them".into(),
+        ));
+    }
+    PortfolioSupervisor::new(policies.clone(), groups.clone())
+        .map_err(|error| invalid(format!("invalid policies: {error}")))?;
+    Ok((policies, groups))
+}
+
+fn prepare_portfolio_run(
+    state: &ServerState,
+    req: &RunPortfolioRequest,
+) -> Result<AcceptedPortfolioRun> {
+    let spec = &req.request;
+    validate_future_quote_scalars(&req.future)?;
+    account_currency_from_msg(&req.future)?;
+    let limits = &state.strategies.limits;
+    let max_instances = limits.max_portfolio_instances.min(MAX_PORTFOLIO_INSTANCES);
+    if spec.instances.is_empty() {
+        return Err(invalid(
+            "a portfolio run needs at least one instance".into(),
+        ));
+    }
+    if spec.instances.len() > max_instances {
+        return Err(invalid(format!(
+            "the portfolio has {} instances, above the server limit of {max_instances}",
+            spec.instances.len()
+        )));
+    }
+    let bar_seconds = data_geometry(&spec.data_type, spec.timeframe.as_deref())?;
+    let mut instances = Vec::with_capacity(spec.instances.len());
+    let mut identities = BTreeSet::new();
+    let mut retained = 0usize;
+    let mut emits_entries = false;
+    for (index, item) in spec.instances.iter().enumerate() {
+        let context = |error: BacktestServerError| match error {
+            BacktestServerError::InvalidRequest(message) => {
+                invalid(format!("instances[{index}]: {message}"))
+            }
+            other => other,
+        };
+        let symbol = required_symbol(&state.symbol_registry, &item.symbol).map_err(context)?;
+        check_document_size(limits, "strategy document", &item.strategy.document)
+            .map_err(context)?;
+        let document: StrategyConfig =
+            decode_document("strategy document", &item.strategy.document).map_err(context)?;
+        let instance_id = item.strategy.instance_id.clone().ok_or_else(|| {
+            invalid(format!(
+                "instances[{index}]: a portfolio instance requires strategy.instance_id"
+            ))
+        })?;
+        if !identities.insert(instance_id.clone()) {
+            return Err(invalid(format!(
+                "instances[{index}]: instance '{instance_id}' appears more than once"
+            )));
+        }
+        let geometry = item
+            .strategy
+            .sources
+            .iter()
+            .map(|binding| geometry_from_msg(binding, &symbol, bar_seconds))
+            .collect::<Result<Vec<_>>>()
+            .map_err(context)?;
+        let adapter = build_adapter(
+            &document,
+            &instance_id,
+            &symbol,
+            geometry.clone(),
+            item.strategy.decision_latency_ms,
+            limits,
+        )
+        .map_err(context)?;
+        retained += adapter
+            .series_specs()
+            .map(|series| series.retained_bars())
+            .sum::<usize>();
+        let profiles = resolve_entry_profiles(
+            state,
+            item.profile.as_ref(),
+            item.profile_def.as_ref(),
+            &item.entry_profile_routes,
+        )
+        .map_err(context)?;
+        adapter
+            .preflight_entry_profiles(&profiles)
+            .map_err(|error| {
+                invalid(format!(
+                    "instances[{index}]: entry profile routing: {error}"
+                ))
+            })?;
+        emits_entries |= !adapter.configured_requirements().entries.is_empty();
+        instances.push(AcceptedPortfolioInstance {
+            document,
+            document_value: item.strategy.document.clone(),
+            sources: item.strategy.sources.clone(),
+            geometry,
+            symbol,
+            instance_id,
+            decision_latency_ms: item.strategy.decision_latency_ms,
+            profiles,
+        });
+    }
+    if retained > limits.max_retained_bars {
+        return Err(invalid(format!(
+            "the portfolio retains {retained} bars across all instances, above the server limit of {}",
+            limits.max_retained_bars
+        )));
+    }
+    if emits_entries && spec.config.sizing.is_none() {
+        return Err(invalid(
+            "a portfolio whose strategies emit Entry actions requires config.sizing".into(),
+        ));
+    }
+    let mut symbols = instances
+        .iter()
+        .map(|instance| instance.symbol.clone())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    let config = config_from_msg(&spec.config, &state.symbol_registry, &symbols)?;
+    evaluation_options_from_msg_for_symbols(&req.evaluation, &state.symbol_registry, &symbols)?;
+    let (policies, mut groups) = decode_supervisor(spec.policies.as_ref(), spec.groups.as_ref())?;
+    // Group symbols name symbols the same way instance symbols do, so a cap compares normalized symbols; a group that names none of the portfolio's symbols could never apply and is almost certainly a mistake.
+    for group in &mut groups {
+        group.symbols = group
+            .symbols
+            .iter()
+            .map(|symbol| normalize_symbol(&state.symbol_registry, symbol.trim()))
+            .collect();
+        if !group.symbols.iter().any(|symbol| symbols.contains(symbol)) {
+            return Err(invalid(format!(
+                "group '{}' names none of the portfolio's symbols {}",
+                group.id,
+                symbols.join(", ")
+            )));
+        }
+    }
+    if policies
+        .iter()
+        .any(|policy| matches!(policy, RiskPolicy::GroupRiskCap { .. }))
+        && !matches!(
+            config.sizing,
+            Some(qs_backtest::sizing::SizingPolicy::FixedRiskAmount { .. })
+                | Some(qs_backtest::sizing::SizingPolicy::BalanceRiskPercent { .. })
+        )
+    {
+        return Err(invalid(
+            "a group risk cap needs a monetary sizing policy, because a fixed-lot entry's risk is unknown until it fills".into(),
+        ));
+    }
+    let from = parse_optional_datetime(&spec.from)?;
+    let to = parse_optional_datetime(&spec.to)?;
+    if let (Some(from), Some(to)) = (from, to)
+        && from >= to
+    {
+        return Err(invalid(format!("from {from} must be before to {to}")));
+    }
+    Ok(AcceptedPortfolioRun {
+        instances,
+        symbols,
+        exchange: spec.exchange.to_lowercase(),
+        data_type: spec.data_type.to_lowercase(),
+        timeframe: spec.timeframe.clone(),
+        requested_from: spec.from.clone(),
+        requested_to: spec.to.clone(),
+        from,
+        to,
+        config: spec.config.clone(),
+        future: req.future.clone(),
+        evaluation: req.evaluation.clone(),
+        policies,
+        groups,
+        delivery: req.result_delivery,
+    })
+}
+
+fn execute_portfolio_run(
+    state: &ServerState,
+    run: &AcceptedPortfolioRun,
+    cancellation: &JobCancellationToken,
+    progress: &mut dyn FnMut(BacktestProgress),
+) -> Result<BacktestResultMsg> {
+    ensure_not_cancelled(Some(cancellation))?;
+    let mut adapters = Vec::with_capacity(run.instances.len());
+    let mut instance_starts = Vec::with_capacity(run.instances.len());
+    let mut loading_start: Option<NaiveDateTime> = None;
+    for instance in &run.instances {
+        let adapter = build_adapter(
+            &instance.document,
+            &instance.instance_id,
+            &instance.symbol,
+            instance.geometry.clone(),
+            instance.decision_latency_ms,
+            &state.strategies.limits,
+        )?;
+        if let Some(from) = run.from {
+            let start = ConfiguredHistoricalBindings::from_geometry(
+                instance.geometry.clone(),
+                adapter.configured_requirements(),
+            )
+            .and_then(|bindings| bindings.warmup_start(from))
+            .map_err(|error| invalid(error.to_string()))?;
+            loading_start = Some(loading_start.map_or(start, |current| current.min(start)));
+            instance_starts.push(Some(start));
+        } else {
+            instance_starts.push(None);
+        }
+        adapters.push(adapter);
+    }
+    let symbols = run.symbols.clone();
+    let total_symbols = symbols.len() as u64;
+    let evaluation_options =
+        evaluation_options_from_msg_for_symbols(&run.evaluation, &state.symbol_registry, &symbols)?;
+    let mut config = config_from_msg(&run.config, &state.symbol_registry, &symbols)?;
+    let account_currency = account_currency_from_msg(&run.future)?;
+
+    progress(BacktestProgress {
+        stage: "loading_data".into(),
+        total_symbols,
+        ..BacktestProgress::default()
+    });
+    let mut cancelled = || cancellation.is_cancelled();
+    let mut primary = describe_primary_market_stream(
+        &state.data_dir,
+        &run.exchange,
+        &symbols,
+        &run.data_type,
+        run.timeframe.as_deref(),
+        loading_start,
+        run.to,
+        &mut cancelled,
+        &mut |processed_symbols| {
+            progress(BacktestProgress {
+                stage: "loading_data".into(),
+                processed_symbols,
+                total_symbols,
+                ..BacktestProgress::default()
+            })
+        },
+    )?;
+    primary.apply_bar_point_sizes(&bar_point_sizes(&state.symbol_registry, &symbols));
+    let bundle = describe_future_stream(
+        &state.data_dir,
+        &run.exchange,
+        &state.symbol_registry,
+        &account_currency,
+        &symbols,
+        &run.data_type,
+        loading_start,
+        primary,
+        &mut cancelled,
+    )?;
+    let primary_eod = bundle.description.primary_eod();
+    if let Some(loading_start) = loading_start {
+        let mut instrument_symbols = symbols.clone();
+        instrument_symbols.extend(bundle.currency_plan.conversion_symbols().iter().cloned());
+        instrument_symbols.sort();
+        instrument_symbols.dedup();
+        let mut manifest = state.instrument_domain.resolve_manifest(
+            &instrument_symbols,
+            loading_start,
+            primary_eod.or(run.to),
+        )?;
+        state.instrument_domain.attach_stored_series(
+            &mut manifest,
+            bundle.description.stored_series_coordinates(),
+        )?;
+        bundle
+            .description
+            .validate_stored_series_bindings(&manifest)?;
+        config.instrument_manifest = Some(manifest);
+    }
+    let future_config = future_config_from_msg(&run.future, bundle.currency_plan)?;
+    let token = cancellation.clone();
+    let stream_cancellation: CancellationCheck = Arc::new(move || token.is_cancelled());
+    let mut feed = bundle.description.open(stream_cancellation)?;
+    ensure_not_cancelled(Some(cancellation))?;
+    progress(BacktestProgress {
+        stage: "replay".into(),
+        processed_symbols: total_symbols,
+        total_symbols,
+        ..BacktestProgress::default()
+    });
+    let requirements = adapters
+        .iter()
+        .map(|adapter| requirements_value(adapter.configured_requirements()))
+        .collect::<Vec<_>>();
+    let mut instances = Vec::with_capacity(adapters.len());
+    for ((adapter, accepted), start) in adapters
+        .into_iter()
+        .zip(&run.instances)
+        .zip(instance_starts)
+    {
+        let analysis = AnalysisPipeline::new(
+            Vec::new(),
+            ObservationStoreLimits::default(),
+            AnnotationLimits::default(),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        // The shared feed starts at the earliest warmup; each instance reads from its own, as a single run would.
+        let mut instance = ConfiguredInstance::new(adapter, analysis)
+            .with_entry_profiles(accepted.profiles.clone());
+        if let Some(start) = start {
+            instance = instance.with_feed_from(start);
+        }
+        instances.push(instance);
+    }
+    let supervisor = if run.policies.is_empty() {
+        None
+    } else {
+        Some(
+            PortfolioSupervisor::new(run.policies.clone(), run.groups.clone())
+                .map_err(|error| invalid(format!("invalid policies: {error}")))?,
+        )
+    };
+    let output = BacktestRunner::new_future(config, future_config)
+        .with_evaluation_options(evaluation_options)
+        .run_portfolio_future_streaming_controlled(
+            &mut feed,
+            primary_eod,
+            instances,
+            supervisor,
+            StrategyRetentionLimits::default(),
+            || cancellation.is_cancelled(),
+            |ReplayProgress {
+                 processed_events,
+                 total_events,
+                 ..
+             }| {
+                progress(BacktestProgress {
+                    stage: "replay".into(),
+                    processed_events: processed_events as u64,
+                    total_events: total_events as u64,
+                    processed_symbols: total_symbols,
+                    total_symbols,
+                    ..BacktestProgress::default()
+                })
+            },
+        )
+        .map_err(map_portfolio_replay_error)?;
+    ensure_not_cancelled(Some(cancellation))?;
+
+    let mut result = output.replay;
+    attach_portfolio_metadata(&mut result, run, loading_start);
+    let mut message = result_to_msg(&result);
+    let mut instance_outputs = Vec::with_capacity(output.instances.len());
+    for ((instance, accepted), requirements) in output
+        .instances
+        .iter()
+        .zip(&run.instances)
+        .zip(requirements)
+    {
+        instance_outputs.push(PortfolioInstanceOutputMsg {
+            instance_id: instance.instance_id.clone(),
+            symbol: accepted.symbol.clone(),
+            strategy: ConfiguredStrategyOutputMsg {
+                document: accepted.document_value.clone(),
+                sources: accepted.sources.clone(),
+                requirements,
+                data_mode: data_mode(&run.data_type).into(),
+                decisions: to_json(&instance.decisions)?,
+                research: to_json(&instance.research)?,
+            },
+        });
+    }
+    message.portfolio = Some(PortfolioOutputMsg {
+        instances: instance_outputs,
+        policies: if run.policies.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "policies": to_json(&run.policies)?,
+                "groups": to_json(&run.groups)?,
+            }))
+        },
+        supervisor: output.supervisor.as_ref().map(to_json).transpose()?,
+    });
+    Ok(message)
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> Result<serde_json::Value> {
+    serde_json::to_value(value).map_err(|error| BacktestServerError::Serde(error.to_string()))
+}
+
+fn map_portfolio_replay_error(
+    error: PortfolioReplayError<MarketStreamError>,
+) -> BacktestServerError {
+    match error {
+        PortfolioReplayError::Cancelled => BacktestServerError::Cancelled,
+        PortfolioReplayError::Feed(error) => {
+            map_streaming_replay_error(StreamingReplayError::Feed(error))
+        }
+        PortfolioReplayError::Instance {
+            instance_id,
+            source: StrategyReplayError::Input(error),
+        } => invalid(format!("instance '{instance_id}': {error}")),
+        error @ (PortfolioReplayError::NoInstances
+        | PortfolioReplayError::TooManyInstances(_)
+        | PortfolioReplayError::DuplicateInstanceIdentity { .. }
+        | PortfolioReplayError::Input(_)
+        | PortfolioReplayError::MixedPrimaryInput { .. }
+        | PortfolioReplayError::Supervisor(_)) => invalid(error.to_string()),
+        other => BacktestServerError::Strategy(other.to_string()),
+    }
+}
+
+/// Record the reproducibility tags of a configured run for the whole portfolio, with instances and policies listed.
+fn attach_portfolio_metadata(
+    result: &mut BacktestResult,
+    run: &AcceptedPortfolioRun,
+    loading_start: Option<NaiveDateTime>,
+) {
+    let Some(metadata) = result.execution_metadata.as_mut() else {
+        return;
+    };
+    let tags = &mut metadata.tags;
+    tags.insert("data.exchange".into(), run.exchange.clone());
+    tags.insert("data.type".into(), run.data_type.clone());
+    tags.insert(
+        "data.timeframe".into(),
+        run.timeframe.clone().unwrap_or_else(|| "none".into()),
+    );
+    tags.insert(
+        "data.requested_from".into(),
+        run.requested_from
+            .clone()
+            .unwrap_or_else(|| "unbounded".into()),
+    );
+    tags.insert(
+        "data.requested_to".into(),
+        run.requested_to
+            .clone()
+            .unwrap_or_else(|| "unbounded".into()),
+    );
+    tags.insert("data.symbols".into(), run.symbols.join(","));
+    tags.insert(
+        "data.loading_from".into(),
+        loading_start
+            .map(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "none".into()),
+    );
+    if run.data_type == "bar" {
+        tags.insert(
+            "data.bar_quote_convention".into(),
+            "open_range_close".into(),
+        );
+        tags.insert("data.intrabar_order".into(), "adverse_extreme_first".into());
+    }
+    tags.insert(
+        "strategy.data_mode".into(),
+        data_mode(&run.data_type).into(),
+    );
+    tags.insert(
+        "portfolio.instances".into(),
+        run.instances
+            .iter()
+            .map(|instance| format!("{}/{}", instance.document.strategy_id, instance.instance_id))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    tags.insert(
+        "portfolio.policies".into(),
+        if run.policies.is_empty() {
+            "none".into()
+        } else {
+            run.policies
+                .iter()
+                .map(RiskPolicy::name)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
     );
 }
 

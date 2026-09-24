@@ -12,8 +12,9 @@ use crate::{
     GetSearchResultResponse, ListProfilesResponse, ListSymbolsRequest, ListSymbolsResponse,
     PingResponse, ReloadProfilesResponse, RemoveProfileRequest, RemoveProfileResponse,
     RunBacktestMultiRequest, RunBacktestMultiResponse, RunBacktestRequest, RunBacktestResponse,
-    RunConfiguredStrategyRequest, SubmitBacktestRequest, SubmitBacktestResponse,
-    SubmitConfiguredStrategyRequest, SubmitSearchRequest,
+    RunConfiguredStrategyRequest, RunPortfolioRequest, SubmitBacktestRequest,
+    SubmitBacktestResponse, SubmitConfiguredStrategyRequest, SubmitPortfolioRequest,
+    SubmitSearchRequest,
 };
 
 pub type BacktestEventStream =
@@ -64,7 +65,7 @@ pub trait BacktestDiscoveryClient: Send + Sync {
     ) -> Result<ListSymbolsResponse, BacktestClientError>;
 }
 
-/// Provider-neutral client port for configured strategy runs and server-side parameter searches.
+/// Provider-neutral client port for configured strategy runs, portfolio runs, and server-side parameter searches.
 ///
 /// Submitted jobs share the retained-job workflow: status, watch, cancel, results, and artifacts go through [`BacktestClient`] with the returned job ID.
 #[async_trait]
@@ -76,6 +77,14 @@ pub trait BacktestStrategyClient: Send + Sync {
     async fn submit_configured_strategy(
         &self,
         request: SubmitConfiguredStrategyRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError>;
+    async fn run_portfolio(
+        &self,
+        request: RunPortfolioRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError>;
+    async fn submit_portfolio(
+        &self,
+        request: SubmitPortfolioRequest,
     ) -> Result<SubmitBacktestResponse, BacktestClientError>;
     async fn submit_search(
         &self,

@@ -8,8 +8,8 @@
 mod strategy;
 
 pub use strategy::{
-    handle_get_search_result, handle_run_configured_strategy, handle_submit_configured_strategy,
-    handle_submit_search,
+    handle_get_search_result, handle_run_configured_strategy, handle_run_portfolio,
+    handle_submit_configured_strategy, handle_submit_portfolio, handle_submit_search,
 };
 
 use std::collections::{BTreeSet, HashMap};
@@ -106,6 +106,7 @@ pub struct AcceptedBacktestJobInput {
 pub enum AcceptedJobInput {
     Backtest(Box<AcceptedBacktestJobInput>),
     ConfiguredStrategy(Box<strategy::AcceptedConfiguredRun>),
+    Portfolio(Box<strategy::AcceptedPortfolioRun>),
     Search(Box<strategy::AcceptedSearch>),
 }
 
@@ -1022,9 +1023,9 @@ fn attach_future_reproducibility_metadata(
     if req.data_type.eq_ignore_ascii_case("bar") {
         tags.insert(
             "data.bar_quote_convention".into(),
-            "close_only_zero_spread".into(),
+            "open_range_close".into(),
         );
-        tags.insert("data.intrabar_simulation".into(), "false".into());
+        tags.insert("data.intrabar_order".into(), "adverse_extreme_first".into());
     }
 
     match profile {
@@ -2317,6 +2318,9 @@ pub fn run_job_and_store(state: Arc<ServerState>, job_id: String) {
         }
         Some(AcceptedJobInput::ConfiguredStrategy(accepted)) => {
             strategy::run_configured_job(state, job_id, *accepted)
+        }
+        Some(AcceptedJobInput::Portfolio(accepted)) => {
+            strategy::run_portfolio_job(state, job_id, *accepted)
         }
         Some(AcceptedJobInput::Search(accepted)) => {
             strategy::run_search_job(state, job_id, *accepted)

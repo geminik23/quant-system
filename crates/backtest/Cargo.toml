@@ -19,6 +19,7 @@ qs-instruments = { workspace = true }
 qs-data-preprocess = { workspace = true }
 qs-symbols = { workspace = true }
 qs-strategy = { workspace = true }
+qs-risk = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
@@ -26,6 +27,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+qs-risk = { workspace = true }
 serde_json = { workspace = true }
 qs-data-preprocess = { workspace = true, features = ["parquet"] }
 

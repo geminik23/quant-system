@@ -35,6 +35,8 @@ fn row(window: &str, fast: &str, slow: &str) -> ResearchRow {
         forced_closes: 1,
         entries_before_window: 0,
         points_total: 2,
+        rejected_entries: None,
+        halt_minutes: None,
     }
 }
 

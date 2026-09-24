@@ -1643,7 +1643,7 @@ fn effective_start_after_requested_end_returns_zero_trade_result() {
 }
 
 #[test]
-fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_claims() {
+fn future_quote_bar_result_records_reproducibility_metadata_and_intrabar_order() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1743,8 +1743,8 @@ fn future_quote_bar_result_records_reproducibility_metadata_without_intrabar_cla
     assert_eq!(tags["data.timeframe"], "1m");
     assert_eq!(tags["data.requested_from"], "2026-01-15T10:00:00");
     assert_eq!(tags["data.requested_to"], "2026-01-15T10:00:02");
-    assert_eq!(tags["data.bar_quote_convention"], "close_only_zero_spread");
-    assert_eq!(tags["data.intrabar_simulation"], "false");
+    assert_eq!(tags["data.bar_quote_convention"], "open_range_close");
+    assert_eq!(tags["data.intrabar_order"], "adverse_extreme_first");
     assert_eq!(tags["execution.signal_latency_ms"], "750");
     assert_eq!(tags["profile.identity"], "future-parity");
     assert_eq!(tags["sizing.identity"], "fixed_lot");

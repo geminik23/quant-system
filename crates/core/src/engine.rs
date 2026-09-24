@@ -432,8 +432,46 @@ impl TradeEngine {
         pricer: &ExecutionPricer,
         pip_size: f64,
     ) -> FutureApplyResult<FutureEngineTransaction> {
+        self.begin_on_price_future_effects_priced_filtered(
+            quote,
+            prepared_pending,
+            pricer,
+            pip_size,
+            None,
+        )
+    }
+
+    /// Apply one quote in place to the pending and open positions of one side only, and retain a rollback token.
+    ///
+    /// A bar replay walks a different intrabar price path for long and short exposure, so each path's quotes must settle only the positions that path belongs to.
+    pub fn begin_on_price_future_effects_priced_for_side(
+        &mut self,
+        quote: &PriceQuote,
+        prepared_pending: &[PreparedPendingFill],
+        pricer: &ExecutionPricer,
+        pip_size: f64,
+        side: Side,
+    ) -> FutureApplyResult<FutureEngineTransaction> {
+        self.begin_on_price_future_effects_priced_filtered(
+            quote,
+            prepared_pending,
+            pricer,
+            pip_size,
+            Some(side),
+        )
+    }
+
+    fn begin_on_price_future_effects_priced_filtered(
+        &mut self,
+        quote: &PriceQuote,
+        prepared_pending: &[PreparedPendingFill],
+        pricer: &ExecutionPricer,
+        pip_size: f64,
+        side: Option<Side>,
+    ) -> FutureApplyResult<FutureEngineTransaction> {
         let checkpoint = self.checkpoint_for_quote(quote);
-        match self.on_price_future_effects_in_place(quote, prepared_pending, pricer, pip_size) {
+        match self.on_price_future_effects_in_place(quote, prepared_pending, pricer, pip_size, side)
+        {
             Ok(effects) => Ok(FutureEngineTransaction {
                 effects,
                 checkpoint,
@@ -515,12 +553,30 @@ impl TradeEngine {
         prepared_pending: &[PreparedPendingFill],
         pricer: &ExecutionPricer,
         pip_size: f64,
+        side: Option<Side>,
     ) -> FutureApplyResult<Vec<FutureEffect>> {
         self.last_quotes.insert(quote.symbol.clone(), quote.clone());
 
         let fill_model = self.fill_model;
-        let existing_open_ids = self.manager.open_ids_by_symbol_sorted(&quote.symbol);
-        let pending_ids = self.manager.pending_ids_by_symbol_sorted(&quote.symbol);
+        let on_side = |manager: &PositionManager, id: &PositionId| {
+            side.is_none_or(|side| {
+                manager
+                    .get(id)
+                    .is_some_and(|position| position.data.side == side)
+            })
+        };
+        let existing_open_ids = self
+            .manager
+            .open_ids_by_symbol_sorted(&quote.symbol)
+            .into_iter()
+            .filter(|id| on_side(&self.manager, id))
+            .collect::<Vec<_>>();
+        let pending_ids = self
+            .manager
+            .pending_ids_by_symbol_sorted(&quote.symbol)
+            .into_iter()
+            .filter(|id| on_side(&self.manager, id))
+            .collect::<Vec<_>>();
         let mut all_effects = Vec::new();
 
         for id in pending_ids {

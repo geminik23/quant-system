@@ -85,20 +85,68 @@ fn stored_bar_run_makes_the_same_decisions_as_the_tick_run() {
     assert_eq!(decisions(&bars), expected);
 }
 
+/// The same stored bars with an open below the close, so an open fill and a close fill differ while the closes the strategy reads are unchanged.
+fn stored_bar_feed_with_distinct_opens() -> VecFeed {
+    let events = crossover_events()
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let MarketEvent::Tick {
+                symbol, ts, bid, ..
+            } = event
+            else {
+                unreachable!("the crossover fixture is tick-only");
+            };
+            FeedEvent::new(
+                MarketEvent::Bar {
+                    symbol,
+                    ts,
+                    open: bid - OPEN_OFFSET,
+                    high: bid,
+                    low: bid - OPEN_OFFSET,
+                    close: bid,
+                    volume: 0,
+                    spread: Some(SPREAD),
+                    timeframe_seconds: Some(60),
+                    tick_count: Some(1),
+                },
+                EventMetadata::new(SeriesRoles::PRIMARY, 0, index as u64),
+            )
+        })
+        .collect();
+    VecFeed::from_feed_events(events)
+}
+
+const OPEN_OFFSET: f64 = 0.00005;
+
 #[test]
-fn stored_bar_fills_use_bar_close_quotes_rather_than_intrabar_prices() {
-    let bars = run(stored_bar_feed());
+fn a_stored_bar_decision_fills_at_the_open_of_the_bar_that_revealed_it() {
+    let bars = run(stored_bar_feed_with_distinct_opens());
+    let decision = bars
+        .decisions
+        .records
+        .iter()
+        .find(|record| !record.emitted_signals().is_empty())
+        .expect("the crossover decides to enter");
     let entry = bars
         .replay
         .recorded_fills
         .first()
         .expect("the crossover enters");
-    let bar_close = entry.bid + SPREAD / 2.0;
-    assert!((entry.fill.price - (bar_close + SPREAD / 2.0)).abs() < 1e-12);
-    assert!(
-        crossover_events()
-            .iter()
-            .any(|event| event.ts() == entry.execution_ts.unwrap()),
-        "a bar fill happens at a stored bar timestamp"
-    );
+    let decided_at = decision.observed_through();
+    assert_eq!(entry.execution_ts, Some(decided_at));
+
+    let tick_bid = crossover_events()
+        .into_iter()
+        .find_map(|event| match event {
+            MarketEvent::Tick { ts, bid, .. } if ts == decided_at => Some(bid),
+            _ => None,
+        })
+        .expect("a decision happens at a stored bar timestamp");
+    let open = tick_bid - OPEN_OFFSET;
+    let expected = match entry.fill.side {
+        qs_core::types::Side::Buy => open + SPREAD / 2.0,
+        qs_core::types::Side::Sell => open - SPREAD / 2.0,
+    };
+    assert!((entry.fill.price - expected).abs() < 1e-12);
 }

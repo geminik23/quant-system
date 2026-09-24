@@ -55,6 +55,7 @@ pub use currency::{
     ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,
     RunCurrencyPlan, RunCurrencyPlanError, resolve_conversion_route, resolve_fx_pair,
 };
+pub use data_feed::BarExecutionPrices;
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
 pub use economic_support::{
     EconomicSupportError, LEGACY_ECONOMIC_GUARD_ID, LegacyEconomicModel, SupportedLegacyEconomics,
@@ -119,4 +120,9 @@ pub use strategy::{
     StrategyRequirements, StrategyResearchLimits, StrategyResearchOutput, StrategyRetentionLimits,
     StrategyRuntimeError, SwingKind, SwingPoint, Timeframe, WarmupRequirement, ZoneId, ZoneSide,
     ZoneSource, ZoneState,
+};
+pub use strategy::{
+    ConfiguredInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES, PortfolioBacktestResult,
+    PortfolioInstanceOutput, PortfolioReplayError, SupervisorEvent, SupervisorHaltAction,
+    SupervisorOutput,
 };

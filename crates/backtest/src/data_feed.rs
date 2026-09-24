@@ -72,7 +72,7 @@ impl MarketEvent {
 
     /// Convert the event into a [`PriceQuote`] suitable for the trade engine.
     ///
-    /// A tick carries its own two-sided quote. A bar is priced at its close, and its recorded spread is applied symmetrically around that close. A bar without a recorded spread keeps the historical zero-spread approximation; use [`MarketEvent::to_quote_with_spread_fallback`] to supply one.
+    /// A tick carries its own two-sided quote. A bar yields its closing quote, with its recorded spread applied symmetrically around the close; FutureQuote replay executes a bar through [`MarketEvent::bar_execution_prices`] instead, over its open, range, and close. A bar without a recorded spread keeps the zero-spread approximation; use [`MarketEvent::to_quote_with_spread_fallback`] to supply one.
     pub fn to_quote(&self) -> PriceQuote {
         self.to_quote_with_spread_fallback(None)
     }
@@ -114,6 +114,36 @@ impl MarketEvent {
         }
     }
 
+    /// The execution view of a bar: its prices and half of the spread applied around each of them, using `fallback` when the bar records no spread. `None` for a tick.
+    pub fn bar_execution_prices(&self, fallback: Option<f64>) -> Option<BarExecutionPrices> {
+        match self {
+            MarketEvent::Tick { .. } => None,
+            MarketEvent::Bar {
+                symbol,
+                ts,
+                open,
+                high,
+                low,
+                close,
+                spread,
+                timeframe_seconds,
+                ..
+            } => Some(BarExecutionPrices {
+                symbol: symbol.clone(),
+                ts: *ts,
+                open: *open,
+                high: *high,
+                low: *low,
+                close: *close,
+                half_spread: spread
+                    .or(fallback)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map_or(0.0, |value| value / 2.0),
+                timeframe_seconds: *timeframe_seconds,
+            }),
+        }
+    }
+
     /// Whether this event is a bar that carries no usable spread.
     pub fn is_zero_spread_bar(&self) -> bool {
         matches!(
@@ -128,6 +158,56 @@ impl MarketEvent {
     pub fn to_valid_quote(&self) -> Option<PriceQuote> {
         let quote = self.to_quote();
         ExecutionPricer::validate_quote(&quote).ok().map(|()| quote)
+    }
+}
+
+/// Prices a FutureQuote replay executes a bar against, read as midpoints with a symmetric half spread.
+///
+/// A bar is replayed in three steps stamped at its bucket open: a quote at `open`, a walk through the bar's range, and a quote at `close` used only for marking. The walk visits the adverse extreme first for each side, so long exposure sees `low` before `high` and short exposure sees `high` before `low`, which is the pessimistic order when the bar alone cannot say which came first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarExecutionPrices {
+    pub symbol: String,
+    pub ts: NaiveDateTime,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub half_spread: f64,
+    pub timeframe_seconds: Option<u64>,
+}
+
+impl BarExecutionPrices {
+    /// The bar ready for execution, or `None` when a price is not finite or a quote at its lowest price would not be positive.
+    ///
+    /// A range that does not contain the open and close is widened to contain them, because the bar did trade at both.
+    pub fn executable(mut self) -> Option<Self> {
+        let prices = [self.open, self.high, self.low, self.close, self.half_spread];
+        if prices.iter().any(|price| !price.is_finite()) {
+            return None;
+        }
+        self.high = self.high.max(self.open).max(self.close);
+        self.low = self.low.min(self.open).min(self.close);
+        (self.low - self.half_spread > 0.0).then_some(self)
+    }
+
+    /// Quote whose midpoint is `mid`, with the bar's spread.
+    pub fn quote_at_mid(&self, mid: f64) -> PriceQuote {
+        PriceQuote {
+            symbol: self.symbol.clone(),
+            ts: self.ts,
+            bid: mid - self.half_spread,
+            ask: mid + self.half_spread,
+        }
+    }
+
+    /// Quote at the bar's open, where fills waiting for the bar execute.
+    pub fn open_quote(&self) -> PriceQuote {
+        self.quote_at_mid(self.open)
+    }
+
+    /// Quote at the bar's close, which marks positions after the bar settled.
+    pub fn close_quote(&self) -> PriceQuote {
+        self.quote_at_mid(self.close)
     }
 }
 

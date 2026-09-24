@@ -715,12 +715,90 @@ pub struct ConfiguredStrategyOutputMsg {
     pub sources: Vec<SourceBindingMsg>,
     /// Compiled requirements the run was bound with: per-source completed-bar lookback, trade slots, Entry slots and classes, and stop-managed slots.
     pub requirements: serde_json::Value,
-    /// `ticks` or `bars`; a bar run fills and settles stops at bar-close quotes.
+    /// `ticks` or `bars`; a bar run fills waiting orders at each bar's open and settles stops, targets, and pending orders against its range, meeting the adverse extreme first.
     pub data_mode: String,
     /// Retained configured decisions with the signals each emitted.
     pub decisions: serde_json::Value,
     /// Configured notes and research-only output.
     pub research: serde_json::Value,
+}
+
+// ── Portfolio Runs ──────────────────────────────────────────────────────────
+
+/// One configured strategy instance of a portfolio run, trading one symbol against the shared account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioInstanceMsg {
+    pub symbol: String,
+    /// Strategy document and source bindings. `instance_id` is required here and must be unique in the run, because it labels the instance's positions, reviews, and output.
+    pub strategy: ConfiguredStrategyRunMsg,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profile_def: Option<ManagementProfileMsg>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_profile_routes: Vec<EntryProfileRouteMsg>,
+}
+
+/// Execution scope of a portfolio run: several configured instances, one account, and optional portfolio policies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortfolioRunSpec {
+    pub instances: Vec<PortfolioInstanceMsg>,
+    pub exchange: String,
+    /// `tick`, or `bar` together with `timeframe`; every instance source declares the same bar duration.
+    pub data_type: String,
+    #[serde(default)]
+    pub timeframe: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub config: BacktestConfigMsg,
+    /// Portfolio policies as a JSON array, decoded strictly by the server; omitted or empty means the run has no supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<serde_json::Value>,
+    /// Correlation groups the policies refer to, as a JSON array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<serde_json::Value>,
+}
+
+/// Synchronous portfolio run.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunPortfolioRequest {
+    pub request: PortfolioRunSpec,
+    #[serde(default)]
+    pub future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    pub evaluation: ProviderEvaluationOptionsMsg,
+    #[serde(default)]
+    pub result_delivery: ResultDeliveryMsg,
+}
+
+/// Asynchronous portfolio submission retained as a job.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitPortfolioRequest {
+    pub request: RunPortfolioRequest,
+}
+
+/// What one portfolio instance compiled, decided, and recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioInstanceOutputMsg {
+    pub instance_id: String,
+    pub symbol: String,
+    pub strategy: ConfiguredStrategyOutputMsg,
+}
+
+/// Instance and supervisor output returned with a portfolio run's shared economic result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioOutputMsg {
+    pub instances: Vec<PortfolioInstanceOutputMsg>,
+    /// The decoded policies and groups the run was supervised with, when it had a supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<serde_json::Value>,
+    /// Every review, halt action, and halt interval, when the run had a supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<serde_json::Value>,
 }
 
 // ── Parameter Search ────────────────────────────────────────────────────────
@@ -841,6 +919,9 @@ pub struct BacktestResultMsg {
     /// Strategy document, sources, decisions, and notes when the run executed a configured strategy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<ConfiguredStrategyOutputMsg>,
+    /// Instance and supervisor output when the run executed a portfolio of configured strategies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portfolio: Option<PortfolioOutputMsg>,
     pub initial_balance: f64,
     pub final_balance: f64,
     pub total_pnl: f64,
@@ -1817,6 +1898,83 @@ struct StrictSubmitSearchRequest {
     future: FutureQuoteConfigMsg,
     #[serde(default)]
     evaluation: ProviderEvaluationOptionsMsg,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictPortfolioInstanceMsg {
+    symbol: String,
+    strategy: ConfiguredStrategyRunMsg,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    profile_def: Option<StrictManagementProfileMsg>,
+    #[serde(default)]
+    entry_profile_routes: Vec<StrictEntryProfileRouteMsg>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictPortfolioRunSpec {
+    instances: Vec<StrictPortfolioInstanceMsg>,
+    exchange: String,
+    data_type: String,
+    #[serde(default)]
+    timeframe: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    config: StrictBacktestConfigMsg,
+    #[serde(default)]
+    policies: Option<serde_json::Value>,
+    #[serde(default)]
+    groups: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRunPortfolioRequest {
+    request: StrictPortfolioRunSpec,
+    #[serde(default)]
+    future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    evaluation: ProviderEvaluationOptionsMsg,
+    #[serde(default)]
+    result_delivery: ResultDeliveryMsg,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSubmitPortfolioRequest {
+    request: RunPortfolioRequest,
+}
+
+impl<'de> Deserialize<'de> for RunPortfolioRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let strict = StrictRunPortfolioRequest::deserialize(deserializer)?;
+        Ok(Self {
+            request: strict_into_wire(strict.request).map_err(serde::de::Error::custom)?,
+            future: strict.future,
+            evaluation: strict.evaluation,
+            result_delivery: strict.result_delivery,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitPortfolioRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let strict = StrictSubmitPortfolioRequest::deserialize(deserializer)?;
+        Ok(Self {
+            request: strict.request,
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for RunConfiguredStrategyRequest {

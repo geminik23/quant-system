@@ -12,6 +12,7 @@ pub mod experiment;
 pub mod feedback;
 pub mod geometry;
 pub mod journal;
+pub mod portfolio;
 pub mod replay;
 pub mod runtime;
 pub mod series;
@@ -61,6 +62,11 @@ pub use journal::{
     MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,
     StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput, StrategyJournalRecord,
     StrategyJournalRecorder, StrategyJournalRetention, StrategyResearchLimits,
+};
+pub use portfolio::{
+    ConfiguredInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES, PortfolioBacktestResult,
+    PortfolioInstanceOutput, PortfolioReplayError, SupervisorEvent, SupervisorHaltAction,
+    SupervisorOutput,
 };
 pub use replay::{StrategyReplayError, StrategyReplayInputError};
 pub use runtime::{

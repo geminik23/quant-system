@@ -811,6 +811,51 @@ impl Position {
         effects
     }
 
+    /// Every price at which a quote could change this position under FutureQuote evaluation: a pending order's requested price, or an open position's fixed stop, current trailing-stop level, untriggered targets, and untriggered breakeven triggers.
+    ///
+    /// Pending levels are compared against the quote's fill price and open levels against its evaluation price, so a caller that walks a price path can place one quote exactly at each level.
+    pub fn future_trigger_levels(&self) -> Vec<f64> {
+        match self.data.status {
+            PositionStatus::Pending => self.data.pending_price.into_iter().collect(),
+            PositionStatus::Open => {
+                let average_entry = self.data.average_entry();
+                self.rules
+                    .iter()
+                    .filter_map(|rule| match rule {
+                        Rule::FixedStoploss { price } => Some(*price),
+                        Rule::TrailingStop {
+                            distance,
+                            peak_price,
+                            initialized,
+                        } => {
+                            let peak = if *initialized {
+                                *peak_price
+                            } else {
+                                average_entry
+                            };
+                            Some(match self.data.side {
+                                Side::Buy => peak - *distance,
+                                Side::Sell => peak + *distance,
+                            })
+                        }
+                        Rule::TakeProfit {
+                            price,
+                            triggered: false,
+                            ..
+                        } => Some(*price),
+                        Rule::BreakevenWhen {
+                            trigger_price,
+                            triggered: false,
+                        } => Some(*trigger_price),
+                        _ => None,
+                    })
+                    .filter(|level| level.is_finite() && *level > 0.0)
+                    .collect()
+            }
+            PositionStatus::Closed | PositionStatus::Cancelled => Vec::new(),
+        }
+    }
+
     /// Find the current fixed-stoploss price, if any.
     pub fn current_effective_stop(&self) -> Option<crate::types::EffectiveStop> {
         self.current_stoploss()

@@ -24,7 +24,8 @@ use backtest_server::handlers::{
 };
 use backtest_server::handlers::{
     StrategyServiceState, handle_get_search_result, handle_run_configured_strategy,
-    handle_submit_configured_strategy, handle_submit_search,
+    handle_run_portfolio, handle_submit_configured_strategy, handle_submit_portfolio,
+    handle_submit_search,
 };
 use qs_backtest_api::*;
 
@@ -253,7 +254,20 @@ fn register_client_handlers(
         );
     }
 
-    // ── Register: submit_configured_strategy and submit_search ──
+    // ── Register: run_portfolio ──
+    {
+        let state = state.clone();
+        server.register_typed("run_portfolio", move |req: RunPortfolioRequest| {
+            let state = state.clone();
+            async move {
+                tokio::task::spawn_blocking(move || handle_run_portfolio(&state, &req))
+                    .await
+                    .map_err(|e| xrpc::RpcError::ServerError(format!("portfolio task failed: {e}")))
+            }
+        });
+    }
+
+    // ── Register: submit_configured_strategy, submit_portfolio, and submit_search ──
     {
         let state = state.clone();
         let blocking_jobs = blocking_jobs.clone();
@@ -274,6 +288,24 @@ fn register_client_handlers(
                 }
             },
         );
+    }
+    {
+        let state = state.clone();
+        let blocking_jobs = blocking_jobs.clone();
+        server.register_typed("submit_portfolio", move |req: SubmitPortfolioRequest| {
+            let state = state.clone();
+            let blocking_jobs = blocking_jobs.clone();
+            async move {
+                let submitted = handle_submit_portfolio(&state, &req);
+                if let Some(ref id) = submitted.job_id {
+                    let id = id.clone();
+                    let st = state.clone();
+                    let handle = tokio::task::spawn_blocking(move || run_job_and_store(st, id));
+                    track_blocking_job(&blocking_jobs, handle);
+                }
+                Ok(submitted)
+            }
+        });
     }
     {
         let state = state.clone();
@@ -598,6 +630,8 @@ mod tests {
             "submit_backtest",
             "run_configured_strategy",
             "submit_configured_strategy",
+            "run_portfolio",
+            "submit_portfolio",
             "submit_search",
             "get_search_result",
         ] {

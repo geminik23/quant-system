@@ -20,7 +20,7 @@ pub use error::{ResearchError, RunFailure};
 pub use family::StrategyFamily;
 pub use geometry::SeriesGeometry;
 pub use loader::{load_symbol_bars, load_symbol_ticks};
-pub use plan::ResearchPlan;
+pub use plan::{PortfolioPlan, ResearchPlan};
 pub use runner::{
     BatchProgress, ResearchBatch, SymbolEvents, batch_data_range, run_batch, run_batch_controlled,
     validate_batch,

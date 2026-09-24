@@ -149,6 +149,9 @@ pub struct StrategiesSection {
     /// Most runs, counted as points times symbols times windows, one search may schedule.
     #[serde(default = "default_max_search_runs")]
     pub max_search_runs: usize,
+    /// Most configured strategy instances one portfolio run may replay together; `max_retained_bars` bounds their combined retained history.
+    #[serde(default = "default_max_portfolio_instances")]
+    pub max_portfolio_instances: usize,
 }
 
 impl Default for StrategiesSection {
@@ -158,6 +161,7 @@ impl Default for StrategiesSection {
             max_retained_bars: default_max_retained_bars(),
             max_search_workers: default_max_search_workers(),
             max_search_runs: default_max_search_runs(),
+            max_portfolio_instances: default_max_portfolio_instances(),
         }
     }
 }
@@ -176,6 +180,10 @@ fn default_max_search_workers() -> usize {
 
 fn default_max_search_runs() -> usize {
     20_000
+}
+
+fn default_max_portfolio_instances() -> usize {
+    16
 }
 
 /// Large-result artifact storage settings.

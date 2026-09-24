@@ -2,10 +2,33 @@ use std::collections::HashSet;
 
 use qs_backtest::evaluation::EvaluationOptions;
 use qs_backtest::runner::BacktestConfig;
+use qs_backtest::sizing::SizingPolicy;
 use qs_backtest::{FutureQuoteConfig, PreparedEntryProfiles, StrategyRetentionLimits};
+use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
 
 use crate::error::ResearchError;
 use crate::window::WindowPlan;
+
+/// Replay every symbol of the plan together, one instance per symbol against one account, instead of one run per symbol.
+///
+/// Each run then covers one point over one window, and a supervisor built from `policies` and `groups` reviews the instances' entries. Empty policies replay the portfolio without supervision.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PortfolioPlan {
+    pub policies: Vec<RiskPolicy>,
+    pub groups: Vec<CorrelationGroup>,
+}
+
+impl PortfolioPlan {
+    /// A fresh supervisor for one run, or `None` when the plan declares no policy.
+    pub(crate) fn supervisor(&self) -> Result<Option<PortfolioSupervisor>, ResearchError> {
+        if self.policies.is_empty() {
+            return Ok(None);
+        }
+        PortfolioSupervisor::new(self.policies.clone(), self.groups.clone())
+            .map(Some)
+            .map_err(|error| ResearchError::InvalidPlan(format!("portfolio policies: {error}")))
+    }
+}
 
 /// Everything a batch needs besides the family and the market data itself.
 #[derive(Debug, Clone)]
@@ -32,6 +55,8 @@ pub struct ResearchPlan {
     pub workers: usize,
     /// Management profiles every run selects from, exactly as raw-signal replay does; `None` runs unprofiled.
     pub entry_profiles: Option<PreparedEntryProfiles>,
+    /// When set, every run replays all symbols together against one account.
+    pub portfolio: Option<PortfolioPlan>,
 }
 
 impl ResearchPlan {
@@ -46,7 +71,13 @@ impl ResearchPlan {
             decision_latency_ms: 0,
             workers: 1,
             entry_profiles: None,
+            portfolio: None,
         }
+    }
+
+    pub fn with_portfolio(mut self, portfolio: PortfolioPlan) -> Self {
+        self.portfolio = Some(portfolio);
+        self
     }
 
     pub fn with_entry_profiles(mut self, profiles: PreparedEntryProfiles) -> Self {
@@ -91,6 +122,20 @@ impl ResearchPlan {
         if self.workers == 0 {
             return Err(ResearchError::InvalidPlan(
                 "a research plan must use at least one worker".into(),
+            ));
+        }
+        if let Some(portfolio) = &self.portfolio
+            && let Some(supervisor) = portfolio.supervisor()?
+            && supervisor.caps_group_risk()
+            && !matches!(
+                self.config.sizing,
+                Some(
+                    SizingPolicy::FixedRiskAmount { .. } | SizingPolicy::BalanceRiskPercent { .. }
+                )
+            )
+        {
+            return Err(ResearchError::InvalidPlan(
+                "a group risk cap needs a monetary sizing policy, because a fixed-lot entry's risk is unknown until it fills".into(),
             ));
         }
         Ok(())

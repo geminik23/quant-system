@@ -181,6 +181,9 @@ pub struct ExecutionMetadata {
     /// These are separate from `tags` so that a caller cannot overwrite an engine diagnostic and an engine diagnostic cannot become a breakdown dimension.
     #[serde(default)]
     pub run_tags: BTreeMap<String, String>,
+    /// Labels that belong to single positions rather than to the whole run, keyed by position ID, such as the instance of a multi-instance run that opened the position. They join the run tags as breakdown dimensions of that position.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub position_tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for ExecutionMetadata {
@@ -206,6 +209,7 @@ impl Default for ExecutionMetadata {
             pnl_epsilon: DEFAULT_PNL_EPSILON,
             tags: BTreeMap::new(),
             run_tags: BTreeMap::new(),
+            position_tags: BTreeMap::new(),
         }
     }
 }

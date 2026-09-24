@@ -14,9 +14,9 @@ use crate::{
     GetSearchResultRequest, GetSearchResultResponse, ListProfilesResponse, ListSymbolsRequest,
     ListSymbolsResponse, PingResponse, ReloadProfilesResponse, RemoveProfileRequest,
     RemoveProfileResponse, RunBacktestMultiRequest, RunBacktestMultiResponse, RunBacktestRequest,
-    RunBacktestResponse, RunConfiguredStrategyRequest, SubmitBacktestRequest,
-    SubmitBacktestResponse, SubmitConfiguredStrategyRequest, SubmitSearchRequest,
-    WatchBacktestRequest,
+    RunBacktestResponse, RunConfiguredStrategyRequest, RunPortfolioRequest, SubmitBacktestRequest,
+    SubmitBacktestResponse, SubmitConfiguredStrategyRequest, SubmitPortfolioRequest,
+    SubmitSearchRequest, WatchBacktestRequest,
 };
 
 /// Backtest connection facade. Its public contract is provider-neutral.
@@ -200,6 +200,26 @@ impl BacktestStrategyClient for BacktestXrpcClient {
     ) -> Result<SubmitBacktestResponse, BacktestClientError> {
         self.session
             .call("submit_configured_strategy", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn run_portfolio(
+        &self,
+        request: RunPortfolioRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError> {
+        self.session
+            .call("run_portfolio", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn submit_portfolio(
+        &self,
+        request: SubmitPortfolioRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError> {
+        self.session
+            .call("submit_portfolio", &request)
             .await
             .map_err(map_provider_error)
     }

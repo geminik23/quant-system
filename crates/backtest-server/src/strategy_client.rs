@@ -1,6 +1,6 @@
-//! TOML run files that describe a configured strategy run or a parameter search for the backtest service.
+//! TOML run files that describe a configured strategy run, a portfolio run, or a parameter search for the backtest service.
 //!
-//! A run file names a bound strategy document, or a strategy template and a space document, by path relative to the run file, together with the data scope, profiles, sizing, and series geometry. Documents stay in their TOML authoring form on disk and are converted to JSON values only when the request is built, because the service transport is JSON and the service decodes documents strictly.
+//! A run file names a bound strategy document, a list of `[[instances]]` each naming one, or a strategy template and a space document, by path relative to the run file, together with the data scope, profiles, sizing, and series geometry. A portfolio run file may also carry `[[policies]]` and `[[groups]]` for its supervisor. Documents stay in their TOML authoring form on disk and are converted to JSON values only when the request is built, because the service transport is JSON and the service decodes documents and policies strictly.
 
 use std::path::{Path, PathBuf};
 
@@ -8,16 +8,34 @@ use serde::Deserialize;
 
 use crate::rpc_types::{
     BacktestConfigMsg, ConfiguredStrategyRunMsg, ConfiguredStrategyRunSpec, EntryProfileRouteMsg,
-    FutureQuoteConfigMsg, ProfileRef, ProviderEvaluationOptionsMsg, ResultDeliveryMsg,
-    RunConfiguredStrategyRequest, SearchRunSpec, SearchWindowsMsg, SourceBindingMsg,
-    SubmitConfiguredStrategyRequest, SubmitSearchRequest,
+    FutureQuoteConfigMsg, PortfolioInstanceMsg, PortfolioRunSpec, ProfileRef,
+    ProviderEvaluationOptionsMsg, ResultDeliveryMsg, RunConfiguredStrategyRequest,
+    RunPortfolioRequest, SearchRunSpec, SearchWindowsMsg, SourceBindingMsg,
+    SubmitConfiguredStrategyRequest, SubmitPortfolioRequest, SubmitSearchRequest,
 };
 
 /// A request built from a run file, ready to submit.
 #[derive(Debug, Clone)]
 pub enum StrategyClientRequest {
     Run(SubmitConfiguredStrategyRequest),
+    Portfolio(SubmitPortfolioRequest),
     Search(SubmitSearchRequest),
+}
+
+/// One `[[instances]]` entry of a portfolio run file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstanceFile {
+    strategy: PathBuf,
+    symbol: String,
+    instance_id: String,
+    #[serde(default)]
+    decision_latency_ms: u64,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    entry_profile_routes: Vec<RouteFile>,
+    series: Vec<SourceBindingMsg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +75,12 @@ struct RunFile {
     decision_latency_ms: u64,
     #[serde(default)]
     workers: Option<usize>,
+    #[serde(default)]
+    instances: Vec<InstanceFile>,
+    #[serde(default)]
+    policies: Vec<toml::Value>,
+    #[serde(default)]
+    groups: Vec<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,14 +106,74 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
         account_currency: file.account_currency.clone(),
         ..FutureQuoteConfigMsg::default()
     };
-    let routes = file
-        .entry_profile_routes
-        .iter()
-        .map(|route| EntryProfileRouteMsg {
-            entry_class: route.entry_class.clone(),
-            profile: ProfileRef::Named(route.profile.clone()),
-        })
-        .collect::<Vec<_>>();
+    let named_routes = |routes: &[RouteFile]| {
+        routes
+            .iter()
+            .map(|route| EntryProfileRouteMsg {
+                entry_class: route.entry_class.clone(),
+                profile: ProfileRef::Named(route.profile.clone()),
+            })
+            .collect::<Vec<_>>()
+    };
+    let routes = named_routes(&file.entry_profile_routes);
+    if !file.instances.is_empty() {
+        if file.strategy.is_some() || file.template.is_some() || file.space.is_some() {
+            return Err("a portfolio run file names its documents under [[instances]] only".into());
+        }
+        if file.symbol.is_some()
+            || !file.symbols.is_empty()
+            || !file.series.is_empty()
+            || file.instance_id.is_some()
+            || file.profile.is_some()
+            || !file.entry_profile_routes.is_empty()
+            || file.windows.is_some()
+            || file.workers.is_some()
+        {
+            return Err("symbol, series, instance_id, and profiles belong to each [[instances]] entry of a portfolio, and windows and workers apply only to a search".into());
+        }
+        let mut instances = Vec::with_capacity(file.instances.len());
+        for instance in &file.instances {
+            instances.push(PortfolioInstanceMsg {
+                symbol: instance.symbol.clone(),
+                strategy: ConfiguredStrategyRunMsg {
+                    document: document_value(&base.join(&instance.strategy))?,
+                    sources: instance.series.clone(),
+                    instance_id: Some(instance.instance_id.clone()),
+                    decision_latency_ms: instance.decision_latency_ms,
+                },
+                profile: instance.profile.clone(),
+                profile_def: None,
+                entry_profile_routes: named_routes(&instance.entry_profile_routes),
+            });
+        }
+        let json = |values: &[toml::Value]| {
+            (!values.is_empty())
+                .then(|| serde_json::Value::Array(values.iter().map(json_value).collect()))
+        };
+        return Ok(StrategyClientRequest::Portfolio(SubmitPortfolioRequest {
+            request: RunPortfolioRequest {
+                request: PortfolioRunSpec {
+                    instances,
+                    exchange: file.exchange,
+                    data_type: file.data_type,
+                    timeframe: file.timeframe,
+                    from: file.from,
+                    to: file.to,
+                    config: file.config,
+                    policies: json(&file.policies),
+                    groups: json(&file.groups),
+                },
+                future,
+                evaluation: ProviderEvaluationOptionsMsg::default(),
+                result_delivery: ResultDeliveryMsg::Auto,
+            },
+        }));
+    }
+    if !file.policies.is_empty() || !file.groups.is_empty() {
+        return Err(
+            "policies and groups apply only to a portfolio run file with [[instances]]".into(),
+        );
+    }
     match (&file.strategy, &file.template, &file.space) {
         (Some(strategy), None, None) => {
             let symbol = file
@@ -164,7 +248,9 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
                 evaluation: ProviderEvaluationOptionsMsg::default(),
             }))
         }
-        _ => Err("a run file names either strategy, or both template and space".into()),
+        _ => Err(
+            "a run file names either strategy, [[instances]], or both template and space".into(),
+        ),
     }
 }
 
@@ -174,8 +260,28 @@ fn document_value(path: &Path) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("cannot read document {}: {error}", path.display()))?;
     let value: toml::Value = toml::from_str(&text)
         .map_err(|error| format!("invalid TOML document {}: {error}", path.display()))?;
-    serde_json::to_value(value)
-        .map_err(|error| format!("cannot convert {}: {error}", path.display()))
+    Ok(json_value(&value))
+}
+
+/// Convert TOML to the JSON the service decodes, writing a TOML date or time as the ISO text a strict decoder reads, so `reset_at_utc = 22:00:00` means the same as `reset_at_utc = "22:00:00"`.
+fn json_value(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(text) => serde_json::Value::String(text.clone()),
+        toml::Value::Integer(number) => serde_json::Value::from(*number),
+        toml::Value::Float(number) => serde_json::Number::from_f64(*number)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        toml::Value::Boolean(flag) => serde_json::Value::Bool(*flag),
+        toml::Value::Datetime(datetime) => serde_json::Value::String(datetime.to_string()),
+        toml::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(json_value).collect())
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +362,37 @@ sizing = { type = "FixedLot", lots = 0.1 }
     }
 
     #[test]
+    fn a_portfolio_file_builds_one_request_with_every_instance_and_its_policies() {
+        let base = directory();
+        let text = format!(
+            "{COMMON}\n[[instances]]\nstrategy = \"strategy.toml\"\nsymbol = \"EURUSD\"\ninstance_id = \"eur\"\nprofile = \"trail\"\n[[instances.series]]\nsource = \"primary\"\ntimeframe_seconds = 60\nprice_basis = \"mid\"\n\n[[instances]]\nstrategy = \"strategy.toml\"\nsymbol = \"GBPUSD\"\ninstance_id = \"gbp\"\n[[instances.series]]\nsource = \"primary\"\ntimeframe_seconds = 60\nprice_basis = \"mid\"\n\n[[policies]]\ntype = \"max_open_positions\"\nlimit = 1\n\n[[policies]]\ntype = \"daily_loss_halt\"\nmax_loss = {{ amount = 100.0 }}\nreset_at_utc = 22:00:00\n\n[[groups]]\nid = \"usd\"\nsymbols = [\"EURUSD\", \"GBPUSD\"]\n"
+        );
+        let StrategyClientRequest::Portfolio(request) = build_request(&text, &base).unwrap() else {
+            panic!("[[instances]] build a portfolio request");
+        };
+        let spec = &request.request.request;
+        assert_eq!(spec.instances.len(), 2);
+        assert_eq!(
+            spec.instances[0].strategy.instance_id.as_deref(),
+            Some("eur")
+        );
+        assert_eq!(spec.instances[0].profile.as_deref(), Some("trail"));
+        assert_eq!(spec.instances[1].symbol, "GBPUSD");
+        assert_eq!(
+            spec.policies,
+            Some(serde_json::json!([
+                { "type": "max_open_positions", "limit": 1 },
+                { "type": "daily_loss_halt", "max_loss": { "amount": 100.0 }, "reset_at_utc": "22:00:00" }
+            ]))
+        );
+        assert_eq!(
+            spec.groups,
+            Some(serde_json::json!([{ "id": "usd", "symbols": ["EURUSD", "GBPUSD"] }]))
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn contradictory_or_incomplete_run_files_are_rejected() {
         let base = directory();
         let cases = [
@@ -282,6 +419,10 @@ sizing = { type = "FixedLot", lots = 0.1 }
             (
                 "strategy = \"strategy.toml\"\nsymbol = \"EURUSD\"\nunknown = 1\n",
                 "invalid run file",
+            ),
+            (
+                "strategy = \"strategy.toml\"\nsymbol = \"EURUSD\"\n[[series]]\nsource = \"primary\"\ntimeframe_seconds = 60\nprice_basis = \"mid\"\n[[policies]]\ntype = \"max_open_positions\"\nlimit = 1\n",
+                "only to a portfolio",
             ),
         ];
         for (head, expected) in cases {

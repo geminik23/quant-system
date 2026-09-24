@@ -1496,8 +1496,16 @@ fn evaluate_future_positions(
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    // Every position of a run shares the run's labels, which is what lets a breakdown group positions across runs by parameter or window.
-                    tags: artifacts.execution.run_tags.clone(),
+                    // Every position of a run shares the run's labels, which is what lets a breakdown group positions across runs by parameter or window; a label of the position itself, such as its instance, joins them.
+                    tags: {
+                        let mut tags = artifacts.execution.run_tags.clone();
+                        if let Some(own) =
+                            artifacts.execution.position_tags.get(&position.position_id)
+                        {
+                            tags.extend(own.clone());
+                        }
+                        tags
+                    },
                 },
                 outcome: position.net_pnl,
                 outcome_classification: Some(match position.outcome {

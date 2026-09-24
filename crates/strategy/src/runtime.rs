@@ -409,6 +409,15 @@ impl ConfiguredStrategy {
         &self.primary_symbol
     }
 
+    pub fn strategy_id(&self) -> &str {
+        &self.strategy_id
+    }
+
+    /// Instance identity; together with the strategy ID it scopes every generated campaign, trade, and command identifier.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     pub fn input_requirements(&self) -> &ConfiguredStrategyRequirements {
         &self.requirements
     }

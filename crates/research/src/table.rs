@@ -69,6 +69,10 @@ pub struct ResearchRow {
     pub entries_before_window: usize,
     /// How many configurations the search visited in total, so a reader can weigh the multiple-comparison risk of the row they are looking at.
     pub points_total: usize,
+    /// Entries the portfolio supervisor rejected, present only when the run was supervised.
+    pub rejected_entries: Option<usize>,
+    /// Minutes during which the supervisor halted new exposure, a halt still in force counting to the window's end; present only when the run was supervised.
+    pub halt_minutes: Option<i64>,
 }
 
 impl ResearchRow {
@@ -147,9 +151,13 @@ impl ResearchTable {
         pairs
     }
 
-    /// Render the table as CSV with one column per parameter key.
+    /// Render the table as CSV with one column per parameter key, and the supervisor columns when any run was supervised.
     pub fn to_csv(&self) -> String {
         let parameters = self.parameter_columns();
+        let supervised = self
+            .rows
+            .iter()
+            .any(|row| row.rejected_entries.is_some() || row.halt_minutes.is_some());
         let mut out = String::new();
 
         let mut header: Vec<String> = vec!["family_id".into(), "symbol".into()];
@@ -180,6 +188,9 @@ impl ResearchTable {
             .iter()
             .map(|name| (*name).to_owned()),
         );
+        if supervised {
+            header.extend(["rejected_entries".to_owned(), "halt_minutes".to_owned()]);
+        }
         writeln!(out, "{}", header.join(",")).expect("writing to a string cannot fail");
 
         for row in &self.rows {
@@ -210,6 +221,18 @@ impl ResearchTable {
             fields.push(row.forced_closes.to_string());
             fields.push(row.entries_before_window.to_string());
             fields.push(row.points_total.to_string());
+            if supervised {
+                fields.push(
+                    row.rejected_entries
+                        .map(|count| count.to_string())
+                        .unwrap_or_default(),
+                );
+                fields.push(
+                    row.halt_minutes
+                        .map(|minutes| minutes.to_string())
+                        .unwrap_or_default(),
+                );
+            }
             writeln!(out, "{}", fields.join(",")).expect("writing to a string cannot fail");
         }
         out

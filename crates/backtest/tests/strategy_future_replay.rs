@@ -733,3 +733,98 @@ fn streaming_feed_errors_are_preserved() {
     assert!(matches!(error, StrategyReplayError::Feed("source failed")));
     assert!(strategy.callbacks.is_empty());
 }
+
+/// Enters when the newest primary bar it is handed closed above its open, which is only knowable once that bar has finished.
+struct BarReadingStrategy {
+    descriptor: StrategyDescriptor,
+    requirements: StrategyRequirements,
+    entered: bool,
+}
+
+impl HistoricalStrategy for BarReadingStrategy {
+    type Error = Infallible;
+
+    fn descriptor(&self) -> &StrategyDescriptor {
+        &self.descriptor
+    }
+
+    fn requirements(&self) -> &StrategyRequirements {
+        &self.requirements
+    }
+
+    fn on_event(
+        &mut self,
+        event: StrategyEvent<'_>,
+        context: StrategyContext<'_>,
+    ) -> Result<StrategyOutput, Self::Error> {
+        let rising = event.primary_events().iter().any(
+            |event| matches!(event.event, MarketEvent::Bar { open, close, .. } if close > open),
+        );
+        if self.entered || !rising || !context.warmup_complete() {
+            return Ok(StrategyOutput::none());
+        }
+        self.entered = true;
+        let draft = StrategyDecisionDraft::new(
+            StrategyDecisionKind::Entry,
+            "the bar closed up",
+            Some("trade-1".into()),
+            vec![entry(context.observed_through())],
+            StrategyRetentionLimits::default(),
+        )
+        .unwrap();
+        Ok(StrategyOutput::from_decision(draft))
+    }
+}
+
+#[test]
+fn a_direct_strategy_that_reads_the_batch_bar_fills_at_the_next_bar_open() {
+    let bar = |minute: i64, row: u64, open: f64, close: f64| {
+        FeedEvent::new(
+            MarketEvent::Bar {
+                symbol: SYMBOL.into(),
+                ts: ts(minute),
+                open,
+                high: open.max(close),
+                low: open.min(close),
+                close,
+                volume: 0,
+                spread: Some(0.0002),
+                timeframe_seconds: Some(60),
+                tick_count: Some(5),
+            },
+            EventMetadata::new(SeriesRoles::PRIMARY, 0, row),
+        )
+    };
+    let mut strategy = BarReadingStrategy {
+        descriptor: descriptor("bar_reader"),
+        requirements: StrategyRequirements::new(
+            vec![SYMBOL.into()],
+            vec![requirement(1)],
+            0,
+            false,
+            true,
+        )
+        .unwrap(),
+        entered: false,
+    };
+    let mut feed = VecFeed::from_feed_events(vec![
+        bar(0, 0, 1.1000, 1.1000),
+        bar(1, 1, 1.1000, 1.1050),
+        bar(2, 2, 1.1200, 1.1210),
+    ]);
+    let result = BacktestRunner::new_future(config(false), FutureQuoteConfig::default())
+        .run_historical_strategy_future(
+            &mut feed,
+            &mut strategy,
+            vec![spec(1)],
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    // The strategy saw the rising bar stamped at minute 1, whole, so its order may not fill inside that bar.
+    let fill = &result.replay.recorded_fills[0];
+    assert_eq!(fill.signal_ts, Some(ts(1)));
+    assert_eq!(fill.execution_ts, Some(ts(2)));
+    assert!((fill.fill.price - (1.1200 + 0.0001)).abs() < 1e-9);
+}

@@ -10,7 +10,8 @@ use qs_backtest::evaluation::{
 use qs_backtest::report::BacktestResult;
 use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
-    ObservationStoreLimits, StrategyDescriptor, StrategyId, VecFeed,
+    ConfiguredInstance, INSTANCE_POSITION_TAG, ObservationStoreLimits, StrategyDescriptor,
+    StrategyId, SupervisorOutput, VecFeed,
 };
 use qs_core::CloseReason;
 use qs_strategy::{ConfiguredStrategy, ParameterBinding, StrategyConfig, parameter_value_label};
@@ -24,6 +25,8 @@ use crate::window::DataWindow;
 /// Data mode recorded for a symbol that supplied no primary events.
 const DEFAULT_DATA_MODE: &str = "ticks";
 const RESERVED_TAGS: [&str; 3] = ["window", "symbol", "data_mode"];
+/// Separator of the symbols a portfolio run's row and `symbol` tag name.
+const PORTFOLIO_SYMBOL_SEPARATOR: &str = "+";
 
 pub type SymbolEvents = Arc<[FeedEvent]>;
 
@@ -129,7 +132,7 @@ where
         .iter()
         .map(|point| family.parameter_binding(point))
         .collect();
-    validate_parameter_labels(family.family_id(), &bindings, &plan.config.run_tags)?;
+    validate_parameter_labels(family.family_id(), &bindings, plan)?;
 
     let mut data_modes = BTreeMap::new();
     for symbol in &plan.symbols {
@@ -147,8 +150,28 @@ where
         data_modes.insert(symbol.as_str(), data_mode(symbol, symbol_events)?);
     }
 
+    let portfolio_label = plan.symbols.join(PORTFOLIO_SYMBOL_SEPARATOR);
+    let run_symbols: Vec<&str> = if plan.portfolio.is_some() {
+        let modes = data_modes
+            .values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if modes.len() > 1 {
+            return Err(ResearchError::InvalidPlan(
+                "a portfolio replays every symbol in one feed, so they must all be ticks or all be stored bars".into(),
+            ));
+        }
+        vec![portfolio_label.as_str()]
+    } else {
+        plan.symbols.iter().map(String::as_str).collect()
+    };
+    let portfolio_mode = data_modes
+        .values()
+        .next()
+        .copied()
+        .unwrap_or(DEFAULT_DATA_MODE);
     let mut specs = Vec::new();
-    for symbol in &plan.symbols {
+    for symbol in run_symbols {
         for pair in &pairs {
             for window in [&pair.in_sample, &pair.out_of_sample] {
                 for (point_index, point) in points.iter().enumerate() {
@@ -156,12 +179,13 @@ where
                         run_index: specs.len(),
                         point,
                         point_index,
-                        symbol: symbol.as_str(),
+                        symbol,
                         window,
-                        data_mode: data_modes
-                            .get(symbol.as_str())
-                            .copied()
-                            .unwrap_or(DEFAULT_DATA_MODE),
+                        data_mode: if plan.portfolio.is_some() {
+                            portfolio_mode
+                        } else {
+                            data_modes.get(symbol).copied().unwrap_or(DEFAULT_DATA_MODE)
+                        },
                     });
                 }
             }
@@ -243,8 +267,13 @@ where
         .iter()
         .map(|point| family.parameter_binding(point))
         .collect();
-    validate_parameter_labels(family.family_id(), &bindings, &plan.config.run_tags)?;
-    Ok(plan.symbols.len() * pairs.len() * 2 * points.len())
+    validate_parameter_labels(family.family_id(), &bindings, plan)?;
+    let symbol_runs = if plan.portfolio.is_some() {
+        1
+    } else {
+        plan.symbols.len()
+    };
+    Ok(symbol_runs * pairs.len() * 2 * points.len())
 }
 
 /// The span of stored data a batch reads: the earliest warmup start any point needs for any window on any symbol, through the latest window end.
@@ -293,13 +322,16 @@ where
 fn validate_parameter_labels(
     family_id: &str,
     bindings: &[ParameterBinding],
-    common_tags: &BTreeMap<String, String>,
+    plan: &ResearchPlan,
 ) -> Result<(), ResearchError> {
+    let common_tags = &plan.config.run_tags;
+    // A portfolio run labels every position with its instance, so that name is reserved as well.
+    let portfolio_reserved = plan.portfolio.as_ref().map(|_| INSTANCE_POSITION_TAG);
     let mut labels = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let label = binding_labels(binding);
         for key in label.keys().chain(common_tags.keys()) {
-            if RESERVED_TAGS.contains(&key.as_str()) {
+            if RESERVED_TAGS.contains(&key.as_str()) || portfolio_reserved == Some(key.as_str()) {
                 return Err(ResearchError::InvalidPlan(format!(
                     "run tag '{key}' is reserved by the research runner"
                 )));
@@ -431,7 +463,32 @@ where
         forced_closes: 0,
         entries_before_window: 0,
         points_total,
+        rejected_entries: None,
+        halt_minutes: None,
     };
+
+    if let Some(portfolio) = &plan.portfolio {
+        return match run_portfolio(plan, portfolio, family, spec, events, &tags) {
+            Ok((result, supervisor)) => {
+                let mut row = make_row(RunStatus::Completed);
+                fill_metrics(&mut row, &result, spec.window);
+                if let Some(supervisor) = supervisor {
+                    row.rejected_entries = Some(supervisor.rejected_entries());
+                    row.halt_minutes = Some(supervisor.halt_minutes(spec.window.to()));
+                }
+                RunRecord {
+                    run_index: spec.run_index,
+                    row,
+                    positions: result.provider_positions,
+                }
+            }
+            Err(failure) => RunRecord {
+                run_index: spec.run_index,
+                row: make_row(failure.into()),
+                positions: Vec::new(),
+            },
+        };
+    }
 
     let Some(symbol_events) = events.get(spec.symbol) else {
         return RunRecord {
@@ -557,6 +614,80 @@ where
         .run_configured_strategy_future(&mut feed, &mut adapter, analysis, plan.retention, None)
         .map(|result| result.replay)
         .map_err(|error| RunFailure::Replay(error.to_string()))
+}
+
+/// Replay every plan symbol as one instance of the point against one account over the window, each instance reading from its own derived warmup start.
+fn run_portfolio<F>(
+    plan: &ResearchPlan,
+    portfolio: &crate::plan::PortfolioPlan,
+    family: &F,
+    spec: &RunSpec<'_, F::Params>,
+    events: &BTreeMap<String, SymbolEvents>,
+    tags: &BTreeMap<String, String>,
+) -> Result<(BacktestResult, Option<SupervisorOutput>), RunFailure>
+where
+    F: StrategyFamily,
+{
+    let mut instances = Vec::with_capacity(plan.symbols.len());
+    let mut feed_events = Vec::new();
+    for symbol in &plan.symbols {
+        let symbol_events = events
+            .get(symbol.as_str())
+            .ok_or_else(|| RunFailure::Replay(format!("no market data supplied for '{symbol}'")))?;
+        let config_document = family.config(spec.point);
+        let strategy_id = config_document.strategy_id.clone();
+        // The symbol is the instance identity, so each position's instance tag names the symbol it traded.
+        let strategy = ConfiguredStrategy::compile(
+            config_document,
+            &family.library(),
+            symbol.clone(),
+            symbol.as_str(),
+        )
+        .map_err(|error| RunFailure::Compile(error.to_string()))?;
+        let bindings = family
+            .bindings(symbol, spec.point, strategy.input_requirements())
+            .map_err(RunFailure::Bind)?;
+        let start = warmup_start(&bindings, spec.window.from())?;
+        let descriptor = StrategyDescriptor::new(
+            StrategyId::new(strategy_id.clone())
+                .map_err(|error| RunFailure::Compile(error.to_string()))?,
+            format!("p{}", spec.point_index),
+            strategy_id,
+        )
+        .map_err(|error| RunFailure::Compile(error.to_string()))?;
+        let adapter = BacktestConfiguredStrategyAdapter::new(
+            strategy,
+            descriptor,
+            bindings,
+            plan.decision_latency_ms,
+        )
+        .map_err(|error| RunFailure::Bind(error.to_string()))?;
+        let analysis = AnalysisPipeline::new(
+            Vec::new(),
+            ObservationStoreLimits::default(),
+            AnnotationLimits::default(),
+        )
+        .map_err(|error| RunFailure::Bind(error.to_string()))?;
+        instances.push(
+            ConfiguredInstance::new(adapter, analysis)
+                .with_entry_profiles(plan.entry_profiles.clone().unwrap_or_default())
+                .with_feed_from(start),
+        );
+        feed_events.extend(slice_events(symbol_events, spec.window, start));
+    }
+    let mut feed = VecFeed::from_feed_events(feed_events);
+
+    let mut config = plan.config.clone();
+    config.run_tags = tags.clone();
+    config.close_on_finish = true;
+    let supervisor = portfolio
+        .supervisor()
+        .map_err(|error| RunFailure::Replay(error.to_string()))?;
+    let result = BacktestRunner::new_future(config, plan.future.clone())
+        .with_evaluation_options(plan.evaluation.clone())
+        .run_portfolio_future(&mut feed, instances, supervisor, plan.retention)
+        .map_err(|error| RunFailure::Replay(error.to_string()))?;
+    Ok((result.replay, result.supervisor))
 }
 
 fn warmup_start(

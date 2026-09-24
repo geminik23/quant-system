@@ -1,7 +1,8 @@
-//! Configured strategy and search requests decode strictly at every level except the strategy documents, which the service decodes itself.
+//! Configured strategy, portfolio, and search requests decode strictly at every level except the strategy documents and portfolio policies, which the service decodes itself.
 
 use qs_backtest_api::{
-    RunConfiguredStrategyRequest, SubmitConfiguredStrategyRequest, SubmitSearchRequest,
+    RunConfiguredStrategyRequest, RunPortfolioRequest, SubmitConfiguredStrategyRequest,
+    SubmitPortfolioRequest, SubmitSearchRequest,
 };
 use serde_json::{Value, json};
 
@@ -41,6 +42,31 @@ fn search() -> Value {
             "config": { "sizing": { "type": "FixedLot", "lots": 0.1 } },
             "workers": 2
         }
+    })
+}
+
+fn portfolio() -> Value {
+    json!({
+        "request": {
+            "instances": [{
+                "symbol": "EURUSD",
+                "strategy": {
+                    "document": { "strategy_id": "alpha" },
+                    "sources": [
+                        { "source": "primary", "timeframe_seconds": 60, "price_basis": "mid" }
+                    ],
+                    "instance_id": "eur"
+                },
+                "profile_def": { "name": "trail", "use_targets": [], "close_ratios": [] },
+                "entry_profile_routes": [{ "entry_class": "trend", "profile": "trail" }]
+            }],
+            "exchange": "fixture",
+            "data_type": "tick",
+            "config": { "sizing": { "type": "FixedLot", "lots": 0.1 } },
+            "policies": [{ "type": "max_open_positions", "limit": 2, "future_field": true }],
+            "groups": [{ "id": "usd", "symbols": ["EURUSD"] }]
+        },
+        "future": { "account_currency": "USD" }
     })
 }
 
@@ -104,4 +130,40 @@ fn search_requests_reject_unknown_fields_at_every_level_and_round_trip() {
     ] {
         rejects::<SubmitSearchRequest>(search(), pointer);
     }
+}
+
+#[test]
+fn portfolio_requests_reject_unknown_fields_at_every_level_but_carry_documents_and_policies_as_values()
+ {
+    let decoded: RunPortfolioRequest = serde_json::from_value(portfolio()).unwrap();
+    let spec = &decoded.request;
+    assert_eq!(
+        spec.instances[0].strategy.instance_id.as_deref(),
+        Some("eur")
+    );
+    assert_eq!(
+        spec.policies.as_ref().unwrap()[0]["future_field"],
+        json!(true),
+        "policies are carried as values for the service to decode strictly"
+    );
+    for pointer in [
+        "",
+        "/request",
+        "/request/instances/0",
+        "/request/instances/0/strategy",
+        "/request/instances/0/strategy/sources/0",
+        "/request/instances/0/profile_def",
+        "/request/instances/0/entry_profile_routes/0",
+        "/request/config",
+        "/future",
+    ] {
+        rejects::<RunPortfolioRequest>(portfolio(), pointer);
+    }
+
+    let submit = json!({ "request": portfolio() });
+    let decoded = serde_json::from_value::<SubmitPortfolioRequest>(submit.clone()).unwrap();
+    let again: SubmitPortfolioRequest =
+        serde_json::from_value(serde_json::to_value(&decoded).unwrap()).unwrap();
+    assert_eq!(again.request.request.instances.len(), 1);
+    rejects::<SubmitPortfolioRequest>(submit, "");
 }

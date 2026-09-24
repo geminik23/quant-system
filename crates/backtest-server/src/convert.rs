@@ -745,6 +745,7 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
 pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
     BacktestResultMsg {
         strategy: None,
+        portfolio: None,
         initial_balance: r.initial_balance,
         final_balance: r.final_balance,
         total_pnl: r.total_pnl,

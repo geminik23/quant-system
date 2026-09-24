@@ -3621,6 +3621,7 @@ dependencies = [
  "criterion",
  "qs-data-preprocess",
  "qs-instruments",
+ "qs-risk",
  "qs-strategy",
  "qs-symbols",
  "quant-system-core",
@@ -3660,6 +3661,7 @@ dependencies = [
  "qs-instruments",
  "qs-market-loader",
  "qs-research",
+ "qs-risk",
  "qs-service",
  "qs-service-xrpc",
  "qs-strategy",
@@ -3760,12 +3762,24 @@ dependencies = [
  "qs-backtest",
  "qs-data-preprocess",
  "qs-market-loader",
+ "qs-risk",
  "qs-strategy",
  "qs-symbols",
  "quant-system-core",
  "serde",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "qs-risk"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "quant-system-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
