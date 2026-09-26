@@ -32,6 +32,8 @@ qs-symbols -----> qs-instruments -----> quant-system-core
                                               |      configured core only
                                               +----> qs-risk
                                               |      portfolio supervision
+                                              +----> qs-execution
+                                              |      request/report contracts
                                               v
                                       qs-backtest -> qs-backtest-server
                                            ^                  ^
@@ -56,6 +58,8 @@ An instrument listing venue, trading platform, execution venue, and market-data 
 `qs-strategy` owns the reusable synchronous configured strategy core. It validates typed parameter templates against explicit immutable material-factory schemas, substitutes one complete binding, prunes unused material branches, and compiles the resulting strict unversioned configuration against bounded logical source IDs. It derives compositional source lookback and named-input requirements, evaluates ordered source updates, total trade-slot facts, bounded typed expressions, causal indicator primitives, and deterministic finite-state transitions, and emits generic decisions and notes plus ordered commands carrying strict `RawSignal` values with deterministic correlation IDs. An Entry may declare an optional entry class, and the compiled requirements list every slot and class an Entry can emit together with the slots whose stop the strategy moves itself, so an adapter can check profile routing before a run. An open trade slot also carries its entry fill time, favorable and adverse campaign excursion, and initial risk, which an adapter must supply, and calendar materials derive the weekday and seconds of day from the input time alone. Command feedback rejects unknown, mismatched, duplicate, or replayed events, retains successful correlations until the action-specific committed fact and terminal disposition are both observed, and supports an adapter-owned final feedback boundary without evaluating another market transition. The crate is library-only and does not own logical-source binding, historical history or feeds, FutureQuote adaptation, service or RPC execution, live runtime orchestration, persistence, or management-profile composition.
 
 `qs-risk` owns synchronous portfolio supervision: strictly decodable policies (position-count limits, correlation-group risk caps, a daily loss halt, and a drawdown kill switch), correlation groups, halt state, and approve-or-reject verdicts over requests for new exposure. It receives account facts from its caller, never blocks risk reduction, and has no clock, storage, async runtime, or dependency beyond `quant-system-core`, so a historical replay and a later live runtime can share it.
+
+`qs-execution` owns broker-neutral execution preparation, explicit per-instance automatic or entry-approval gating, a runtime-neutral request/report port, and report projection into the existing configured command fact-plus-terminal contract. Preparation consumes caller-supplied quotes, instrument and account facts, selected profiles, sizing policy, logical-to-provider position snapshots, and provider capabilities. The application then applies a fresh current risk verdict before reservation and dispatch. It emits concrete quantity-bearing requests and preserves preparation audits. Accepted submission is not a fill; duplicate, partial, cancelled, modified, rejected, failed, and acceptance-unknown outcomes remain explicit. The crate owns no market-data connection, broker adapter, scheduler, account store, persistence, P&L, recovery, or automatic retry. Ongoing management rules require an explicit provider or external runtime owner. The included recording/scripted consumer is contract evidence, not a fill simulator or venue implementation.
 
 `qs-symbols` remains the compatibility facade for current canonical symbols, aliases, precision, lot, and currency metadata. Supported FX, metal, commodity, and index rows can be translated through the guarded compatibility economics result into an immutable instrument snapshot. Registry-backed cryptocurrency and unknown rows are not promoted into executable instruments.
 
@@ -128,13 +132,21 @@ signed webhook request ----> authenticated provider edge
 manual/API RawSignal, direct historical strategy output, or configured adapter output
   -> Entry profile selection by entry class or run default, resolution, and sizing
   -> deterministic replay
+
+caller-selected RawSignal + current quote/account/instrument/position facts
+  -> optional entry approval
+  -> fresh profile resolution, sizing and risk review
+  -> concrete qs-execution request
+  -> accepted submission (not a fill)
+  -> validated provider observations
+  -> configured command feedback
 ```
 
 All source adapters terminate before runner ownership. The webhook edge authenticates and binds requests to one source before admission. A hosted `202 Accepted` response returns before source application completes. The runner owns source application and committed-batch publication; adapters do not own normalization state or sink publication. Source deletes commit lifecycle withdrawal only and do not create trading actions.
 
 The existing `OfflineRunner`, optional `OnlineServer`, handler callbacks, and standalone JSONL contracts remain unchanged compatibility facades and are not hosted through durable state.
 
-A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts. A source event is not a trade, and a parsed signal is not an engine action until the replay boundary validates and resolves an explicitly supplied `RawSignal`. Strategy decisions, sizing, execution scheduling, and accounting remain explicit downstream responsibilities.
+A committed normalization batch is an authoritative ingestion result, but it does not enter replay automatically. Source edits, deletes, supersession, and withdrawal remain audit and lifecycle facts. A source event is not a trade, and a parsed signal is not an engine action until the replay boundary validates and resolves an explicitly supplied `RawSignal`. Strategy decisions, sizing, approval, provider dispatch, execution reports, and accounting remain explicit downstream responsibilities. `qs-execution` supplies the preparation/report contract but does not connect ingestion to trading or host a live runtime.
 
 ## Market-data flow
 

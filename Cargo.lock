@@ -3694,6 +3694,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qs-execution"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "futures",
+ "qs-backtest",
+ "qs-instruments",
+ "qs-risk",
+ "qs-strategy",
+ "qs-symbols",
+ "quant-system-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "qs-instruments"
 version = "0.3.2"
 dependencies = [

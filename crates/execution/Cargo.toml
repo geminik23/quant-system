@@ -1,0 +1,27 @@
+[package]
+name = "qs-execution"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Broker-neutral execution preparation, approval, and report contracts"
+keywords = ["trading", "execution", "broker", "risk"]
+categories = ["finance"]
+
+[lib]
+name = "qs_execution"
+
+[dependencies]
+qs-core = { workspace = true }
+qs-instruments = { workspace = true }
+qs-risk = { workspace = true }
+qs-strategy = { workspace = true }
+
+chrono = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+qs-backtest = { workspace = true }
+qs-symbols = { workspace = true }

@@ -11,7 +11,7 @@ Use this index to enter the workspace by goal rather than by crate name.
 | Search a strategy's parameter space | [Parameter search](research.md) |
 | Normalize and durably apply source events | [Signal ingestion](signal-ingestion.md) |
 | Run the CTrader quote service | [Market data](market-data.md) |
-| Understand crate and service ownership | [Architecture](architecture.md) |
+| Understand crate, execution, and service ownership | [Architecture](architecture.md) |
 | Review intended project direction | [Roadmap](roadmap.md) |
 | Construct strict signal JSONL | [RawSignal reference](reference/raw-signal.md) |
 

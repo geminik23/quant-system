@@ -2,7 +2,7 @@
 
 The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and a historical adapter that connects configured behavior to that replay path, both in process and through the backtest service, which accepts configured strategy documents, management profiles, and parameter searches by request.
 
-> This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
+> This roadmap does not schedule a live trading platform. The workspace now includes a broker-neutral execution contract library, but no broker adapter, live scheduler, account reconciliation, persistence, or operational recovery.
 
 ## Current foundation
 
@@ -81,7 +81,13 @@ The configured core now provides:
 
 The historical adapter binds complete logical source specifications to historical series built from ticks or accepted from stored bars of the declared timeframe, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts including open-position time, excursion, and initial risk, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, and routes configured entries to management profiles through the same selection raw-signal replay uses, by entry class or run default, rejecting an unrouted class or a stop-ownership conflict before the run. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, and configured-state persistence remain unavailable.
 
-Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
+Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time strategy-input adapter or live execution runtime is part of the current implementation goal. The implemented `qs-execution` library is the lower-level request/report contract a future runtime may consume; it is not itself a gateway.
+
+## Broker-neutral execution contract
+
+`qs-execution` now provides a library-only boundary from strict `RawSignal` intent and caller-owned current facts to concrete quantity-bearing requests. It reuses core profile resolution and catalog-aware sizing, supports explicit automatic or entry-approval modes, and translates committed provider observations into the configured fact-plus-terminal feedback contract. Submission acceptance remains distinct from fills, acceptance-unknown work is not automatically retried, partial exposure is retained, and original-entered-size ratio closes are capped at the remaining quantity.
+
+The contract is exercised by a local scripted consumer without credentials, network access, account P&L, or a second fill engine. Preparation records its quote and sizing reference separately from later fills; a provider does not silently resize a submitted market request when execution price differs. Ongoing profile rules require an explicit provider or external runtime owner. Actual broker integrations and live orchestration remain outside the current roadmap.
 
 ## Design constraints
 
@@ -137,7 +143,7 @@ Concrete private strategy configurations may be added later when there is a real
 - strategy code, custom materials, or analyzers received over RPC; a remotely submitted strategy document may use only materials registered in the server build;
 - ingestion-to-trading bridges;
 - multi-strategy portfolio allocation or optimization; portfolio supervision approves or rejects each instance's requests but never allocates capital between strategies;
-- paper or live execution gateways;
+- paper or live execution gateways beyond the implemented provider-neutral request/report library;
 - restart-safe configured or live strategy state;
 - broker and exchange order adapters;
 - cryptocurrency economics beyond the current rejection guard;
@@ -158,6 +164,7 @@ The implementation now allows a developer to:
 6. reproduce equivalent direct-signal economic results;
 7. reuse one custom material across several configurations;
 8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
-9. continue implementing direct Rust strategies without framework regression.
+9. continue implementing direct Rust strategies without framework regression;
+10. prepare and validate broker-neutral execution requests, approval state, and report feedback locally without a broker or live scheduler.
 
 The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. The backtest service now also runs configured strategy documents, portfolios of configured instances under optional portfolio policies, and parameter searches received at runtime, reusing the same adapter, portfolio replay, and research batch. See [Backtesting](backtesting.md) for current replay behavior and limitations.
