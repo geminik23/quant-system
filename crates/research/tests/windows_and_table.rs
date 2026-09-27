@@ -98,6 +98,30 @@ fn walk_forward_rolls_forward_and_only_emits_complete_splits() {
 }
 
 #[test]
+fn walk_forward_limits_and_timestamp_overflow_fail_before_expansion() {
+    let many = WindowPlan::RollingWalkForward {
+        start: at(0),
+        end: at(500),
+        train: Duration::minutes(200),
+        test: Duration::minutes(100),
+        step: Duration::minutes(100),
+    };
+    let error = many.pairs_with_limit(2).err().unwrap();
+    assert!(error.to_string().contains("above the limit"));
+
+    let overflow = WindowPlan::RollingWalkForward {
+        start: chrono::NaiveDateTime::MAX
+            .checked_sub_signed(Duration::nanoseconds(1))
+            .unwrap(),
+        end: chrono::NaiveDateTime::MAX,
+        train: Duration::nanoseconds(1),
+        test: Duration::nanoseconds(1),
+        step: Duration::nanoseconds(1),
+    };
+    assert!(overflow.pairs_with_limit(1).is_err());
+}
+
+#[test]
 fn a_range_too_short_for_one_split_is_rejected() {
     let plan = WindowPlan::RollingWalkForward {
         start: at(0),

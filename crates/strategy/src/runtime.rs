@@ -514,6 +514,27 @@ impl ConfiguredStrategy {
                         && !provenance.dynamic
                 })
                 .collect::<Vec<_>>();
+            let any_input_updates = self.materials[index]
+                .input_provenance
+                .iter()
+                .map(|provenance| {
+                    provenance
+                        .material_indexes
+                        .iter()
+                        .any(|dependency| material_updates[*dependency])
+                        || provenance
+                            .sources
+                            .iter()
+                            .any(|source| updated_sources.contains(source))
+                        || provenance.named_inputs.iter().any(|name| {
+                            input
+                                .values
+                                .iter()
+                                .find(|item| item.name == *name)
+                                .is_some_and(|item| item.updated)
+                        })
+                })
+                .collect::<Vec<_>>();
             let triggered = match &self.materials[index].update_trigger {
                 MaterialUpdateTrigger::EveryInput => true,
                 MaterialUpdateTrigger::Source(source) => updated_sources.contains(source),
@@ -523,7 +544,7 @@ impl ConfiguredStrategy {
                 MaterialUpdateTrigger::AllInputs => {
                     !input_updates.is_empty() && input_updates.iter().all(|updated| *updated)
                 }
-                MaterialUpdateTrigger::AnyInput => input_updates.iter().any(|updated| *updated),
+                MaterialUpdateTrigger::AnyInput => any_input_updates.iter().any(|updated| *updated),
             };
             if !triggered {
                 if self.materials[index].clear_pulse_when_idle {
@@ -546,6 +567,7 @@ impl ConfiguredStrategy {
             let context = MaterialEvalContext {
                 input,
                 input_updates: &input_updates,
+                any_input_updates: &any_input_updates,
                 feedback: &current_observations,
                 retained_feedback: &retained_observations,
             };

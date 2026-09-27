@@ -9,6 +9,7 @@ mod family;
 mod geometry;
 mod loader;
 mod plan;
+mod recipe;
 mod runner;
 mod space;
 mod table;
@@ -20,11 +21,18 @@ pub use error::{ResearchError, RunFailure};
 pub use family::StrategyFamily;
 pub use geometry::SeriesGeometry;
 pub use loader::{load_symbol_bars, load_symbol_ticks};
-pub use plan::{PortfolioPlan, ResearchPlan};
-pub use runner::{
-    BatchProgress, ResearchBatch, SymbolEvents, batch_data_range, run_batch, run_batch_controlled,
-    validate_batch,
+pub use plan::{PortfolioPlan, ResearchAdmissionLimits, ResearchPlan};
+pub use recipe::{
+    CandidateRecipe, EndpointBounds, ExperimentId, ExperimentOptions, ExperimentRecipe,
+    RunCoverage, RunRecipe, SeriesBindingSnapshot, UnavailableCoverage, snapshot_bindings,
 };
-pub use space::DeclaredSpace;
+pub use runner::{
+    BatchProgress, ResearchBatch, SymbolEvents, batch_data_range, batch_data_range_with_limits,
+    run_batch, run_batch_controlled, run_batch_controlled_with_experiment,
+    run_batch_controlled_with_limits, run_batch_with_experiment, validate_bar_window_alignment,
+    validate_bar_window_alignment_with_limits, validate_batch, validate_batch_with_limits,
+};
+pub use space::{DeclaredSpace, DeclaredSpaceLimits};
+
 pub use table::{PairedRow, ResearchRow, ResearchTable, RunStatus};
 pub use window::{DataWindow, WindowPair, WindowPlan};

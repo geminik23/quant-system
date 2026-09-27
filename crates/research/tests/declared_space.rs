@@ -2,14 +2,20 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use qs_backtest::Timeframe;
+use chrono::Duration;
 use qs_backtest::evaluation::{BreakdownDimension, EvaluationOptions};
+use qs_backtest::{ConfiguredHistoricalBindings, Timeframe};
 use qs_research::families::{EmaCrossFamily, EmaEntryCondition};
 use qs_research::{
-    DataWindow, DeclaredSpace, ResearchPlan, StrategyFamily, SymbolEvents, WindowPlan, run_batch,
+    DataWindow, DeclaredSpace, DeclaredSpaceLimits, ResearchAdmissionLimits, ResearchPlan,
+    StrategyFamily, SymbolEvents, WindowPlan, run_batch, validate_bar_window_alignment,
+    validate_batch, validate_batch_with_limits,
 };
-use qs_strategy::{ParameterConfig, ParameterKind, StrategyConfig};
-use support::{SYMBOL, at, config, synthetic_ticks};
+use qs_strategy::{
+    ConfiguredStrategyRequirements, MaterialLibrary, ParameterBinding, ParameterConfig,
+    ParameterKind, StrategyConfig,
+};
+use support::{SYMBOL, at, config, synthetic_bars, synthetic_ticks};
 
 fn strategy_toml() -> &'static str {
     include_str!("../examples/ema_strategy.toml")
@@ -168,6 +174,169 @@ fn bound_documents_round_trip_and_geometry_may_use_a_parameter() {
     let encoded = toml::to_string(bound).unwrap();
     let decoded: qs_strategy::StrategyConfig = toml::from_str(&encoded).unwrap();
     assert_eq!(&decoded, bound);
+}
+
+#[test]
+fn bar_windows_validate_every_primary_offset_without_restricting_tick_plans() {
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let misaligned = ResearchPlan::new(
+        vec![SYMBOL.to_owned()],
+        WindowPlan::Fixed {
+            in_sample: DataWindow::new("is", at(200) + Duration::seconds(30), at(600)).unwrap(),
+            out_of_sample: DataWindow::new("oos", at(600), at(900)).unwrap(),
+        },
+        config(),
+    );
+    assert!(validate_batch(&misaligned, &declared).is_ok());
+    assert!(validate_bar_window_alignment(&misaligned, &declared).is_err());
+
+    let offset_space = space_toml().replace(
+        "alignment_offset_seconds = 0",
+        "alignment_offset_seconds = 30",
+    );
+    let offset = DeclaredSpace::from_toml(strategy_toml(), &offset_space).unwrap();
+    let aligned = ResearchPlan::new(
+        vec![SYMBOL.to_owned()],
+        WindowPlan::Fixed {
+            in_sample: DataWindow::new(
+                "is",
+                at(200) + Duration::seconds(30),
+                at(600) + Duration::seconds(30),
+            )
+            .unwrap(),
+            out_of_sample: DataWindow::new(
+                "oos",
+                at(600) + Duration::seconds(30),
+                at(900) + Duration::seconds(30),
+            )
+            .unwrap(),
+        },
+        config(),
+    );
+    validate_bar_window_alignment(&aligned, &offset).unwrap();
+}
+
+#[test]
+fn mixed_nonportfolio_input_aligns_only_symbols_backed_by_bars() {
+    struct MixedGeometry(DeclaredSpace);
+    impl StrategyFamily for MixedGeometry {
+        type Params = usize;
+
+        fn family_id(&self) -> &str {
+            self.0.family_id()
+        }
+
+        fn points(&self) -> Vec<Self::Params> {
+            self.0.points()
+        }
+
+        fn parameter_binding(&self, point: &Self::Params) -> ParameterBinding {
+            self.0.parameter_binding(point)
+        }
+
+        fn config(&self, point: &Self::Params) -> StrategyConfig {
+            self.0.config(point)
+        }
+
+        fn geometry(&self, symbol: &str, point: &Self::Params) -> Vec<qs_research::SeriesGeometry> {
+            let mut geometry = self.0.geometry(symbol, point);
+            if symbol == SYMBOL {
+                geometry[0].alignment_offset_seconds = 30;
+            }
+            geometry
+        }
+
+        fn bindings(
+            &self,
+            symbol: &str,
+            point: &Self::Params,
+            requirements: &ConfiguredStrategyRequirements,
+        ) -> Result<ConfiguredHistoricalBindings, String> {
+            self.0.bindings(symbol, point, requirements)
+        }
+
+        fn library(&self) -> MaterialLibrary {
+            self.0.library()
+        }
+    }
+
+    let family = MixedGeometry(DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap());
+    let plan = ResearchPlan::new(
+        vec![SYMBOL.to_owned(), "GBPUSD".into()],
+        WindowPlan::Fixed {
+            in_sample: DataWindow::new("is", at(200), at(600)).unwrap(),
+            out_of_sample: DataWindow::new("oos", at(600), at(900)).unwrap(),
+        },
+        config(),
+    );
+    let events = BTreeMap::from([
+        (SYMBOL.to_owned(), synthetic_ticks(960)),
+        ("GBPUSD".to_owned(), synthetic_bars(960)),
+    ]);
+    assert!(run_batch(&plan, &family, &events).is_ok());
+
+    let bar_only = ResearchPlan::new(
+        vec![SYMBOL.to_owned()],
+        WindowPlan::Fixed {
+            in_sample: DataWindow::new("is", at(200), at(600)).unwrap(),
+            out_of_sample: DataWindow::new("oos", at(600), at(900)).unwrap(),
+        },
+        config(),
+    );
+    let bars = BTreeMap::from([(SYMBOL.to_owned(), synthetic_bars(960))]);
+    assert!(run_batch(&bar_only, &family, &bars).is_ok());
+}
+
+#[test]
+fn declared_space_limits_ranges_products_and_admitted_points_before_expansion() {
+    let limits = DeclaredSpaceLimits::new(10, 20, 20).unwrap();
+    let integer_axis = space_toml().replace(
+        "range = { from = 3, to = 4, step = 1 }",
+        "range = { from = -100, to = 100, step = 1 }",
+    );
+    let error = DeclaredSpace::from_toml_with_limits(strategy_toml(), &integer_axis, limits)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("axis limit"), "{error}");
+
+    let integer_overflow = space_toml().replace(
+        "range = { from = 3, to = 4, step = 1 }",
+        "range = { from = -9223372036854775808, to = 9223372036854775807, step = 1 }",
+    );
+    let error = DeclaredSpace::from_toml_with_limits(strategy_toml(), &integer_overflow, limits)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("overflowed"), "{error}");
+
+    let floating_axis = space_toml().replace(
+        "range = { from = 1.0, to = 1.5, step = 0.5 }",
+        "range = { from = -1.0e308, to = 1.0e308, step = 1.0e-308 }",
+    );
+    let error = DeclaredSpace::from_toml_with_limits(strategy_toml(), &floating_axis, limits)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("not finite"));
+
+    let product_limits = DeclaredSpaceLimits::new(10, 11, 11).unwrap();
+    let error = DeclaredSpace::from_toml_with_limits(strategy_toml(), space_toml(), product_limits)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("pre-constraint limit"));
+
+    let point_limits = DeclaredSpaceLimits::new(10, 20, 5).unwrap();
+    let error = DeclaredSpace::from_toml_with_limits(strategy_toml(), space_toml(), point_limits)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("admitted point limit"));
+
+    let declared = DeclaredSpace::from_toml(strategy_toml(), space_toml()).unwrap();
+    let limited = ResearchAdmissionLimits::new(1, 23).unwrap();
+    assert!(validate_batch_with_limits(&plan(1), &declared, limited).is_err());
+    let admitted = ResearchAdmissionLimits::new(1, 24).unwrap();
+    assert_eq!(
+        validate_batch_with_limits(&plan(1), &declared, admitted).unwrap(),
+        24
+    );
 }
 
 #[test]
@@ -396,7 +565,7 @@ fn validation_and_data_range_need_no_market_data() {
 #[test]
 fn a_plan_with_profiles_routes_classified_entries_in_every_run() {
     use qs_backtest::profile::{
-        ManagementProfile, PreparedEntryProfiles, RuleConfigDef, StoplossMode,
+        ManagementProfile, PreparedEntryProfiles, ProfileRegistry, RuleConfigDef, StoplossMode,
     };
 
     let classified = strategy_toml().replacen(
@@ -417,10 +586,21 @@ fn a_plan_with_profiles_routes_classified_entries_in_every_run() {
         let_remainder_run: false,
         entry_geometry: qs_backtest::EntryGeometryPolicy::Strict,
     };
+    let mut registry = ProfileRegistry::empty();
+    registry.insert(trailing.clone(), false).unwrap();
     let plan = plan(1).with_entry_profiles(
-        PreparedEntryProfiles::try_new(None, [("trend".to_owned(), trailing)]).unwrap(),
+        PreparedEntryProfiles::try_new(
+            None,
+            [("trend".to_owned(), registry.get("trail").unwrap().clone())],
+        )
+        .unwrap(),
     );
     let batch = run_batch(&plan, &declared, &events()).unwrap();
+    let frozen_profiles = batch.experiment_recipe().profiles.clone();
+    let mut replacement = trailing;
+    replacement.let_remainder_run = true;
+    registry.insert(replacement, true).unwrap();
+    assert_eq!(batch.experiment_recipe().profiles, frozen_profiles);
     assert!(
         batch
             .table()
@@ -429,4 +609,8 @@ fn a_plan_with_profiles_routes_classified_entries_in_every_run() {
             .all(|row| row.status.is_completed())
     );
     assert!(batch.table().rows().iter().any(|row| row.positions > 0));
+    assert_eq!(
+        batch.experiment_recipe().profiles.as_ref().unwrap()["routes"]["trend"]["let_remainder_run"],
+        false
+    );
 }

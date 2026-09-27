@@ -490,6 +490,23 @@ fn a_stored_bar_request_runs_over_bars_of_the_declared_timeframe() {
     mismatched.request.timeframe = Some("5m".into());
     let response = handle_run_configured_strategy(&fixture.state, &mismatched);
     assert!(response.error.unwrap().contains("declares 60s bars"));
+
+    let mut unaligned = request.clone();
+    unaligned.request.from = Some(text(at(200) + ChronoDuration::seconds(30)));
+    let response = handle_run_configured_strategy(&fixture.state, &unaligned);
+    assert!(!response.success);
+    assert!(response.error.unwrap().contains("not aligned"));
+
+    let mut fractional = request;
+    fractional.request.to = Some("2026-01-05T15:00:00.500".into());
+    let response = handle_run_configured_strategy(&fixture.state, &fractional);
+    assert!(!response.success);
+    assert!(response.error.unwrap().contains("not aligned"));
+
+    let mut tick = run_request(document_value(&bound_document()));
+    tick.request.from = Some(text(at(200) + ChronoDuration::seconds(30)));
+    let response = handle_run_configured_strategy(&fixture.state, &tick);
+    assert!(response.success, "{:?}", response.error);
 }
 
 #[test]
@@ -668,4 +685,38 @@ fn searches_are_validated_completely_before_any_data_is_loaded() {
     let mut reserved = search_request();
     reserved.request.space["parameters"]["window"] = serde_json::json!({ "values": [1] });
     assert!(!rejected(reserved).is_empty());
+
+    let mut oversized = search_request();
+    oversized.request.space["parameters"]["ema_fast"] =
+        serde_json::json!({ "range": { "from": 1, "to": 100_001, "step": 1 } });
+    let message = rejected(oversized);
+    assert!(message.contains("axis limit") || message.contains("pre-constraint limit"));
+
+    let mut unaligned_bar = search_request();
+    unaligned_bar.request.data_type = "bar".into();
+    unaligned_bar.request.timeframe = Some("1m".into());
+    if let SearchWindowsMsg::Fixed { in_sample, .. } = &mut unaligned_bar.request.windows {
+        in_sample.from = text(at(200) + ChronoDuration::seconds(30));
+    }
+    assert!(rejected(unaligned_bar).contains("not aligned"));
+
+    let mut candidate_timeframe = search_request();
+    candidate_timeframe.request.data_type = "bar".into();
+    candidate_timeframe.request.timeframe = Some("1m".into());
+    candidate_timeframe.request.template["parameters"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "timeframe_seconds",
+            "kind": { "type": "integer" }
+        }));
+    candidate_timeframe.request.space["parameters"]["timeframe_seconds"] =
+        serde_json::json!({ "values": [60, 120] });
+    candidate_timeframe.request.space["series"][0]["timeframe_seconds"] =
+        serde_json::json!({ "param": "timeframe_seconds" });
+    let message = rejected(candidate_timeframe);
+    assert!(
+        message.contains("search point") && message.contains("120s bars"),
+        "{message}"
+    );
 }

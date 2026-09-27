@@ -450,6 +450,198 @@ impl MaterialFactory for PassFactory {
     }
 }
 
+#[derive(Clone, Default)]
+struct CountEvaluator {
+    evaluations: i64,
+}
+
+impl MaterialEvaluator for CountEvaluator {
+    fn clone_box(&self) -> Box<dyn MaterialEvaluator> {
+        Box::new(self.clone())
+    }
+
+    fn evaluate(
+        &mut self,
+        _: &[Value],
+        context: &MaterialEvalContext<'_>,
+    ) -> Result<Value, String> {
+        if context.input_updates.len() != 2
+            || context.any_input_updates.len() != 2
+            || !context.input_updates[1]
+            || context.any_input_updates[1]
+        {
+            return Err("constant update provenance changed".into());
+        }
+        self.evaluations += 1;
+        Ok(Value::Integer(self.evaluations))
+    }
+}
+
+struct CountFactory;
+
+impl MaterialFactory for CountFactory {
+    fn build(&self, _: &MaterialArgs, input_types: &[ValueType]) -> Result<MaterialBuild, String> {
+        if input_types.len() != 2 {
+            return Err("two inputs required".into());
+        }
+        Ok(MaterialBuild {
+            output_type: ValueType::required(ScalarType::Integer),
+            lookback: MaterialLookback::InheritInputs { minimum: 1 },
+            max_state_bytes: std::mem::size_of::<i64>(),
+            evaluator: Box::<CountEvaluator>::default(),
+        })
+    }
+
+    fn update_trigger(
+        &self,
+        _: &MaterialArgs,
+        _: &[ValueType],
+    ) -> Result<MaterialUpdateTrigger, String> {
+        Ok(MaterialUpdateTrigger::AnyInput)
+    }
+}
+
+#[test]
+fn any_input_uses_any_causal_leaf_without_constant_spurious_updates() {
+    let library = MaterialLibrary::builtins()
+        .with_factory(
+            "pass_any",
+            Arc::new(PassFactory {
+                trigger: MaterialUpdateTrigger::AnyInput,
+                lookback: MaterialLookback::InheritInputs { minimum: 1 },
+            }),
+        )
+        .unwrap()
+        .with_factory("count_any", Arc::new(CountFactory))
+        .unwrap();
+
+    let mut compound = base(vec![
+        state(
+            "idle",
+            vec![transition(
+                1,
+                "done",
+                Expr::Eq {
+                    left: Box::new(Expr::Material { id: "sum".into() }),
+                    right: Box::new(price(13.0)),
+                },
+            )],
+        ),
+        state("done", vec![]),
+    ]);
+    compound.materials = vec![
+        MaterialConfig {
+            id: "fast_close".into(),
+            key: MATERIAL_BAR_FIELD.into(),
+            inputs: vec![],
+            params: MaterialParams::BarField {
+                source: source("fast"),
+                field: BarField::Close,
+            }
+            .into(),
+        },
+        MaterialConfig {
+            id: "slow_close".into(),
+            key: MATERIAL_BAR_FIELD.into(),
+            inputs: vec![],
+            params: MaterialParams::BarField {
+                source: source("slow"),
+                field: BarField::Close,
+            }
+            .into(),
+        },
+        MaterialConfig {
+            id: "sum".into(),
+            key: "pass_any".into(),
+            inputs: vec![Expr::Add {
+                left: Box::new(Expr::Material {
+                    id: "fast_close".into(),
+                }),
+                right: Box::new(Expr::Material {
+                    id: "slow_close".into(),
+                }),
+            }],
+            params: MaterialParams::None.into(),
+        },
+    ];
+    let mut strategy =
+        ConfiguredStrategy::compile(compound, &library, "compound", "EURUSD").unwrap();
+    let mut initial = input(0, false);
+    initial.completed_bars = vec![
+        CompletedBarUpdate {
+            source: source("fast"),
+            bar: bar(2.0),
+        },
+        CompletedBarUpdate {
+            source: source("slow"),
+            bar: bar(10.0),
+        },
+    ];
+    strategy.evaluate(&initial).unwrap();
+    let mut fast_only = input(1, true);
+    fast_only.completed_bars.push(CompletedBarUpdate {
+        source: source("fast"),
+        bar: bar(3.0),
+    });
+    strategy.evaluate(&fast_only).unwrap();
+    assert_eq!(strategy.state_id(), "done");
+
+    let mut constant = base(vec![
+        state(
+            "idle",
+            vec![transition(
+                1,
+                "done",
+                Expr::Eq {
+                    left: Box::new(Expr::Material { id: "count".into() }),
+                    right: Box::new(literal(Literal::Integer(2))),
+                },
+            )],
+        ),
+        state("done", vec![]),
+    ]);
+    constant.materials = vec![
+        MaterialConfig {
+            id: "fast_close".into(),
+            key: MATERIAL_BAR_FIELD.into(),
+            inputs: vec![],
+            params: MaterialParams::BarField {
+                source: source("fast"),
+                field: BarField::Close,
+            }
+            .into(),
+        },
+        MaterialConfig {
+            id: "count".into(),
+            key: "count_any".into(),
+            inputs: vec![
+                Expr::Material {
+                    id: "fast_close".into(),
+                },
+                number(1.0),
+            ],
+            params: MaterialParams::None.into(),
+        },
+    ];
+    let mut strategy =
+        ConfiguredStrategy::compile(constant, &library, "constant", "EURUSD").unwrap();
+    let mut initial = input(0, false);
+    initial.completed_bars.push(CompletedBarUpdate {
+        source: source("fast"),
+        bar: bar(2.0),
+    });
+    strategy.evaluate(&initial).unwrap();
+    strategy.evaluate(&input(1, true)).unwrap();
+    assert_eq!(strategy.state_id(), "idle");
+    let mut updated = input(2, true);
+    updated.completed_bars.push(CompletedBarUpdate {
+        source: source("fast"),
+        bar: bar(2.0),
+    });
+    strategy.evaluate(&updated).unwrap();
+    assert_eq!(strategy.state_id(), "done");
+}
+
 #[test]
 fn named_input_schema_conflicts_and_updated_provenance_are_enforced() {
     let conflict = base(vec![
@@ -1315,6 +1507,37 @@ fn checked_arithmetic_missing_and_priority_selection_remain_deterministic() {
     strategy.evaluate(&input(0, true)).unwrap();
     assert_eq!(strategy.state_id(), "low");
 
+    let missing_not_equal = base(vec![
+        state(
+            "idle",
+            vec![
+                transition(
+                    10,
+                    "ne",
+                    Expr::Ne {
+                        left: Box::new(missing(ScalarType::Number)),
+                        right: Box::new(number(1.0)),
+                    },
+                ),
+                transition(
+                    5,
+                    "not",
+                    Expr::Not {
+                        value: Box::new(Expr::Eq {
+                            left: Box::new(missing(ScalarType::Number)),
+                            right: Box::new(number(1.0)),
+                        }),
+                    },
+                ),
+            ],
+        ),
+        state("ne", vec![]),
+        state("not", vec![]),
+    ]);
+    let mut strategy = compile(missing_not_equal).unwrap();
+    strategy.evaluate(&input(0, true)).unwrap();
+    assert_eq!(strategy.state_id(), "not");
+
     let divide = Expr::Gt {
         left: Box::new(Expr::Div {
             left: Box::new(number(1.0)),
@@ -1324,6 +1547,28 @@ fn checked_arithmetic_missing_and_priority_selection_remain_deterministic() {
     };
     let mut strategy = compile(base(vec![
         state("idle", vec![transition(1, "done", divide)]),
+        state("done", vec![]),
+    ]))
+    .unwrap();
+    assert!(matches!(
+        strategy.evaluate(&input(0, true)),
+        Err(EvaluationError::DivisionByZero { .. })
+    ));
+
+    let eager = Expr::Any {
+        items: vec![
+            boolean(true),
+            Expr::Gt {
+                left: Box::new(Expr::Div {
+                    left: Box::new(number(1.0)),
+                    right: Box::new(number(0.0)),
+                }),
+                right: Box::new(number(0.0)),
+            },
+        ],
+    };
+    let mut strategy = compile(base(vec![
+        state("idle", vec![transition(1, "done", eager)]),
         state("done", vec![]),
     ]))
     .unwrap();

@@ -19,6 +19,43 @@ struct BoundPoint {
     document: StrategyConfig,
 }
 
+/// Bounds applied before a declared parameter space allocates axes or candidate points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredSpaceLimits {
+    pub max_axis_values: usize,
+    pub max_pre_constraint_points: usize,
+    pub max_points: usize,
+}
+
+impl DeclaredSpaceLimits {
+    pub fn new(
+        max_axis_values: usize,
+        max_pre_constraint_points: usize,
+        max_points: usize,
+    ) -> Result<Self, ResearchError> {
+        if [max_axis_values, max_pre_constraint_points, max_points].contains(&0) {
+            return Err(ResearchError::InvalidPlan(
+                "declared-space limits must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            max_axis_values,
+            max_pre_constraint_points,
+            max_points,
+        })
+    }
+}
+
+impl Default for DeclaredSpaceLimits {
+    fn default() -> Self {
+        Self {
+            max_axis_values: 1_000_000,
+            max_pre_constraint_points: 1_000_000,
+            max_points: 1_000_000,
+        }
+    }
+}
+
 /// A strict declared parameter space backed by one strategy document and one space document.
 #[derive(Clone)]
 pub struct DeclaredSpace {
@@ -47,7 +84,20 @@ impl DeclaredSpace {
     }
 
     pub fn from_toml(strategy: &str, space: &str) -> Result<Self, ResearchError> {
-        Self::from_toml_with_library(strategy, space, MaterialLibrary::builtins())
+        Self::from_toml_with_limits(strategy, space, DeclaredSpaceLimits::default())
+    }
+
+    pub fn from_toml_with_limits(
+        strategy: &str,
+        space: &str,
+        limits: DeclaredSpaceLimits,
+    ) -> Result<Self, ResearchError> {
+        Self::from_toml_with_library_and_limits(
+            strategy,
+            space,
+            MaterialLibrary::builtins(),
+            limits,
+        )
     }
 
     pub fn from_toml_with_library(
@@ -55,13 +105,38 @@ impl DeclaredSpace {
         space: &str,
         library: MaterialLibrary,
     ) -> Result<Self, ResearchError> {
+        Self::from_toml_with_library_and_limits(
+            strategy,
+            space,
+            library,
+            DeclaredSpaceLimits::default(),
+        )
+    }
+
+    pub fn from_toml_with_library_and_limits(
+        strategy: &str,
+        space: &str,
+        library: MaterialLibrary,
+        limits: DeclaredSpaceLimits,
+    ) -> Result<Self, ResearchError> {
         let document: StrategyConfig = toml::from_str(strategy).map_err(ResearchError::Toml)?;
         let space: SpaceDocument = toml::from_str(space).map_err(ResearchError::Toml)?;
-        Self::build(StrategyTemplate::new(document), space, library)
+        Self::build(StrategyTemplate::new(document), space, library, limits)
     }
 
     /// Build from an already decoded strategy template and a space document read from any serde source, such as a JSON value a service received, with the built-in material library.
     pub fn from_documents<'de, S>(template: StrategyConfig, space: S) -> Result<Self, ResearchError>
+    where
+        S: serde::Deserializer<'de>,
+    {
+        Self::from_documents_with_limits(template, space, DeclaredSpaceLimits::default())
+    }
+
+    pub fn from_documents_with_limits<'de, S>(
+        template: StrategyConfig,
+        space: S,
+        limits: DeclaredSpaceLimits,
+    ) -> Result<Self, ResearchError>
     where
         S: serde::Deserializer<'de>,
     {
@@ -71,6 +146,7 @@ impl DeclaredSpace {
             StrategyTemplate::new(template),
             space,
             MaterialLibrary::builtins(),
+            limits,
         )
     }
 
@@ -78,34 +154,42 @@ impl DeclaredSpace {
         template: StrategyTemplate,
         space: SpaceDocument,
         library: MaterialLibrary,
+        limits: DeclaredSpaceLimits,
     ) -> Result<Self, ResearchError> {
         template
             .validate(&library)
             .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
         validate_constraints(&space.constraints)?;
         validate_series(&space.series, template.document())?;
-        let bindings = enumerate_bindings(template.document(), &space)?;
-        let mut points = Vec::with_capacity(bindings.len());
-        for binding in bindings {
+        let dimensions = binding_dimensions(template.document(), &space, limits)?;
+        let mut points = Vec::new();
+        for_each_binding(&dimensions, |binding| {
             let accepted = space
                 .constraints
                 .iter()
-                .map(|constraint| {
+                .try_fold(true, |accepted, constraint| {
+                    if !accepted {
+                        return Ok(false);
+                    }
                     let value = evaluate_parameter_expression(constraint, &binding)
                         .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
                     require_boolean(value, "constraints")
                         .map_err(|error| ResearchError::InvalidDocument(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .all(|value| value);
+                })?;
             if accepted {
+                if points.len() >= limits.max_points {
+                    return Err(ResearchError::InvalidPlan(format!(
+                        "declared search space exceeds the admitted point limit of {}",
+                        limits.max_points
+                    )));
+                }
                 let document = template
                     .bind(&binding, &library)
                     .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
                 points.push(BoundPoint { binding, document });
             }
-        }
+            Ok(())
+        })?;
         if points.is_empty() {
             return Err(ResearchError::InvalidPlan(
                 "declared search space produced no parameter points".into(),
@@ -268,11 +352,13 @@ impl GeometryInteger {
     }
 }
 
-fn enumerate_bindings(
+fn binding_dimensions(
     strategy: &StrategyConfig,
     space: &SpaceDocument,
-) -> Result<Vec<ParameterBinding>, ResearchError> {
-    let mut dimensions = Vec::new();
+    limits: DeclaredSpaceLimits,
+) -> Result<Vec<(String, Vec<ParameterValue>)>, ResearchError> {
+    let mut dimensions = Vec::with_capacity(strategy.parameters.len());
+    let mut product = 1usize;
     for parameter in &strategy.parameters {
         let binding = space.parameters.get(&parameter.id).ok_or_else(|| {
             ResearchError::InvalidPlan(format!(
@@ -280,10 +366,22 @@ fn enumerate_bindings(
                 parameter.id
             ))
         })?;
-        dimensions.push((
-            parameter.id.clone(),
-            binding_values(&parameter.kind, binding, &parameter.id)?,
-        ));
+        let values = binding_values(
+            &parameter.kind,
+            binding,
+            &parameter.id,
+            limits.max_axis_values,
+        )?;
+        product = product.checked_mul(values.len()).ok_or_else(|| {
+            ResearchError::InvalidPlan("declared search-space product overflowed".into())
+        })?;
+        if product > limits.max_pre_constraint_points {
+            return Err(ResearchError::InvalidPlan(format!(
+                "declared search-space product {product} exceeds the pre-constraint limit of {}",
+                limits.max_pre_constraint_points
+            )));
+        }
+        dimensions.push((parameter.id.clone(), values));
     }
     for name in space.parameters.keys() {
         if !strategy
@@ -296,26 +394,43 @@ fn enumerate_bindings(
             )));
         }
     }
+    Ok(dimensions)
+}
 
-    let mut points = vec![ParameterBinding::default()];
-    for (name, values) in dimensions {
-        let mut next = Vec::with_capacity(points.len().saturating_mul(values.len()));
-        for point in points {
-            for value in &values {
-                let mut point = point.clone();
-                point.0.insert(name.clone(), value.clone());
-                next.push(point);
-            }
+fn for_each_binding(
+    dimensions: &[(String, Vec<ParameterValue>)],
+    mut visitor: impl FnMut(ParameterBinding) -> Result<(), ResearchError>,
+) -> Result<(), ResearchError> {
+    fn visit(
+        index: usize,
+        dimensions: &[(String, Vec<ParameterValue>)],
+        binding: &mut ParameterBinding,
+        visitor: &mut dyn FnMut(ParameterBinding) -> Result<(), ResearchError>,
+    ) -> Result<(), ResearchError> {
+        let Some((name, values)) = dimensions.get(index) else {
+            return visitor(binding.clone());
+        };
+        for value in values {
+            binding.0.insert(name.clone(), value.clone());
+            visit(index + 1, dimensions, binding, visitor)?;
         }
-        points = next;
+        binding.0.remove(name);
+        Ok(())
     }
-    Ok(points)
+
+    visit(
+        0,
+        dimensions,
+        &mut ParameterBinding::default(),
+        &mut visitor,
+    )
 }
 
 fn binding_values(
     kind: &ParameterKind,
     binding: &SpaceBinding,
     name: &str,
+    max_axis_values: usize,
 ) -> Result<Vec<ParameterValue>, ResearchError> {
     let forms = usize::from(binding.values.is_some())
         + usize::from(binding.range.is_some())
@@ -329,6 +444,12 @@ fn binding_values(
         if values.is_empty() {
             return Err(ResearchError::InvalidPlan(format!(
                 "space binding '{name}' must not be empty"
+            )));
+        }
+        if values.len() > max_axis_values {
+            return Err(ResearchError::InvalidPlan(format!(
+                "space binding '{name}' has {} values, above the axis limit of {max_axis_values}",
+                values.len()
             )));
         }
         values
@@ -352,13 +473,23 @@ fn binding_values(
                         "range for '{name}' requires a positive step and non-empty bounds"
                     )));
                 }
-                let mut values = Vec::new();
-                let mut current = from;
-                while current <= to {
-                    values.push(ParameterValue::Integer(current));
-                    current = current.checked_add(step).ok_or_else(|| {
+                let span = i128::from(to) - i128::from(from);
+                let count = span / i128::from(step) + 1;
+                let count = usize::try_from(count).map_err(|_| {
+                    ResearchError::InvalidPlan(format!("range count for '{name}' overflowed"))
+                })?;
+                if count > max_axis_values {
+                    return Err(ResearchError::InvalidPlan(format!(
+                        "range for '{name}' has {count} values, above the axis limit of {max_axis_values}"
+                    )));
+                }
+                let mut values = Vec::with_capacity(count);
+                for index in 0..count {
+                    let value = i128::from(from) + i128::from(step) * index as i128;
+                    let value = i64::try_from(value).map_err(|_| {
                         ResearchError::InvalidPlan(format!("range for '{name}' overflowed"))
                     })?;
+                    values.push(ParameterValue::Integer(value));
                 }
                 values
             }
@@ -371,15 +502,37 @@ fn binding_values(
                         "range for '{name}' requires a positive step and non-empty bounds"
                     )));
                 }
-                let count = ((to - from) / step).floor() as usize + 1;
-                if count > 1_000_000 {
+                let quotient = (to - from) / step;
+                if !quotient.is_finite() || quotient < 0.0 {
                     return Err(ResearchError::InvalidPlan(format!(
-                        "range for '{name}' exceeds one million values"
+                        "range count for '{name}' is not finite"
                     )));
                 }
-                (0..count)
-                    .map(|index| ParameterValue::Number(from + step * index as f64))
-                    .collect()
+                let floored = quotient.floor();
+                if floored > (usize::MAX - 1) as f64 {
+                    return Err(ResearchError::InvalidPlan(format!(
+                        "range count for '{name}' overflowed"
+                    )));
+                }
+                let count = (floored as usize).checked_add(1).ok_or_else(|| {
+                    ResearchError::InvalidPlan(format!("range count for '{name}' overflowed"))
+                })?;
+                if count > max_axis_values {
+                    return Err(ResearchError::InvalidPlan(format!(
+                        "range for '{name}' has {count} values, above the axis limit of {max_axis_values}"
+                    )));
+                }
+                let mut values = Vec::with_capacity(count);
+                for index in 0..count {
+                    let value = from + step * index as f64;
+                    if !value.is_finite() {
+                        return Err(ResearchError::InvalidPlan(format!(
+                            "range value for '{name}' is not finite"
+                        )));
+                    }
+                    values.push(ParameterValue::Number(value));
+                }
+                values
             }
             ParameterKind::Choice { .. } => {
                 return Err(ResearchError::InvalidPlan(format!(
@@ -396,6 +549,12 @@ fn binding_values(
         if binding.all != Some(true) {
             return Err(ResearchError::InvalidPlan(format!(
                 "all for '{name}' must be true"
+            )));
+        }
+        if options.len() > max_axis_values {
+            return Err(ResearchError::InvalidPlan(format!(
+                "choice axis '{name}' has {} values, above the axis limit of {max_axis_values}",
+                options.len()
             )));
         }
         options

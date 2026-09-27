@@ -191,7 +191,10 @@ pub(crate) struct FeedbackObservation {
 
 pub struct MaterialEvalContext<'a> {
     pub input: &'a StrategyInput,
+    /// Whether every causal leaf of each input expression updated at this boundary.
     pub input_updates: &'a [bool],
+    /// Whether any causal leaf of each input expression updated at this boundary.
+    pub any_input_updates: &'a [bool],
     pub(crate) feedback: &'a [FeedbackObservation],
     pub(crate) retained_feedback: &'a [FeedbackObservation],
 }
@@ -1354,6 +1357,7 @@ mod tests {
         let context = MaterialEvalContext {
             input: &input,
             input_updates: &[true],
+            any_input_updates: &[true],
             feedback: &[],
             retained_feedback: &[],
         };
@@ -1382,6 +1386,73 @@ mod tests {
             scalar: ScalarType::Number,
         };
         assert!((final_number(evaluate_values(&mut ema, &[1.0, 2.0, 3.0])) - 2.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn legacy_seed_and_valid_sample_missing_behavior_is_stable() {
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            any_input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+
+        let mut ema = EmaEvaluator {
+            alpha: 0.5,
+            value: None,
+            scalar: ScalarType::Number,
+        };
+        assert_eq!(
+            ema.evaluate(&[Value::Missing(ScalarType::Number)], &context)
+                .unwrap(),
+            Value::Missing(ScalarType::Number)
+        );
+        assert_eq!(
+            ema.evaluate(&[Value::Number(10.0)], &context).unwrap(),
+            Value::Number(10.0)
+        );
+
+        let mut rolling = RollingEvaluator {
+            period: 2,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+            kind: RollingKind::Mean,
+        };
+        assert_eq!(
+            rolling.evaluate(&[Value::Number(1.0)], &context).unwrap(),
+            Value::Missing(ScalarType::Number)
+        );
+        assert_eq!(
+            rolling
+                .evaluate(&[Value::Missing(ScalarType::Number)], &context)
+                .unwrap(),
+            Value::Missing(ScalarType::Number)
+        );
+        assert_eq!(
+            rolling.evaluate(&[Value::Number(3.0)], &context).unwrap(),
+            Value::Number(2.0)
+        );
+
+        let mut lag = LagEvaluator {
+            period: 1,
+            values: VecDeque::new(),
+            scalar: ScalarType::Number,
+        };
+        assert_eq!(
+            lag.evaluate(&[Value::Number(1.0)], &context).unwrap(),
+            Value::Missing(ScalarType::Number)
+        );
+        assert_eq!(
+            lag.evaluate(&[Value::Missing(ScalarType::Number)], &context)
+                .unwrap(),
+            Value::Missing(ScalarType::Number)
+        );
+        assert_eq!(
+            lag.evaluate(&[Value::Number(3.0)], &context).unwrap(),
+            Value::Number(1.0)
+        );
     }
 
     #[test]
@@ -1499,18 +1570,30 @@ mod tests {
             }],
             ..input()
         };
-        for item in [&first, &second] {
-            atr.evaluate(
+        let first_output = atr
+            .evaluate(
                 &[],
                 &MaterialEvalContext {
-                    input: item,
+                    input: &first,
                     input_updates: &[],
+                    any_input_updates: &[],
                     feedback: &[],
                     retained_feedback: &[],
                 },
             )
             .unwrap();
-        }
+        assert_eq!(first_output, Value::Price(0.0));
+        atr.evaluate(
+            &[],
+            &MaterialEvalContext {
+                input: &second,
+                input_updates: &[],
+                any_input_updates: &[],
+                feedback: &[],
+                retained_feedback: &[],
+            },
+        )
+        .unwrap();
         assert_eq!(atr.value, Some(2.0));
     }
 }

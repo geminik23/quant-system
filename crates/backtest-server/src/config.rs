@@ -146,6 +146,9 @@ pub struct StrategiesSection {
     /// Most worker threads one search may use; a request asking for more is capped here.
     #[serde(default = "default_max_search_workers")]
     pub max_search_workers: usize,
+    /// Most pre-constraint parameter combinations one search may enumerate.
+    #[serde(default = "default_max_search_generation_points")]
+    pub max_search_generation_points: usize,
     /// Most runs, counted as points times symbols times windows, one search may schedule.
     #[serde(default = "default_max_search_runs")]
     pub max_search_runs: usize,
@@ -160,6 +163,7 @@ impl Default for StrategiesSection {
             max_document_bytes: default_max_document_bytes(),
             max_retained_bars: default_max_retained_bars(),
             max_search_workers: default_max_search_workers(),
+            max_search_generation_points: default_max_search_generation_points(),
             max_search_runs: default_max_search_runs(),
             max_portfolio_instances: default_max_portfolio_instances(),
         }
@@ -176,6 +180,10 @@ fn default_max_retained_bars() -> usize {
 
 fn default_max_search_workers() -> usize {
     4
+}
+
+fn default_max_search_generation_points() -> usize {
+    100_000
 }
 
 fn default_max_search_runs() -> usize {

@@ -13,8 +13,10 @@ use qs_backtest::{
 };
 use qs_market_loader::MarketStreamError;
 use qs_research::{
-    DataWindow, DeclaredSpace, ResearchError, ResearchPlan, WindowPlan, batch_data_range,
-    load_symbol_bars, load_symbol_ticks, run_batch_controlled, validate_batch,
+    DataWindow, DeclaredSpace, DeclaredSpaceLimits, ResearchAdmissionLimits, ResearchError,
+    ResearchPlan, StrategyFamily, WindowPlan, batch_data_range_with_limits, load_symbol_bars,
+    load_symbol_ticks, run_batch_controlled_with_limits, validate_bar_window_alignment_with_limits,
+    validate_batch_with_limits,
 };
 use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
 use qs_strategy::{ConfiguredStrategy, MaterialLibrary, SourceId, StrategyConfig};
@@ -57,6 +59,8 @@ pub struct AcceptedSearch {
     data_type: String,
     timeframe: Option<String>,
     range: (NaiveDateTime, NaiveDateTime),
+    space_limits: DeclaredSpaceLimits,
+    admission_limits: ResearchAdmissionLimits,
 }
 
 // ── Configured strategy runs ────────────────────────────────────────────────
@@ -176,6 +180,9 @@ fn prepare_configured_run(
         && from >= to
     {
         return Err(invalid(format!("from {from} must be before to {to}")));
+    }
+    if bar_seconds.is_some() {
+        validate_server_bar_bounds("configured run", &geometry, from, to)?;
     }
     Ok(AcceptedConfiguredRun {
         document,
@@ -717,6 +724,16 @@ fn prepare_portfolio_run(
     {
         return Err(invalid(format!("from {from} must be before to {to}")));
     }
+    if bar_seconds.is_some() {
+        for (index, instance) in instances.iter().enumerate() {
+            validate_server_bar_bounds(
+                &format!("portfolio instances[{index}]"),
+                &instance.geometry,
+                from,
+                to,
+            )?;
+        }
+    }
     Ok(AcceptedPortfolioRun {
         instances,
         symbols,
@@ -1091,19 +1108,53 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
     let spec = &req.request;
     validate_future_quote_scalars(&req.future)?;
     let account_currency = account_currency_from_msg(&req.future)?;
-    data_geometry(&spec.data_type, spec.timeframe.as_deref())?;
+    let bar_seconds = data_geometry(&spec.data_type, spec.timeframe.as_deref())?;
     let limits = &state.strategies.limits;
+    if limits.max_search_runs == 0 || limits.max_search_generation_points == 0 {
+        return Err(invalid(
+            "max_search_runs and max_search_generation_points must be positive".into(),
+        ));
+    }
     check_document_size(limits, "strategy template", &spec.template)?;
     check_document_size(limits, "space document", &spec.space)?;
     let template: StrategyConfig = decode_document("strategy template", &spec.template)?;
-    let family = DeclaredSpace::from_documents(template.clone(), spec.space.clone())
-        .map_err(research_error)?;
 
     let mut symbols = Vec::new();
     for raw in &spec.symbols {
         symbols.push(required_symbol(&state.symbol_registry, raw)?);
     }
     let window_plan = window_plan_from_msg(&spec.windows)?;
+    let pair_count = window_plan
+        .pairs_with_limit(limits.max_search_runs)
+        .map_err(research_error)?
+        .len();
+    let runs_per_point = symbols
+        .len()
+        .checked_mul(pair_count)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| invalid("search run multiplier overflowed".into()))?;
+    if runs_per_point == 0 || runs_per_point > limits.max_search_runs {
+        return Err(invalid(format!(
+            "the search needs {runs_per_point} runs before adding any parameter points, above the server limit of {}",
+            limits.max_search_runs
+        )));
+    }
+    let max_points = limits.max_search_runs / runs_per_point;
+    let space_limits = DeclaredSpaceLimits::new(
+        limits.max_search_generation_points,
+        limits.max_search_generation_points,
+        max_points,
+    )
+    .map_err(research_error)?;
+    let family = DeclaredSpace::from_documents_with_limits(
+        template.clone(),
+        spec.space.clone(),
+        space_limits,
+    )
+    .map_err(research_error)?;
+    if let Some(bar_seconds) = bar_seconds {
+        validate_search_bar_geometry(&family, &symbols, bar_seconds)?;
+    }
     let config = config_from_msg(&spec.config, &state.symbol_registry, &symbols)?;
     let currency_plan = same_currency_plan(state, &account_currency, &symbols)?;
     let future = future_config_from_msg(&req.future, currency_plan)?;
@@ -1128,6 +1179,9 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
         .workers
         .unwrap_or(1)
         .clamp(1, limits.max_search_workers.max(1));
+    let admission_limits =
+        ResearchAdmissionLimits::new(limits.max_search_runs, limits.max_search_runs)
+            .map_err(research_error)?;
     let mut plan = ResearchPlan::new(symbols, window_plan, config)
         .with_future(future)
         .with_evaluation(evaluation)
@@ -1136,15 +1190,20 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
     if !profiles.is_empty() {
         plan = plan.with_entry_profiles(profiles);
     }
+    if bar_seconds.is_some() {
+        validate_bar_window_alignment_with_limits(&plan, &family, admission_limits)
+            .map_err(research_error)?;
+    }
 
-    let runs = validate_batch(&plan, &family).map_err(research_error)?;
+    let runs =
+        validate_batch_with_limits(&plan, &family, admission_limits).map_err(research_error)?;
     if runs > limits.max_search_runs {
         return Err(invalid(format!(
             "the search schedules {runs} runs, above the server limit of {}",
             limits.max_search_runs
         )));
     }
-    let range = batch_data_range(&plan, &family)
+    let range = batch_data_range_with_limits(&plan, &family, admission_limits)
         .map_err(research_error)?
         .ok_or_else(|| invalid("the search schedules no runs".into()))?;
     Ok(AcceptedSearch {
@@ -1155,6 +1214,8 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
         data_type: spec.data_type.to_lowercase(),
         timeframe: spec.timeframe.clone(),
         range,
+        space_limits,
+        admission_limits,
     })
 }
 
@@ -1216,8 +1277,12 @@ fn execute_search(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_not_cancelled(Some(cancellation))?;
-    let family = DeclaredSpace::from_documents(search.template.clone(), search.space.clone())
-        .map_err(research_error)?;
+    let family = DeclaredSpace::from_documents_with_limits(
+        search.template.clone(),
+        search.space.clone(),
+        search.space_limits,
+    )
+    .map_err(research_error)?;
     let (from, to) = search.range;
     let total_symbols = search.plan.symbols.len() as u64;
     let mut events = BTreeMap::new();
@@ -1254,10 +1319,11 @@ fn execute_search(
         );
     }
 
-    let batch = run_batch_controlled(
+    let batch = run_batch_controlled_with_limits(
         &search.plan,
         &family,
         &events,
+        search.admission_limits,
         &|| cancellation.is_cancelled(),
         &|progress| {
             update_job_progress(
@@ -1355,6 +1421,61 @@ fn data_geometry(data_type: &str, timeframe: Option<&str>) -> Result<Option<u64>
             "data_type must be 'tick' or 'bar', got '{other}'"
         ))),
     }
+}
+
+fn validate_server_bar_bounds(
+    context: &str,
+    geometry: &[SeriesGeometry],
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Result<()> {
+    let mut shortest = BTreeMap::<&str, u64>::new();
+    for series in geometry {
+        let duration = series.timeframe.duration_seconds();
+        shortest
+            .entry(series.symbol.as_str())
+            .and_modify(|current| *current = (*current).min(duration))
+            .or_insert(duration);
+    }
+    for series in geometry {
+        if shortest.get(series.symbol.as_str()) != Some(&series.timeframe.duration_seconds()) {
+            continue;
+        }
+        for (name, timestamp) in [("from", from), ("to", to)] {
+            if let Some(timestamp) = timestamp
+                && !series.is_aligned(timestamp)
+            {
+                return Err(invalid(format!(
+                    "{context} {name} {timestamp} is not aligned to source '{}' {}s bars with offset {}s",
+                    series.source,
+                    series.timeframe.duration_seconds(),
+                    series.alignment_offset_seconds
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_search_bar_geometry(
+    family: &DeclaredSpace,
+    symbols: &[String],
+    bar_seconds: u64,
+) -> Result<()> {
+    for (point_index, point) in family.points().iter().enumerate() {
+        for symbol in symbols {
+            for geometry in family.geometry(symbol, point) {
+                let declared = geometry.timeframe.duration_seconds();
+                if declared != bar_seconds {
+                    return Err(invalid(format!(
+                        "search point {point_index} source '{}' declares {declared}s bars but the request loads {bar_seconds}s bars",
+                        geometry.source
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_document_size(

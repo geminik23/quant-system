@@ -5,14 +5,45 @@ use qs_backtest::runner::BacktestConfig;
 use qs_backtest::sizing::SizingPolicy;
 use qs_backtest::{FutureQuoteConfig, PreparedEntryProfiles, StrategyRetentionLimits};
 use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
+use serde::Serialize;
 
 use crate::error::ResearchError;
-use crate::window::WindowPlan;
+use crate::window::{DEFAULT_MAX_WINDOW_PAIRS, WindowPlan};
+
+/// Bounds applied before a research plan expands windows or scheduled runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResearchAdmissionLimits {
+    pub max_window_pairs: usize,
+    pub max_scheduled_runs: usize,
+}
+
+impl ResearchAdmissionLimits {
+    pub fn new(max_window_pairs: usize, max_scheduled_runs: usize) -> Result<Self, ResearchError> {
+        if max_window_pairs == 0 || max_scheduled_runs == 0 {
+            return Err(ResearchError::InvalidPlan(
+                "research admission limits must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            max_window_pairs,
+            max_scheduled_runs,
+        })
+    }
+}
+
+impl Default for ResearchAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_window_pairs: DEFAULT_MAX_WINDOW_PAIRS,
+            max_scheduled_runs: 1_000_000,
+        }
+    }
+}
 
 /// Replay every symbol of the plan together, one instance per symbol against one account, instead of one run per symbol.
 ///
 /// Each run then covers one point over one window, and a supervisor built from `policies` and `groups` reviews the instances' entries. Empty policies replay the portfolio without supervision.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PortfolioPlan {
     pub policies: Vec<RiskPolicy>,
     pub groups: Vec<CorrelationGroup>,
@@ -124,6 +155,7 @@ impl ResearchPlan {
                 "a research plan must use at least one worker".into(),
             ));
         }
+
         if let Some(portfolio) = &self.portfolio
             && let Some(supervisor) = portfolio.supervisor()?
             && supervisor.caps_group_risk()

@@ -517,6 +517,15 @@ fn invalid_portfolios_are_rejected_before_admission_with_their_location() {
     );
     unrelated.request.groups = Some(serde_json::json!([{ "id": "jpy", "symbols": ["USDJPY"] }]));
     reject(unrelated, "names none of the portfolio's symbols");
+    let mut unaligned_bar = portfolio_request(
+        vec![instance_msg("EURUSD", Some("eur"))],
+        None,
+        SizingPolicyMsg::FixedLot { lots: 0.1 },
+    );
+    unaligned_bar.request.data_type = "bar".into();
+    unaligned_bar.request.timeframe = Some("1m".into());
+    unaligned_bar.request.from = Some(text(at(200) + ChronoDuration::seconds(30)));
+    reject(unaligned_bar, "not aligned");
     let limit = fixture.state.strategies.limits.max_portfolio_instances;
     reject(
         portfolio_request(

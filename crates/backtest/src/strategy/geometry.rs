@@ -37,6 +37,17 @@ impl SeriesGeometry {
             alignment_offset_seconds,
         }
     }
+
+    /// Whether a timestamp is exactly on this fixed-duration series' aligned bucket boundary.
+    pub fn is_aligned(&self, timestamp: NaiveDateTime) -> bool {
+        if timestamp.and_utc().timestamp_subsec_nanos() != 0 {
+            return false;
+        }
+        let duration = i64::try_from(self.timeframe.duration_seconds())
+            .expect("fixed timeframe duration always fits i64");
+        let offset = i64::from(self.alignment_offset_seconds).rem_euclid(duration);
+        (timestamp.and_utc().timestamp() - offset).rem_euclid(duration) == 0
+    }
 }
 
 /// Geometry that cannot be bound or whose warmup cannot be represented.

@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use qs_backtest::Timeframe;
 use qs_research::families::EmaCrossFamily;
-use qs_research::{DataWindow, ResearchPlan, RunStatus, SymbolEvents, WindowPlan, run_batch};
+use qs_research::{
+    DataWindow, EndpointBounds, ExperimentId, ExperimentOptions, ResearchAdmissionLimits,
+    ResearchPlan, RunStatus, SymbolEvents, WindowPlan, run_batch, run_batch_with_experiment,
+};
 use support::{SYMBOL, at, config, synthetic_ticks};
 
 fn family() -> EmaCrossFamily {
@@ -56,6 +59,104 @@ fn a_batch_produces_the_same_table_sequentially_and_in_parallel() {
     let parallel = run_batch(&plan(4), &family(), &events).unwrap();
     assert_eq!(sequential, parallel);
     assert_eq!(sequential.to_csv(), parallel.to_csv());
+}
+
+#[test]
+fn effective_recipes_are_deduplicated_and_worker_stable() {
+    let events = events();
+    let options = ExperimentOptions {
+        experiment_id: Some(ExperimentId::new("recipe-fixture").unwrap()),
+        caller_revision: Some("test-revision".into()),
+        dataset_reference: Some("synthetic-minute-ticks".into()),
+    };
+    let sequential = run_batch_with_experiment(
+        &plan(1),
+        &family(),
+        &events,
+        ResearchAdmissionLimits::default(),
+        options.clone(),
+    )
+    .unwrap();
+    let parallel = run_batch_with_experiment(
+        &plan(4),
+        &family(),
+        &events,
+        ResearchAdmissionLimits::default(),
+        options,
+    )
+    .unwrap();
+
+    assert_eq!(sequential.experiment_recipe(), parallel.experiment_recipe());
+    assert_eq!(sequential.candidate_recipes(), parallel.candidate_recipes());
+    assert_eq!(sequential.run_recipes(), parallel.run_recipes());
+    assert_eq!(
+        sequential.experiment_recipe().endpoint_bounds,
+        EndpointBounds::HalfOpen
+    );
+    assert_eq!(
+        sequential.experiment_recipe().backtest["close_on_finish"],
+        true
+    );
+    assert!(
+        sequential
+            .experiment_recipe()
+            .research_retention
+            .is_object()
+    );
+    assert!(
+        sequential
+            .run_recipes()
+            .iter()
+            .all(|recipe| recipe.run_tags["window"] == recipe.window)
+    );
+    assert_eq!(sequential.candidate_recipes().len(), 8);
+    assert_eq!(sequential.run_recipes().len(), 16);
+    assert!(
+        sequential
+            .candidate_recipes()
+            .iter()
+            .all(|recipe| recipe.series_by_symbol.contains_key(SYMBOL))
+    );
+    assert!(
+        sequential
+            .run_recipes()
+            .iter()
+            .all(|recipe| recipe.coverage.is_some())
+    );
+
+    let encoded = serde_json::to_string(sequential.candidate_recipes()).unwrap();
+    let decoded: Vec<qs_research::CandidateRecipe> = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, sequential.candidate_recipes());
+    let encoded = serde_json::to_string(sequential.run_recipes()).unwrap();
+    let decoded: Vec<qs_research::RunRecipe> = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, sequential.run_recipes());
+}
+
+#[test]
+fn coverage_is_recorded_only_after_successful_replay() {
+    let completed = run_batch(&plan(1), &family(), &events()).unwrap();
+    for recipe in completed.run_recipes() {
+        let coverage = recipe.coverage.as_ref().unwrap();
+        assert!(coverage.processed_primary_events > 0);
+        assert!(coverage.first_input_at <= coverage.last_input_at);
+        assert_eq!(coverage.unavailable.len(), 2);
+        assert!(coverage.first_ready_at.is_some());
+    }
+
+    let broken = EmaCrossFamily::new(0..=0, 8..=8, vec![10], Timeframe::minutes(1).unwrap());
+    let failed = run_batch(&plan(1), &broken, &events()).unwrap();
+    assert!(
+        failed
+            .run_recipes()
+            .iter()
+            .all(|recipe| recipe.coverage.is_none())
+    );
+    assert!(failed.candidate_recipes().iter().all(|recipe| {
+        recipe
+            .admission_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("compile:"))
+    }));
 }
 
 #[test]

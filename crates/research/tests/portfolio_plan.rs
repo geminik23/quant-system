@@ -105,6 +105,15 @@ fn a_portfolio_plan_runs_each_point_once_per_window_over_all_symbols() {
         .filter_map(|position| position.dimensions.tags.get("instance").cloned())
         .collect::<std::collections::BTreeSet<_>>();
     assert!(instances.contains(SYMBOL), "{instances:?}");
+    assert_eq!(batch.experiment_recipe().ordered_symbols, [SYMBOL, SECOND]);
+    assert!(batch.experiment_recipe().portfolio.is_some());
+    assert!(batch.run_recipes().iter().all(|recipe| {
+        recipe.coverage.as_ref().is_some_and(|coverage| {
+            coverage
+                .unavailable
+                .contains(&qs_research::UnavailableCoverage::FirstReady)
+        })
+    }));
     assert!(
         batch
             .position_outcomes()

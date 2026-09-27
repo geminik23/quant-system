@@ -13,7 +13,7 @@ The runnable example uses [`ema_strategy.toml`](../crates/research/examples/ema_
 
 A parameter is fixed for one run and is substituted before compilation. It is different from an `input`, which an adapter supplies at every evaluation, and from a variable, which strategy state may change during a run. Binding produces a complete ordinary `StrategyConfig`; unresolved parameters never reach the runtime.
 
-A research batch runs without management profiles, so every Entry uses its own signal stop and targets. If a document's Entry declares an `entry_class`, every run fails before replay with an unrouted-class error and is recorded as a failed row, because the batch supplies no route for that class.
+A research batch may run unprofiled or with an immutable `PreparedEntryProfiles` snapshot supplied through `ResearchPlan::with_entry_profiles`. Unclassified Entries use the run default profile when present; classified Entries require an exact route. Missing routes and stop-ownership conflicts fail explicitly rather than falling back.
 
 A strategy and space are loaded explicitly:
 
@@ -68,7 +68,7 @@ right = { op = "param", id = "ema_slow" }
 
 Constraints reuse the typed expression model but may contain only parameters and literals. Runtime inputs, materials, position facts, feedback, and bar fields are rejected in a space constraint.
 
-Enumeration follows strategy parameter declaration order and is independent of map iteration. `points_total` reports the number of combinations remaining after constraints.
+Enumeration follows strategy parameter declaration order and is independent of map iteration. Axis cardinality and the pre-constraint Cartesian product are checked before expansion; constraints cannot justify an unbounded intermediate product. `DeclaredSpaceLimits` selects axis, pre-constraint, and admitted-point limits, while `ResearchAdmissionLimits` bounds rolling-window pairs and scheduled runs. Existing convenience constructors use documented bounded compatibility defaults, and the service applies its stricter configured run limit during both admission and worker reconstruction. `points_total` reports the number of combinations remaining after constraints.
 
 ## Geometry and warmup
 
@@ -87,7 +87,7 @@ WindowPlan::Fixed { in_sample, out_of_sample }
 WindowPlan::RollingWalkForward { start, end, train, test, step }
 ```
 
-Windows are half-open: events at `to` belong to the following window. Fixed in-sample and out-of-sample labels must be distinct. A rolling split is emitted only when its complete test span fits inside the declared range.
+Research windows, including service searches, are half-open: events at `to` belong to the following window. Stored-bar `from` and `to` must align to every candidate's shortest execution timeframe and offset; malformed bounds fail before replay or retained-job admission and are never rounded or split. This differs from the legacy configured/portfolio service endpoint, whose inclusive storage cursor may select the full bar beginning at an aligned `to`; identical timestamp strings therefore do not select equivalent data across those endpoint contracts. Fixed in-sample and out-of-sample labels must be distinct. A rolling split is counted with checked timestamp arithmetic and emitted only when its complete test span fits inside the declared range.
 
 The feed includes the derived warmup preceding `from`. Positions still open when the window ends are closed by the run and counted in `forced_closes`. Every row reports `entries_before_window` so an early-entry violation remains visible.
 
@@ -102,9 +102,12 @@ let report = batch.evaluate(EvaluationOptions {
     ..EvaluationOptions::default()
 });
 let document = batch.bound_document(0);
+let experiment = batch.experiment_recipe();
+let candidates = batch.candidate_recipes();
+let runs = batch.run_recipes();
 ```
 
-The table and pooled evaluation are projections of the same retained runs. Each normalized position ID is prefixed with a deterministic run ordinal before pooling, so IDs remain unique across symbols, windows, parameter points, and worker schedules.
+The table and pooled evaluation are projections of the same retained runs. Each normalized position ID is prefixed with a deterministic run ordinal before pooling, so IDs remain unique across symbols, windows, parameter points, and worker schedules. A batch stores one experiment recipe, one recipe per candidate, and one lightweight recipe per run. `run_batch_with_experiment` accepts an optional validated experiment ID plus caller revision and dataset reference without changing `ResearchPlan`; the compatibility APIs intentionally use no persistent experiment ID. Candidate recipes retain typed parameters, the exact bound document, and effective admission-time series bindings. The experiment recipe snapshots replay, FutureQuote, evaluation, retention, profile, decision-latency, ordered-symbol, portfolio-policy, currency, instrument, sizing, and cost settings through their owning typed values. Run recipes refer to a candidate ordinal and record half-open bounds, data mode, successful replay input coverage, actual single-instance first-ready time, and forced closes. Per-source validity and missing-bucket counts remain explicitly unavailable until their owning calendar/input contracts exist, and portfolio first-ready remains unavailable until the portfolio runner returns per-instance adapter metadata. Recipes reference caller-owned data and code; they do not prove a mutable dataset or revision stayed available. Selected-candidate trace reruns, resume, cache, and service recipe artifacts remain planned.
 
 Rows are ordered by family, symbol, parameter labels, and window, never by a metric. Individual compilation, binding, or replay failures become failed rows while other runs continue. Invalid plans, documents, spaces, labels, or input ordering fail before the batch starts.
 

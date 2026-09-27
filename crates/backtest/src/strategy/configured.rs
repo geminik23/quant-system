@@ -328,6 +328,7 @@ pub struct BacktestConfiguredStrategyAdapter {
     requirements: StrategyRequirements,
     bindings: ConfiguredHistoricalBindings,
     command_routes: BTreeMap<String, CommandRoute>,
+    first_ready_at: Option<NaiveDateTime>,
 }
 
 impl BacktestConfiguredStrategyAdapter {
@@ -366,6 +367,7 @@ impl BacktestConfiguredStrategyAdapter {
             requirements,
             bindings,
             command_routes: BTreeMap::new(),
+            first_ready_at: None,
         })
     }
 
@@ -387,6 +389,10 @@ impl BacktestConfiguredStrategyAdapter {
 
     pub fn series_specs(&self) -> impl ExactSizeIterator<Item = &BarSeriesSpec> {
         self.bindings.sources.iter().map(|binding| &binding.series)
+    }
+
+    pub fn first_ready_at(&self) -> Option<NaiveDateTime> {
+        self.first_ready_at
     }
 
     pub fn configured_strategy(&self) -> &ConfiguredStrategy {
@@ -504,6 +510,9 @@ impl BacktestConfiguredStrategyAdapter {
         retention: StrategyRetentionLimits,
         research: StrategyResearchLimits,
     ) -> Result<ConfiguredBoundaryOutput, ConfiguredStrategyAdapterError> {
+        if ready && self.first_ready_at.is_none() {
+            self.first_ready_at = Some(observed_through);
+        }
         let feedback = self.project_feedback(feedback_events)?;
         let input = StrategyInput {
             time: observed_through,

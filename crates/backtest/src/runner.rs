@@ -30,6 +30,7 @@ use qs_instruments::{
     Decimal, DecimalGrid, EconomicsModelId, InstrumentSpec, ListingStatus, PositiveDecimal,
     QuantityUnit,
 };
+use serde::Serialize;
 
 use crate::artifacts::{
     EntryProfileResolutionAudit, EntryProfileSelectionSource, EntryResolutionStage,
@@ -67,7 +68,7 @@ use crate::strategy::{
 
 /// Future-quote execution settings. Existing runners remain on legacy semantics
 /// unless [`BacktestRunner::run_raw_signals_future`] is used.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FutureQuoteConfig {
     /// Signal processing latency added before an action becomes eligible.
     pub signal_latency_ms: i64,
@@ -922,7 +923,7 @@ impl<F: DataFeed> FallibleBatchFeed for DataFeedBatchAdapter<'_, F> {
 }
 
 /// Configuration for a backtest run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BacktestConfig {
     /// Starting account balance.
     pub initial_balance: f64,
