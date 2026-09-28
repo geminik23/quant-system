@@ -94,7 +94,7 @@ pub struct ClosedBar {
     high: f64,
     low: f64,
     close: f64,
-    tick_count: u64,
+    tick_count: Option<u64>,
 }
 
 impl ClosedBar {
@@ -130,7 +130,7 @@ impl ClosedBar {
         self.close
     }
 
-    pub fn tick_count(&self) -> u64 {
+    pub fn tick_count(&self) -> Option<u64> {
         self.tick_count
     }
 }
@@ -294,7 +294,7 @@ struct OpenBar {
     high: f64,
     low: f64,
     close: f64,
-    tick_count: u64,
+    tick_count: Option<u64>,
 }
 
 impl OpenBar {
@@ -306,7 +306,7 @@ impl OpenBar {
             high: price,
             low: price,
             close: price,
-            tick_count: 1,
+            tick_count: Some(1),
         }
     }
 
@@ -314,12 +314,14 @@ impl OpenBar {
         self.high = self.high.max(price);
         self.low = self.low.min(price);
         self.close = price;
-        self.tick_count =
+        self.tick_count = Some(
             self.tick_count
+                .expect("tick-built bars always have a count")
                 .checked_add(1)
                 .ok_or_else(|| SeriesError::TickCountOverflow {
                     series_id: series_id.clone(),
-                })?;
+                })?,
+        );
         Ok(())
     }
 }
@@ -458,10 +460,10 @@ impl BatchSeriesState {
         if bar.low > bar.open.min(bar.close) || bar.high < bar.open.max(bar.close) {
             return Err(invalid("open and close must lie within low and high"));
         }
-        let tick_count = bar
-            .tick_count
-            .filter(|count| *count > 0)
-            .ok_or_else(|| invalid("a positive tick count is required"))?;
+        if bar.tick_count == Some(0) {
+            return Err(invalid("zero is not a valid tick count"));
+        }
+        let tick_count = bar.tick_count;
         if let Some(current) = self.open.as_ref() {
             if current.open_time == open_time {
                 return Err(SeriesError::DuplicateStoredBar {

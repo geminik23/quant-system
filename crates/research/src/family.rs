@@ -34,4 +34,12 @@ pub trait StrategyFamily: Sync {
     fn library(&self) -> MaterialLibrary {
         MaterialLibrary::builtins()
     }
+
+    fn input_projector_recipe(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+    ) -> Vec<crate::InputProjectorSnapshot> {
+        Vec::new()
+    }
 }

@@ -147,7 +147,7 @@ fn assert_identical(engine: &[ClosedBar], stored: &[data_preprocess::models::Bar
             "{label}[{index}] close"
         );
         assert_eq!(
-            i64::try_from(engine_bar.tick_count()).unwrap(),
+            i64::try_from(engine_bar.tick_count().unwrap()).unwrap(),
             stored_bar.tick_vol,
             "{label}[{index}] tick count"
         );

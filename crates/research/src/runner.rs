@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -32,6 +32,32 @@ const DEFAULT_DATA_MODE: &str = "ticks";
 const RESERVED_TAGS: [&str; 3] = ["window", "symbol", "data_mode"];
 /// Separator of the symbols a portfolio run's row and `symbol` tag name.
 const PORTFOLIO_SYMBOL_SEPARATOR: &str = "+";
+
+#[derive(Clone)]
+struct RecipeFamily {
+    family_id: String,
+    binding: ParameterBinding,
+    document: StrategyConfig,
+    geometry: BTreeMap<String, Vec<crate::SeriesGeometry>>,
+}
+impl StrategyFamily for RecipeFamily {
+    type Params = ();
+    fn family_id(&self) -> &str {
+        &self.family_id
+    }
+    fn points(&self) -> Vec<Self::Params> {
+        vec![()]
+    }
+    fn parameter_binding(&self, _: &Self::Params) -> ParameterBinding {
+        self.binding.clone()
+    }
+    fn config(&self, _: &Self::Params) -> StrategyConfig {
+        self.document.clone()
+    }
+    fn geometry(&self, symbol: &str, _: &Self::Params) -> Vec<crate::SeriesGeometry> {
+        self.geometry.get(symbol).cloned().unwrap_or_default()
+    }
+}
 
 pub type SymbolEvents = Arc<[FeedEvent]>;
 
@@ -72,12 +98,12 @@ struct ExecutedPortfolio {
 /// All retained outcomes and projections produced by one parameter search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResearchBatch {
-    table: ResearchTable,
-    positions: Vec<PositionOutcome>,
-    bound_documents: Vec<StrategyConfig>,
-    experiment_recipe: ExperimentRecipe,
-    candidate_recipes: Vec<CandidateRecipe>,
-    run_recipes: Vec<RunRecipe>,
+    pub(crate) table: ResearchTable,
+    pub(crate) positions: Vec<PositionOutcome>,
+    pub(crate) bound_documents: Vec<Option<StrategyConfig>>,
+    pub(crate) experiment_recipe: ExperimentRecipe,
+    pub(crate) candidate_recipes: Vec<CandidateRecipe>,
+    pub(crate) run_recipes: Vec<RunRecipe>,
 }
 
 impl ResearchBatch {
@@ -94,7 +120,7 @@ impl ResearchBatch {
     }
 
     pub fn bound_document(&self, point: usize) -> Option<&StrategyConfig> {
-        self.bound_documents.get(point)
+        self.bound_documents.get(point).and_then(Option::as_ref)
     }
 
     pub fn position_outcomes(&self) -> &[PositionOutcome] {
@@ -111,6 +137,81 @@ impl ResearchBatch {
 
     pub fn run_recipes(&self) -> &[RunRecipe] {
         &self.run_recipes
+    }
+
+    pub fn merge_checkpoint(
+        mut self,
+        checkpoint: &crate::SearchCheckpoint,
+    ) -> Result<Self, ResearchError> {
+        let mut candidates = checkpoint.candidate_recipes.clone();
+        for candidate in self.candidate_recipes.drain(..) {
+            if let Some(previous) = candidates.insert(candidate.ordinal, candidate.clone())
+                && previous != candidate
+            {
+                return Err(ResearchError::InvalidPlan(
+                    "resumed candidate recipe differs from its checkpoint".into(),
+                ));
+            }
+        }
+        let mut runs = checkpoint
+            .committed_runs
+            .values()
+            .map(|outcome| (outcome.recipe.ordinal, outcome.recipe.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for run in self.run_recipes.drain(..) {
+            if runs.insert(run.ordinal, run.clone()).is_some() {
+                return Err(ResearchError::InvalidPlan(
+                    "resumed run duplicates a committed checkpoint run".into(),
+                ));
+            }
+        }
+        let mut rows = checkpoint
+            .committed_runs
+            .values()
+            .map(|outcome| outcome.row.clone())
+            .collect::<Vec<_>>();
+        rows.extend(self.table.rows().iter().cloned());
+        let mut positions = checkpoint
+            .committed_runs
+            .values()
+            .flat_map(|outcome| outcome.positions.iter().cloned())
+            .collect::<Vec<_>>();
+        positions.extend(self.positions);
+        let mut position_ids = BTreeSet::new();
+        if positions
+            .iter()
+            .any(|position| !position_ids.insert(position.id.clone()))
+        {
+            return Err(ResearchError::InvalidPlan(
+                "resumed positions duplicate a committed position identity".into(),
+            ));
+        }
+        let mut experiment = checkpoint
+            .experiment_recipe
+            .clone()
+            .unwrap_or(self.experiment_recipe);
+        experiment.candidate_count = candidates.len();
+        let mut candidate_recipes = candidates.into_values().collect::<Vec<_>>();
+        candidate_recipes.sort_by_key(|candidate| candidate.ordinal);
+        let bound_documents = candidate_recipes
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .document
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| ResearchError::InvalidDocument(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            table: ResearchTable::new(rows),
+            positions,
+            bound_documents,
+            experiment_recipe: experiment,
+            candidate_recipes,
+            run_recipes: runs.into_values().collect(),
+        })
     }
 }
 
@@ -150,6 +251,159 @@ where
     F: StrategyFamily,
 {
     run_batch_controlled_with_experiment(plan, family, events, limits, options, &|| false, &|_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rerun_selected_candidate_protected(
+    plan: &ResearchPlan,
+    experiment: &ExperimentRecipe,
+    candidate: &CandidateRecipe,
+    run: &RunRecipe,
+    events: &BTreeMap<String, SymbolEvents>,
+    protected: &mut crate::ProtectedExperiment,
+    role: crate::EvaluationRole,
+    caller_revision: &str,
+) -> Result<ResearchBatch, ResearchError> {
+    if role == crate::EvaluationRole::Final {
+        let frozen = protected.frozen().ok_or_else(|| {
+            ResearchError::InvalidPlan("final rerun requires frozen selection".into())
+        })?;
+        if &frozen.candidate != candidate || &frozen.experiment != experiment {
+            return Err(ResearchError::InvalidPlan(
+                "final rerun differs from the frozen selection".into(),
+            ));
+        }
+    }
+    let window = DataWindow::new(run.window.clone(), run.from, run.to)?;
+    protected.access(role, &window, caller_revision, true)?;
+    rerun_selected_candidate(plan, experiment, candidate, run, events)
+}
+
+pub fn rerun_selected_candidate(
+    plan: &ResearchPlan,
+    experiment: &ExperimentRecipe,
+    candidate: &CandidateRecipe,
+    run: &RunRecipe,
+    events: &BTreeMap<String, SymbolEvents>,
+) -> Result<ResearchBatch, ResearchError> {
+    if experiment.endpoint_bounds != EndpointBounds::HalfOpen
+        || run.symbol.contains(PORTFOLIO_SYMBOL_SEPARATOR)
+    {
+        return Err(ResearchError::InvalidPlan(
+            "selected rerun requires one half-open configured run".into(),
+        ));
+    }
+    let document_value = candidate.document.clone().ok_or_else(|| {
+        ResearchError::InvalidPlan(
+            "selected candidate is a direct factory, not a configured document".into(),
+        )
+    })?;
+    if candidate.registered_factory.is_some() {
+        return Err(ResearchError::InvalidPlan(
+            "candidate recipe cannot contain both document and factory".into(),
+        ));
+    }
+    let document: StrategyConfig = serde_json::from_value(document_value)
+        .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
+    let effective_backtest = {
+        let mut value = plan.config.clone();
+        value.close_on_finish = true;
+        recipe_value("rerun backtest", &value)?
+    };
+    if effective_backtest != experiment.backtest
+        || recipe_value("rerun future", &plan.future)? != experiment.future
+        || recipe_value("rerun evaluation", &plan.evaluation)? != experiment.evaluation
+        || recipe_value("rerun retention", &plan.retention)? != experiment.retention
+    {
+        return Err(ResearchError::InvalidPlan(
+            "selected rerun settings differ from the frozen experiment recipe".into(),
+        ));
+    }
+    let snapshots = candidate.series_by_symbol.get(&run.symbol).ok_or_else(|| {
+        ResearchError::InvalidPlan("candidate recipe has no series for rerun symbol".into())
+    })?;
+    let geometry = snapshots
+        .iter()
+        .map(|snapshot| {
+            let timeframe = qs_backtest::Timeframe::seconds(
+                u32::try_from(snapshot.timeframe_seconds).map_err(|_| {
+                    ResearchError::InvalidPlan("rerun timeframe exceeds u32".into())
+                })?,
+            )
+            .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+            let basis = match snapshot.price_basis.as_str() {
+                "bid" => qs_backtest::PriceBasis::Bid,
+                "ask" => qs_backtest::PriceBasis::Ask,
+                "mid" => qs_backtest::PriceBasis::Mid,
+                other => {
+                    return Err(ResearchError::InvalidPlan(format!(
+                        "unknown rerun price basis {other}"
+                    )));
+                }
+            };
+            Ok(crate::SeriesGeometry::new(
+                qs_strategy::SourceId::new(snapshot.source.clone())
+                    .map_err(ResearchError::InvalidPlan)?,
+                snapshot.symbol.clone(),
+                timeframe,
+                basis,
+                i32::try_from(snapshot.alignment_offset_seconds).map_err(|_| {
+                    ResearchError::InvalidPlan("rerun alignment exceeds i32".into())
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ResearchError>>()?;
+    let family = RecipeFamily {
+        family_id: candidate.family_id.clone(),
+        binding: ParameterBinding::new(candidate.parameters.clone()),
+        document: document.clone(),
+        geometry: BTreeMap::from([(run.symbol.clone(), geometry)]),
+    };
+    let window = DataWindow::new(run.window.clone(), run.from, run.to)?;
+    let admitted = AdmittedPoint {
+        point: (),
+        binding: family.binding.clone(),
+        document: document.clone(),
+    };
+    let data_mode = match run.data_mode.as_str() {
+        "ticks" => "ticks",
+        "bars" => "bars",
+        other => {
+            return Err(ResearchError::InvalidPlan(format!(
+                "unsupported rerun data mode '{other}'"
+            )));
+        }
+    };
+    let spec = RunSpec {
+        run_index: 0,
+        candidate: &admitted,
+        point_index: 0,
+        symbol: &run.symbol,
+        window: &window,
+        data_mode,
+    };
+    let mut record = evaluate_run(
+        plan,
+        &family,
+        &spec,
+        events,
+        experiment.candidate_count.max(1),
+    );
+    let mut positions = Vec::new();
+    for position in &mut record.positions {
+        position.id = format!("run:{}|{}", run.ordinal, position.id);
+        positions.push(position.clone());
+    }
+    let mut run_recipe = run.clone();
+    run_recipe.coverage = record.coverage;
+    Ok(ResearchBatch {
+        table: ResearchTable::new(vec![record.row]),
+        positions,
+        bound_documents: vec![Some(document)],
+        experiment_recipe: experiment.clone(),
+        candidate_recipes: vec![candidate.clone()],
+        run_recipes: vec![run_recipe],
+    })
 }
 
 /// Runs completed so far out of the batch's total, reported after each run.
@@ -215,6 +469,32 @@ pub fn run_batch_controlled_with_experiment<F>(
 where
     F: StrategyFamily,
 {
+    run_batch_controlled_with_experiment_resume(
+        plan,
+        family,
+        events,
+        limits,
+        options,
+        &BTreeSet::new(),
+        is_cancelled,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_batch_controlled_with_experiment_resume<F>(
+    plan: &ResearchPlan,
+    family: &F,
+    events: &BTreeMap<String, SymbolEvents>,
+    limits: ResearchAdmissionLimits,
+    options: ExperimentOptions,
+    completed_runs: &BTreeSet<u64>,
+    is_cancelled: &(dyn Fn() -> bool + Sync),
+    on_progress: &(dyn Fn(BatchProgress) + Sync),
+) -> Result<ResearchBatch, ResearchError>
+where
+    F: StrategyFamily,
+{
     plan.validate()?;
     options.validate()?;
     ResearchAdmissionLimits::new(limits.max_window_pairs, limits.max_scheduled_runs)?;
@@ -247,7 +527,7 @@ where
         .collect::<Vec<_>>();
     let bound_documents = candidates
         .iter()
-        .map(|candidate| candidate.document.clone())
+        .map(|candidate| Some(candidate.document.clone()))
         .collect();
     let bindings = candidates
         .iter()
@@ -258,6 +538,7 @@ where
     effective_backtest.close_on_finish = true;
     let experiment_recipe = ExperimentRecipe {
         experiment_id: options.experiment_id,
+        candidate_count: points_total,
         caller_revision: options.caller_revision,
         dataset_reference: options.dataset_reference,
         endpoint_bounds: EndpointBounds::HalfOpen,
@@ -361,6 +642,11 @@ where
         }
     }
 
+    specs.retain(|spec| {
+        u64::try_from(spec.run_index)
+            .ok()
+            .is_none_or(|ordinal| !completed_runs.contains(&ordinal))
+    });
     let workers = plan.workers.min(specs.len()).max(1);
     let control = RunControl {
         is_cancelled,
@@ -372,7 +658,7 @@ where
         let mut records = Vec::with_capacity(specs.len());
         for spec in &specs {
             if is_cancelled() {
-                return Err(ResearchError::Cancelled);
+                break;
             }
             records.push(evaluate_run(plan, family, spec, events, points_total));
             control.completed_one();
@@ -389,16 +675,19 @@ where
             &control,
         )
     };
-    if records.len() < specs.len() {
-        return Err(ResearchError::Cancelled);
-    }
+    let cancelled = is_cancelled() || records.len() < specs.len();
     records.sort_by_key(|record| record.run_index);
 
     let mut positions = Vec::new();
     let mut rows = Vec::with_capacity(records.len());
     let mut run_recipes = Vec::with_capacity(records.len());
     for mut record in records {
-        let spec = &specs[record.run_index];
+        let spec = specs
+            .iter()
+            .find(|spec| spec.run_index == record.run_index)
+            .ok_or_else(|| {
+                ResearchError::InvalidPlan("completed run has no admitted specification".into())
+            })?;
         let candidate_recipe = &mut candidate_recipes[spec.point_index];
         for (symbol, snapshots) in record.binding_snapshots {
             match candidate_recipe.series_by_symbol.get(&symbol) {
@@ -437,14 +726,23 @@ where
         rows.push(record.row);
     }
 
-    Ok(ResearchBatch {
+    let batch = ResearchBatch {
         table: ResearchTable::new(rows),
         positions,
         bound_documents,
         experiment_recipe,
         candidate_recipes,
         run_recipes,
-    })
+    };
+    if cancelled {
+        if batch.run_recipes.is_empty() {
+            Err(ResearchError::Cancelled)
+        } else {
+            Err(ResearchError::CancelledWithPartial(Box::new(batch)))
+        }
+    } else {
+        Ok(batch)
+    }
 }
 
 /// Validate every evaluation boundary against each candidate's shortest execution series per symbol.
@@ -593,6 +891,7 @@ where
     F: StrategyFamily,
 {
     let mut series_by_symbol = BTreeMap::new();
+    let mut input_projectors = Vec::new();
     let mut admission_error = None;
     for symbol in symbols {
         let strategy = match ConfiguredStrategy::compile(
@@ -607,6 +906,7 @@ where
                 continue;
             }
         };
+        input_projectors.extend(family.input_projector_recipe(symbol, &candidate.point));
         match family.bindings(symbol, &candidate.point, strategy.input_requirements()) {
             Ok(bindings) => {
                 series_by_symbol.insert(symbol.clone(), snapshot_bindings(&bindings));
@@ -624,8 +924,14 @@ where
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
-        document: recipe_value("bound strategy document", &candidate.document)?,
+        document: Some(recipe_value(
+            "bound strategy document",
+            &candidate.document,
+        )?),
+        registered_factory: None,
         series_by_symbol,
+        series_by_instance: BTreeMap::new(),
+        input_projectors,
         admission_error,
     })
 }
@@ -1121,7 +1427,10 @@ fn warmup_start(
         .map_err(|error| RunFailure::Bind(error.to_string()))
 }
 
-fn input_coverage(events: &[FeedEvent], window: &DataWindow) -> Result<RunCoverage, RunFailure> {
+pub(crate) fn input_coverage(
+    events: &[FeedEvent],
+    window: &DataWindow,
+) -> Result<RunCoverage, RunFailure> {
     let primary = events
         .iter()
         .filter(|event| event.metadata.roles.primary)
@@ -1152,7 +1461,10 @@ fn input_coverage(events: &[FeedEvent], window: &DataWindow) -> Result<RunCovera
     })
 }
 
-fn coverage_with_result(mut coverage: RunCoverage, result: &BacktestResult) -> RunCoverage {
+pub(crate) fn coverage_with_result(
+    mut coverage: RunCoverage,
+    result: &BacktestResult,
+) -> RunCoverage {
     coverage.forced_closes = result
         .completed_positions
         .iter()
@@ -1163,7 +1475,7 @@ fn coverage_with_result(mut coverage: RunCoverage, result: &BacktestResult) -> R
     coverage
 }
 
-fn slice_events(
+pub(crate) fn slice_events(
     events: &SymbolEvents,
     window: &DataWindow,
     warmup_start: NaiveDateTime,
@@ -1192,7 +1504,7 @@ fn partition_point(
     low
 }
 
-fn fill_metrics(row: &mut ResearchRow, result: &BacktestResult, window: &DataWindow) {
+pub(crate) fn fill_metrics(row: &mut ResearchRow, result: &BacktestResult, window: &DataWindow) {
     row.net_pnl = result.total_pnl;
     row.gross_pnl = result.gross_pnl;
     row.commission = result.total_commission;

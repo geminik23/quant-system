@@ -19,6 +19,8 @@ pub const MATERIAL_SECONDS_OF_DAY: &str = "seconds_of_day";
 pub const MATERIAL_EMA: &str = "ema";
 pub const MATERIAL_ATR: &str = "atr";
 pub const MATERIAL_SMA: &str = "sma";
+pub const MATERIAL_STRICT_SMA: &str = "strict_sma";
+pub const MATERIAL_STRICT_EMA: &str = "strict_ema";
 pub const MATERIAL_STDDEV: &str = "stddev";
 pub const MATERIAL_ROLLING_MIN: &str = "rolling_min";
 pub const MATERIAL_ROLLING_MAX: &str = "rolling_max";
@@ -50,7 +52,7 @@ pub struct CompletedBar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
-    pub volume: f64,
+    pub volume: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +161,8 @@ pub struct NamedInputRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredStrategyRequirements {
     pub completed_bars: Vec<CompletedBarRequirement>,
+    /// Sources whose documents directly consume exact completed-bar count.
+    pub count_required_sources: Vec<SourceId>,
     pub named_inputs: Vec<NamedInputRequirement>,
     pub trade_slots: Vec<String>,
     pub needs_command_feedback: bool,
@@ -291,6 +295,15 @@ pub struct MaterialBuild {
 }
 
 pub trait MaterialFactory: Send + Sync {
+    /// Describe an implemented strict numeric contract without allocating evaluator state.
+    fn numeric_descriptor(
+        &self,
+        _params: &MaterialArgs,
+        _input_types: &[ValueType],
+    ) -> Result<Option<crate::NumericDescriptor>, String> {
+        Ok(None)
+    }
+
     fn params(&self) -> &[ParamSpec] {
         &[]
     }
@@ -332,6 +345,8 @@ impl MaterialLibrary {
             MATERIAL_EMA,
             MATERIAL_ATR,
             MATERIAL_SMA,
+            MATERIAL_STRICT_SMA,
+            MATERIAL_STRICT_EMA,
             MATERIAL_STDDEV,
             MATERIAL_ROLLING_MIN,
             MATERIAL_ROLLING_MAX,
@@ -357,15 +372,62 @@ impl MaterialLibrary {
             MATERIAL_CANCELLATION_APPLIED,
             MATERIAL_CANCELLATION_REJECTED,
         ];
-        Self {
-            registrations: keys
-                .into_iter()
-                .map(|key| Registration {
-                    key: key.into(),
-                    factory: Arc::new(BuiltinFactory { key }),
-                })
-                .collect(),
-        }
+        let mut registrations = keys
+            .into_iter()
+            .map(|key| Registration {
+                key: key.into(),
+                factory: Arc::new(BuiltinFactory { key }),
+            })
+            .collect::<Vec<_>>();
+        registrations.extend(
+            crate::bar_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        registrations.extend(
+            crate::series_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        registrations.extend(
+            crate::momentum_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        registrations.extend(crate::statistical_primitives::registrations().map(
+            |(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            },
+        ));
+        registrations.extend(
+            crate::recursive_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        registrations.extend(crate::normalization_primitives::registrations().map(
+            |(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            },
+        ));
+        registrations.extend(
+            crate::temporal_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        registrations.extend(
+            crate::structure_primitives::registrations().map(|(key, factory)| Registration {
+                key: key.into(),
+                factory,
+            }),
+        );
+        Self { registrations }
     }
 
     pub fn with_factory(
@@ -392,6 +454,19 @@ impl MaterialLibrary {
         self.registration(key).map(|item| &item.factory)
     }
 
+    /// Inspect a registered numeric contract using the same validation as evaluator construction.
+    /// None means the registered factory does not supply a numeric descriptor, not inferred support.
+    pub fn numeric_descriptor(
+        &self,
+        key: &str,
+        params: &MaterialArgs,
+        input_types: &[ValueType],
+    ) -> Result<Option<crate::NumericDescriptor>, String> {
+        self.factory(key)
+            .ok_or_else(|| format!("unknown material key: {key}"))?
+            .numeric_descriptor(params, input_types)
+    }
+
     pub fn parameter_schema(&self, key: &str) -> Option<&[ParamSpec]> {
         self.registration(key).map(|item| item.factory.params())
     }
@@ -413,6 +488,18 @@ const PERIOD_SCHEMA: [ParamSpec; 1] = [ParamSpec {
     },
     required: true,
 }];
+const STRICT_PERIOD_SCHEMA: [ParamSpec; 2] = [
+    ParamSpec {
+        name: "source",
+        kind: ParamKind::Source,
+        required: true,
+    },
+    ParamSpec {
+        name: "period",
+        kind: ParamKind::Integer { min: 1, max: 1024 },
+        required: true,
+    },
+];
 const SOURCE_FIELD_SCHEMA: [ParamSpec; 2] = [
     ParamSpec {
         name: "source",
@@ -471,9 +558,76 @@ const FEEDBACK_SCHEMA: [ParamSpec; 2] = [
 ];
 
 impl MaterialFactory for BuiltinFactory {
+    fn numeric_descriptor(
+        &self,
+        params: &MaterialArgs,
+        inputs: &[ValueType],
+    ) -> Result<Option<crate::NumericDescriptor>, String> {
+        if !matches!(self.key, MATERIAL_STRICT_SMA | MATERIAL_STRICT_EMA) {
+            return Ok(None);
+        }
+        if params.len() != 2
+            || params
+                .iter()
+                .any(|(key, _)| !matches!(key.as_str(), "source" | "period"))
+        {
+            return Err("strict average requires only source and period parameters".into());
+        }
+        let period = checked_period(params)?;
+        require_one_numeric(inputs)?;
+        let source_clock = source_arg(params, "source")?;
+        let max_state_bytes = crate::numeric::ObservedWindow::state_bytes(period)?
+            .checked_add(std::mem::size_of::<StrictEmaEvaluator>())
+            .ok_or_else(|| "strict average state bound overflowed".to_string())?;
+        if max_state_bytes > crate::MAX_MATERIAL_STATE_BYTES {
+            return Err("strict average state exceeds the material bound".into());
+        }
+        let sma = self.key == MATERIAL_STRICT_SMA;
+        Ok(Some(crate::NumericDescriptor {
+            calculation: if sma {
+                crate::NumericCalculation::ObservedSma { period }
+            } else {
+                crate::NumericCalculation::SmaSeededEma {
+                    period,
+                    alpha: 2.0 / (period as f64 + 1.0),
+                }
+            },
+            source_clock,
+            inputs: crate::NumericInputs::Scalar(inputs.to_vec()),
+            output_type: ValueType::optional(inputs[0].scalar),
+            unit: match inputs[0].scalar {
+                ScalarType::Price => crate::NumericUnit::Price,
+                ScalarType::Ratio => crate::NumericUnit::Ratio,
+                ScalarType::Percent => crate::NumericUnit::Percent,
+                ScalarType::PricePerObservation => crate::NumericUnit::PricePerObservation,
+                ScalarType::PricePerObservationSquared => {
+                    crate::NumericUnit::PricePerObservationSquared
+                }
+                ScalarType::RatioPerObservation => crate::NumericUnit::RatioPerObservation,
+                ScalarType::RatioPerObservationSquared => {
+                    crate::NumericUnit::RatioPerObservationSquared
+                }
+                ScalarType::LogReturn => crate::NumericUnit::LogReturn,
+                ScalarType::LogReturnVariance => crate::NumericUnit::LogReturnVariance,
+                _ => crate::NumericUnit::Number,
+            },
+            range: crate::NumericRange::Unbounded,
+            missing: if sma {
+                crate::NumericMissingPolicy::ConsumeWindowSlot
+            } else {
+                crate::NumericMissingPolicy::ResetAndReseed
+            },
+            first_output_observations: period,
+            required_lookback: period,
+            max_state_bytes,
+            exact_aliases: &[],
+        }))
+    }
+
     fn params(&self) -> &[ParamSpec] {
         match self.key {
             MATERIAL_BAR_FIELD => &SOURCE_FIELD_SCHEMA,
+            MATERIAL_STRICT_SMA | MATERIAL_STRICT_EMA => &STRICT_PERIOD_SCHEMA,
             MATERIAL_EMA | MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN
             | MATERIAL_ROLLING_MAX | MATERIAL_LAG | MATERIAL_RSI => &PERIOD_SCHEMA,
             MATERIAL_ATR => &SOURCE_PERIOD_SCHEMA,
@@ -499,11 +653,15 @@ impl MaterialFactory for BuiltinFactory {
     }
 
     fn build(&self, params: &MaterialArgs, inputs: &[ValueType]) -> Result<MaterialBuild, String> {
+        let descriptor = self.numeric_descriptor(params, inputs)?;
         let state_bytes = match self.key {
             MATERIAL_EMA | MATERIAL_RSI => 64,
             MATERIAL_ATR | MATERIAL_CROSS_ABOVE | MATERIAL_CROSS_BELOW => 48,
             MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN | MATERIAL_ROLLING_MAX
             | MATERIAL_LAG => checked_period(params)? * std::mem::size_of::<f64>() + 64,
+            MATERIAL_STRICT_SMA | MATERIAL_STRICT_EMA => {
+                descriptor.as_ref().unwrap().max_state_bytes
+            }
             _ => crate::MAX_GENERATED_ID_BYTES + 64,
         };
         let build = |output_type, lookback, evaluator: Box<dyn MaterialEvaluator>| {
@@ -580,6 +738,30 @@ impl MaterialFactory for BuiltinFactory {
                         previous_close: None,
                         value: None,
                     }),
+                )
+            }
+            MATERIAL_STRICT_SMA | MATERIAL_STRICT_EMA => {
+                let descriptor = descriptor.unwrap();
+                let period = descriptor.first_output_observations;
+                let source = descriptor.source_clock;
+                let scalar = descriptor.output_type.scalar;
+                let evaluator: Box<dyn MaterialEvaluator> = if self.key == MATERIAL_STRICT_SMA {
+                    Box::new(StrictSmaEvaluator {
+                        values: crate::numeric::ObservedWindow::new(period)?,
+                        scalar,
+                    })
+                } else {
+                    Box::new(StrictEmaEvaluator {
+                        period,
+                        seed_values: crate::numeric::ObservedWindow::new(period)?,
+                        value: None,
+                        scalar,
+                    })
+                };
+                build(
+                    ValueType::optional(scalar),
+                    source_lookback(source, period),
+                    evaluator,
                 )
             }
             MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN | MATERIAL_ROLLING_MAX => {
@@ -710,6 +892,9 @@ impl MaterialFactory for BuiltinFactory {
             MATERIAL_BAR_FIELD | MATERIAL_ATR => {
                 MaterialUpdateTrigger::Source(source_arg(params, "source")?)
             }
+            MATERIAL_STRICT_SMA | MATERIAL_STRICT_EMA => {
+                MaterialUpdateTrigger::Source(source_arg(params, "source")?)
+            }
             MATERIAL_EMA | MATERIAL_SMA | MATERIAL_STDDEV | MATERIAL_ROLLING_MIN
             | MATERIAL_ROLLING_MAX | MATERIAL_LAG | MATERIAL_RSI | MATERIAL_CROSS_ABOVE
             | MATERIAL_CROSS_BELOW => MaterialUpdateTrigger::AnyInput,
@@ -789,7 +974,21 @@ fn require_inputs(actual: &[ValueType], expected: &[ValueType]) -> Result<(), St
 }
 
 fn require_one_numeric(inputs: &[ValueType]) -> Result<(), String> {
-    if inputs.len() == 1 && matches!(inputs[0].scalar, ScalarType::Number | ScalarType::Price) {
+    if inputs.len() == 1
+        && matches!(
+            inputs[0].scalar,
+            ScalarType::Number
+                | ScalarType::Price
+                | ScalarType::Ratio
+                | ScalarType::Percent
+                | ScalarType::PricePerObservation
+                | ScalarType::PricePerObservationSquared
+                | ScalarType::RatioPerObservation
+                | ScalarType::RatioPerObservationSquared
+                | ScalarType::LogReturn
+                | ScalarType::LogReturnVariance
+        )
+    {
         Ok(())
     } else {
         Err("expected one number or price input".into())
@@ -801,7 +1000,17 @@ fn require_cross(inputs: &[ValueType]) -> Result<(), String> {
         && inputs[0].scalar == inputs[1].scalar
         && matches!(
             inputs[0].scalar,
-            ScalarType::Integer | ScalarType::Number | ScalarType::Price
+            ScalarType::Integer
+                | ScalarType::Number
+                | ScalarType::Price
+                | ScalarType::Ratio
+                | ScalarType::Percent
+                | ScalarType::PricePerObservation
+                | ScalarType::PricePerObservationSquared
+                | ScalarType::RatioPerObservation
+                | ScalarType::RatioPerObservationSquared
+                | ScalarType::LogReturn
+                | ScalarType::LogReturnVariance
         )
     {
         Ok(())
@@ -963,6 +1172,81 @@ impl MaterialEvaluator for EmaEvaluator {
             .unwrap_or(Value::Missing(self.scalar)))
     }
 }
+
+#[derive(Clone)]
+struct StrictSmaEvaluator {
+    values: crate::numeric::ObservedWindow,
+    scalar: ScalarType,
+}
+
+impl MaterialEvaluator for StrictSmaEvaluator {
+    clone_eval!(Self);
+
+    fn evaluate(
+        &mut self,
+        inputs: &[Value],
+        context: &MaterialEvalContext<'_>,
+    ) -> Result<Value, String> {
+        let sample = if context.input_updates.first() == Some(&false) {
+            None
+        } else {
+            numeric_value(&inputs[0])?
+        };
+        self.values.push(sample)?;
+        Ok(self
+            .values
+            .mean()?
+            .map(|value| numeric(self.scalar, value))
+            .unwrap_or(Value::Missing(self.scalar)))
+    }
+}
+
+#[derive(Clone)]
+struct StrictEmaEvaluator {
+    period: usize,
+    seed_values: crate::numeric::ObservedWindow,
+    value: Option<f64>,
+    scalar: ScalarType,
+}
+
+impl MaterialEvaluator for StrictEmaEvaluator {
+    clone_eval!(Self);
+
+    fn evaluate(
+        &mut self,
+        inputs: &[Value],
+        context: &MaterialEvalContext<'_>,
+    ) -> Result<Value, String> {
+        let sample = if context.input_updates.first() == Some(&false) {
+            None
+        } else {
+            numeric_value(&inputs[0])?
+        };
+        let Some(sample) = sample else {
+            self.seed_values.reset();
+            self.value = None;
+            return Ok(Value::Missing(self.scalar));
+        };
+        let next = if let Some(previous) = self.value {
+            crate::numeric::ema_step(sample, previous, self.period)?
+        } else {
+            self.seed_values.push(Some(sample))?;
+            let Some(seed) = self.seed_values.mean()? else {
+                return Ok(Value::Missing(self.scalar));
+            };
+            self.seed_values.reset();
+            seed
+        };
+        if !next.is_finite() {
+            return Err("strict EMA arithmetic overflowed".into());
+        }
+        self.value = Some(next);
+        Ok(numeric(self.scalar, next))
+    }
+}
+
+#[cfg(test)]
+use crate::numeric::stable_mean;
 
 #[derive(Clone, Copy)]
 enum RollingKind {
@@ -1253,7 +1537,10 @@ pub(crate) fn bar_value(bar: &CompletedBar, field: BarField) -> Value {
         BarField::High => Value::Price(bar.high),
         BarField::Low => Value::Price(bar.low),
         BarField::Close => Value::Price(bar.close),
-        BarField::Volume => Value::Number(bar.volume),
+        BarField::Volume => bar
+            .volume
+            .map(Value::Number)
+            .unwrap_or(Value::Missing(ScalarType::Number)),
     }
 }
 
@@ -1313,10 +1600,17 @@ fn open_number(
 }
 
 fn numeric(scalar: ScalarType, value: f64) -> Value {
-    if scalar == ScalarType::Price {
-        Value::Price(value)
-    } else {
-        Value::Number(value)
+    match scalar {
+        ScalarType::Price => Value::Price(value),
+        ScalarType::Ratio => Value::Ratio(value),
+        ScalarType::Percent => Value::Percent(value),
+        ScalarType::PricePerObservation => Value::PricePerObservation(value),
+        ScalarType::PricePerObservationSquared => Value::PricePerObservationSquared(value),
+        ScalarType::RatioPerObservation => Value::RatioPerObservation(value),
+        ScalarType::RatioPerObservationSquared => Value::RatioPerObservationSquared(value),
+        ScalarType::LogReturn => Value::LogReturn(value),
+        ScalarType::LogReturnVariance => Value::LogReturnVariance(value),
+        _ => Value::Number(value),
     }
 }
 
@@ -1324,8 +1618,30 @@ fn numeric_value(value: &Value) -> Result<Option<f64>, String> {
     match value {
         Value::Missing(_) => Ok(None),
         Value::Integer(value) => Ok(Some(*value as f64)),
-        Value::Number(value) | Value::Price(value) if value.is_finite() => Ok(Some(*value)),
-        Value::Number(_) | Value::Price(_) => Err("numeric material input must be finite".into()),
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value)
+            if value.is_finite() =>
+        {
+            Ok(Some(*value))
+        }
+        Value::Number(_)
+        | Value::Price(_)
+        | Value::Ratio(_)
+        | Value::Percent(_)
+        | Value::PricePerObservation(_)
+        | Value::PricePerObservationSquared(_)
+        | Value::RatioPerObservation(_)
+        | Value::RatioPerObservationSquared(_)
+        | Value::LogReturn(_)
+        | Value::LogReturnVariance(_) => Err("numeric material input must be finite".into()),
         _ => Err("material input must be numeric".into()),
     }
 }
@@ -1340,6 +1656,238 @@ pub(crate) fn material_error(id: &str, reason: String) -> EvaluationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_averages_preserve_extreme_values_through_seed_recursion_and_clone() {
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            any_input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+        for key in [MATERIAL_STRICT_SMA, MATERIAL_STRICT_EMA] {
+            let factory = BuiltinFactory { key };
+            let params = MaterialArgs::new([
+                (
+                    "source",
+                    MaterialArg::Source(SourceId::new("fast").unwrap()),
+                ),
+                ("period", MaterialArg::Integer(3)),
+            ]);
+            for value in [f64::from_bits(1), -f64::from_bits(1), f64::MAX, -f64::MAX] {
+                let mut evaluator = factory
+                    .build(&params, &[ValueType::optional(ScalarType::Number)])
+                    .unwrap()
+                    .evaluator;
+                for step in 0..16 {
+                    evaluator = evaluator.clone_box();
+                    let actual = evaluator
+                        .evaluate(&[Value::Number(value)], &context)
+                        .unwrap();
+                    assert_eq!(
+                        actual,
+                        if step < 2 {
+                            Value::Missing(ScalarType::Number)
+                        } else {
+                            Value::Number(value)
+                        },
+                        "{key}, sample {step}"
+                    );
+                }
+                let mut fork = evaluator.clone_box();
+                assert_eq!(
+                    fork.evaluate(&[Value::Missing(ScalarType::Number)], &context)
+                        .unwrap(),
+                    Value::Missing(ScalarType::Number)
+                );
+                assert_eq!(
+                    evaluator
+                        .evaluate(&[Value::Number(value)], &context)
+                        .unwrap(),
+                    Value::Number(value)
+                );
+            }
+            let mut evaluator = factory
+                .build(&params, &[ValueType::optional(ScalarType::Number)])
+                .unwrap()
+                .evaluator;
+            for value in [f64::MAX, -f64::MAX] {
+                assert_eq!(
+                    evaluator
+                        .evaluate(&[Value::Number(value)], &context)
+                        .unwrap(),
+                    Value::Missing(ScalarType::Number)
+                );
+            }
+            assert_eq!(
+                evaluator
+                    .evaluate(&[Value::Number(3.0 * f64::from_bits(1))], &context)
+                    .unwrap(),
+                Value::Number(f64::from_bits(1))
+            );
+        }
+    }
+
+    #[test]
+    fn strict_average_seeds_do_not_overflow_for_a_representable_mean() {
+        let library = MaterialLibrary::builtins();
+        let arguments = MaterialArgs::new([
+            (
+                "source",
+                MaterialArg::Source(SourceId::new("fast").unwrap()),
+            ),
+            ("period", MaterialArg::Integer(2)),
+        ]);
+        let types = [ValueType::optional(ScalarType::Number)];
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            any_input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+        for key in [MATERIAL_STRICT_SMA, MATERIAL_STRICT_EMA] {
+            let mut evaluator = library
+                .factory(key)
+                .unwrap()
+                .build(&arguments, &types)
+                .unwrap()
+                .evaluator;
+            assert_eq!(
+                evaluator
+                    .evaluate(&[Value::Number(f64::MAX)], &context)
+                    .unwrap(),
+                Value::Missing(ScalarType::Number)
+            );
+            assert_eq!(
+                evaluator
+                    .evaluate(&[Value::Number(f64::MAX)], &context)
+                    .unwrap(),
+                Value::Number(f64::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn strict_average_rounds_representable_subnormal_means_without_early_underflow() {
+        let least = f64::from_bits(1);
+        assert_eq!(stable_mean([least, least, 0.0, 0.0]).unwrap(), 0.0);
+        assert_eq!(stable_mean([least, least, least]).unwrap(), least);
+        let library = MaterialLibrary::builtins();
+        let arguments = MaterialArgs::new([
+            (
+                "source",
+                MaterialArg::Source(SourceId::new("fast").unwrap()),
+            ),
+            ("period", MaterialArg::Integer(4)),
+        ]);
+        let types = [ValueType::optional(ScalarType::Number)];
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            any_input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+        for key in [MATERIAL_STRICT_SMA, MATERIAL_STRICT_EMA] {
+            let mut evaluator = library
+                .factory(key)
+                .unwrap()
+                .build(&arguments, &types)
+                .unwrap()
+                .evaluator;
+            for value in [least, least, 0.0] {
+                assert_eq!(
+                    evaluator
+                        .evaluate(&[Value::Number(value)], &context)
+                        .unwrap(),
+                    Value::Missing(ScalarType::Number)
+                );
+            }
+            assert_eq!(
+                evaluator.evaluate(&[Value::Number(0.0)], &context).unwrap(),
+                Value::Number(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn strict_averages_consume_missing_samples_and_reseed_only_recursive_state() {
+        let library = MaterialLibrary::builtins();
+        let arguments = MaterialArgs::new([
+            (
+                "source",
+                MaterialArg::Source(SourceId::new("fast").unwrap()),
+            ),
+            ("period", MaterialArg::Integer(3)),
+        ]);
+        let types = [ValueType::optional(ScalarType::Price)];
+        let mut sma = library
+            .factory(MATERIAL_STRICT_SMA)
+            .unwrap()
+            .build(&arguments, &types)
+            .unwrap()
+            .evaluator;
+        let mut ema = library
+            .factory(MATERIAL_STRICT_EMA)
+            .unwrap()
+            .build(&arguments, &types)
+            .unwrap()
+            .evaluator;
+        let input = input();
+        let context = MaterialEvalContext {
+            input: &input,
+            input_updates: &[true],
+            any_input_updates: &[true],
+            feedback: &[],
+            retained_feedback: &[],
+        };
+        for (sample, expected_sma, expected_ema) in [
+            (
+                Value::Price(1.0),
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+            ),
+            (
+                Value::Price(2.0),
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+            ),
+            (Value::Price(3.0), Value::Price(2.0), Value::Price(2.0)),
+            (
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+            ),
+            (
+                Value::Price(4.0),
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+            ),
+            (
+                Value::Price(5.0),
+                Value::Missing(ScalarType::Price),
+                Value::Missing(ScalarType::Price),
+            ),
+            (Value::Price(6.0), Value::Price(5.0), Value::Price(5.0)),
+            (
+                Value::Price(8.0),
+                Value::Price(19.0 / 3.0),
+                Value::Price(6.5),
+            ),
+        ] {
+            assert_eq!(
+                sma.evaluate(std::slice::from_ref(&sample), &context)
+                    .unwrap(),
+                expected_sma
+            );
+            assert_eq!(ema.evaluate(&[sample], &context).unwrap(), expected_ema);
+        }
+    }
 
     fn input() -> StrategyInput {
         StrategyInput {
@@ -1373,7 +1921,16 @@ mod tests {
 
     fn final_number(values: Vec<Value>) -> f64 {
         match values.last().unwrap() {
-            Value::Number(value) | Value::Price(value) => *value,
+            Value::Number(value)
+            | Value::Price(value)
+            | Value::Ratio(value)
+            | Value::Percent(value)
+            | Value::PricePerObservation(value)
+            | Value::PricePerObservationSquared(value)
+            | Value::RatioPerObservation(value)
+            | Value::RatioPerObservationSquared(value)
+            | Value::LogReturn(value)
+            | Value::LogReturnVariance(value) => *value,
             value => panic!("unexpected material output {value:?}"),
         }
     }
@@ -1552,7 +2109,7 @@ mod tests {
                     high: 10.0,
                     low: 10.0,
                     close: 10.0,
-                    volume: 1.0,
+                    volume: Some(1.0),
                 },
             }],
             ..input()
@@ -1565,7 +2122,7 @@ mod tests {
                     high: 13.0,
                     low: 9.0,
                     close: 12.0,
-                    volume: 1.0,
+                    volume: Some(1.0),
                 },
             }],
             ..input()

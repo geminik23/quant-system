@@ -2,21 +2,31 @@
 //!
 //! This crate is the bridge between stored market data and the replay engine. `qs-data-preprocess` owns the storage layout and its chronological cursors, `qs-backtest` consumes ordered market events, and nothing in either crate reads the other's world. The bridge lives here so that both the backtest service and an in-process parameter search open the same streams through the same code, instead of each growing its own loader that could silently diverge.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
 use data_preprocess::scanner::{ParquetBarScan, ParquetTickScan};
-use data_preprocess::{Bar, DataError, ParquetScanBounds, Tick, Timeframe};
-use qs_backtest::ReplayInstrumentManifest;
+use data_preprocess::{Bar, DataError, ParquetScanBounds, ParquetStore, PriceBar, Tick, Timeframe};
+use qs_backtest::currency::{ConversionRoute, resolve_conversion_route};
 use qs_backtest::data_feed::{
-    EventBatchFeed, EventBatchFeedError, KWayMergeError, KWayMergeFeed, MarketEvent,
+    EventBatchFeed, EventBatchFeedError, FeedEvent, KWayMergeError, KWayMergeFeed, MarketEvent,
     SequencedMarketEvent, SeriesRoles,
 };
+use qs_backtest::{
+    HistoricalNamedInputProjector, NamedInputProjectionContext, NamedInputProjectionError,
+    ProjectedNamedInput, ReplayInstrumentManifest, SeriesId,
+};
+use qs_strategy::{ScalarType, Value, ValueType};
+use qs_symbols::SymbolRegistry;
 
 mod error;
 
+pub use data_preprocess::{
+    CountCapability, PriceBins, QuoteStatistics, SeriesDescriptor, StoredPriceBasis, StoredTick,
+};
 pub use error::{MarketLoadError, Result};
 
 pub type CancellationCheck = Arc<dyn Fn() -> bool>;
@@ -24,6 +34,635 @@ type EventSource = Box<dyn FnMut() -> Result<Option<SequencedMarketEvent>>>;
 type SeriesFeed = EventBatchFeed<EventSource, SequencedMarketEvent>;
 pub type MarketStream = KWayMergeFeed<SeriesFeed>;
 pub type MarketStreamError = KWayMergeError<EventBatchFeedError<MarketLoadError>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteStatisticKind {
+    Accepted,
+    Rejected,
+    DuplicateProviderRows,
+    CoverageMillis,
+    SpreadLast,
+    SpreadMean,
+    SpreadMax,
+    SpreadP90,
+    SpreadTimeMean,
+    SpreadBpsMean,
+    QuoteActivity,
+    QuoteRatePerSecond,
+    MidChangeCount,
+    InterarrivalMeanMillis,
+    InterarrivalMaxMillis,
+    InterarrivalCv,
+    DirectionChanges,
+    LongestDirectionStreak,
+    PathLength,
+    PathEfficiency,
+    MidChangeVariance,
+    FirstHighAt,
+    LastHighAt,
+    FirstLowAt,
+    LastLowAt,
+    Twap,
+    Crossings,
+    CumulativeAboveMillis,
+    ContinuousAboveMillis,
+    ElapsedSinceBreakoutMillis,
+    DominantBin,
+    DominantBinCenter,
+    DistanceFromDominantCenter,
+}
+
+impl QuoteStatisticKind {
+    fn scalar_type(self) -> ScalarType {
+        match self {
+            Self::Accepted
+            | Self::Rejected
+            | Self::DuplicateProviderRows
+            | Self::CoverageMillis
+            | Self::QuoteActivity
+            | Self::MidChangeCount
+            | Self::InterarrivalMaxMillis
+            | Self::DirectionChanges
+            | Self::LongestDirectionStreak
+            | Self::Crossings
+            | Self::CumulativeAboveMillis
+            | Self::ContinuousAboveMillis
+            | Self::ElapsedSinceBreakoutMillis => ScalarType::Integer,
+            Self::SpreadBpsMean
+            | Self::QuoteRatePerSecond
+            | Self::InterarrivalCv
+            | Self::PathEfficiency => ScalarType::Ratio,
+            Self::Twap | Self::DominantBinCenter => ScalarType::Price,
+            Self::FirstHighAt | Self::LastHighAt | Self::FirstLowAt | Self::LastLowAt => {
+                ScalarType::Timestamp
+            }
+            _ => ScalarType::Number,
+        }
+    }
+}
+
+#[derive(Default)]
+struct QuoteProjectorState {
+    last_open: Option<NaiveDateTime>,
+    retained: Option<Value>,
+}
+
+/// Projects exact quote-window statistics from an immutable, source-ordered tick slice.
+pub struct QuoteStatisticsProjector {
+    series_id: SeriesId,
+    ticks: Arc<[StoredTick]>,
+    kind: QuoteStatisticKind,
+    captured_level: Option<f64>,
+    bins: Option<PriceBins>,
+    maximum_rows_per_query: usize,
+    state: RefCell<QuoteProjectorState>,
+}
+
+impl QuoteStatisticsProjector {
+    pub fn new(
+        series_id: SeriesId,
+        ticks: Arc<[StoredTick]>,
+        kind: QuoteStatisticKind,
+        captured_level: Option<f64>,
+        bins: Option<PriceBins>,
+        maximum_rows_per_query: usize,
+    ) -> Result<Self> {
+        if maximum_rows_per_query == 0 {
+            return Err(MarketLoadError::InvalidSeries(
+                "quote projector row limit must be positive".into(),
+            ));
+        }
+        if ticks.windows(2).any(|rows| {
+            (rows[0].tick.ts, rows[0].source_ordinal) > (rows[1].tick.ts, rows[1].source_ordinal)
+        }) {
+            return Err(MarketLoadError::InvalidSeries(
+                "quote projector ticks are not source ordered".into(),
+            ));
+        }
+        Ok(Self {
+            series_id,
+            ticks,
+            kind,
+            captured_level,
+            bins,
+            maximum_rows_per_query,
+            state: RefCell::new(QuoteProjectorState::default()),
+        })
+    }
+
+    fn value(&self, statistics: &QuoteStatistics) -> Value {
+        let integer = |value: Option<i64>| {
+            value
+                .map(Value::Integer)
+                .unwrap_or(Value::Missing(ScalarType::Integer))
+        };
+        let number = |value: Option<f64>| {
+            value
+                .map(Value::Number)
+                .unwrap_or(Value::Missing(ScalarType::Number))
+        };
+        let ratio = |value: Option<f64>| {
+            value
+                .map(Value::Ratio)
+                .unwrap_or(Value::Missing(ScalarType::Ratio))
+        };
+        match self.kind {
+            QuoteStatisticKind::Accepted => integer(i64::try_from(statistics.accepted).ok()),
+            QuoteStatisticKind::Rejected => integer(i64::try_from(statistics.rejected).ok()),
+            QuoteStatisticKind::DuplicateProviderRows => {
+                integer(i64::try_from(statistics.duplicate_provider_rows).ok())
+            }
+            QuoteStatisticKind::CoverageMillis => integer(Some(statistics.coverage_millis)),
+            QuoteStatisticKind::SpreadLast => number(statistics.spread_last),
+            QuoteStatisticKind::SpreadMean => number(statistics.spread_mean),
+            QuoteStatisticKind::SpreadMax => number(statistics.spread_max),
+            QuoteStatisticKind::SpreadP90 => number(statistics.spread_p90),
+            QuoteStatisticKind::SpreadTimeMean => number(statistics.spread_time_mean),
+            QuoteStatisticKind::SpreadBpsMean => ratio(statistics.spread_bps_mean),
+            QuoteStatisticKind::QuoteActivity => {
+                integer(i64::try_from(statistics.quote_activity).ok())
+            }
+            QuoteStatisticKind::QuoteRatePerSecond => ratio(statistics.quote_rate_per_second),
+            QuoteStatisticKind::MidChangeCount => {
+                integer(i64::try_from(statistics.mid_change_count).ok())
+            }
+            QuoteStatisticKind::InterarrivalMeanMillis => {
+                number(statistics.interarrival_mean_millis)
+            }
+            QuoteStatisticKind::InterarrivalMaxMillis => {
+                integer(statistics.interarrival_max_millis)
+            }
+            QuoteStatisticKind::InterarrivalCv => ratio(statistics.interarrival_cv),
+            QuoteStatisticKind::DirectionChanges => {
+                integer(i64::try_from(statistics.direction_changes).ok())
+            }
+            QuoteStatisticKind::LongestDirectionStreak => {
+                integer(i64::try_from(statistics.longest_direction_streak).ok())
+            }
+            QuoteStatisticKind::PathLength => Value::Number(statistics.path_length),
+            QuoteStatisticKind::PathEfficiency => ratio(statistics.path_efficiency),
+            QuoteStatisticKind::MidChangeVariance => number(statistics.mid_change_variance),
+            QuoteStatisticKind::FirstHighAt => statistics
+                .first_high_at
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Missing(ScalarType::Timestamp)),
+            QuoteStatisticKind::LastHighAt => statistics
+                .last_high_at
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Missing(ScalarType::Timestamp)),
+            QuoteStatisticKind::FirstLowAt => statistics
+                .first_low_at
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Missing(ScalarType::Timestamp)),
+            QuoteStatisticKind::LastLowAt => statistics
+                .last_low_at
+                .map(Value::Timestamp)
+                .unwrap_or(Value::Missing(ScalarType::Timestamp)),
+            QuoteStatisticKind::Twap => statistics
+                .twap
+                .map(Value::Price)
+                .unwrap_or(Value::Missing(ScalarType::Price)),
+            QuoteStatisticKind::Crossings => integer(i64::try_from(statistics.crossings).ok()),
+            QuoteStatisticKind::CumulativeAboveMillis => {
+                integer(Some(statistics.cumulative_above_millis))
+            }
+            QuoteStatisticKind::ContinuousAboveMillis => {
+                integer(Some(statistics.continuous_above_millis))
+            }
+            QuoteStatisticKind::ElapsedSinceBreakoutMillis => {
+                integer(statistics.elapsed_since_breakout_millis)
+            }
+            QuoteStatisticKind::DominantBin => integer(
+                statistics
+                    .dominant_bin
+                    .and_then(|value| i64::try_from(value).ok()),
+            ),
+            QuoteStatisticKind::DominantBinCenter => statistics
+                .dominant_bin_center
+                .map(Value::Price)
+                .unwrap_or(Value::Missing(ScalarType::Price)),
+            QuoteStatisticKind::DistanceFromDominantCenter => {
+                number(statistics.distance_from_dominant_center)
+            }
+        }
+    }
+}
+
+impl HistoricalNamedInputProjector for QuoteStatisticsProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::optional(self.kind.scalar_type())
+    }
+
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> std::result::Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let Some(bar) = context
+            .closed_bars
+            .iter()
+            .find(|bar| bar.series_id() == &self.series_id)
+        else {
+            return Ok(ProjectedNamedInput {
+                value: Value::Missing(self.kind.scalar_type()),
+                updated: false,
+            });
+        };
+        let mut state = self.state.borrow_mut();
+        if state.last_open == Some(bar.open_time()) {
+            return Ok(ProjectedNamedInput {
+                value: state
+                    .retained
+                    .clone()
+                    .unwrap_or(Value::Missing(self.kind.scalar_type())),
+                updated: false,
+            });
+        }
+        let start = self
+            .ticks
+            .partition_point(|tick| tick.tick.ts < bar.open_time());
+        let end = self
+            .ticks
+            .partition_point(|tick| tick.tick.ts < bar.close_time());
+        let rows = end.saturating_sub(start);
+        if rows > self.maximum_rows_per_query {
+            return Err(NamedInputProjectionError::new(
+                "quote projector query exceeds its row limit",
+            ));
+        }
+        let statistics = data_preprocess::aggregate_quote_statistics(
+            &self.ticks[start..end],
+            bar.open_time(),
+            bar.close_time(),
+            bar.close(),
+            self.captured_level,
+            self.bins,
+            None,
+        )
+        .map_err(|error| NamedInputProjectionError::new(error.to_string()))?;
+        let value = self.value(&statistics);
+        state.last_open = Some(bar.open_time());
+        state.retained = Some(value.clone());
+        Ok(ProjectedNamedInput {
+            value,
+            updated: true,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketLoadLimits {
+    pub max_rows: usize,
+    pub max_resident_bytes: usize,
+}
+impl MarketLoadLimits {
+    pub fn new(max_rows: usize, max_resident_bytes: usize) -> Result<Self> {
+        if max_rows == 0 || max_resident_bytes == 0 {
+            Err(MarketLoadError::InvalidSeries(
+                "market load limits must be positive".into(),
+            ))
+        } else {
+            Ok(Self {
+                max_rows,
+                max_resident_bytes,
+            })
+        }
+    }
+}
+
+pub fn load_ordered_stored_ticks(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    canonical_symbol: &str,
+    limits: MarketLoadLimits,
+) -> Result<Arc<[FeedEvent]>> {
+    load_ordered_stored_ticks_controlled(
+        data_dir,
+        exchange,
+        symbol,
+        canonical_symbol,
+        limits,
+        Arc::new(|| false),
+    )
+}
+
+pub fn load_ordered_stored_ticks_controlled(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    canonical_symbol: &str,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<Arc<[FeedEvent]>> {
+    let query_bytes = limits.max_resident_bytes / 2;
+    if is_cancelled() {
+        return Err(MarketLoadError::Cancelled);
+    }
+    if query_bytes == 0 {
+        return Err(MarketLoadError::InvalidSeries(
+            "enhanced tick load has no query budget".into(),
+        ));
+    }
+    let rows = ParquetStore::open(data_dir)?.query_stored_ticks_bounded(
+        exchange,
+        symbol,
+        limits.max_rows,
+        query_bytes,
+        || is_cancelled(),
+    )?;
+    check_materialized_bound(
+        rows.len(),
+        std::mem::size_of::<FeedEvent>() + canonical_symbol.len(),
+        MarketLoadLimits {
+            max_rows: limits.max_rows,
+            max_resident_bytes: limits.max_resident_bytes - query_bytes,
+        },
+    )?;
+    let events = rows
+        .into_iter()
+        .filter_map(|row| {
+            tick_to_valid_event(row.tick, canonical_symbol).map(|event| {
+                FeedEvent::new(
+                    event,
+                    qs_backtest::data_feed::EventMetadata::new(
+                        SeriesRoles::PRIMARY,
+                        0,
+                        row.source_ordinal,
+                    ),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if is_cancelled() {
+        return Err(MarketLoadError::Cancelled);
+    }
+    Ok(Arc::from(events))
+}
+
+pub fn load_price_only_bars(
+    data_dir: &str,
+    descriptor: &SeriesDescriptor,
+    canonical_symbol: &str,
+    limits: MarketLoadLimits,
+) -> Result<Arc<[FeedEvent]>> {
+    load_price_only_bars_controlled(
+        data_dir,
+        descriptor,
+        canonical_symbol,
+        limits,
+        Arc::new(|| false),
+    )
+}
+
+pub fn load_price_only_bars_controlled(
+    data_dir: &str,
+    descriptor: &SeriesDescriptor,
+    canonical_symbol: &str,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<Arc<[FeedEvent]>> {
+    let query_bytes = limits.max_resident_bytes / 2;
+    if is_cancelled() {
+        return Err(MarketLoadError::Cancelled);
+    }
+    if query_bytes == 0 {
+        return Err(MarketLoadError::InvalidSeries(
+            "price-bar load has no query budget".into(),
+        ));
+    }
+    let rows = ParquetStore::open(data_dir)?.query_price_bars_bounded(
+        descriptor,
+        limits.max_rows,
+        query_bytes,
+        || is_cancelled(),
+    )?;
+    check_materialized_bound(
+        rows.len(),
+        std::mem::size_of::<FeedEvent>() + canonical_symbol.len(),
+        MarketLoadLimits {
+            max_rows: limits.max_rows,
+            max_resident_bytes: limits.max_resident_bytes - query_bytes,
+        },
+    )?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (ordinal, row) in rows.into_iter().enumerate() {
+        let available_at = row.available_at;
+        let metadata = qs_backtest::data_feed::EventMetadata::new(
+            SeriesRoles::PRIMARY,
+            0,
+            u64::try_from(ordinal).map_err(|_| {
+                MarketLoadError::InvalidSeries("price-bar ordinal overflowed".into())
+            })?,
+        )
+        .with_available_at(available_at);
+        events.push(FeedEvent::new(
+            price_bar_to_event(row, canonical_symbol, descriptor.point_size),
+            metadata,
+        ));
+    }
+    if is_cancelled() {
+        return Err(MarketLoadError::Cancelled);
+    }
+    Ok(Arc::from(events))
+}
+
+pub fn open_ordered_stored_tick_stream(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    canonical_symbol: &str,
+    bounds: ParquetScanBounds,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<MarketStream> {
+    let rows_per_read = streaming_rows_per_read::<StoredTick>(limits)?;
+    let store = ParquetStore::open(data_dir)?;
+    let mut cursor =
+        store.scan_stored_ticks_cancellable(exchange, symbol, bounds, rows_per_read, {
+            let is_cancelled = is_cancelled.clone();
+            move || is_cancelled()
+        })?;
+    let canonical_symbol = canonical_symbol.to_owned();
+    let mut observed = 0usize;
+    let source: EventSource = Box::new(move || {
+        loop {
+            ensure_not_cancelled(&is_cancelled)?;
+            let Some(scanned) = cursor
+                .next_stored_tick_with_ordinal_cancellable({
+                    let is_cancelled = is_cancelled.clone();
+                    move || is_cancelled()
+                })
+                .map_err(map_data_error)?
+            else {
+                return Ok(None);
+            };
+            observed = observed.checked_add(1).ok_or_else(|| {
+                MarketLoadError::InvalidSeries("stream row count overflowed".into())
+            })?;
+            if observed > limits.max_rows {
+                return Err(MarketLoadError::InvalidSeries(
+                    "ordered-tick stream exceeds its row limit".into(),
+                ));
+            }
+            if let Some(event) = tick_to_valid_event(scanned.row.tick, &canonical_symbol) {
+                return Ok(Some(SequencedMarketEvent::new(
+                    event,
+                    scanned.row.source_ordinal,
+                )));
+            }
+        }
+    });
+    Ok(KWayMergeFeed::new(vec![EventBatchFeed::new(
+        source,
+        SeriesRoles::PRIMARY,
+        0,
+    )]))
+}
+
+pub fn open_price_bar_stream(
+    data_dir: &str,
+    descriptor: &SeriesDescriptor,
+    canonical_symbol: &str,
+    bounds: ParquetScanBounds,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<MarketStream> {
+    let rows_per_read = streaming_rows_per_read::<PriceBar>(limits)?;
+    let store = ParquetStore::open(data_dir)?;
+    let mut cursor = store.scan_price_bars_cancellable(descriptor, bounds, rows_per_read, {
+        let is_cancelled = is_cancelled.clone();
+        move || is_cancelled()
+    })?;
+    let canonical_symbol = canonical_symbol.to_owned();
+    let point_size = descriptor.point_size;
+    let mut observed = 0usize;
+    let source: EventSource = Box::new(move || {
+        ensure_not_cancelled(&is_cancelled)?;
+        let Some(scanned) = cursor
+            .next_price_bar_with_ordinal_cancellable({
+                let is_cancelled = is_cancelled.clone();
+                move || is_cancelled()
+            })
+            .map_err(map_data_error)?
+        else {
+            return Ok(None);
+        };
+        observed = observed
+            .checked_add(1)
+            .ok_or_else(|| MarketLoadError::InvalidSeries("stream row count overflowed".into()))?;
+        if observed > limits.max_rows {
+            return Err(MarketLoadError::InvalidSeries(
+                "price-bar stream exceeds its row limit".into(),
+            ));
+        }
+        let available_at = scanned.row.available_at;
+        Ok(Some(
+            SequencedMarketEvent::new(
+                price_bar_to_event(scanned.row, &canonical_symbol, point_size),
+                scanned.source_row_ordinal,
+            )
+            .with_available_at(available_at),
+        ))
+    });
+    Ok(KWayMergeFeed::new(vec![EventBatchFeed::new(
+        source,
+        SeriesRoles::PRIMARY,
+        0,
+    )]))
+}
+
+fn streaming_rows_per_read<T>(limits: MarketLoadLimits) -> Result<usize> {
+    let row_bytes = std::mem::size_of::<T>()
+        .checked_add(std::mem::size_of::<FeedEvent>())
+        .ok_or_else(|| MarketLoadError::InvalidSeries("stream row byte count overflowed".into()))?;
+    let byte_rows = limits.max_resident_bytes / row_bytes;
+    let rows = limits.max_rows.min(byte_rows);
+    if rows == 0 {
+        Err(MarketLoadError::InvalidSeries(
+            "stream limits cannot hold one decoded row".into(),
+        ))
+    } else {
+        Ok(rows)
+    }
+}
+
+fn check_materialized_bound(rows: usize, row_bytes: usize, limits: MarketLoadLimits) -> Result<()> {
+    if rows > limits.max_rows
+        || rows
+            .checked_mul(row_bytes)
+            .is_none_or(|bytes| bytes > limits.max_resident_bytes)
+    {
+        Err(MarketLoadError::InvalidSeries(
+            "materialized market input exceeds its declared row or resident-byte bound".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrencyStreamPlan {
+    pub pnl_currency_by_primary_symbol: BTreeMap<String, String>,
+    pub routes: BTreeMap<String, ConversionRoute>,
+    pub conversion_symbols: std::collections::BTreeSet<String>,
+}
+
+pub fn plan_currency_streams(
+    registry: &SymbolRegistry,
+    account_currency: &str,
+    exchange: &str,
+    primary_symbols: &std::collections::BTreeSet<String>,
+    available_symbols: &std::collections::BTreeSet<String>,
+) -> Result<CurrencyStreamPlan> {
+    let pnl_currency_by_primary_symbol = primary_symbols
+        .iter()
+        .map(|symbol| {
+            let metadata = registry.currency_metadata(symbol).ok_or_else(|| {
+                MarketLoadError::InvalidSeries(format!(
+                    "primary symbol '{symbol}' has no currency metadata"
+                ))
+            })?;
+            if metadata.pnl_currency.is_empty() {
+                return Err(MarketLoadError::InvalidSeries(format!(
+                    "primary symbol '{symbol}' has no P&L currency"
+                )));
+            }
+            Ok((symbol.clone(), metadata.pnl_currency.clone()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    plan_currency_routes(
+        registry,
+        account_currency,
+        exchange,
+        pnl_currency_by_primary_symbol,
+        available_symbols,
+    )
+}
+
+pub fn plan_currency_routes(
+    registry: &SymbolRegistry,
+    account_currency: &str,
+    exchange: &str,
+    pnl_currency_by_primary_symbol: BTreeMap<String, String>,
+    available_symbols: &std::collections::BTreeSet<String>,
+) -> Result<CurrencyStreamPlan> {
+    let routes = pnl_currency_by_primary_symbol.values().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().map(|source_currency| {
+        let route = resolve_conversion_route(registry, &source_currency, account_currency, available_symbols)
+            .map_err(|error| MarketLoadError::InvalidSeries(format!("cannot resolve {source_currency} to {account_currency} on exchange '{exchange}': {error}")))?;
+        Ok((source_currency, route))
+    }).collect::<Result<BTreeMap<_, _>>>()?;
+    let conversion_symbols = routes
+        .values()
+        .flat_map(ConversionRoute::symbols)
+        .map(ToOwned::to_owned)
+        .collect();
+    Ok(CurrencyStreamPlan {
+        pnl_currency_by_primary_symbol,
+        routes,
+        conversion_symbols,
+    })
+}
 
 #[derive(Debug, Clone)]
 enum MarketSeriesSource {
@@ -534,6 +1173,27 @@ fn tick_to_valid_event(tick: Tick, canonical_symbol: &str) -> Option<MarketEvent
 /// Convert one stored bar into a feed event, expressing its recorded spread in price units.
 ///
 /// The stored spread is a point count, so it becomes a price only when the caller knows the symbol's price point size. Without one the bar keeps the historical zero-spread approximation.
+fn price_bar_to_event(bar: PriceBar, canonical_symbol: &str, point_size: f64) -> MarketEvent {
+    MarketEvent::Bar {
+        symbol: canonical_symbol.to_owned(),
+        ts: bar.ts,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: 0,
+        spread: bar
+            .spread
+            .map(|spread| f64::from(spread.max(0)) * point_size)
+            .filter(|spread| *spread > 0.0),
+        timeframe_seconds: bar
+            .timeframe
+            .fixed_duration_seconds()
+            .and_then(|value| u64::try_from(value).ok()),
+        tick_count: bar.tick_count,
+    }
+}
+
 fn bar_to_event(bar: Bar, canonical_symbol: &str, point_size: Option<f64>) -> MarketEvent {
     let spread = point_size
         .filter(|size| size.is_finite() && *size > 0.0)

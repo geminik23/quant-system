@@ -7,7 +7,7 @@ Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar
 | Backend | Feature Flag | Default | Build Time | Description |
 |---------|-------------|---------|------------|-------------|
 | **Parquet + Polars** | `parquet` | ✅ Yes | ~30s | Hive-partitioned Parquet files. No C++ compilation. zstd compressed. |
-| **DuckDB** | `duckdb-backend` | No | ~150s | Embedded columnar database. Opt-in for SQL exploration. |
+| **DuckDB** | `duckdb-backend` | No | Native build, environment dependent | Embedded columnar database. Opt-in for SQL exploration. |
 
 ### Parquet Directory Layout (Hive-Style Partitioning)
 
@@ -26,7 +26,9 @@ Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar
                 └── 2026-01-16.parquet
 ```
 
-Each file covers one date for one exchange+symbol (or exchange+symbol+timeframe for bars). Files are sorted by timestamp ascending and compressed with zstd.
+Each legacy file covers one date for one exchange+symbol (or exchange+symbol+timeframe for bars). Files are sorted by timestamp ascending and compressed with zstd.
+
+The additive library-only enhanced paths use `ordered_ticks/` and `price_bars/`. `StoredTick` persists a source ordinal and preserves equal timestamps; provider sequence is treated as duplicate identity only together with a source identity, and conflicting payloads reject. `PriceBar` stores nullable `tick_count`, actual `available_at`, and a verified `SeriesDescriptor`; unknown count is never represented by zero, one, volume, or another sentinel. Enhanced paths support both bounded materialization and fingerprinted slice-bounded cursors. `ParquetStoredTickCursor` and `ParquetPriceBarCursor` decode at most the admitted rows per read, validate partition generations and monotonic order between slices, and check cancellation without materializing the full dataset. Materialized compatibility queries still check row and resident-byte limits while accumulating partitions and include owned string storage in retained-byte accounting. Replay metadata keeps `available_at` separate from the nominal bucket timestamp, so delayed bars are ordered by actual publication and cannot replay their old range as a new executable bar. The legacy `Tick` and `Bar { tick_vol: i64 }` APIs and partitions remain unchanged. New enhanced writes require verified descriptors, while a caller may read metadata-free legacy data only as an explicitly unverified assertion.
 
 ## Quick Start
 
@@ -196,9 +198,12 @@ Tab-delimited, with header. Filename convention: `{SYMBOL}_*.csv`
 - **Exchanges** are always stored lowercase (`ctrader`, `binance`)
 - **Symbols** are always stored uppercase (`BTCUSD`, `EURUSD`)
 - **Timestamps** are stored in UTC — source timezone is converted on import
-- **Deduplication** uses `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
+- **Legacy deduplication** uses `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
   - Parquet: read-merge-write per date partition file (bounded to one file per dedup operation)
   - DuckDB: `INSERT OR IGNORE` with UNIQUE constraints
+  - `parse_tick_csv_with_audit` reports parsed/distinct/simultaneous row counts and the greatest observed fractional-second precision. The legacy CSV has no provider sequence and the legacy write path persists no source ordinal, so its audit always marks exact quote-path capability false. More than six fractional digits also warns that the Parquet microsecond representation may lose timestamp precision.
+  - Existing legacy partitions remain readable but may already have discarded simultaneous rows; conversion cannot reconstruct them and must not mark them complete.
+- **Enhanced ordered ticks** use persisted `(timestamp, source_ordinal)` order without timestamp deduplication. A provider sequence is duplicate identity only when paired with a nonempty source identity; without it, even identical simultaneous payloads remain distinct.
 
 ## Library Usage
 

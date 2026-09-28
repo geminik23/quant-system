@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::error::RunFailure;
+use serde::{Deserialize, Serialize};
 
 /// Whether one run produced a result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunStatus {
     Completed,
     Failed { kind: String, message: String },
@@ -37,7 +39,7 @@ impl From<RunFailure> for RunStatus {
 /// Every figure here is net of trading costs. The profit-and-loss and drawdown columns come from the run result, whose trade log settles each position's commission and swap; the R and excursion columns come from provider evaluation, which reads completed positions directly. Both sit on the same basis, so a row never mixes a gross figure with a net one.
 ///
 /// There is deliberately no score, rank, or overall rating column. The table reports what each configuration did and leaves the judgement to the reader.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchRow {
     pub family_id: String,
     pub symbol: String,

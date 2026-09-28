@@ -89,14 +89,37 @@ pub fn snapshot_bindings(bindings: &ConfiguredHistoricalBindings) -> Vec<SeriesB
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputProjectorSnapshot {
+    pub symbol: String,
+    pub name: String,
+    pub kind: String,
+    pub configuration: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CandidateRecipe {
     pub ordinal: u64,
     pub family_id: String,
     pub parameters: BTreeMap<String, ParameterValue>,
-    pub document: serde_json::Value,
+    #[serde(default)]
+    pub document: Option<serde_json::Value>,
+    #[serde(default)]
+    pub registered_factory: Option<RegisteredFactorySelection>,
     pub series_by_symbol: BTreeMap<String, Vec<SeriesBindingSnapshot>>,
+    #[serde(default)]
+    pub series_by_instance: BTreeMap<String, Vec<SeriesBindingSnapshot>>,
+    #[serde(default)]
+    pub input_projectors: Vec<InputProjectorSnapshot>,
     pub admission_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RegisteredFactorySelection {
+    pub name: String,
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +133,8 @@ pub enum EndpointBounds {
 #[non_exhaustive]
 pub struct ExperimentRecipe {
     pub experiment_id: Option<ExperimentId>,
+    #[serde(default)]
+    pub candidate_count: usize,
     pub caller_revision: Option<String>,
     pub dataset_reference: Option<String>,
     pub endpoint_bounds: EndpointBounds,

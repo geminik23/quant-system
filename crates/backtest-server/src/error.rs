@@ -33,6 +33,9 @@ pub enum BacktestServerError {
     #[error("Backtest cancelled")]
     Cancelled,
 
+    #[error("Backtest cancelled with a resumable research checkpoint")]
+    CancelledWithCheckpoint(Box<qs_research::SearchCheckpoint>),
+
     #[error("Configured strategy replay failed: {0}")]
     Strategy(String),
 

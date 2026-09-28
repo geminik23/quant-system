@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::NaiveDateTime;
-use duckdb::{Connection, params};
+use duckdb::{Connection, OptionalExt, params};
 
 use crate::error::{DataError, Result};
 use crate::models::*;
@@ -80,6 +80,27 @@ impl Database {
                 spread      INTEGER DEFAULT 0,
                 UNIQUE (exchange, symbol, timeframe, ts)
             );
+
+            CREATE TABLE IF NOT EXISTS ordered_ticks (
+                exchange VARCHAR NOT NULL, symbol VARCHAR NOT NULL, ts VARCHAR NOT NULL,
+                bid DOUBLE, ask DOUBLE, last DOUBLE, volume DOUBLE, flags INTEGER,
+                source_ordinal BIGINT NOT NULL, source_identity VARCHAR, provider_sequence BIGINT,
+                UNIQUE(exchange, symbol, source_ordinal)
+            );
+
+            CREATE TABLE IF NOT EXISTS price_bars (
+                exchange VARCHAR NOT NULL, symbol VARCHAR NOT NULL, timeframe VARCHAR NOT NULL,
+                timeframe_seconds BIGINT NOT NULL, ts VARCHAR NOT NULL, available_at VARCHAR NOT NULL,
+                open DOUBLE NOT NULL, high DOUBLE NOT NULL, low DOUBLE NOT NULL, close DOUBLE NOT NULL,
+                tick_count BIGINT, spread INTEGER,
+                UNIQUE(exchange, symbol, timeframe_seconds, ts)
+            );
+
+            CREATE TABLE IF NOT EXISTS series_descriptors (
+                exchange VARCHAR NOT NULL, symbol VARCHAR NOT NULL, timeframe_seconds BIGINT NOT NULL,
+                descriptor_json VARCHAR NOT NULL,
+                UNIQUE(exchange, symbol, timeframe_seconds)
+            );
             ",
         )?;
         Ok(())
@@ -120,6 +141,189 @@ impl Database {
 
         let count_after = self.count_ticks(exchange, symbol)?;
         Ok((count_after - count_before) as usize)
+    }
+
+    pub fn insert_stored_ticks(&self, ticks: &[StoredTick]) -> Result<usize> {
+        let mut inserted = 0usize;
+        for row in ticks {
+            row.validate()?;
+            let ordinal = i64::try_from(row.source_ordinal)
+                .map_err(|_| DataError::Other("source ordinal exceeds DuckDB BIGINT".into()))?;
+            if let (Some(source), Some(sequence)) = (&row.source_identity, row.provider_sequence) {
+                let mut stmt=self.conn.prepare("SELECT exchange,symbol,ts,bid,ask,last,volume,flags FROM ordered_ticks WHERE source_identity=? AND provider_sequence=?")?;
+                let mut rows = stmt.query(params![
+                    source,
+                    i64::try_from(sequence).map_err(|_| DataError::Other(
+                        "provider sequence exceeds DuckDB BIGINT".into()
+                    ))?
+                ])?;
+                if let Some(existing) = rows.next()? {
+                    let tick = Tick {
+                        exchange: existing.get(0)?,
+                        symbol: existing.get(1)?,
+                        ts: string_to_ndt(&existing.get::<_, String>(2)?)?,
+                        bid: existing.get(3)?,
+                        ask: existing.get(4)?,
+                        last: existing.get(5)?,
+                        volume: existing.get(6)?,
+                        flags: existing.get(7)?,
+                    };
+                    if tick == row.tick {
+                        continue;
+                    } else {
+                        return Err(DataError::Other(
+                            "conflicting payload for provider sequence".into(),
+                        ));
+                    }
+                }
+            }
+            let changed=self.conn.execute("INSERT INTO ordered_ticks(exchange,symbol,ts,bid,ask,last,volume,flags,source_ordinal,source_identity,provider_sequence) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![row.tick.exchange,row.tick.symbol,ndt_to_string(&row.tick.ts),row.tick.bid,row.tick.ask,row.tick.last,row.tick.volume,row.tick.flags,ordinal,row.source_identity,row.provider_sequence.map(i64::try_from).transpose().map_err(|_|DataError::Other("provider sequence exceeds DuckDB BIGINT".into()))?])?;
+            inserted += changed;
+        }
+        Ok(inserted)
+    }
+
+    pub fn query_stored_ticks(&self, exchange: &str, symbol: &str) -> Result<Vec<StoredTick>> {
+        let mut stmt=self.conn.prepare("SELECT exchange,symbol,ts,bid,ask,last,volume,flags,source_ordinal,source_identity,provider_sequence FROM ordered_ticks WHERE exchange=? AND symbol=? ORDER BY ts,source_ordinal")?;
+        let rows = stmt.query_map(params![exchange, symbol], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get::<_, i64>(8)?,
+                row.get(9)?,
+                row.get::<_, Option<i64>>(10)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (
+                exchange,
+                symbol,
+                ts,
+                bid,
+                ask,
+                last,
+                volume,
+                flags,
+                ordinal,
+                source_identity,
+                provider_sequence,
+            ) = row?;
+            result.push(StoredTick {
+                tick: Tick {
+                    exchange,
+                    symbol,
+                    ts: string_to_ndt(&ts)?,
+                    bid,
+                    ask,
+                    last,
+                    volume,
+                    flags,
+                },
+                source_ordinal: u64::try_from(ordinal)
+                    .map_err(|_| DataError::Other("negative stored ordinal".into()))?,
+                source_identity,
+                provider_sequence: provider_sequence
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| DataError::Other("negative provider sequence".into()))?,
+            })
+        }
+        Ok(result)
+    }
+
+    pub fn insert_price_bars(
+        &self,
+        descriptor: &SeriesDescriptor,
+        bars: &[PriceBar],
+    ) -> Result<usize> {
+        descriptor.validate()?;
+        if !descriptor.verified {
+            return Err(DataError::Other(
+                "new DuckDB price bars require verified descriptor".into(),
+            ));
+        }
+        let seconds = i64::try_from(descriptor.timeframe_seconds)
+            .map_err(|_| DataError::Other("timeframe exceeds DuckDB BIGINT".into()))?;
+        let encoded = serde_json::to_string(descriptor)
+            .map_err(|error| DataError::Other(error.to_string()))?;
+        let existing:Option<String>=self.conn.query_row("SELECT descriptor_json FROM series_descriptors WHERE exchange=? AND symbol=? AND timeframe_seconds=?",params![descriptor.exchange,descriptor.symbol,seconds],|row|row.get(0)).optional()?;
+        if existing.as_ref().is_some_and(|value| value != &encoded) {
+            return Err(DataError::Other("DuckDB series descriptor conflict".into()));
+        }
+        if existing.is_none() {
+            self.conn.execute(
+                "INSERT INTO series_descriptors VALUES(?,?,?,?)",
+                params![descriptor.exchange, descriptor.symbol, seconds, encoded],
+            )?;
+        }
+        let mut inserted = 0;
+        for bar in bars {
+            bar.validate()?;
+            let count = bar
+                .tick_count
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| DataError::Other("tick count exceeds DuckDB BIGINT".into()))?;
+            inserted+=self.conn.execute("INSERT OR IGNORE INTO price_bars(exchange,symbol,timeframe,timeframe_seconds,ts,available_at,open,high,low,close,tick_count,spread) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![bar.exchange,bar.symbol,bar.timeframe.as_str(),seconds,ndt_to_string(&bar.ts),ndt_to_string(&bar.available_at),bar.open,bar.high,bar.low,bar.close,count,bar.spread])?;
+        }
+        Ok(inserted)
+    }
+
+    pub fn query_price_bars(&self, descriptor: &SeriesDescriptor) -> Result<Vec<PriceBar>> {
+        descriptor.validate()?;
+        let seconds = i64::try_from(descriptor.timeframe_seconds)
+            .map_err(|_| DataError::Other("timeframe exceeds DuckDB BIGINT".into()))?;
+        let encoded = serde_json::to_string(descriptor)
+            .map_err(|error| DataError::Other(error.to_string()))?;
+        let stored:Option<String>=self.conn.query_row("SELECT descriptor_json FROM series_descriptors WHERE exchange=? AND symbol=? AND timeframe_seconds=?",params![descriptor.exchange,descriptor.symbol,seconds],|row|row.get(0)).optional()?;
+        if stored.as_ref().is_some_and(|value| value != &encoded) {
+            return Err(DataError::Other("DuckDB series descriptor conflict".into()));
+        }
+        let mut stmt=self.conn.prepare("SELECT timeframe,ts,available_at,open,high,low,close,tick_count,spread FROM price_bars WHERE exchange=? AND symbol=? AND timeframe_seconds=? ORDER BY ts")?;
+        let rows = stmt.query_map(
+            params![descriptor.exchange, descriptor.symbol, seconds],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (tf, ts, available_at, open, high, low, close, count, spread) = row?;
+            result.push(PriceBar {
+                exchange: descriptor.exchange.clone(),
+                symbol: descriptor.symbol.clone(),
+                timeframe: Timeframe::parse(&tf)?,
+                ts: string_to_ndt(&ts)?,
+                available_at: string_to_ndt(&available_at)?,
+                open,
+                high,
+                low,
+                close,
+                tick_count: count
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| DataError::Other("negative DuckDB count".into()))?,
+                spread,
+            })
+        }
+        Ok(result)
     }
 
     /// Bulk insert bars using INSERT OR IGNORE for dedup.

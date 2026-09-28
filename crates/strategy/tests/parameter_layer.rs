@@ -89,7 +89,7 @@ fn strategy_input(second: u32, updates: Vec<(&str, f64)>, ready: bool) -> Strate
                     high: close,
                     low: close,
                     close,
-                    volume: 1.0,
+                    volume: Some(1.0),
                 },
             })
             .collect(),

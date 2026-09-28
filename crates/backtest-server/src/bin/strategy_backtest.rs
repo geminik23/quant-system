@@ -60,9 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let search = matches!(request, StrategyClientRequest::Search(_));
     let submitted = match request {
-        StrategyClientRequest::Run(request) => client.submit_configured_strategy(request).await?,
-        StrategyClientRequest::Portfolio(request) => client.submit_portfolio(request).await?,
-        StrategyClientRequest::Search(request) => client.submit_search(request).await?,
+        StrategyClientRequest::Run(request) => client.submit_configured_strategy(*request).await?,
+        StrategyClientRequest::Portfolio(request) => client.submit_portfolio(*request).await?,
+        StrategyClientRequest::Search(request) => client.submit_search(*request).await?,
     };
     let job_id = submitted.job_id.ok_or_else(|| {
         submitted

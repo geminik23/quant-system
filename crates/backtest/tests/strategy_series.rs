@@ -267,7 +267,7 @@ fn exact_boundary_tick_starts_new_bar_and_subseconds_keep_source_order() {
         .unwrap();
     assert_eq!(closed[0].open(), 3.0);
     assert_eq!(closed[0].close(), 2.0);
-    assert_eq!(closed[0].tick_count(), 2);
+    assert_eq!(closed[0].tick_count(), Some(2));
 
     let next = series
         .on_batch(&primary_tick(
@@ -278,7 +278,7 @@ fn exact_boundary_tick_starts_new_bar_and_subseconds_keep_source_order() {
         ))
         .unwrap();
     assert_eq!(next[0].open(), 9.0);
-    assert_eq!(next[0].tick_count(), 1);
+    assert_eq!(next[0].tick_count(), Some(1));
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn computes_exact_bid_ask_and_overflow_safe_midpoint_ohlc() {
         (mid.open(), mid.high(), mid.low(), mid.close()),
         (2.0, 3.0, 2.0, 2.75)
     );
-    assert_eq!(mid.tick_count(), 3);
+    assert_eq!(mid.tick_count(), Some(3));
 
     let mut large = MultiTimeframeSeries::new(vec![spec(
         "large-mid",
@@ -495,7 +495,7 @@ fn selects_primary_ticks_once_and_ignores_conversion_ticks() {
         .unwrap();
     assert_eq!(closed[0].open(), 2.0);
     assert_eq!(closed[0].close(), 3.0);
-    assert_eq!(closed[0].tick_count(), 2);
+    assert_eq!(closed[0].tick_count(), Some(2));
 }
 
 #[test]
@@ -603,7 +603,7 @@ fn rejects_bad_batch_metadata_and_preserves_state() {
         .on_batch(&primary_tick("EURUSD", boundary, 4.0, 4.1))
         .unwrap();
     assert_eq!(closed[0].open(), 1.0);
-    assert_eq!(closed[0].tick_count(), 1);
+    assert_eq!(closed[0].tick_count(), Some(1));
 }
 
 #[test]
@@ -925,7 +925,7 @@ fn stored_bar_becomes_visible_only_when_a_later_bucket_arrives() {
         (bar.open(), bar.high(), bar.low(), bar.close()),
         (1.4, 1.7, 1.3, 1.5)
     );
-    assert_eq!(bar.tick_count(), 7);
+    assert_eq!(bar.tick_count(), Some(7));
     assert_eq!(series.warmup(&id).unwrap().available_bars(), 1);
 }
 
@@ -967,7 +967,7 @@ fn stored_bars_route_only_to_series_with_their_timeframe() {
 }
 
 #[test]
-fn stored_bars_with_unknown_or_mismatched_geometry_are_rejected() {
+fn stored_bars_with_unknown_counts_are_preserved_while_bad_geometry_is_rejected() {
     let start = base_ts();
     let reject = |event: FeedEvent| {
         let mut series = m5_series(MissingIntervalPolicy::Skip);
@@ -996,10 +996,26 @@ fn stored_bars_with_unknown_or_mismatched_geometry_are_rejected() {
             bucket_open: start,
         }
     );
-    assert!(matches!(
-        reject(stored_bar("EURUSD", start, ohlc, Some(300), None)),
-        SeriesError::InvalidStoredBar { .. }
-    ));
+    let mut price_only = m5_series(MissingIntervalPolicy::Skip);
+    price_only
+        .on_batch(&batch(
+            start,
+            vec![stored_bar("EURUSD", start, ohlc, Some(300), None)],
+        ))
+        .unwrap();
+    let revealed = price_only
+        .on_batch(&batch(
+            start + Duration::minutes(5),
+            vec![stored_bar(
+                "EURUSD",
+                start + Duration::minutes(5),
+                ohlc,
+                Some(300),
+                None,
+            )],
+        ))
+        .unwrap();
+    assert_eq!(revealed[0].tick_count(), None);
     assert!(matches!(
         reject(stored_bar(
             "EURUSD",

@@ -4,22 +4,38 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use qs_backtest::data_feed::FallibleBatchFeed;
 use qs_backtest::{
-    AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter,
+    AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BarSeriesSpec,
     ConfiguredHistoricalBindings, ConfiguredInstance, ConfiguredStrategyAdapterError,
-    MAX_PORTFOLIO_INSTANCES, ObservationStoreLimits, PortfolioReplayError, PriceBasis,
-    RunCurrencyPlan, SeriesGeometry, StrategyDescriptor, StrategyId, StrategyReplayError,
-    StrategyRetentionLimits, Timeframe as SeriesTimeframe,
+    HistoricalStrategy, MAX_PORTFOLIO_INSTANCES, MissingIntervalPolicy, ObservationStoreLimits,
+    PortfolioReplayError, PriceBasis, RunCurrencyPlan, SeriesGeometry, SeriesId, SeriesRequirement,
+    StrategyContext, StrategyDescriptor, StrategyEvent, StrategyId, StrategyOutput,
+    StrategyReplayError, StrategyRequirements, StrategyRetentionLimits,
+    Timeframe as SeriesTimeframe, WarmupRequirement,
 };
-use qs_market_loader::MarketStreamError;
+use qs_market_loader::{
+    MarketLoadLimits, MarketStreamError, open_ordered_stored_tick_stream, open_price_bar_stream,
+};
 use qs_research::{
-    DataWindow, DeclaredSpace, DeclaredSpaceLimits, ResearchAdmissionLimits, ResearchError,
-    ResearchPlan, StrategyFamily, WindowPlan, batch_data_range_with_limits, load_symbol_bars,
-    load_symbol_ticks, run_batch_controlled_with_limits, validate_bar_window_alignment_with_limits,
-    validate_batch_with_limits,
+    BoundedTrace, CheckpointDependency, CheckpointLimits, CompletedRunCheckpoint, DataWindow,
+    DeclaredSpace, DeclaredSpaceLimits, DirectFactoryPoint, DirectResearchFactory,
+    DirectRunCandidate, DirectStrategyError, ExecutionVariant, ExecutionVariantLimits,
+    GeneratedStructuralFamily, HeterogeneousDirectInstanceSpec, HeterogeneousInstanceSpec,
+    HeterogeneousPortfolioCandidate, MixedHeterogeneousPortfolioCandidate, PredicateAtom,
+    ResearchAdmissionLimits, ResearchError, ResearchPlan, SearchCheckpoint, StrategyFamily,
+    StructuralCandidate, StructuralOperators, StructuralResourceLimits, StructuralSearchSpec,
+    TraceLimits, TraceRecord, UncertaintyAssessment, WindowPlan, batch_data_range_with_limits,
+    load_symbol_bars, load_symbol_ticks, run_batch_controlled_with_experiment_resume,
+    run_direct_factory_batch_controlled_resume, run_execution_variants_controlled,
+    run_heterogeneous_portfolios_controlled, run_mixed_heterogeneous_portfolios,
+    validate_bar_window_alignment_with_limits, validate_batch_with_limits,
 };
 use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
-use qs_strategy::{ConfiguredStrategy, MaterialLibrary, SourceId, StrategyConfig};
+use qs_strategy::{
+    ConfiguredStrategy, ConfiguredStrategyRequirements, MaterialLibrary, ParameterBinding,
+    ParameterValue, SourceId, StrategyConfig,
+};
 
 use super::*;
 
@@ -49,18 +65,279 @@ pub struct AcceptedConfiguredRun {
     delivery: ResultDeliveryMsg,
 }
 
+#[derive(Clone)]
+enum SearchFamily {
+    Declared(DeclaredSpace),
+    Structural(GeneratedStructuralFamily),
+    Direct,
+}
+
+struct TrustedNoopStrategy {
+    descriptor: StrategyDescriptor,
+    requirements: StrategyRequirements,
+}
+
+impl HistoricalStrategy for TrustedNoopStrategy {
+    type Error = DirectStrategyError;
+
+    fn descriptor(&self) -> &StrategyDescriptor {
+        &self.descriptor
+    }
+
+    fn requirements(&self) -> &StrategyRequirements {
+        &self.requirements
+    }
+
+    fn on_event(
+        &mut self,
+        _: StrategyEvent<'_>,
+        _: StrategyContext<'_>,
+    ) -> std::result::Result<StrategyOutput, Self::Error> {
+        Ok(StrategyOutput::none())
+    }
+}
+
+#[derive(Clone)]
+struct TrustedDirectFactory {
+    points: Vec<DirectFactoryPoint>,
+    timeframe: SeriesTimeframe,
+}
+
+impl DirectResearchFactory for TrustedDirectFactory {
+    fn factory_name(&self) -> &str {
+        "noop_direct"
+    }
+
+    fn revision(&self) -> &str {
+        "r1"
+    }
+
+    fn point_count(&self) -> usize {
+        self.points.len()
+    }
+
+    fn point(&self, index: usize) -> Option<DirectFactoryPoint> {
+        self.points.get(index).cloned()
+    }
+
+    fn create(
+        &self,
+        point: &DirectFactoryPoint,
+        symbol: &str,
+        window: &DataWindow,
+    ) -> std::result::Result<DirectRunCandidate, ResearchError> {
+        let warmup_bars = match point.binding.get("warmup_bars") {
+            Some(ParameterValue::Integer(value)) => usize::try_from(*value).map_err(|_| {
+                ResearchError::InvalidPlan("trusted factory warmup is negative".into())
+            })?,
+            _ => {
+                return Err(ResearchError::InvalidPlan(
+                    "trusted factory point omitted warmup_bars".into(),
+                ));
+            }
+        };
+        let series = SeriesRequirement::new(
+            SeriesId::new("primary").map_err(|error| {
+                ResearchError::InvalidPlan(format!("trusted factory series: {error}"))
+            })?,
+            symbol,
+            self.timeframe,
+            PriceBasis::Bid,
+            WarmupRequirement::bars(warmup_bars).map_err(|error| {
+                ResearchError::InvalidPlan(format!("trusted factory warmup: {error}"))
+            })?,
+        )
+        .map_err(|error| ResearchError::InvalidPlan(format!("trusted factory series: {error}")))?;
+        let requirements = StrategyRequirements::new(
+            vec![symbol.to_owned()],
+            vec![series.clone()],
+            0,
+            false,
+            false,
+        )
+        .map_err(|error| {
+            ResearchError::InvalidPlan(format!("trusted factory requirements: {error}"))
+        })?;
+        let point_label = point
+            .binding
+            .iter()
+            .map(|(name, value)| format!("{name}={}", qs_strategy::parameter_value_label(value)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let descriptor = StrategyDescriptor::new(
+            StrategyId::new("trusted_noop").map_err(|error| {
+                ResearchError::InvalidPlan(format!("trusted factory strategy ID: {error}"))
+            })?,
+            "r1",
+            format!("Trusted no-op {symbol} {} {point_label}", window.label()),
+        )
+        .map_err(|error| {
+            ResearchError::InvalidPlan(format!("trusted factory descriptor: {error}"))
+        })?;
+        Ok(DirectRunCandidate {
+            strategy: Box::new(TrustedNoopStrategy {
+                descriptor,
+                requirements,
+            }),
+            series: vec![
+                BarSeriesSpec::new(series, 2, 0, MissingIntervalPolicy::Skip).map_err(|error| {
+                    ResearchError::InvalidPlan(format!("trusted factory bar series: {error}"))
+                })?,
+            ],
+            analysis: AnalysisPipeline::new(
+                vec![],
+                ObservationStoreLimits::default(),
+                AnnotationLimits::default(),
+            )
+            .map_err(|error| {
+                ResearchError::InvalidPlan(format!("trusted factory analysis: {error}"))
+            })?,
+        })
+    }
+}
+
+#[derive(Clone)]
+enum SearchPoint {
+    Declared(usize),
+    Structural(Box<StructuralCandidate>),
+}
+
+impl StrategyFamily for SearchFamily {
+    type Params = SearchPoint;
+    fn family_id(&self) -> &str {
+        match self {
+            Self::Declared(value) => value.family_id(),
+            Self::Structural(value) => value.family_id(),
+            Self::Direct => "noop_direct",
+        }
+    }
+    fn points(&self) -> Vec<Self::Params> {
+        match self {
+            Self::Declared(value) => value
+                .points()
+                .into_iter()
+                .map(SearchPoint::Declared)
+                .collect(),
+            Self::Structural(value) => value
+                .points()
+                .into_iter()
+                .map(|point| SearchPoint::Structural(Box::new(point)))
+                .collect(),
+            Self::Direct => Vec::new(),
+        }
+    }
+    fn parameter_binding(&self, point: &Self::Params) -> ParameterBinding {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => value.parameter_binding(point),
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.parameter_binding(point)
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn config(&self, point: &Self::Params) -> StrategyConfig {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => value.config(point),
+            (Self::Structural(value), SearchPoint::Structural(point)) => value.config(point),
+            _ => unreachable!(),
+        }
+    }
+    fn geometry(&self, symbol: &str, point: &Self::Params) -> Vec<SeriesGeometry> {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => value.geometry(symbol, point),
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.geometry(symbol, point)
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn bindings(
+        &self,
+        symbol: &str,
+        point: &Self::Params,
+        requirements: &ConfiguredStrategyRequirements,
+    ) -> std::result::Result<ConfiguredHistoricalBindings, String> {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => {
+                value.bindings(symbol, point, requirements)
+            }
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.bindings(symbol, point, requirements)
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn library(&self) -> MaterialLibrary {
+        match self {
+            Self::Declared(value) => value.library(),
+            Self::Structural(value) => value.library(),
+            Self::Direct => MaterialLibrary::builtins(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuralRequestDocument {
+    family_id: String,
+    state_id: String,
+    transition_priority: i32,
+    atoms: Vec<PredicateAtom>,
+    operators: StructuralOperators,
+    sequence_source: SourceId,
+    sequence_max_gap: usize,
+    #[serde(default)]
+    captures: Vec<qs_research::CaptureCandidate>,
+    limits: StructuralResourceLimits,
+}
+
 /// A validated parameter search, kept until its worker starts.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+struct AcceptedSelectedRerun {
+    experiment: qs_research::ExperimentRecipe,
+    candidate: qs_research::CandidateRecipe,
+    run: qs_research::RunRecipe,
+    role: qs_research::EvaluationRole,
+    caller_revision: String,
+    release_final: bool,
+    future_horizon_millis: Option<u64>,
+    embargo_millis: Option<u64>,
+}
+
+#[derive(Clone)]
 pub struct AcceptedSearch {
-    template: StrategyConfig,
-    space: serde_json::Value,
+    family: SearchFamily,
     plan: ResearchPlan,
     exchange: String,
     data_type: String,
     timeframe: Option<String>,
     range: (NaiveDateTime, NaiveDateTime),
-    space_limits: DeclaredSpaceLimits,
     admission_limits: ResearchAdmissionLimits,
+    generation_dispositions: Option<serde_json::Value>,
+    checkpoint_limits: CheckpointLimits,
+    trace_limits: TraceLimits,
+    market_load_limits: MarketLoadLimits,
+    enhanced_descriptors: BTreeMap<String, data_preprocess::SeriesDescriptor>,
+    resume_checkpoint: Option<SearchCheckpoint>,
+    selected_rerun: Option<AcceptedSelectedRerun>,
+    portfolio_candidates: Vec<HeterogeneousPortfolioCandidate>,
+    mixed_portfolio_candidates: Vec<MixedHeterogeneousPortfolioCandidate>,
+    variants: Vec<ExecutionVariant>,
+    direct_factory: Option<TrustedDirectFactory>,
+}
+
+impl std::fmt::Debug for AcceptedSearch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptedSearch")
+            .field("family_id", &self.family.family_id())
+            .field("symbols", &self.plan.symbols)
+            .field("exchange", &self.exchange)
+            .field("data_type", &self.data_type)
+            .field("timeframe", &self.timeframe)
+            .field("range", &self.range)
+            .finish()
+    }
 }
 
 // ── Configured strategy runs ────────────────────────────────────────────────
@@ -1083,12 +1360,23 @@ pub fn handle_get_search_result(
         error: Some(error),
         summary: None,
         artifact: None,
+        checkpoint_artifact: None,
     };
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(&req.job_id) {
         None => failure(format!("Job '{}' not found", req.job_id)),
         Some(job) if job.kind != JobKind::Search => {
             failure("Job is not a parameter search; use get_backtest_result".into())
+        }
+        Some(job) if job.status == JobStatus::Cancelled && job.checkpoint_artifact.is_some() => {
+            GetSearchResultResponse {
+                success: false,
+                job_id: req.job_id.clone(),
+                error: Some("Search was cancelled; a resumable checkpoint is available".into()),
+                summary: None,
+                artifact: None,
+                checkpoint_artifact: job.checkpoint_artifact.clone(),
+            }
         }
         Some(job) if job.status != JobStatus::Completed => failure(format!(
             "Job is not completed (status: {})",
@@ -1100,6 +1388,7 @@ pub fn handle_get_search_result(
             error: None,
             summary: job.search.clone(),
             artifact: job.artifact.clone(),
+            checkpoint_artifact: None,
         },
     }
 }
@@ -1115,13 +1404,80 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
             "max_search_runs and max_search_generation_points must be positive".into(),
         ));
     }
-    check_document_size(limits, "strategy template", &spec.template)?;
-    check_document_size(limits, "space document", &spec.space)?;
-    let template: StrategyConfig = decode_document("strategy template", &spec.template)?;
+    let direct_requested = spec.direct_factory.is_some();
+    let template = if direct_requested {
+        if !spec.template.is_null() || !spec.space.is_null() {
+            return Err(invalid(
+                "a direct factory request must use null template and space documents".into(),
+            ));
+        }
+        if spec.structural.is_some()
+            || spec.resource_limits.is_some()
+            || !spec.variants.is_empty()
+            || !spec.portfolio_candidates.is_empty()
+            || spec.selected_rerun.is_some()
+        {
+            return Err(invalid(
+                "a direct factory request cannot be combined with configured, structural, variant, portfolio, or selected-rerun modes".into(),
+            ));
+        }
+        None
+    } else {
+        check_document_size(limits, "strategy template", &spec.template)?;
+        check_document_size(limits, "space document", &spec.space)?;
+        Some(decode_document("strategy template", &spec.template)?)
+    };
 
     let mut symbols = Vec::new();
     for raw in &spec.symbols {
         symbols.push(required_symbol(&state.symbol_registry, raw)?);
+    }
+    let data_type = spec.data_type.to_lowercase();
+    let mut enhanced_descriptors = BTreeMap::new();
+    for value in &spec.series_descriptors {
+        let descriptor: data_preprocess::SeriesDescriptor =
+            serde_json::from_value(value.clone())
+                .map_err(|error| invalid(format!("invalid series descriptor: {error}")))?;
+        descriptor
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        if !descriptor.verified {
+            return Err(invalid(
+                "enhanced service input requires verified series descriptors".into(),
+            ));
+        }
+        if !symbols.contains(&descriptor.symbol) {
+            return Err(invalid(format!(
+                "series descriptor symbol '{}' is not admitted",
+                descriptor.symbol
+            )));
+        }
+        let key = descriptor.symbol.clone();
+        if enhanced_descriptors
+            .insert(key.clone(), descriptor)
+            .is_some()
+        {
+            return Err(invalid(format!("duplicate series descriptor for '{key}'")));
+        }
+    }
+    if data_type == "price_bar" {
+        if enhanced_descriptors.len() != symbols.len() {
+            return Err(invalid(
+                "price_bar search requires one verified descriptor per symbol".into(),
+            ));
+        }
+        if enhanced_descriptors
+            .values()
+            .any(|descriptor| Some(descriptor.timeframe_seconds) != bar_seconds)
+        {
+            return Err(invalid(
+                "price_bar descriptor timeframe differs from the request".into(),
+            ));
+        }
+    } else if !enhanced_descriptors.is_empty() {
+        return Err(invalid(
+            "series_descriptors is only valid for price_bar input".into(),
+        ));
     }
     let window_plan = window_plan_from_msg(&spec.windows)?;
     let pair_count = window_plan
@@ -1146,13 +1502,95 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
         max_points,
     )
     .map_err(research_error)?;
-    let family = DeclaredSpace::from_documents_with_limits(
-        template.clone(),
-        spec.space.clone(),
-        space_limits,
-    )
-    .map_err(research_error)?;
-    if let Some(bar_seconds) = bar_seconds {
+    let declared = template
+        .map(|template| {
+            DeclaredSpace::from_documents_with_limits(template, spec.space.clone(), space_limits)
+                .map_err(research_error)
+        })
+        .transpose()?;
+    let mut checkpoint_limits =
+        CheckpointLimits::new(limits.max_document_bytes, limits.max_search_runs)
+            .map_err(research_error)?;
+    let mut trace_limits = TraceLimits::new(limits.max_search_runs, limits.max_document_bytes)
+        .map_err(research_error)?;
+    let mut structural_resource_limits = None;
+    let (family, generation_dispositions) = if direct_requested {
+        (SearchFamily::Direct, None)
+    } else if let Some(document) = &spec.structural {
+        let request: StructuralRequestDocument = serde_json::from_value(document.clone())
+            .map_err(|error| invalid(format!("invalid structural search document: {error}")))?;
+        if let Some(limits) = &spec.resource_limits {
+            let limits: StructuralResourceLimits = serde_json::from_value(limits.clone())
+                .map_err(|error| invalid(format!("invalid structural resource limits: {error}")))?;
+            if limits != request.limits {
+                return Err(invalid(
+                    "resource_limits must equal the structural document limits".into(),
+                ));
+            }
+        }
+        structural_resource_limits = Some(request.limits);
+        checkpoint_limits = CheckpointLimits::new(
+            request.limits.max_checkpoint_bytes,
+            request.limits.max_checkpoint_records,
+        )
+        .map_err(research_error)?;
+        trace_limits = TraceLimits::new(
+            request.limits.max_trace_records,
+            request.limits.max_trace_bytes,
+        )
+        .map_err(research_error)?;
+        let declared = declared
+            .as_ref()
+            .expect("configured declaration exists for structural requests");
+        let points = declared.points();
+        if points.len() != 1 {
+            return Err(invalid(
+                "a structural request requires a one-point base declared space".into(),
+            ));
+        }
+        let point = &points[0];
+        let geometry_by_symbol = symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), declared.geometry(symbol, point)))
+            .collect();
+        let structural = StructuralSearchSpec {
+            family_id: request.family_id,
+            base_document: declared.config(point),
+            state_id: request.state_id,
+            transition_priority: request.transition_priority,
+            atoms: request.atoms,
+            operators: request.operators,
+            sequence_source: request.sequence_source,
+            sequence_max_gap: request.sequence_max_gap,
+            captures: request.captures,
+            geometry_by_symbol,
+            limits: request.limits,
+        };
+        let (generated, generation) =
+            GeneratedStructuralFamily::new(&structural).map_err(research_error)?;
+        (
+            SearchFamily::Structural(generated),
+            Some(
+                serde_json::to_value(generation.dispositions)
+                    .map_err(|error| invalid(error.to_string()))?,
+            ),
+        )
+    } else {
+        if spec.resource_limits.is_some() {
+            return Err(invalid(
+                "resource_limits requires structural generation".into(),
+            ));
+        }
+        (
+            SearchFamily::Declared(
+                declared.expect("configured declaration exists for declared requests"),
+            ),
+            None,
+        )
+    };
+    if let Some(bar_seconds) = bar_seconds
+        && !direct_requested
+    {
         validate_search_bar_geometry(&family, &symbols, bar_seconds)?;
     }
     let config = config_from_msg(&spec.config, &state.symbol_registry, &symbols)?;
@@ -1175,10 +1613,273 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
         None,
         &spec.entry_profile_routes,
     )?;
-    let workers = spec
-        .workers
-        .unwrap_or(1)
-        .clamp(1, limits.max_search_workers.max(1));
+    let direct_factory = spec
+        .direct_factory
+        .as_ref()
+        .map(|request| trusted_direct_factory(request, bar_seconds, max_points))
+        .transpose()?;
+
+    let mut variants = Vec::with_capacity(spec.variants.len());
+    for variant in &spec.variants {
+        let variant_config = config_from_msg(&variant.config, &state.symbol_registry, &symbols)?;
+        let variant_currency = same_currency_plan(state, &account_currency, &symbols)?;
+        let variant_future = future_config_from_msg(&variant.future, variant_currency)?;
+        let variant_profiles = resolve_entry_profiles(state, variant.profile.as_ref(), None, &[])?;
+        variants.push(ExecutionVariant {
+            id: variant.id.clone(),
+            backtest: variant_config,
+            future: variant_future,
+            profiles: (!variant_profiles.is_empty()).then_some(variant_profiles),
+            portfolio: None,
+        });
+    }
+    let mut portfolio_candidates = Vec::with_capacity(spec.portfolio_candidates.len());
+    let mut mixed_portfolio_candidates = Vec::new();
+    for (candidate_index, candidate) in spec.portfolio_candidates.iter().enumerate() {
+        if candidate.instances.is_empty() {
+            return Err(invalid(format!(
+                "portfolio_candidates[{candidate_index}] needs at least one instance"
+            )));
+        }
+        let total_instances = candidate
+            .instances
+            .len()
+            .checked_add(candidate.direct_instances.len())
+            .ok_or_else(|| invalid("portfolio instance count overflowed".into()))?;
+        if total_instances > limits.max_portfolio_instances {
+            return Err(invalid(format!(
+                "portfolio_candidates[{candidate_index}] exceeds the instance limit"
+            )));
+        }
+        let mut identities = BTreeSet::new();
+        let mut instances = Vec::with_capacity(candidate.instances.len());
+        for (instance_index, item) in candidate.instances.iter().enumerate() {
+            let symbol = required_symbol(&state.symbol_registry, &item.symbol)?;
+            if !symbols.contains(&symbol) {
+                return Err(invalid(format!(
+                    "portfolio_candidates[{candidate_index}].instances[{instance_index}] symbol is not admitted by search.symbols"
+                )));
+            }
+            check_document_size(limits, "strategy document", &item.strategy.document)?;
+            let document: StrategyConfig =
+                decode_document("strategy document", &item.strategy.document)?;
+            let instance_id = item.strategy.instance_id.clone().ok_or_else(|| {
+                invalid(format!(
+                    "portfolio_candidates[{candidate_index}].instances[{instance_index}] requires strategy.instance_id"
+                ))
+            })?;
+            if !identities.insert(instance_id.clone()) {
+                return Err(invalid(format!(
+                    "portfolio_candidates[{candidate_index}] has duplicate instance '{instance_id}'"
+                )));
+            }
+            let geometry = item
+                .strategy
+                .sources
+                .iter()
+                .map(|binding| geometry_from_msg(binding, &symbol, bar_seconds))
+                .collect::<Result<Vec<_>>>()?;
+            let adapter = build_adapter(
+                &document,
+                &instance_id,
+                &symbol,
+                geometry.clone(),
+                item.strategy.decision_latency_ms,
+                limits,
+            )?;
+            let profiles = resolve_entry_profiles(
+                state,
+                item.profile.as_ref(),
+                item.profile_def.as_ref(),
+                &item.entry_profile_routes,
+            )?;
+            adapter
+                .preflight_entry_profiles(&profiles)
+                .map_err(|error| invalid(format!("portfolio profile routing: {error}")))?;
+            instances.push(HeterogeneousInstanceSpec {
+                instance_id,
+                symbol,
+                document,
+                geometry,
+                profiles: (!profiles.is_empty()).then_some(profiles),
+            });
+        }
+        let mut direct = Vec::with_capacity(candidate.direct_instances.len());
+        for (instance_index, item) in candidate.direct_instances.iter().enumerate() {
+            let symbol = required_symbol(&state.symbol_registry, &item.symbol)?;
+            if !symbols.contains(&symbol) {
+                return Err(invalid(format!(
+                    "portfolio_candidates[{candidate_index}].direct_instances[{instance_index}] symbol is not admitted by search.symbols"
+                )));
+            }
+            if !identities.insert(item.instance_id.clone()) {
+                return Err(invalid(format!(
+                    "portfolio_candidates[{candidate_index}] has duplicate instance '{}'",
+                    item.instance_id
+                )));
+            }
+            let factory = trusted_direct_factory(&item.factory, bar_seconds, 1)?;
+            if factory.point_count() != 1 {
+                return Err(invalid(
+                    "a mixed direct instance requires exactly one factory point".into(),
+                ));
+            }
+            let profiles = resolve_entry_profiles(state, item.profile.as_ref(), None, &[])?;
+            direct.push(HeterogeneousDirectInstanceSpec {
+                instance_id: item.instance_id.clone(),
+                symbol,
+                factory_name: factory.factory_name().into(),
+                point: factory.point(0).expect("one factory point was admitted"),
+                profiles: (!profiles.is_empty()).then_some(profiles),
+            });
+        }
+        let (policies, groups) =
+            decode_supervisor(candidate.policies.as_ref(), candidate.groups.as_ref())?;
+        let portfolio = qs_research::PortfolioPlan { policies, groups };
+        if direct.is_empty() {
+            portfolio_candidates.push(HeterogeneousPortfolioCandidate {
+                id: candidate.id.clone(),
+                instances,
+                portfolio,
+            });
+        } else {
+            mixed_portfolio_candidates.push(MixedHeterogeneousPortfolioCandidate {
+                id: candidate.id.clone(),
+                configured: instances,
+                direct,
+                portfolio,
+            });
+        }
+    }
+    if (!portfolio_candidates.is_empty() || !mixed_portfolio_candidates.is_empty())
+        && (!variants.is_empty()
+            || spec.selected_rerun.is_some()
+            || spec.resume_checkpoint.is_some())
+    {
+        return Err(invalid(
+            "portfolio candidates cannot be combined with variants, resume, or selected rerun"
+                .into(),
+        ));
+    }
+    let portfolio_runs = portfolio_candidates
+        .len()
+        .checked_add(mixed_portfolio_candidates.len())
+        .ok_or_else(|| invalid("portfolio candidate count overflowed".into()))?
+        .checked_mul(pair_count)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| invalid("portfolio candidate run count overflowed".into()))?;
+    if portfolio_runs > limits.max_search_runs {
+        return Err(invalid(
+            "portfolio candidate search exceeds max_search_runs".into(),
+        ));
+    }
+
+    let resume_checkpoint = spec
+        .resume_checkpoint
+        .as_ref()
+        .map(|value| {
+            if !variants.is_empty() {
+                return Err(invalid(
+                    "checkpoint resume cannot be combined with execution variants".into(),
+                ));
+            }
+            let checkpoint: SearchCheckpoint = serde_json::from_value(value.clone())
+                .map_err(|error| invalid(format!("invalid search checkpoint: {error}")))?;
+            checkpoint
+                .validate(checkpoint_limits)
+                .map_err(research_error)?;
+            let expected = CheckpointDependency {
+                experiment_id: checkpoint.dependency.experiment_id.clone(),
+                caller_revision: "server-admission".into(),
+                dataset_reference: state.data_dir.clone(),
+                factory_revision: direct_factory
+                    .as_ref()
+                    .map(|factory| factory.revision().to_owned()),
+            };
+            if checkpoint.dependency != expected {
+                return Err(invalid("search checkpoint dependencies changed".into()));
+            }
+            Ok(checkpoint)
+        })
+        .transpose()?;
+    let selected_rerun = spec
+        .selected_rerun
+        .as_ref()
+        .map(|selected| {
+            if !variants.is_empty() {
+                return Err(invalid(
+                    "selected rerun cannot be combined with execution variants".into(),
+                ));
+            }
+            let experiment = serde_json::from_value(selected.experiment_recipe.clone())
+                .map_err(|error| invalid(format!("invalid experiment recipe: {error}")))?;
+            let candidate = serde_json::from_value(selected.candidate_recipe.clone())
+                .map_err(|error| invalid(format!("invalid candidate recipe: {error}")))?;
+            let run: qs_research::RunRecipe =
+                serde_json::from_value(selected.run_recipe.clone())
+                    .map_err(|error| invalid(format!("invalid run recipe: {error}")))?;
+            if selected.caller_revision.is_empty()
+                || selected.caller_revision.len() > 256
+                || selected.caller_revision.chars().any(char::is_control)
+            {
+                return Err(invalid("invalid selected rerun caller revision".into()));
+            }
+            if !symbols.contains(&run.symbol) {
+                return Err(invalid(
+                    "selected rerun symbol is not admitted by the request".into(),
+                ));
+            }
+            let window_matches = window_plan
+                .pairs_with_limit(limits.max_search_runs)
+                .map_err(research_error)?
+                .iter()
+                .flat_map(|pair| [&pair.in_sample, &pair.out_of_sample])
+                .any(|window| {
+                    window.label() == run.window
+                        && window.from() == run.from
+                        && window.to() == run.to
+                });
+            if !window_matches {
+                return Err(invalid(
+                    "selected rerun window differs from the admitted windows".into(),
+                ));
+            }
+            let role = match selected.role {
+                SearchEvaluationRoleMsg::Search => qs_research::EvaluationRole::Search,
+                SearchEvaluationRoleMsg::Validation => qs_research::EvaluationRole::Validation,
+                SearchEvaluationRoleMsg::Final => qs_research::EvaluationRole::Final,
+            };
+            Ok(AcceptedSelectedRerun {
+                experiment,
+                candidate,
+                run,
+                role,
+                caller_revision: selected.caller_revision.clone(),
+                release_final: selected.release_final,
+                future_horizon_millis: selected.future_horizon_millis,
+                embargo_millis: selected.embargo_millis,
+            })
+        })
+        .transpose()?;
+    let variant_multiplier = variants.len().max(1);
+    let admitted_points = direct_factory.as_ref().map_or_else(
+        || max_points.min(family.points().len()),
+        |factory| factory.point_count(),
+    );
+    let variant_runs = runs_per_point
+        .checked_mul(admitted_points)
+        .and_then(|runs| runs.checked_mul(variant_multiplier))
+        .ok_or_else(|| invalid("variant run count overflowed".into()))?;
+    if variant_runs > limits.max_search_runs {
+        return Err(invalid(
+            "variant search exceeds max_search_runs before replay".into(),
+        ));
+    }
+    let requested_worker_limit = structural_resource_limits
+        .map_or(limits.max_search_workers, |resource| resource.max_workers)
+        .min(limits.max_search_workers)
+        .max(1);
+    let workers = spec.workers.unwrap_or(1).clamp(1, requested_worker_limit);
     let admission_limits =
         ResearchAdmissionLimits::new(limits.max_search_runs, limits.max_search_runs)
             .map_err(research_error)?;
@@ -1190,32 +1891,111 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
     if !profiles.is_empty() {
         plan = plan.with_entry_profiles(profiles);
     }
-    if bar_seconds.is_some() {
-        validate_bar_window_alignment_with_limits(&plan, &family, admission_limits)
-            .map_err(research_error)?;
-    }
-
-    let runs =
-        validate_batch_with_limits(&plan, &family, admission_limits).map_err(research_error)?;
+    let runs = if let Some(factory) = &direct_factory {
+        if bar_seconds.is_some() {
+            for pair in plan
+                .window_plan
+                .pairs_with_limit(admission_limits.max_window_pairs)
+                .map_err(research_error)?
+            {
+                for boundary in [
+                    pair.in_sample.from(),
+                    pair.in_sample.to(),
+                    pair.out_of_sample.from(),
+                    pair.out_of_sample.to(),
+                ] {
+                    if boundary.and_utc().timestamp().rem_euclid(60) != 0
+                        || boundary.and_utc().timestamp_subsec_nanos() != 0
+                    {
+                        return Err(invalid(
+                            "trusted direct bar search boundaries must align to one-minute bars"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        factory
+            .point_count()
+            .checked_mul(plan.symbols.len())
+            .and_then(|runs| runs.checked_mul(pair_count))
+            .and_then(|runs| runs.checked_mul(2))
+            .ok_or_else(|| invalid("trusted direct run count overflowed".into()))?
+    } else {
+        if bar_seconds.is_some() {
+            validate_bar_window_alignment_with_limits(&plan, &family, admission_limits)
+                .map_err(research_error)?;
+        }
+        validate_batch_with_limits(&plan, &family, admission_limits).map_err(research_error)?
+    };
     if runs > limits.max_search_runs {
         return Err(invalid(format!(
             "the search schedules {runs} runs, above the server limit of {}",
             limits.max_search_runs
         )));
     }
-    let range = batch_data_range_with_limits(&plan, &family, admission_limits)
-        .map_err(research_error)?
-        .ok_or_else(|| invalid("the search schedules no runs".into()))?;
+    if structural_resource_limits.is_some_and(|resource| runs > resource.max_runs) {
+        return Err(invalid(
+            "the structural search exceeds its declared run limit".into(),
+        ));
+    }
+    let range = if direct_factory.is_some() {
+        let pairs = plan
+            .window_plan
+            .pairs_with_limit(admission_limits.max_window_pairs)
+            .map_err(research_error)?;
+        let from = pairs
+            .iter()
+            .flat_map(|pair| [&pair.in_sample, &pair.out_of_sample])
+            .map(DataWindow::from)
+            .min()
+            .and_then(|from| from.checked_sub_signed(chrono::Duration::minutes(1)))
+            .ok_or_else(|| invalid("trusted direct loading range overflowed".into()))?;
+        let to = pairs
+            .iter()
+            .flat_map(|pair| [&pair.in_sample, &pair.out_of_sample])
+            .map(DataWindow::to)
+            .max()
+            .ok_or_else(|| invalid("the search schedules no runs".into()))?;
+        (from, to)
+    } else {
+        batch_data_range_with_limits(&plan, &family, admission_limits)
+            .map_err(research_error)?
+            .ok_or_else(|| invalid("the search schedules no runs".into()))?
+    };
+    let default_market_bytes = limits
+        .max_retained_bars
+        .checked_mul(std::mem::size_of::<qs_backtest::data_feed::FeedEvent>())
+        .ok_or_else(|| invalid("server market byte limit overflowed".into()))?;
+    let market_load_limits = MarketLoadLimits::new(
+        structural_resource_limits.map_or(limits.max_retained_bars, |resource| {
+            resource.max_retained_records
+        }),
+        structural_resource_limits.map_or(default_market_bytes, |resource| {
+            resource.max_feed_bytes.min(resource.max_resident_bytes)
+        }),
+    )
+    .map_err(ResearchError::from)
+    .map_err(research_error)?;
     Ok(AcceptedSearch {
-        template,
-        space: spec.space.clone(),
+        family,
         plan,
         exchange: spec.exchange.to_lowercase(),
         data_type: spec.data_type.to_lowercase(),
         timeframe: spec.timeframe.clone(),
         range,
-        space_limits,
         admission_limits,
+        generation_dispositions,
+        checkpoint_limits,
+        trace_limits,
+        market_load_limits,
+        enhanced_descriptors,
+        resume_checkpoint,
+        selected_rerun,
+        portfolio_candidates,
+        mixed_portfolio_candidates,
+        variants,
+        direct_factory,
     })
 }
 
@@ -1232,6 +2012,20 @@ pub(super) fn run_search_job(state: Arc<ServerState>, job_id: String, search: Ac
             .map_err(|error| BacktestServerError::Serde(error.to_string()))?;
         Ok((output.summary, reference))
     });
+    let checkpoint_reference = match &outcome {
+        Err(BacktestServerError::CancelledWithCheckpoint(checkpoint)) => {
+            serde_json::to_vec(checkpoint.as_ref())
+                .map_err(|error| BacktestServerError::Serde(error.to_string()))
+                .and_then(|bytes| {
+                    state
+                        .artifact_store
+                        .persist_json(&bytes)
+                        .map_err(|error| BacktestServerError::Serde(error.to_string()))
+                })
+                .ok()
+        }
+        _ => None,
+    };
 
     let mut jobs = state.jobs.lock().unwrap();
     let Some(job) = jobs.get_mut(&job_id) else {
@@ -1246,6 +2040,8 @@ pub(super) fn run_search_job(state: Arc<ServerState>, job_id: String, search: Ac
             let _ = state.artifact_store.delete(&reference.artifact_id);
         }
         mark_job_cancelled(&job_id, job);
+        job.checkpoint_artifact = checkpoint_reference;
+        publish_job_status(&job_id, job);
         return;
     }
     match outcome {
@@ -1265,6 +2061,183 @@ pub(super) fn run_search_job(state: Arc<ServerState>, job_id: String, search: Ac
     }
 }
 
+fn collect_enhanced_stream(
+    mut stream: qs_market_loader::MarketStream,
+    limits: MarketLoadLimits,
+    cancellation: &JobCancellationToken,
+) -> Result<qs_research::SymbolEvents> {
+    let mut events = Vec::new();
+    let mut resident_bytes = 0usize;
+    while let Some(batch) = stream
+        .next_batch()
+        .map_err(|error| map_streaming_replay_error(StreamingReplayError::Feed(error)))?
+    {
+        ensure_not_cancelled(Some(cancellation))?;
+        let next_rows = events
+            .len()
+            .checked_add(batch.events.len())
+            .ok_or_else(|| invalid("enhanced feed row count overflowed".into()))?;
+        let batch_bytes = batch.events.iter().try_fold(0usize, |bytes, event| {
+            bytes.checked_add(event.retained_bytes_upper_bound())
+        });
+        resident_bytes = resident_bytes
+            .checked_add(
+                batch_bytes.ok_or_else(|| invalid("enhanced feed byte count overflowed".into()))?,
+            )
+            .ok_or_else(|| invalid("enhanced feed byte count overflowed".into()))?;
+        if next_rows > limits.max_rows || resident_bytes > limits.max_resident_bytes {
+            return Err(invalid(
+                "enhanced feed exceeds its admitted row or resident-byte limit".into(),
+            ));
+        }
+        events.extend(batch.events);
+    }
+    ensure_not_cancelled(Some(cancellation))?;
+    Ok(events.into())
+}
+
+fn checkpoint_from_batch(
+    state: &ServerState,
+    search: &AcceptedSearch,
+    batch: &qs_research::ResearchBatch,
+    frozen_selection: Option<qs_research::FrozenSelection>,
+    split_access: Vec<qs_research::SplitAccessRecord>,
+) -> Result<SearchCheckpoint> {
+    let table = batch.table();
+    let points_total = batch.candidate_recipes().len();
+    let completed_runs = batch
+        .run_recipes()
+        .iter()
+        .filter_map(|recipe| recipe.coverage.is_some().then_some(recipe.ordinal))
+        .collect();
+    let failures = batch
+        .run_recipes()
+        .iter()
+        .filter(|recipe| recipe.coverage.is_none())
+        .map(|recipe| {
+            (
+                recipe.ordinal,
+                "run did not produce committed coverage".into(),
+            )
+        })
+        .collect();
+    let completed_candidates = batch
+        .candidate_recipes()
+        .iter()
+        .filter(|candidate| {
+            let runs = batch
+                .run_recipes()
+                .iter()
+                .filter(|run| run.candidate_ordinal == candidate.ordinal)
+                .collect::<Vec<_>>();
+            !runs.is_empty() && runs.iter().all(|run| run.coverage.is_some())
+        })
+        .map(|candidate| candidate.ordinal)
+        .collect();
+    let mut committed_runs = std::collections::BTreeMap::new();
+    for recipe in batch
+        .run_recipes()
+        .iter()
+        .filter(|recipe| recipe.coverage.is_some())
+    {
+        let candidate = batch
+            .candidate_recipes()
+            .iter()
+            .find(|candidate| candidate.ordinal == recipe.candidate_ordinal)
+            .ok_or_else(|| BacktestServerError::Serde("run candidate recipe is absent".into()))?;
+        let params = candidate
+            .parameters
+            .iter()
+            .map(|(key, value)| (key.clone(), qs_strategy::parameter_value_label(value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let row = table
+            .rows()
+            .iter()
+            .find(|row| {
+                row.family_id == candidate.family_id
+                    && row.symbol == recipe.symbol
+                    && row.window == recipe.window
+                    && row.params == params
+            })
+            .cloned()
+            .ok_or_else(|| BacktestServerError::Serde("completed run row is absent".into()))?;
+        let positions = batch
+            .position_outcomes()
+            .iter()
+            .filter(|position| {
+                recipe
+                    .run_tags
+                    .iter()
+                    .all(|(key, value)| position.dimensions.tags.get(key) == Some(value))
+            })
+            .cloned()
+            .collect();
+        committed_runs.insert(
+            recipe.ordinal,
+            CompletedRunCheckpoint {
+                recipe: recipe.clone(),
+                row,
+                positions,
+            },
+        );
+    }
+    let checkpoint = SearchCheckpoint {
+        dependency: CheckpointDependency {
+            experiment_id: batch
+                .experiment_recipe()
+                .experiment_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            caller_revision: batch
+                .experiment_recipe()
+                .caller_revision
+                .clone()
+                .unwrap_or_else(|| "server-admission".into()),
+            dataset_reference: batch
+                .experiment_recipe()
+                .dataset_reference
+                .clone()
+                .unwrap_or_else(|| state.data_dir.clone()),
+            factory_revision: batch
+                .candidate_recipes()
+                .iter()
+                .find_map(|candidate| candidate.registered_factory.as_ref())
+                .map(|factory| factory.revision.clone()),
+        },
+        experiment_recipe: Some(batch.experiment_recipe().clone()),
+        candidate_recipes: batch
+            .candidate_recipes()
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.ordinal, candidate))
+            .collect(),
+        frozen_selection,
+        frontier: u64::try_from(points_total).unwrap_or(u64::MAX),
+        completed_candidates,
+        completed_runs,
+        committed_runs,
+        failures,
+        generated: search
+            .generation_dispositions
+            .as_ref()
+            .and_then(|value| value.get("generated"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(points_total as u64),
+        executed: u64::try_from(table.len()).unwrap_or(u64::MAX),
+        generation_exhaustive: search
+            .generation_dispositions
+            .as_ref()
+            .and_then(|value| value.get("unvisited"))
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|unvisited| unvisited == 0),
+        split_access,
+    };
+    checkpoint
+        .validate(search.checkpoint_limits)
+        .map_err(research_error)?;
+    Ok(checkpoint)
+}
+
 fn execute_search(
     state: &ServerState,
     job_id: &str,
@@ -1277,35 +2250,68 @@ fn execute_search(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_not_cancelled(Some(cancellation))?;
-    let family = DeclaredSpace::from_documents_with_limits(
-        search.template.clone(),
-        search.space.clone(),
-        search.space_limits,
-    )
-    .map_err(research_error)?;
+    let family = search.family.clone();
     let (from, to) = search.range;
     let total_symbols = search.plan.symbols.len() as u64;
     let mut events = BTreeMap::new();
     for (index, symbol) in search.plan.symbols.iter().enumerate() {
         ensure_not_cancelled(Some(cancellation))?;
-        let loaded = match search.timeframe.as_deref() {
-            Some(timeframe) if search.data_type == "bar" => load_symbol_bars(
+        let loaded = match search.data_type.as_str() {
+            "bar" => load_symbol_bars(
                 &state.data_dir,
                 &search.exchange,
                 symbol,
-                timeframe,
+                search.timeframe.as_deref().expect("bar timeframe admitted"),
                 Some(from),
                 Some(to),
-            ),
+            )
+            .map_err(research_error)?,
+            "ordered_tick" => {
+                let stream = open_ordered_stored_tick_stream(
+                    &state.data_dir,
+                    &search.exchange,
+                    symbol,
+                    symbol,
+                    data_preprocess::ParquetScanBounds::new(Some(from), Some(to)),
+                    search.market_load_limits,
+                    Arc::new({
+                        let cancellation = cancellation.clone();
+                        move || cancellation.is_cancelled()
+                    }),
+                )
+                .map_err(ResearchError::from)
+                .map_err(research_error)?;
+                collect_enhanced_stream(stream, search.market_load_limits, cancellation)?
+            }
+            "price_bar" => {
+                let descriptor = search
+                    .enhanced_descriptors
+                    .get(symbol)
+                    .expect("price-bar descriptor admitted");
+                let stream = open_price_bar_stream(
+                    &state.data_dir,
+                    descriptor,
+                    symbol,
+                    data_preprocess::ParquetScanBounds::new(Some(from), Some(to)),
+                    search.market_load_limits,
+                    Arc::new({
+                        let cancellation = cancellation.clone();
+                        move || cancellation.is_cancelled()
+                    }),
+                )
+                .map_err(ResearchError::from)
+                .map_err(research_error)?;
+                collect_enhanced_stream(stream, search.market_load_limits, cancellation)?
+            }
             _ => load_symbol_ticks(
                 &state.data_dir,
                 &search.exchange,
                 symbol,
                 Some(from),
                 Some(to),
-            ),
-        }
-        .map_err(research_error)?;
+            )
+            .map_err(research_error)?,
+        };
         events.insert(symbol.clone(), loaded);
         update_job_progress(
             state,
@@ -1319,28 +2325,245 @@ fn execute_search(
         );
     }
 
-    let batch = run_batch_controlled_with_limits(
-        &search.plan,
-        &family,
-        &events,
-        search.admission_limits,
-        &|| cancellation.is_cancelled(),
-        &|progress| {
-            update_job_progress(
-                state,
-                job_id,
-                BacktestProgress {
-                    stage: "replay".into(),
-                    processed_events: progress.completed_runs as u64,
-                    total_events: progress.total_runs as u64,
-                    processed_symbols: total_symbols,
-                    total_symbols,
-                    ..BacktestProgress::default()
-                },
+    let experiment_options = qs_research::ExperimentOptions {
+        experiment_id: None,
+        caller_revision: Some("server-admission".into()),
+        dataset_reference: Some(state.data_dir.clone()),
+    };
+    let report_progress = |progress: qs_research::BatchProgress| {
+        update_job_progress(
+            state,
+            job_id,
+            BacktestProgress {
+                stage: "replay".into(),
+                processed_events: progress.completed_runs as u64,
+                total_events: progress.total_runs as u64,
+                processed_symbols: total_symbols,
+                total_symbols,
+                ..BacktestProgress::default()
+            },
+        )
+    };
+    let mut frozen_selection = search
+        .resume_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.frozen_selection.clone());
+    let mut split_access = search
+        .resume_checkpoint
+        .as_ref()
+        .map_or_else(Vec::new, |checkpoint| checkpoint.split_access.clone());
+    let batch = if let Some(factory) = &search.direct_factory {
+        ensure_not_cancelled(Some(cancellation))?;
+        let completed = search
+            .resume_checkpoint
+            .as_ref()
+            .map_or_else(BTreeSet::new, |checkpoint| {
+                checkpoint.completed_runs.clone()
+            });
+        let batch = match run_direct_factory_batch_controlled_resume(
+            &search.plan,
+            factory,
+            &events,
+            experiment_options.clone(),
+            search.admission_limits,
+            &completed,
+            &|| cancellation.is_cancelled(),
+            &report_progress,
+        ) {
+            Ok(batch) => batch,
+            Err(ResearchError::CancelledWithPartial(partial)) => {
+                let partial = match &search.resume_checkpoint {
+                    Some(checkpoint) => partial
+                        .merge_checkpoint(checkpoint)
+                        .map_err(research_error)?,
+                    None => *partial,
+                };
+                let checkpoint = checkpoint_from_batch(
+                    state,
+                    search,
+                    &partial,
+                    frozen_selection.clone(),
+                    split_access.clone(),
+                )?;
+                return Err(BacktestServerError::CancelledWithCheckpoint(Box::new(
+                    checkpoint,
+                )));
+            }
+            Err(error) => return Err(research_error(error)),
+        };
+        match &search.resume_checkpoint {
+            Some(checkpoint) => batch.merge_checkpoint(checkpoint).map_err(research_error)?,
+            None => batch,
+        }
+    } else if !search.mixed_portfolio_candidates.is_empty() {
+        ensure_not_cancelled(Some(cancellation))?;
+        let trusted = TrustedDirectFactory {
+            points: Vec::new(),
+            timeframe: SeriesTimeframe::minutes(1)
+                .map_err(|error| invalid(format!("trusted factory timeframe: {error}")))?,
+        };
+        let factories = BTreeMap::from([(
+            trusted.factory_name().to_owned(),
+            &trusted as &dyn DirectResearchFactory,
+        )]);
+        let batch = run_mixed_heterogeneous_portfolios(
+            &search.plan,
+            &search.mixed_portfolio_candidates,
+            &factories,
+            &events,
+            ExecutionVariantLimits::new(
+                search.mixed_portfolio_candidates.len(),
+                search.admission_limits.max_scheduled_runs,
             )
-        },
-    )
-    .map_err(research_error)?;
+            .map_err(research_error)?,
+        )
+        .map_err(research_error)?
+        .combined_portfolios()
+        .map_err(research_error)?;
+        ensure_not_cancelled(Some(cancellation))?;
+        batch
+    } else if !search.portfolio_candidates.is_empty() {
+        ensure_not_cancelled(Some(cancellation))?;
+        let batch = run_heterogeneous_portfolios_controlled(
+            &search.plan,
+            &search.portfolio_candidates,
+            &events,
+            ExecutionVariantLimits::new(
+                search.portfolio_candidates.len(),
+                search.admission_limits.max_scheduled_runs,
+            )
+            .map_err(research_error)?,
+            &|| cancellation.is_cancelled(),
+            &report_progress,
+        )
+        .map_err(research_error)?
+        .combined_portfolios()
+        .map_err(research_error)?;
+        ensure_not_cancelled(Some(cancellation))?;
+        batch
+    } else if let Some(selected) = &search.selected_rerun {
+        let frozen = match frozen_selection.clone() {
+            Some(frozen)
+                if frozen.candidate == selected.candidate
+                    && frozen.experiment == selected.experiment =>
+            {
+                frozen
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "selected rerun differs from the persisted frozen selection".into(),
+                ));
+            }
+            None => qs_research::FrozenSelection {
+                candidate: selected.candidate.clone(),
+                experiment: selected.experiment.clone(),
+                caller_revision: selected.caller_revision.clone(),
+                future_horizon_millis: selected.future_horizon_millis,
+                embargo_millis: selected.embargo_millis,
+            },
+        };
+        let mut protected = qs_research::ProtectedExperiment::restore(frozen, split_access)
+            .map_err(research_error)?;
+        let window = DataWindow::new(
+            selected.run.window.clone(),
+            selected.run.from,
+            selected.run.to,
+        )
+        .map_err(research_error)?;
+        if selected.release_final && !protected.is_final_released() {
+            protected
+                .release_final_for(&window, &selected.caller_revision)
+                .map_err(research_error)?;
+        }
+        let batch = qs_research::rerun_selected_candidate_protected(
+            &search.plan,
+            &selected.experiment,
+            &selected.candidate,
+            &selected.run,
+            &events,
+            &mut protected,
+            selected.role,
+            &selected.caller_revision,
+        )
+        .map_err(research_error)?;
+        frozen_selection = protected.frozen().cloned();
+        split_access = protected.records().to_vec();
+        batch
+    } else if search.variants.is_empty() {
+        let completed = search
+            .resume_checkpoint
+            .as_ref()
+            .map_or_else(std::collections::BTreeSet::new, |checkpoint| {
+                checkpoint.completed_runs.clone()
+            });
+        let batch = match run_batch_controlled_with_experiment_resume(
+            &search.plan,
+            &family,
+            &events,
+            search.admission_limits,
+            experiment_options.clone(),
+            &completed,
+            &|| cancellation.is_cancelled(),
+            &report_progress,
+        ) {
+            Ok(batch) => batch,
+            Err(ResearchError::CancelledWithPartial(partial)) => {
+                let partial = match &search.resume_checkpoint {
+                    Some(checkpoint) => partial
+                        .merge_checkpoint(checkpoint)
+                        .map_err(research_error)?,
+                    None => *partial,
+                };
+                let checkpoint = checkpoint_from_batch(
+                    state,
+                    search,
+                    &partial,
+                    frozen_selection.clone(),
+                    split_access.clone(),
+                )?;
+                return Err(BacktestServerError::CancelledWithCheckpoint(Box::new(
+                    checkpoint,
+                )));
+            }
+            Err(error) => return Err(research_error(error)),
+        };
+        match &search.resume_checkpoint {
+            Some(checkpoint) => batch.merge_checkpoint(checkpoint).map_err(research_error)?,
+            None => batch,
+        }
+    } else {
+        ensure_not_cancelled(Some(cancellation))?;
+        run_execution_variants_controlled(
+            &search.plan,
+            &family,
+            &events,
+            &search.variants,
+            ExecutionVariantLimits::new(
+                search.variants.len(),
+                search.admission_limits.max_scheduled_runs,
+            )
+            .map_err(research_error)?,
+            experiment_options,
+            &|| cancellation.is_cancelled(),
+            &|progress| {
+                update_job_progress(
+                    state,
+                    job_id,
+                    BacktestProgress {
+                        stage: "replay".into(),
+                        processed_events: progress.completed_runs as u64,
+                        total_events: progress.total_runs as u64,
+                        processed_symbols: total_symbols,
+                        total_symbols,
+                        ..BacktestProgress::default()
+                    },
+                )
+            },
+        )
+        .map_err(research_error)?
+        .combined()
+        .map_err(research_error)?
+    };
 
     let table = batch.table();
     let completed_rows = table
@@ -1356,6 +2579,88 @@ fn execute_search(
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| BacktestServerError::Serde(error.to_string()))?;
+    let checkpoint = checkpoint_from_batch(state, search, &batch, frozen_selection, split_access)?;
+    let mut generation_dispositions = search.generation_dispositions.clone();
+    if let Some(serde_json::Value::Object(dispositions)) = generation_dispositions.as_mut() {
+        dispositions.insert(
+            "executed".into(),
+            serde_json::json!(u64::try_from(table.len()).unwrap_or(u64::MAX)),
+        );
+        dispositions.insert(
+            "failed".into(),
+            serde_json::json!(u64::try_from(table.len() - completed_rows).unwrap_or(u64::MAX)),
+        );
+    }
+    let checkpoint = serde_json::to_value(&checkpoint)
+        .map_err(|error| BacktestServerError::Serde(error.to_string()))?;
+    let experiment_recipe = Some(
+        serde_json::to_value(batch.experiment_recipe())
+            .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+    );
+    let candidate_recipes = batch
+        .candidate_recipes()
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| BacktestServerError::Serde(error.to_string()))?;
+    let run_recipes = batch
+        .run_recipes()
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| BacktestServerError::Serde(error.to_string()))?;
+
+    let (selected_evidence, trace) = if search.selected_rerun.is_some() {
+        let evidence = qs_research::selected_candidate_evidence(
+            batch.position_outcomes(),
+            "regime",
+            UncertaintyAssessment::Incomplete {
+                reason: "no dependence-aware uncertainty method was selected".into(),
+            },
+        )
+        .map_err(research_error)?;
+        let mut trace = BoundedTrace::default();
+        for position in batch.position_outcomes() {
+            let observed = chrono::DateTime::from_timestamp_millis(position.ordinal)
+                .map(|value| value.naive_utc())
+                .unwrap_or_else(|| batch.run_recipes()[0].to);
+            trace
+                .push(
+                    TraceRecord {
+                        feature: "position_outcome".into(),
+                        value: Some(position.outcome),
+                        valid: position.outcome.is_finite(),
+                        source: position.dimensions.symbol.clone(),
+                        sample_at: observed,
+                        available_at: observed,
+                        predicate: None,
+                        event: Some("position_closed".into()),
+                        capture: None,
+                        decision_id: None,
+                        command_id: None,
+                        position_id: Some(position.id.clone()),
+                        entry_regime: position.dimensions.tags.get("regime").cloned(),
+                        fill_regime: position.dimensions.tags.get("fill_regime").cloned(),
+                        hindsight_regime: position.dimensions.tags.get("hindsight_regime").cloned(),
+                    },
+                    search.trace_limits,
+                )
+                .map_err(research_error)?;
+        }
+        (
+            Some(
+                serde_json::to_value(evidence)
+                    .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+            ),
+            Some(
+                serde_json::to_value(trace)
+                    .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+
     Ok(SearchResultMsg {
         summary: SearchSummaryMsg {
             points_total,
@@ -1367,6 +2672,13 @@ fn execute_search(
         table_csv: table.to_csv(),
         evaluation,
         bound_documents,
+        experiment_recipe,
+        candidate_recipes,
+        run_recipes,
+        generation_dispositions,
+        checkpoint: Some(checkpoint),
+        selected_evidence,
+        trace,
     })
 }
 
@@ -1384,7 +2696,7 @@ fn research_error(error: ResearchError) -> BacktestServerError {
 }
 
 fn data_mode(data_type: &str) -> &'static str {
-    if data_type.eq_ignore_ascii_case("bar") {
+    if data_type.eq_ignore_ascii_case("bar") || data_type.eq_ignore_ascii_case("price_bar") {
         "bars"
     } else {
         "ticks"
@@ -1400,13 +2712,98 @@ fn required_symbol(registry: &SymbolRegistry, raw: &str) -> Result<String> {
 }
 
 /// Accept `tick`, or `bar` with a fixed-duration timeframe, and return the bar duration in seconds.
+fn trusted_direct_factory(
+    request: &SearchDirectFactoryMsg,
+    bar_seconds: Option<u64>,
+    max_points: usize,
+) -> Result<TrustedDirectFactory> {
+    if request.name != "noop_direct" || request.revision != "r1" {
+        return Err(invalid(format!(
+            "unknown trusted direct factory '{}@{}'",
+            request.name, request.revision
+        )));
+    }
+    if request.points.is_empty() || request.points.len() > max_points {
+        return Err(invalid(
+            "trusted direct factory point count is empty or exceeds admission".into(),
+        ));
+    }
+    if bar_seconds.is_some_and(|seconds| seconds != 60) {
+        return Err(invalid(
+            "noop_direct@r1 requires one-minute bars when bar input is selected".into(),
+        ));
+    }
+    let mut points = Vec::with_capacity(request.points.len());
+    for (point_index, point) in request.points.iter().enumerate() {
+        if point.parameters.len() != 1 || !point.parameters.contains_key("warmup_bars") {
+            return Err(invalid(format!(
+                "direct factory point {point_index} requires only integer warmup_bars"
+            )));
+        }
+        let mut values = Vec::with_capacity(point.parameters.len());
+        for (name, value) in &point.parameters {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(invalid(format!(
+                    "direct factory point {point_index} has an invalid parameter name"
+                )));
+            }
+            let value = match value {
+                SearchFactoryParameterMsg::Integer(value)
+                    if name == "warmup_bars" && (1..=64).contains(value) =>
+                {
+                    ParameterValue::Integer(*value)
+                }
+                SearchFactoryParameterMsg::Integer(_) => {
+                    return Err(invalid(format!(
+                        "direct factory point {point_index} warmup_bars must be 1 through 64"
+                    )));
+                }
+                SearchFactoryParameterMsg::Number(value) if value.is_finite() => {
+                    ParameterValue::Number(*value)
+                }
+                SearchFactoryParameterMsg::Number(_) => {
+                    return Err(invalid(format!(
+                        "direct factory point {point_index} has a non-finite number"
+                    )));
+                }
+                SearchFactoryParameterMsg::Choice(value)
+                    if !value.is_empty()
+                        && value.len() <= 64
+                        && !value.chars().any(char::is_control) =>
+                {
+                    ParameterValue::Choice(value.clone())
+                }
+                SearchFactoryParameterMsg::Choice(_) => {
+                    return Err(invalid(format!(
+                        "direct factory point {point_index} has an invalid choice"
+                    )));
+                }
+            };
+            values.push((name.clone(), value));
+        }
+        points.push(DirectFactoryPoint {
+            binding: ParameterBinding::new(values),
+        });
+    }
+    Ok(TrustedDirectFactory {
+        points,
+        timeframe: SeriesTimeframe::minutes(1)
+            .map_err(|error| invalid(format!("trusted factory timeframe: {error}")))?,
+    })
+}
+
 fn data_geometry(data_type: &str, timeframe: Option<&str>) -> Result<Option<u64>> {
     match data_type.to_lowercase().as_str() {
-        "tick" => match timeframe {
+        "tick" | "ordered_tick" => match timeframe {
             None => Ok(None),
             Some(_) => Err(invalid("a tick request takes no timeframe".into())),
         },
-        "bar" => {
+        "bar" | "price_bar" => {
             let raw =
                 timeframe.ok_or_else(|| invalid("a bar request requires timeframe".into()))?;
             let parsed = data_preprocess::models::Timeframe::parse(raw)
@@ -1418,7 +2815,7 @@ fn data_geometry(data_type: &str, timeframe: Option<&str>) -> Result<Option<u64>
             Ok(Some(seconds))
         }
         other => Err(invalid(format!(
-            "data_type must be 'tick' or 'bar', got '{other}'"
+            "data_type must be 'tick', 'bar', 'ordered_tick', or 'price_bar', got '{other}'"
         ))),
     }
 }
@@ -1457,8 +2854,8 @@ fn validate_server_bar_bounds(
     Ok(())
 }
 
-fn validate_search_bar_geometry(
-    family: &DeclaredSpace,
+fn validate_search_bar_geometry<F: StrategyFamily>(
+    family: &F,
     symbols: &[String],
     bar_seconds: u64,
 ) -> Result<()> {
@@ -1775,6 +3172,14 @@ lot_step_units = 1000
                 entry_profile_routes: vec![],
                 workers,
                 decision_latency_ms: 0,
+                structural: None,
+                resource_limits: None,
+                variants: vec![],
+                direct_factory: None,
+                resume_checkpoint: None,
+                selected_rerun: None,
+                portfolio_candidates: vec![],
+                series_descriptors: vec![],
             },
             future: FutureQuoteConfigMsg {
                 account_currency: "USD".into(),

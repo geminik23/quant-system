@@ -2,10 +2,60 @@ use std::sync::Arc;
 
 use chrono::NaiveDateTime;
 use qs_backtest::data_feed::FallibleBatchFeed;
-use qs_market_loader::describe_primary_market_stream;
+use qs_market_loader::{
+    CancellationCheck, MarketLoadLimits, SeriesDescriptor, describe_primary_market_stream,
+    load_ordered_stored_ticks, load_ordered_stored_ticks_controlled, load_price_only_bars,
+    load_price_only_bars_controlled,
+};
 
 use crate::error::ResearchError;
 use crate::runner::SymbolEvents;
+
+pub fn load_symbol_ordered_ticks(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    limits: MarketLoadLimits,
+) -> Result<SymbolEvents, ResearchError> {
+    load_ordered_stored_ticks(data_dir, exchange, symbol, symbol, limits)
+        .map_err(ResearchError::from)
+}
+
+pub fn load_symbol_ordered_ticks_controlled(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<SymbolEvents, ResearchError> {
+    load_ordered_stored_ticks_controlled(data_dir, exchange, symbol, symbol, limits, is_cancelled)
+        .map_err(ResearchError::from)
+}
+
+pub fn load_symbol_price_bars(
+    data_dir: &str,
+    descriptor: &SeriesDescriptor,
+    limits: MarketLoadLimits,
+) -> Result<SymbolEvents, ResearchError> {
+    load_price_only_bars(data_dir, descriptor, &descriptor.symbol, limits)
+        .map_err(ResearchError::from)
+}
+
+pub fn load_symbol_price_bars_controlled(
+    data_dir: &str,
+    descriptor: &SeriesDescriptor,
+    limits: MarketLoadLimits,
+    is_cancelled: CancellationCheck,
+) -> Result<SymbolEvents, ResearchError> {
+    load_price_only_bars_controlled(
+        data_dir,
+        descriptor,
+        &descriptor.symbol,
+        limits,
+        is_cancelled,
+    )
+    .map_err(ResearchError::from)
+}
 
 /// Read one symbol's stored ticks into memory once, for a batch to share across every run.
 ///

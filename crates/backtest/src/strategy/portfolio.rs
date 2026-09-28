@@ -9,9 +9,9 @@ use qs_risk::{HaltCommand, HaltInterval, IntentKind, RiskConfigError, Verdict};
 use serde::Serialize;
 
 use super::{
-    AnalysisPipeline, BacktestConfiguredStrategyAdapter, ConfiguredStrategyAdapterError,
-    StrategyDecisionOutput, StrategyDescriptor, StrategyReplayError, StrategyReplayInputError,
-    StrategyResearchOutput,
+    AnalysisPipeline, BacktestConfiguredStrategyAdapter, BarSeriesSpec,
+    ConfiguredStrategyAdapterError, HistoricalStrategy, StrategyDecisionOutput, StrategyDescriptor,
+    StrategyReplayError, StrategyReplayInputError, StrategyResearchOutput,
 };
 use crate::profile::PreparedEntryProfiles;
 use crate::report::BacktestResult;
@@ -59,6 +59,51 @@ impl ConfiguredInstance {
     pub fn instance_id(&self) -> &str {
         self.adapter.configured_strategy().instance_id()
     }
+}
+
+/// One caller-compiled direct strategy instance in a mixed portfolio replay.
+pub struct DirectPortfolioInstance<E> {
+    pub instance_id: String,
+    pub strategy: Box<dyn HistoricalStrategy<Error = E> + Send>,
+    pub series: Vec<BarSeriesSpec>,
+    pub analysis: AnalysisPipeline,
+    pub entry_profiles: PreparedEntryProfiles,
+    pub feed_from: Option<NaiveDateTime>,
+}
+
+impl<E> DirectPortfolioInstance<E> {
+    pub fn new(
+        instance_id: impl Into<String>,
+        strategy: Box<dyn HistoricalStrategy<Error = E> + Send>,
+        series: Vec<BarSeriesSpec>,
+        analysis: AnalysisPipeline,
+    ) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            strategy,
+            series,
+            analysis,
+            entry_profiles: PreparedEntryProfiles::default(),
+            feed_from: None,
+        }
+    }
+
+    pub fn with_entry_profiles(mut self, profiles: PreparedEntryProfiles) -> Self {
+        self.entry_profiles = profiles;
+        self
+    }
+
+    pub fn with_feed_from(mut self, from: NaiveDateTime) -> Self {
+        self.feed_from = Some(from);
+        self
+    }
+}
+
+/// Economic and supervision output of configured and direct instances sharing one account.
+#[derive(Debug)]
+pub struct MixedPortfolioBacktestResult {
+    pub replay: BacktestResult,
+    pub supervisor: Option<SupervisorOutput>,
 }
 
 /// What one instance decided and recorded during a portfolio replay.
@@ -160,6 +205,28 @@ pub enum PortfolioReplayError<FeedError> {
     #[error("market-data stream failed: {0}")]
     Feed(FeedError),
     #[error("portfolio replay was cancelled")]
+    Cancelled,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MixedPortfolioReplayError<FeedError> {
+    #[error("a mixed portfolio replay needs at least one instance")]
+    NoInstances,
+    #[error(
+        "a mixed portfolio replay accepts at most {MAX_PORTFOLIO_INSTANCES} instances, got {0}"
+    )]
+    TooManyInstances(usize),
+    #[error("instance '{instance_id}' appears more than once")]
+    DuplicateInstanceIdentity { instance_id: String },
+    #[error("mixed portfolio replay input is invalid: {0}")]
+    Input(String),
+    #[error("instance '{instance_id}' failed: {reason}")]
+    Instance { instance_id: String, reason: String },
+    #[error("the mixed portfolio feed mixes ticks and stored bars from {timestamp}")]
+    MixedPrimaryInput { timestamp: NaiveDateTime },
+    #[error("market-data stream failed: {0}")]
+    Feed(FeedError),
+    #[error("mixed portfolio replay was cancelled")]
     Cancelled,
 }
 

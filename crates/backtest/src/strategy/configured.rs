@@ -1,5 +1,6 @@
 //! Historical binding for reusable configured strategies.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDateTime;
@@ -31,6 +32,7 @@ const MAX_EXACT_F64_INTEGER: u64 = 1_u64 << 53;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoricalVolumeProjection {
     TickCountExact,
+    OptionalTickCount,
 }
 
 /// Complete historical binding for one logical configured source.
@@ -87,6 +89,181 @@ pub trait HistoricalNamedInputProjector: Send {
     ) -> Result<ProjectedNamedInput, NamedInputProjectionError>;
 }
 
+/// One explicitly selected causal fact from a completed historical source bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceBarFactKind {
+    Ordinal,
+    OpenTime,
+    CloseTime,
+    AvailableAt,
+    GapBefore,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceBarFactState {
+    last_open: Option<NaiveDateTime>,
+    last_close: Option<NaiveDateTime>,
+    ordinal: u64,
+}
+
+/// Projects source-bar timing and explicit gap facts without using host time or callback count.
+pub struct SourceBarFactProjector {
+    series_id: SeriesId,
+    kind: SourceBarFactKind,
+    state: RefCell<SourceBarFactState>,
+}
+
+impl SourceBarFactProjector {
+    pub fn new(series_id: SeriesId, kind: SourceBarFactKind) -> Self {
+        Self {
+            series_id,
+            kind,
+            state: RefCell::new(SourceBarFactState::default()),
+        }
+    }
+}
+
+impl HistoricalNamedInputProjector for SourceBarFactProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::optional(match self.kind {
+            SourceBarFactKind::Ordinal => qs_strategy::ScalarType::Integer,
+            SourceBarFactKind::OpenTime
+            | SourceBarFactKind::CloseTime
+            | SourceBarFactKind::AvailableAt => qs_strategy::ScalarType::Timestamp,
+            SourceBarFactKind::GapBefore => qs_strategy::ScalarType::Bool,
+        })
+    }
+
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let Some(bar) = context
+            .closed_bars
+            .iter()
+            .find(|bar| bar.series_id() == &self.series_id)
+        else {
+            return Ok(ProjectedNamedInput {
+                value: Value::Missing(self.output_type().scalar),
+                updated: false,
+            });
+        };
+        let mut state = self.state.borrow_mut();
+        let is_new = state.last_open != Some(bar.open_time());
+        let previous_close = state.last_close;
+        if is_new {
+            state.ordinal = state
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| NamedInputProjectionError::new("source ordinal overflowed"))?;
+            state.last_open = Some(bar.open_time());
+            state.last_close = Some(bar.close_time());
+        }
+        let value = match self.kind {
+            SourceBarFactKind::Ordinal => Value::Integer(
+                i64::try_from(state.ordinal)
+                    .map_err(|_| NamedInputProjectionError::new("source ordinal exceeds i64"))?,
+            ),
+            SourceBarFactKind::OpenTime => Value::Timestamp(bar.open_time()),
+            SourceBarFactKind::CloseTime => Value::Timestamp(bar.close_time()),
+            SourceBarFactKind::AvailableAt => Value::Timestamp(context.observed_through),
+            SourceBarFactKind::GapBefore => {
+                Value::Bool(previous_close.is_some_and(|close| close != bar.open_time()))
+            }
+        };
+        Ok(ProjectedNamedInput {
+            value,
+            updated: is_new,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmedSwingFactKind {
+    Price,
+    AnchorOpenTime,
+    AnchorCloseTime,
+    ConfirmedAt,
+}
+
+/// Retains the latest confirmed high or low swing while preserving its actual confirmation update.
+pub struct ConfirmedSwingFactProjector {
+    series_id: SeriesId,
+    swing_kind: super::SwingKind,
+    fact: ConfirmedSwingFactKind,
+    retained: RefCell<Option<(u64, Value)>>,
+}
+
+impl ConfirmedSwingFactProjector {
+    pub fn new(
+        series_id: SeriesId,
+        swing_kind: super::SwingKind,
+        fact: ConfirmedSwingFactKind,
+    ) -> Self {
+        Self {
+            series_id,
+            swing_kind,
+            fact,
+            retained: RefCell::new(None),
+        }
+    }
+}
+
+impl HistoricalNamedInputProjector for ConfirmedSwingFactProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::optional(match self.fact {
+            ConfirmedSwingFactKind::Price => qs_strategy::ScalarType::Price,
+            _ => qs_strategy::ScalarType::Timestamp,
+        })
+    }
+
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let newest = context
+            .observations
+            .iter()
+            .filter(|observation| observation.source_series().contains(&self.series_id))
+            .filter_map(|observation| {
+                observation
+                    .value()
+                    .swing()
+                    .map(|swing| (observation.sequence(), swing))
+            })
+            .filter(|(_, swing)| swing.kind() == self.swing_kind)
+            .max_by_key(|(sequence, _)| *sequence);
+        let mut retained = self.retained.borrow_mut();
+        let updated = newest.is_some_and(|(sequence, _)| {
+            retained
+                .as_ref()
+                .is_none_or(|(previous, _)| sequence > *previous)
+        });
+        if let Some((sequence, swing)) = newest
+            && updated
+        {
+            let value = match self.fact {
+                ConfirmedSwingFactKind::Price => Value::Price(swing.price()),
+                ConfirmedSwingFactKind::AnchorOpenTime => {
+                    Value::Timestamp(swing.anchor_open_time())
+                }
+                ConfirmedSwingFactKind::AnchorCloseTime => {
+                    Value::Timestamp(swing.anchor_close_time())
+                }
+                ConfirmedSwingFactKind::ConfirmedAt => Value::Timestamp(swing.confirmed_at()),
+            };
+            *retained = Some((sequence, value));
+        }
+        Ok(ProjectedNamedInput {
+            value: retained
+                .as_ref()
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Missing(self.output_type().scalar)),
+            updated,
+        })
+    }
+}
+
 /// Binding from a configured input name to a historical projector.
 pub struct ConfiguredNamedInputBinding {
     name: String,
@@ -140,6 +317,16 @@ impl ConfiguredHistoricalBindings {
 
     pub fn volume(&self) -> HistoricalVolumeProjection {
         self.volume
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ConfiguredSourceBinding>,
+        Vec<ConfiguredNamedInputBinding>,
+        HistoricalVolumeProjection,
+    ) {
+        (self.sources, self.named_inputs, self.volume)
     }
 }
 
@@ -253,6 +440,8 @@ pub enum ConfiguredStrategyAdapterError {
         source_id: SourceId,
         timestamp: NaiveDateTime,
     },
+    #[error("source '{source_id}' requires a tick count but the bar count is unknown")]
+    MissingTickCount { source_id: SourceId },
     #[error("tick count {tick_count} cannot be represented exactly as f64")]
     TickCountNotExactlyRepresentable { tick_count: u64 },
     #[error("named input '{name}' projection failed: {source}")]
@@ -596,15 +785,18 @@ impl BacktestConfiguredStrategyAdapter {
                             close: bar.close(),
                             volume: match self.bindings.volume {
                                 HistoricalVolumeProjection::TickCountExact => {
-                                    if bar.tick_count() > MAX_EXACT_F64_INTEGER {
+                                    let tick_count = match bar.tick_count() {
+                                        Some(count) => count,
+                                        None => return Some(Err(ConfiguredStrategyAdapterError::MissingTickCount { source_id: requirement.source.clone() })),
+                                    };
+                                    if tick_count > MAX_EXACT_F64_INTEGER {
                                         return Some(Err(
-                                            ConfiguredStrategyAdapterError::TickCountNotExactlyRepresentable {
-                                                tick_count: bar.tick_count(),
-                                            },
+                                            ConfiguredStrategyAdapterError::TickCountNotExactlyRepresentable { tick_count },
                                         ));
                                     }
-                                    bar.tick_count() as f64
+                                    Some(tick_count as f64)
                                 }
+                                HistoricalVolumeProjection::OptionalTickCount => bar.tick_count().map(|count| count as f64)
                             },
                         },
                     })
@@ -909,7 +1101,16 @@ fn value_matches_type(value: &Value, expected: ValueType) -> bool {
         return false;
     }
     match value {
-        Value::Number(value) | Value::Price(value) => value.is_finite(),
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value) => value.is_finite(),
         Value::Text(value) => !value.is_empty() && value.len() <= MAX_TEXT_BYTES,
         _ => true,
     }
@@ -996,13 +1197,23 @@ fn map_note(
     let mut values = BTreeMap::new();
     for output in note.values {
         let value = match output.value {
+            OutputScalar::Bool(value) => f64::from(value),
             OutputScalar::Integer(value) => {
                 if value.unsigned_abs() > MAX_EXACT_F64_INTEGER {
                     return Err(ConfiguredStrategyAdapterError::IntegerOutputPrecision);
                 }
                 value as f64
             }
-            OutputScalar::Number(value) | OutputScalar::Price(value) => value,
+            OutputScalar::Number(value)
+            | OutputScalar::Price(value)
+            | OutputScalar::Ratio(value)
+            | OutputScalar::Percent(value)
+            | OutputScalar::PricePerObservation(value)
+            | OutputScalar::PricePerObservationSquared(value)
+            | OutputScalar::RatioPerObservation(value)
+            | OutputScalar::RatioPerObservationSquared(value)
+            | OutputScalar::LogReturn(value)
+            | OutputScalar::LogReturnVariance(value) => value,
         };
         values.insert(output.name, value);
     }

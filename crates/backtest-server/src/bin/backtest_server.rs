@@ -672,6 +672,7 @@ mod tests {
                     progress: BacktestProgress::default(),
                     result: None,
                     artifact: None,
+                    checkpoint_artifact: None,
                     inline_complete: true,
                     artifact_consumed: false,
                     error: None,

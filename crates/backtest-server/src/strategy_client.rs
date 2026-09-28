@@ -17,9 +17,9 @@ use crate::rpc_types::{
 /// A request built from a run file, ready to submit.
 #[derive(Debug, Clone)]
 pub enum StrategyClientRequest {
-    Run(SubmitConfiguredStrategyRequest),
-    Portfolio(SubmitPortfolioRequest),
-    Search(SubmitSearchRequest),
+    Run(Box<SubmitConfiguredStrategyRequest>),
+    Portfolio(Box<SubmitPortfolioRequest>),
+    Search(Box<SubmitSearchRequest>),
 }
 
 /// One `[[instances]]` entry of a portfolio run file.
@@ -150,24 +150,26 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
             (!values.is_empty())
                 .then(|| serde_json::Value::Array(values.iter().map(json_value).collect()))
         };
-        return Ok(StrategyClientRequest::Portfolio(SubmitPortfolioRequest {
-            request: RunPortfolioRequest {
-                request: PortfolioRunSpec {
-                    instances,
-                    exchange: file.exchange,
-                    data_type: file.data_type,
-                    timeframe: file.timeframe,
-                    from: file.from,
-                    to: file.to,
-                    config: file.config,
-                    policies: json(&file.policies),
-                    groups: json(&file.groups),
+        return Ok(StrategyClientRequest::Portfolio(Box::new(
+            SubmitPortfolioRequest {
+                request: RunPortfolioRequest {
+                    request: PortfolioRunSpec {
+                        instances,
+                        exchange: file.exchange,
+                        data_type: file.data_type,
+                        timeframe: file.timeframe,
+                        from: file.from,
+                        to: file.to,
+                        config: file.config,
+                        policies: json(&file.policies),
+                        groups: json(&file.groups),
+                    },
+                    future,
+                    evaluation: ProviderEvaluationOptionsMsg::default(),
+                    result_delivery: ResultDeliveryMsg::Auto,
                 },
-                future,
-                evaluation: ProviderEvaluationOptionsMsg::default(),
-                result_delivery: ResultDeliveryMsg::Auto,
             },
-        }));
+        )));
     }
     if !file.policies.is_empty() || !file.groups.is_empty() {
         return Err(
@@ -186,7 +188,7 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
             if file.series.is_empty() {
                 return Err("a strategy run requires at least one [[series]]".into());
             }
-            Ok(StrategyClientRequest::Run(
+            Ok(StrategyClientRequest::Run(Box::new(
                 SubmitConfiguredStrategyRequest {
                     request: RunConfiguredStrategyRequest {
                         request: ConfiguredStrategyRunSpec {
@@ -212,7 +214,7 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
                         result_delivery: ResultDeliveryMsg::Auto,
                     },
                 },
-            ))
+            )))
         }
         (None, Some(template), Some(space)) => {
             let mut symbols = file.symbols;
@@ -229,24 +231,34 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
                 return Err("a search takes its range from [windows]".into());
             }
             let windows = file.windows.ok_or("a search requires [windows]")?;
-            Ok(StrategyClientRequest::Search(SubmitSearchRequest {
-                request: SearchRunSpec {
-                    template: document_value(&base.join(template))?,
-                    space: document_value(&base.join(space))?,
-                    symbols,
-                    exchange: file.exchange,
-                    data_type: file.data_type,
-                    timeframe: file.timeframe,
-                    windows,
-                    config: file.config,
-                    profile: file.profile,
-                    entry_profile_routes: routes,
-                    workers: file.workers,
-                    decision_latency_ms: file.decision_latency_ms,
+            Ok(StrategyClientRequest::Search(Box::new(
+                SubmitSearchRequest {
+                    request: SearchRunSpec {
+                        template: document_value(&base.join(template))?,
+                        space: document_value(&base.join(space))?,
+                        symbols,
+                        exchange: file.exchange,
+                        data_type: file.data_type,
+                        timeframe: file.timeframe,
+                        windows,
+                        config: file.config,
+                        profile: file.profile,
+                        entry_profile_routes: routes,
+                        workers: file.workers,
+                        decision_latency_ms: file.decision_latency_ms,
+                        structural: None,
+                        resource_limits: None,
+                        variants: vec![],
+                        direct_factory: None,
+                        resume_checkpoint: None,
+                        selected_rerun: None,
+                        portfolio_candidates: vec![],
+                        series_descriptors: vec![],
+                    },
+                    future,
+                    evaluation: ProviderEvaluationOptionsMsg::default(),
                 },
-                future,
-                evaluation: ProviderEvaluationOptionsMsg::default(),
-            }))
+            )))
         }
         _ => Err(
             "a run file names either strategy, [[instances]], or both template and space".into(),

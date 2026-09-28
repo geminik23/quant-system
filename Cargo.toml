@@ -73,6 +73,7 @@ thiserror = "2.0"
 
 # Time & IDs
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 nanoid = "0.4"
 
 # IPC / RPC

@@ -8,7 +8,8 @@ use qs_risk::{
 use super::*;
 use crate::artifacts::RecordedFill;
 use crate::strategy::{
-    ConfiguredInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES, PortfolioBacktestResult,
+    ConfiguredInstance, DirectPortfolioInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES,
+    MixedPortfolioBacktestResult, MixedPortfolioReplayError, PortfolioBacktestResult,
     PortfolioInstanceOutput, PortfolioReplayError, SupervisorEvent, SupervisorHaltAction,
     SupervisorOutput,
 };
@@ -234,6 +235,317 @@ impl FutureReplayHook for PortfolioReplayHook<'_> {
             let mut events = pending_events.clone();
             if !self.drivers[index].on_final_committed(&mut effects, &mut events) {
                 self.failed = Some(index);
+                return false;
+            }
+        }
+        pending_effects.clear();
+        pending_events.clear();
+        true
+    }
+}
+
+enum MixedDriverFailure {
+    Configured(usize),
+    Direct(usize),
+}
+
+struct MixedPortfolioReplayHook<'a, E> {
+    configured: Vec<ConfiguredStrategyReplayDriver<'a>>,
+    direct: Vec<StrategyReplayDriver<'a, dyn HistoricalStrategy<Error = E> + Send>>,
+    configured_declared: Vec<BTreeMap<String, BTreeSet<u64>>>,
+    direct_declared: Vec<BTreeMap<String, BTreeSet<u64>>>,
+    configured_feed_from: Vec<Option<NaiveDateTime>>,
+    direct_feed_from: Vec<Option<NaiveDateTime>>,
+    state: PortfolioReplayState,
+    failed: Option<MixedDriverFailure>,
+    seen_input: (bool, bool),
+    mixed_input: Option<NaiveDateTime>,
+}
+
+impl<E> MixedPortfolioReplayHook<'_, E> {
+    fn reads(
+        declared: &[BTreeMap<String, BTreeSet<u64>>],
+        feed_from: &[Option<NaiveDateTime>],
+        instance: usize,
+        event: &FeedEvent,
+    ) -> bool {
+        if feed_from[instance].is_some_and(|from| event.available_at() < from) {
+            return false;
+        }
+        let Some(durations) = declared[instance].get(event.event.symbol()) else {
+            return false;
+        };
+        match &event.event {
+            MarketEvent::Tick { .. } => true,
+            MarketEvent::Bar {
+                timeframe_seconds, ..
+            } => timeframe_seconds.is_none_or(|seconds| durations.contains(&seconds)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_configured(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &[FutureEffect],
+        pending_events: &[StrategyFeedbackEvent],
+        scheduled: &mut Vec<ScheduledSignal>,
+    ) -> bool {
+        for index in 0..self.configured.len() {
+            let own_batch = TimestampBatch {
+                ts: batch.ts,
+                events: batch
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        Self::reads(
+                            &self.configured_declared,
+                            &self.configured_feed_from,
+                            index,
+                            event,
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            let mut effects = pending_effects.to_vec();
+            let mut events = pending_events.to_vec();
+            let Some(output) = self.configured[index].on_boundary(
+                &own_batch,
+                engine,
+                lifecycle,
+                positions,
+                &mut effects,
+                &mut events,
+            ) else {
+                self.failed = Some(MixedDriverFailure::Configured(index));
+                return false;
+            };
+            scheduled.extend(output.into_iter().map(|mut signal| {
+                signal.instance = Some(index);
+                signal
+            }));
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_direct(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &[FutureEffect],
+        pending_events: &[StrategyFeedbackEvent],
+        scheduled: &mut Vec<ScheduledSignal>,
+    ) -> bool {
+        let offset = self.configured.len();
+        for index in 0..self.direct.len() {
+            let own_batch = TimestampBatch {
+                ts: batch.ts,
+                events: batch
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        Self::reads(&self.direct_declared, &self.direct_feed_from, index, event)
+                    })
+                    .cloned()
+                    .collect(),
+            };
+            let mut effects = pending_effects.to_vec();
+            let mut events = pending_events.to_vec();
+            let Some(output) = self.direct[index].on_boundary(
+                &own_batch,
+                engine,
+                lifecycle,
+                positions,
+                &mut effects,
+                &mut events,
+            ) else {
+                self.failed = Some(MixedDriverFailure::Direct(index));
+                return false;
+            };
+            scheduled.extend(output.into_iter().map(|mut signal| {
+                signal.instance = Some(offset + index);
+                signal
+            }));
+        }
+        true
+    }
+}
+
+impl<E> FutureReplayHook for MixedPortfolioReplayHook<'_, E> {
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn output_ready(&self) -> bool {
+        self.configured.iter().any(FutureReplayHook::output_ready)
+            || self.direct.iter().any(FutureReplayHook::output_ready)
+    }
+
+    fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool {
+        for event in events {
+            match event.event {
+                MarketEvent::Tick { .. } => self.seen_input.0 = true,
+                MarketEvent::Bar { .. } => self.seen_input.1 = true,
+            }
+            if self.seen_input == (true, true) {
+                self.mixed_input = Some(event.available_at());
+                return false;
+            }
+        }
+        for (index, driver) in self.configured.iter_mut().enumerate() {
+            if !driver.preflight_primary_events(events) {
+                self.failed = Some(MixedDriverFailure::Configured(index));
+                return false;
+            }
+        }
+        for (index, driver) in self.direct.iter_mut().enumerate() {
+            if !driver.preflight_primary_events(events) {
+                self.failed = Some(MixedDriverFailure::Direct(index));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reject_generated_configuration(&mut self, instance: Option<usize>, reason: String) {
+        let index = instance.unwrap_or(0);
+        if index < self.configured.len() {
+            self.failed = Some(MixedDriverFailure::Configured(index));
+            self.configured[index].reject_generated_configuration(None, reason);
+        } else {
+            let direct = index - self.configured.len();
+            self.failed = Some(MixedDriverFailure::Direct(direct));
+            self.direct[direct].reject_generated_configuration(None, reason);
+        }
+    }
+
+    fn observes_position_economics(&self) -> bool {
+        true
+    }
+
+    fn reads_completed_bars_only(&self) -> bool {
+        true
+    }
+
+    fn retains_post_bar_boundary(&self) -> bool {
+        true
+    }
+
+    fn bar_execution_timeframes(&self) -> BTreeMap<String, u64> {
+        let mut shortest = BTreeMap::new();
+        for driver in &self.configured {
+            for (symbol, seconds) in driver.bar_execution_timeframes() {
+                shortest
+                    .entry(symbol)
+                    .and_modify(|current: &mut u64| *current = (*current).min(seconds))
+                    .or_insert(seconds);
+            }
+        }
+        for driver in &self.direct {
+            for (symbol, seconds) in driver.bar_execution_timeframes() {
+                shortest
+                    .entry(symbol)
+                    .and_modify(|current| *current = (*current).min(seconds))
+                    .or_insert(seconds);
+            }
+        }
+        shortest
+    }
+
+    fn portfolio_state(&mut self) -> Option<&mut PortfolioReplayState> {
+        Some(&mut self.state)
+    }
+
+    fn on_pre_bar_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &mut Vec<FutureEffect>,
+        pending_events: &mut Vec<StrategyFeedbackEvent>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        let mut scheduled = Vec::new();
+        self.drive_configured(
+            batch,
+            engine,
+            lifecycle,
+            positions,
+            pending_effects,
+            pending_events,
+            &mut scheduled,
+        )
+        .then_some(scheduled)
+    }
+
+    fn on_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &mut Vec<FutureEffect>,
+        pending_events: &mut Vec<StrategyFeedbackEvent>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        let mut scheduled = Vec::new();
+        let bar_batch = batch
+            .events
+            .iter()
+            .any(|event| matches!(event.event, MarketEvent::Bar { .. }));
+        if !bar_batch
+            && !self.drive_configured(
+                batch,
+                engine,
+                lifecycle,
+                positions,
+                pending_effects,
+                pending_events,
+                &mut scheduled,
+            )
+        {
+            return None;
+        }
+        if !self.drive_direct(
+            batch,
+            engine,
+            lifecycle,
+            positions,
+            pending_effects,
+            pending_events,
+            &mut scheduled,
+        ) {
+            return None;
+        }
+        pending_effects.clear();
+        pending_events.clear();
+        Some(scheduled)
+    }
+
+    fn on_final_committed(
+        &mut self,
+        pending_effects: &mut Vec<FutureEffect>,
+        pending_events: &mut Vec<StrategyFeedbackEvent>,
+    ) -> bool {
+        for (index, driver) in self.configured.iter_mut().enumerate() {
+            let mut effects = pending_effects.clone();
+            let mut events = pending_events.clone();
+            if !driver.on_final_committed(&mut effects, &mut events) {
+                self.failed = Some(MixedDriverFailure::Configured(index));
+                return false;
+            }
+        }
+        for (index, driver) in self.direct.iter_mut().enumerate() {
+            let mut effects = pending_effects.clone();
+            let mut events = pending_events.clone();
+            if !driver.on_final_committed(&mut effects, &mut events) {
+                self.failed = Some(MixedDriverFailure::Direct(index));
                 return false;
             }
         }
@@ -538,6 +850,297 @@ impl BacktestRunner {
         )
     }
 
+    /// Run configured and caller-compiled strategies against one shared account while preserving their distinct bar timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_mixed_portfolio_future<F, E>(
+        self,
+        source_feed: &mut F,
+        configured: Vec<ConfiguredInstance>,
+        direct: Vec<DirectPortfolioInstance<E>>,
+        supervisor: Option<PortfolioSupervisor>,
+        retention: StrategyRetentionLimits,
+    ) -> Result<MixedPortfolioBacktestResult, MixedPortfolioReplayError<Infallible>>
+    where
+        F: DataFeed,
+        E: std::fmt::Display,
+    {
+        let mut events = Vec::new();
+        while let Some(batch) = source_feed.next_batch() {
+            events.extend(batch.events);
+        }
+        events.sort_by_key(FeedEvent::ordering_key);
+        let primary_eod = events
+            .iter()
+            .filter(|event| event.metadata.roles.primary)
+            .map(FeedEvent::available_at)
+            .max();
+        let mut feed = crate::data_feed::VecFeed::from_feed_events(events);
+        let mut feed = DataFeedBatchAdapter { feed: &mut feed };
+        self.run_mixed_portfolio_future_streaming_controlled(
+            &mut feed,
+            primary_eod,
+            configured,
+            direct,
+            supervisor,
+            retention,
+            || false,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_mixed_portfolio_future_streaming_controlled<F, E, C, P>(
+        mut self,
+        feed: &mut F,
+        primary_eod: Option<NaiveDateTime>,
+        configured: Vec<ConfiguredInstance>,
+        direct: Vec<DirectPortfolioInstance<E>>,
+        supervisor: Option<PortfolioSupervisor>,
+        retention: StrategyRetentionLimits,
+        mut is_cancelled: C,
+        mut on_progress: P,
+    ) -> Result<MixedPortfolioBacktestResult, MixedPortfolioReplayError<F::Error>>
+    where
+        F: FallibleBatchFeed,
+        E: std::fmt::Display,
+        C: FnMut() -> bool,
+        P: FnMut(ReplayProgress),
+    {
+        let total = configured.len().checked_add(direct.len()).ok_or_else(|| {
+            MixedPortfolioReplayError::Input("mixed instance count overflowed".into())
+        })?;
+        if total == 0 {
+            return Err(MixedPortfolioReplayError::NoInstances);
+        }
+        if total > MAX_PORTFOLIO_INSTANCES {
+            return Err(MixedPortfolioReplayError::TooManyInstances(total));
+        }
+        if self.entry_profiles.is_some() {
+            return Err(MixedPortfolioReplayError::Input(
+                "mixed portfolio instances carry their own entry profiles".into(),
+            ));
+        }
+        if self.config.run_tags.contains_key(INSTANCE_POSITION_TAG) {
+            return Err(MixedPortfolioReplayError::Input(format!(
+                "run tag '{INSTANCE_POSITION_TAG}' is owned by portfolio replay"
+            )));
+        }
+        if let Some(supervisor) = supervisor.as_ref()
+            && supervisor.caps_group_risk()
+            && !self.config.sizing.as_ref().is_some_and(is_monetary_sizing)
+        {
+            return Err(MixedPortfolioReplayError::Input(
+                "a group risk cap needs a monetary sizing policy".into(),
+            ));
+        }
+        let future = self.future_config.clone().unwrap_or_default();
+        self.future_config = Some(future.clone());
+        validate_replay_config(&self.config, Some(&future), &[])
+            .map_err(MixedPortfolioReplayError::Input)?;
+
+        let mut identities = BTreeSet::new();
+        let mut adapters = Vec::with_capacity(configured.len());
+        let mut configured_analysis = Vec::with_capacity(configured.len());
+        let mut configured_series = Vec::with_capacity(configured.len());
+        let mut configured_feed_from = Vec::with_capacity(configured.len());
+        let mut profiles = Vec::with_capacity(total);
+        let mut instance_ids = Vec::with_capacity(total);
+        for instance in configured {
+            let instance_id = instance.instance_id().to_owned();
+            if !identities.insert(instance_id.clone()) {
+                return Err(MixedPortfolioReplayError::DuplicateInstanceIdentity { instance_id });
+            }
+            instance
+                .adapter
+                .preflight_entry_profiles(&instance.entry_profiles)
+                .map_err(|error| MixedPortfolioReplayError::Instance {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                })?;
+            instance
+                .adapter
+                .preflight(retention, self.strategy_research_limits)
+                .map_err(|error| MixedPortfolioReplayError::Instance {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                })?;
+            let specs = instance.adapter.series_specs().cloned().collect::<Vec<_>>();
+            crate::strategy::replay::validate_series_specs(instance.adapter.requirements(), &specs)
+                .map_err(|error| MixedPortfolioReplayError::Instance {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                })?;
+            configured_series.push(MultiTimeframeSeries::new(specs).map_err(|error| {
+                MixedPortfolioReplayError::Instance {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                }
+            })?);
+            instance_ids.push(instance_id);
+            profiles.push(instance.entry_profiles);
+            configured_feed_from.push(instance.feed_from);
+            configured_analysis.push(instance.analysis);
+            adapters.push(instance.adapter);
+        }
+
+        let mut direct_strategies = Vec::with_capacity(direct.len());
+        let mut direct_analysis = Vec::with_capacity(direct.len());
+        let mut direct_series = Vec::with_capacity(direct.len());
+        let mut direct_feed_from = Vec::with_capacity(direct.len());
+        for instance in direct {
+            let instance_id = instance.instance_id;
+            if !identities.insert(instance_id.clone()) {
+                return Err(MixedPortfolioReplayError::DuplicateInstanceIdentity { instance_id });
+            }
+            crate::strategy::replay::validate_series_specs(
+                instance.strategy.requirements(),
+                &instance.series,
+            )
+            .map_err(|error| MixedPortfolioReplayError::Instance {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?;
+            direct_series.push(MultiTimeframeSeries::new(instance.series).map_err(|error| {
+                MixedPortfolioReplayError::Instance {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                }
+            })?);
+            instance_ids.push(instance_id);
+            profiles.push(instance.entry_profiles);
+            direct_feed_from.push(instance.feed_from);
+            direct_analysis.push(instance.analysis);
+            direct_strategies.push(instance.strategy);
+        }
+        self.instance_profiles = profiles;
+
+        let configured_count = adapters.len();
+        let research_limits = self.strategy_research_limits;
+        let configured_drivers = adapters
+            .iter_mut()
+            .zip(configured_series)
+            .zip(configured_analysis)
+            .map(|((adapter, series), analysis)| {
+                ConfiguredStrategyReplayDriver::new(
+                    adapter,
+                    series,
+                    analysis,
+                    retention,
+                    research_limits,
+                )
+            })
+            .collect::<Vec<_>>();
+        let direct_drivers = direct_strategies
+            .iter_mut()
+            .zip(direct_series)
+            .zip(direct_analysis)
+            .map(|((strategy, series), analysis)| {
+                StrategyReplayDriver::new(
+                    strategy.as_mut(),
+                    series,
+                    analysis,
+                    retention,
+                    research_limits,
+                )
+            })
+            .collect::<Vec<_>>();
+        let configured_declared = configured_drivers
+            .iter()
+            .map(|driver| declared_series(&driver.requirements))
+            .collect();
+        let direct_declared = direct_drivers
+            .iter()
+            .map(|driver| declared_series(&driver.requirements))
+            .collect();
+        let mut hook = MixedPortfolioReplayHook {
+            configured: configured_drivers,
+            direct: direct_drivers,
+            configured_declared,
+            direct_declared,
+            configured_feed_from,
+            direct_feed_from,
+            state: PortfolioReplayState::new(instance_ids.clone(), supervisor),
+            failed: None,
+            seen_input: (false, false),
+            mixed_input: None,
+        };
+        let replay = match self.run_raw_signals_future_batches(
+            feed,
+            primary_eod,
+            Vec::new(),
+            None,
+            future,
+            None,
+            0,
+            0,
+            &mut is_cancelled,
+            &mut on_progress,
+            &mut hook,
+        ) {
+            Ok(replay) => replay,
+            Err(FutureBatchReplayError::Feed(error)) => {
+                return Err(MixedPortfolioReplayError::Feed(error));
+            }
+            Err(FutureBatchReplayError::Cancelled) => {
+                return Err(MixedPortfolioReplayError::Cancelled);
+            }
+            Err(FutureBatchReplayError::Dynamic) => {
+                if let Some(timestamp) = hook.mixed_input {
+                    return Err(MixedPortfolioReplayError::MixedPrimaryInput { timestamp });
+                }
+                let failure = hook
+                    .failed
+                    .take()
+                    .unwrap_or(MixedDriverFailure::Configured(0));
+                let (instance, reason) = match failure {
+                    MixedDriverFailure::Configured(index) => {
+                        let reason = hook
+                            .configured
+                            .swap_remove(index)
+                            .finish()
+                            .err()
+                            .map_or_else(
+                                || "configured instance failed".into(),
+                                |error| format!("{error:?}"),
+                            );
+                        (index, reason)
+                    }
+                    MixedDriverFailure::Direct(index) => {
+                        let reason = hook.direct.swap_remove(index).finish().err().map_or_else(
+                            || "direct instance failed".into(),
+                            |error| mixed_direct_error(&error),
+                        );
+                        (configured_count + index, reason)
+                    }
+                };
+                return Err(MixedPortfolioReplayError::Instance {
+                    instance_id: instance_ids[instance].clone(),
+                    reason,
+                });
+            }
+        };
+        for (index, driver) in hook.configured.into_iter().enumerate() {
+            driver
+                .finish()
+                .map_err(|error| MixedPortfolioReplayError::Instance {
+                    instance_id: instance_ids[index].clone(),
+                    reason: format!("{error:?}"),
+                })?;
+        }
+        for (index, driver) in hook.direct.into_iter().enumerate() {
+            driver
+                .finish()
+                .map_err(|error| MixedPortfolioReplayError::Instance {
+                    instance_id: instance_ids[configured_count + index].clone(),
+                    reason: mixed_direct_error(&error),
+                })?;
+        }
+        Ok(MixedPortfolioBacktestResult {
+            replay,
+            supervisor: hook.state.into_output(),
+        })
+    }
+
     /// Run several configured strategy instances from complete ordered timestamp batches against one account, with cooperative cancellation and replay progress.
     ///
     /// Each instance keeps its own series, analysis, decisions, and entry profiles; fills, balance, costs, marks, and drawdown are shared. When a supervisor is supplied, every Entry and scale-in an instance generates is reviewed before it is scheduled, and a refused one reaches the instance as a rejected command.
@@ -771,6 +1374,39 @@ impl BacktestRunner {
             supervisor: state.into_output(),
         })
     }
+}
+
+fn mixed_direct_error<E: std::fmt::Display>(error: &StrategyDriverError<E>) -> String {
+    match error {
+        StrategyDriverError::Series(error) => error.to_string(),
+        StrategyDriverError::SeriesView(error) => error.to_string(),
+        StrategyDriverError::Analysis(error) => error.to_string(),
+        StrategyDriverError::Strategy(error) => error.to_string(),
+        StrategyDriverError::Runtime(error) => error.to_string(),
+        StrategyDriverError::WarmupSignals { timestamp } => {
+            format!("strategy emitted signals during warmup at {timestamp}")
+        }
+        StrategyDriverError::InvalidGeneratedSignal {
+            signal_index,
+            reason,
+        } => format!("generated signal {signal_index} is invalid: {reason}"),
+        StrategyDriverError::TickExecutionRequired { symbol, timestamp } => {
+            format!("{symbol} requires tick execution at {timestamp}")
+        }
+    }
+}
+
+fn declared_series(
+    requirements: &crate::strategy::StrategyRequirements,
+) -> BTreeMap<String, BTreeSet<u64>> {
+    let mut declared = BTreeMap::<String, BTreeSet<u64>>::new();
+    for requirement in requirements.series() {
+        declared
+            .entry(requirement.symbol().to_owned())
+            .or_default()
+            .insert(requirement.timeframe().duration_seconds());
+    }
+    declared
 }
 
 /// Account-currency risk an Entry requests before its fill: known for monetary sizing, unknown for fixed lots.

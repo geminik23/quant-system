@@ -1,12 +1,17 @@
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use qs_backtest::Timeframe;
 use qs_research::families::EmaCrossFamily;
 use qs_research::{
-    DataWindow, EndpointBounds, ExperimentId, ExperimentOptions, ResearchAdmissionLimits,
-    ResearchPlan, RunStatus, SymbolEvents, WindowPlan, run_batch, run_batch_with_experiment,
+    CheckpointDependency, CompletedRunCheckpoint, DataWindow, EndpointBounds, EvaluationRole,
+    ExperimentId, ExperimentOptions, FeatureCache, FeatureCacheKey, FrozenSelection,
+    ProtectedExperiment, ResearchAdmissionLimits, ResearchError, ResearchPlan, RunStatus,
+    SearchCheckpoint, SplitAccessKind, SymbolEvents, WindowPlan, cached_market_midpoints,
+    rerun_selected_candidate_protected, run_batch, run_batch_controlled_with_experiment_resume,
+    run_batch_with_experiment,
 };
 use support::{SYMBOL, at, config, synthetic_ticks};
 
@@ -50,6 +55,64 @@ fn a_batch_evaluates_every_point_over_every_window() {
             row.params
         );
     }
+}
+
+#[test]
+fn cancellation_retains_only_complete_runs_for_checkpoint_publication() {
+    let completed = AtomicUsize::new(0);
+    let outcome = run_batch_controlled_with_experiment_resume(
+        &plan(1),
+        &family(),
+        &events(),
+        ResearchAdmissionLimits::default(),
+        ExperimentOptions::default(),
+        &BTreeSet::new(),
+        &|| completed.load(Ordering::Acquire) >= 1,
+        &|progress| {
+            completed.store(progress.completed_runs, Ordering::Release);
+        },
+    );
+    let ResearchError::CancelledWithPartial(partial) = outcome.unwrap_err() else {
+        panic!("cancellation after one run must retain a partial batch");
+    };
+    assert_eq!(partial.run_recipes().len(), 1);
+    assert_eq!(partial.rows().len(), 1);
+    assert_eq!(partial.run_recipes()[0].ordinal, 0);
+    assert!(partial.run_recipes()[0].coverage.is_some());
+}
+
+#[test]
+fn immutable_market_feature_cache_preserves_replay_economics_and_clone_isolation() {
+    let events = events();
+    let baseline = run_batch(&plan(1), &family(), &events).unwrap();
+    let source = &events[SYMBOL];
+    let key = FeatureCacheKey {
+        dataset_reference: "synthetic-minute-ticks".into(),
+        symbol: SYMBOL.into(),
+        from: at(0),
+        to: at(960),
+        source: "primary".into(),
+        price_basis: "mid".into(),
+        alignment_offset_seconds: 0,
+        output: "midpoint".into(),
+        parameters: BTreeMap::new(),
+        seed_policy: "none".into(),
+        missing_policy: "explicit".into(),
+        clock: "event_availability".into(),
+        availability_policy: "actual".into(),
+    };
+    let bytes = FeatureCache::entry_bytes_upper_bound(&key, source.len()).unwrap();
+    let mut cache = FeatureCache::new(bytes).unwrap();
+    let mut first = cached_market_midpoints(&mut cache, key.clone(), source).unwrap();
+    let second = cached_market_midpoints(&mut cache, key, source).unwrap();
+    assert_eq!(first, second);
+    first[0] = None;
+    assert_ne!(first, second);
+    assert_eq!(cache.len(), 1);
+
+    let cached = run_batch(&plan(1), &family(), &events).unwrap();
+    assert_eq!(cached.table(), baseline.table());
+    assert_eq!(cached.position_outcomes(), baseline.position_outcomes());
 }
 
 #[test]
@@ -130,6 +193,156 @@ fn effective_recipes_are_deduplicated_and_worker_stable() {
     let encoded = serde_json::to_string(sequential.run_recipes()).unwrap();
     let decoded: Vec<qs_research::RunRecipe> = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, sequential.run_recipes());
+}
+
+#[test]
+fn downloaded_configured_recipe_reruns_with_frozen_settings_and_rejects_tuning() {
+    let events = events();
+    let options = ExperimentOptions {
+        experiment_id: Some(ExperimentId::new("rerun-fixture").unwrap()),
+        caller_revision: Some("r1".into()),
+        dataset_reference: Some("synthetic".into()),
+    };
+    let original = run_batch_with_experiment(
+        &plan(1),
+        &family(),
+        &events,
+        ResearchAdmissionLimits::default(),
+        options,
+    )
+    .unwrap();
+    let candidate = &original.candidate_recipes()[0];
+    let run = original
+        .run_recipes()
+        .iter()
+        .find(|run| run.candidate_ordinal == candidate.ordinal)
+        .unwrap();
+    let rerun = qs_research::rerun_selected_candidate(
+        &plan(1),
+        original.experiment_recipe(),
+        candidate,
+        run,
+        &events,
+    )
+    .unwrap();
+    let expected = original
+        .rows()
+        .iter()
+        .find(|row| {
+            row.window == run.window
+                && row.symbol == run.symbol
+                && row.params == rerun.rows()[0].params
+        })
+        .unwrap();
+    assert_eq!(&rerun.rows()[0], expected);
+
+    let final_window = DataWindow::new(run.window.clone(), run.from, run.to).unwrap();
+    let mut protected = ProtectedExperiment::default();
+    protected
+        .freeze(FrozenSelection {
+            candidate: candidate.clone(),
+            experiment: original.experiment_recipe().clone(),
+            caller_revision: "r1".into(),
+            future_horizon_millis: Some(1),
+            embargo_millis: Some(1),
+        })
+        .unwrap();
+    assert!(
+        rerun_selected_candidate_protected(
+            &plan(1),
+            original.experiment_recipe(),
+            candidate,
+            run,
+            &events,
+            &mut protected,
+            EvaluationRole::Final,
+            "r1",
+        )
+        .is_err(),
+        "final data must not open before release"
+    );
+    protected.release_final_for(&final_window, "r1").unwrap();
+    let protected_rerun = rerun_selected_candidate_protected(
+        &plan(1),
+        original.experiment_recipe(),
+        candidate,
+        run,
+        &events,
+        &mut protected,
+        EvaluationRole::Final,
+        "r1",
+    )
+    .unwrap();
+    assert_eq!(protected_rerun.table(), rerun.table());
+    assert_eq!(protected.records()[0].kind, SplitAccessKind::Release);
+    assert_eq!(protected.records()[1].kind, SplitAccessKind::Access);
+
+    let committed_run = original
+        .run_recipes()
+        .iter()
+        .find(|candidate_run| {
+            candidate_run.candidate_ordinal == candidate.ordinal
+                && candidate_run.ordinal != run.ordinal
+        })
+        .unwrap();
+    let committed_row = original
+        .rows()
+        .iter()
+        .find(|row| {
+            row.window == committed_run.window
+                && row.symbol == committed_run.symbol
+                && row.params == expected.params
+        })
+        .unwrap()
+        .clone();
+    let checkpoint = SearchCheckpoint {
+        dependency: CheckpointDependency {
+            experiment_id: Some("rerun-fixture".into()),
+            caller_revision: "r1".into(),
+            dataset_reference: "synthetic".into(),
+            factory_revision: None,
+        },
+        experiment_recipe: Some(original.experiment_recipe().clone()),
+        candidate_recipes: original
+            .candidate_recipes()
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.ordinal, candidate))
+            .collect(),
+        frozen_selection: protected.frozen().cloned(),
+        frontier: u64::try_from(original.candidate_recipes().len()).unwrap(),
+        completed_candidates: BTreeSet::new(),
+        completed_runs: BTreeSet::from([committed_run.ordinal]),
+        committed_runs: BTreeMap::from([(
+            committed_run.ordinal,
+            CompletedRunCheckpoint {
+                recipe: committed_run.clone(),
+                row: committed_row,
+                positions: vec![],
+            },
+        )]),
+        failures: BTreeMap::new(),
+        generated: u64::try_from(original.candidate_recipes().len()).unwrap(),
+        executed: 1,
+        generation_exhaustive: true,
+        split_access: protected.records().to_vec(),
+    };
+    let recombined = rerun.merge_checkpoint(&checkpoint).unwrap();
+    assert_eq!(recombined.rows().len(), 2);
+    assert_eq!(recombined.run_recipes().len(), 2);
+
+    let mut tuned = plan(1);
+    tuned.future.slippage_pips = 1.0;
+    assert!(
+        qs_research::rerun_selected_candidate(
+            &tuned,
+            original.experiment_recipe(),
+            candidate,
+            run,
+            &events
+        )
+        .is_err()
+    );
 }
 
 #[test]

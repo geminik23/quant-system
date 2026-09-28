@@ -829,6 +829,87 @@ pub enum SearchWindowsMsg {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchEvaluationRoleMsg {
+    Search,
+    Validation,
+    Final,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSelectedRerunMsg {
+    pub experiment_recipe: serde_json::Value,
+    pub candidate_recipe: serde_json::Value,
+    pub run_recipe: serde_json::Value,
+    pub role: SearchEvaluationRoleMsg,
+    pub caller_revision: String,
+    #[serde(default)]
+    pub release_final: bool,
+    #[serde(default)]
+    pub future_horizon_millis: Option<u64>,
+    #[serde(default)]
+    pub embargo_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchDirectPortfolioInstanceMsg {
+    pub instance_id: String,
+    pub symbol: String,
+    pub factory: SearchDirectFactoryMsg,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchPortfolioCandidateMsg {
+    pub id: String,
+    #[serde(default)]
+    pub instances: Vec<PortfolioInstanceMsg>,
+    #[serde(default)]
+    pub direct_instances: Vec<SearchDirectPortfolioInstanceMsg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policies: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum SearchFactoryParameterMsg {
+    Integer(i64),
+    Number(f64),
+    Choice(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchDirectFactoryPointMsg {
+    pub parameters: BTreeMap<String, SearchFactoryParameterMsg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchDirectFactoryMsg {
+    pub name: String,
+    pub revision: String,
+    pub points: Vec<SearchDirectFactoryPointMsg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchExecutionVariantMsg {
+    pub id: String,
+    pub config: BacktestConfigMsg,
+    #[serde(default)]
+    pub future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
 /// Execution scope of a server-side parameter search over a strategy template and a space document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -856,6 +937,27 @@ pub struct SearchRunSpec {
     pub workers: Option<usize>,
     #[serde(default)]
     pub decision_latency_ms: u64,
+    #[serde(default)]
+    pub structural: Option<serde_json::Value>,
+    #[serde(default)]
+    pub resource_limits: Option<serde_json::Value>,
+    #[serde(default)]
+    pub variants: Vec<SearchExecutionVariantMsg>,
+    /// Select a server-registered immutable direct Rust factory; arbitrary code is never accepted.
+    #[serde(default)]
+    pub direct_factory: Option<SearchDirectFactoryMsg>,
+    /// A prior compatible checkpoint whose completed runs are retained and skipped.
+    #[serde(default)]
+    pub resume_checkpoint: Option<serde_json::Value>,
+    /// Execute one downloaded frozen recipe instead of the declared candidate batch.
+    #[serde(default)]
+    pub selected_rerun: Option<SearchSelectedRerunMsg>,
+    /// Explicit configured portfolio candidates evaluated under the request's windows and economics.
+    #[serde(default)]
+    pub portfolio_candidates: Vec<SearchPortfolioCandidateMsg>,
+    /// Verified enhanced series descriptors for `price_bar` inputs.
+    #[serde(default)]
+    pub series_descriptors: Vec<serde_json::Value>,
 }
 
 /// Asynchronous search submission retained as a job.
@@ -894,8 +996,22 @@ pub struct SearchResultMsg {
     pub table_csv: String,
     /// Pooled provider evaluation over every run's completed positions.
     pub evaluation: serde_json::Value,
-    /// Bound strategy document of every point, in point order.
+    /// Bound strategy document of every configured point, in point order.
     pub bound_documents: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub experiment_recipe: Option<serde_json::Value>,
+    #[serde(default)]
+    pub candidate_recipes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub run_recipes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub generation_dispositions: Option<serde_json::Value>,
+    #[serde(default)]
+    pub checkpoint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub selected_evidence: Option<serde_json::Value>,
+    #[serde(default)]
+    pub trace: Option<serde_json::Value>,
 }
 
 /// Response carrying a search summary and the artifact holding its complete output.
@@ -909,6 +1025,9 @@ pub struct GetSearchResultResponse {
     pub summary: Option<SearchSummaryMsg>,
     #[serde(default)]
     pub artifact: Option<ResultArtifactRefMsg>,
+    /// Separately labeled resumable checkpoint produced by a cancelled retained search.
+    #[serde(default)]
+    pub checkpoint_artifact: Option<ResultArtifactRefMsg>,
 }
 
 // ── Backtest Result Message ─────────────────────────────────────────────────
@@ -1870,6 +1989,31 @@ struct StrictSubmitConfiguredStrategyRequest {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StrictSearchExecutionVariantMsg {
+    id: String,
+    config: StrictBacktestConfigMsg,
+    #[serde(default)]
+    future: FutureQuoteConfigMsg,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictSearchPortfolioCandidateMsg {
+    id: String,
+    #[serde(default)]
+    instances: Vec<StrictPortfolioInstanceMsg>,
+    #[serde(default)]
+    direct_instances: Vec<SearchDirectPortfolioInstanceMsg>,
+    #[serde(default)]
+    policies: Option<serde_json::Value>,
+    #[serde(default)]
+    groups: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StrictSearchRunSpec {
     template: serde_json::Value,
     space: serde_json::Value,
@@ -1888,6 +2032,22 @@ struct StrictSearchRunSpec {
     workers: Option<usize>,
     #[serde(default)]
     decision_latency_ms: u64,
+    #[serde(default)]
+    structural: Option<serde_json::Value>,
+    #[serde(default)]
+    resource_limits: Option<serde_json::Value>,
+    #[serde(default)]
+    variants: Vec<StrictSearchExecutionVariantMsg>,
+    #[serde(default)]
+    direct_factory: Option<SearchDirectFactoryMsg>,
+    #[serde(default)]
+    resume_checkpoint: Option<serde_json::Value>,
+    #[serde(default)]
+    selected_rerun: Option<SearchSelectedRerunMsg>,
+    #[serde(default)]
+    portfolio_candidates: Vec<StrictSearchPortfolioCandidateMsg>,
+    #[serde(default)]
+    series_descriptors: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

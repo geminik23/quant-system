@@ -14,7 +14,10 @@ use backtest_server::handlers::{
 };
 use backtest_server::rpc_types::*;
 use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime};
-use data_preprocess::{ParquetStore, Tick};
+use data_preprocess::{
+    CountCapability, ParquetStore, PriceBar, SeriesDescriptor, StoredPriceBasis, Tick,
+    Timeframe as StoredTimeframe,
+};
 use qs_backtest::profile::{ManagementProfile, ProfileRegistry, RuleConfigDef, StoplossMode};
 use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
@@ -510,6 +513,60 @@ fn a_stored_bar_request_runs_over_bars_of_the_declared_timeframe() {
 }
 
 #[test]
+fn enhanced_price_bar_search_streams_unknown_counts_through_service_limits() {
+    let fixture = fixture();
+    let descriptor = SeriesDescriptor {
+        source_identity: "service-fixture".into(),
+        exchange: EXCHANGE.into(),
+        symbol: SYMBOL.into(),
+        timeframe_seconds: 60,
+        price_basis: StoredPriceBasis::Mid,
+        alignment_offset_seconds: 0,
+        digits: 5,
+        point_size: 1.0e-5,
+        count_capability: CountCapability::Optional,
+        verified: true,
+    };
+    let bars = ticks()
+        .into_iter()
+        .map(|tick| {
+            let bid = tick.bid.unwrap();
+            let ask = tick.ask.unwrap();
+            let mid = (bid + ask) / 2.0;
+            PriceBar {
+                exchange: EXCHANGE.into(),
+                symbol: SYMBOL.into(),
+                timeframe: StoredTimeframe::M1,
+                ts: tick.ts,
+                available_at: tick.ts + ChronoDuration::minutes(1),
+                open: mid,
+                high: mid,
+                low: mid,
+                close: mid,
+                tick_count: None,
+                spread: Some(2),
+            }
+        })
+        .collect::<Vec<_>>();
+    ParquetStore::open(&fixture.data_dir)
+        .unwrap()
+        .insert_price_bars(&descriptor, &bars)
+        .unwrap();
+    let mut request = search_request();
+    request.request.data_type = "price_bar".into();
+    request.request.timeframe = Some("1m".into());
+    request.request.series_descriptors = vec![serde_json::to_value(descriptor).unwrap()];
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(response.success, "{:?}", response.error);
+    assert_eq!(response.summary.unwrap().data_mode, "bars");
+}
+
+#[test]
 fn a_job_cancelled_before_its_worker_starts_ends_cancelled() {
     let fixture = fixture();
     let submitted = handle_submit_configured_strategy(
@@ -562,9 +619,59 @@ fn search_request() -> SubmitSearchRequest {
             entry_profile_routes: vec![],
             workers: Some(2),
             decision_latency_ms: 0,
+            structural: None,
+            resource_limits: None,
+            variants: vec![],
+            direct_factory: None,
+            resume_checkpoint: None,
+            selected_rerun: None,
+            portfolio_candidates: vec![],
+            series_descriptors: vec![],
         },
         future: future_msg(),
         evaluation: ProviderEvaluationOptionsMsg::default(),
+    }
+}
+
+fn assert_numeric_text_approx(left: &str, right: &str) {
+    let left_lines = left.lines().collect::<Vec<_>>();
+    let right_lines = right.lines().collect::<Vec<_>>();
+    assert_eq!(left_lines.len(), right_lines.len());
+    for (left, right) in left_lines.iter().zip(right_lines) {
+        let left = left.split(',').collect::<Vec<_>>();
+        let right = right.split(',').collect::<Vec<_>>();
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            match (left.parse::<f64>(), right.parse::<f64>()) {
+                (Ok(left), Ok(right)) => {
+                    assert!((left - right).abs() <= 1.0e-9, "{left} != {right}")
+                }
+                _ => assert_eq!(*left, right),
+            }
+        }
+    }
+}
+
+fn assert_json_approx(left: &serde_json::Value, right: &serde_json::Value) {
+    match (left, right) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            let left = left.as_f64().unwrap();
+            let right = right.as_f64().unwrap();
+            assert!((left - right).abs() <= 1.0e-9, "{left} != {right}");
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            assert_eq!(left.len(), right.len());
+            for (left, right) in left.iter().zip(right) {
+                assert_json_approx(left, right);
+            }
+        }
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            assert_eq!(left.len(), right.len());
+            for (key, left) in left {
+                assert_json_approx(left, &right[key]);
+            }
+        }
+        _ => assert_eq!(left, right),
     }
 }
 
@@ -651,6 +758,489 @@ fn a_server_search_matches_the_in_process_batch() {
     let backtest_result =
         handle_get_backtest_result(&fixture.state, &GetBacktestResultRequest { job_id });
     assert!(backtest_result.error.unwrap().contains("get_search_result"));
+}
+
+#[test]
+fn trusted_remote_direct_factory_runs_bounded_typed_points_and_rejects_unknown_catalog_entries() {
+    let fixture = fixture();
+    let mut request = search_request();
+    request.request.template = serde_json::Value::Null;
+    request.request.space = serde_json::Value::Null;
+    request.request.workers = Some(1);
+    request.request.direct_factory = Some(SearchDirectFactoryMsg {
+        name: "noop_direct".into(),
+        revision: "r1".into(),
+        points: vec![
+            SearchDirectFactoryPointMsg {
+                parameters: BTreeMap::from([(
+                    "warmup_bars".into(),
+                    SearchFactoryParameterMsg::Integer(1),
+                )]),
+            },
+            SearchDirectFactoryPointMsg {
+                parameters: BTreeMap::from([(
+                    "warmup_bars".into(),
+                    SearchFactoryParameterMsg::Integer(2),
+                )]),
+            },
+        ],
+    });
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(
+        response.success,
+        "response={:?}, job={:?}",
+        response.error,
+        fixture
+            .state
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&response.job_id)
+            .and_then(|job| job.error.clone())
+    );
+    let output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert_eq!(output.summary.points_total, 2);
+    assert_eq!(output.summary.rows, 4);
+    assert!(output.bound_documents.is_empty());
+    let recipes = output
+        .candidate_recipes
+        .iter()
+        .map(|value| serde_json::from_value::<qs_research::CandidateRecipe>(value.clone()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(recipes.iter().all(|recipe| {
+        recipe
+            .registered_factory
+            .as_ref()
+            .is_some_and(|factory| factory.name == "noop_direct" && factory.revision == "r1")
+    }));
+
+    let mut unknown = request;
+    unknown.request.direct_factory.as_mut().unwrap().revision = "r2".into();
+    let rejected = handle_submit_search(&fixture.state, &unknown);
+    assert!(!rejected.success);
+    assert!(
+        rejected
+            .error
+            .unwrap()
+            .contains("unknown trusted direct factory")
+    );
+}
+
+#[test]
+fn cancelled_search_publishes_partial_checkpoint_and_resume_matches_uninterrupted() {
+    let fixture = fixture();
+    let mut request = search_request();
+    request.request.workers = Some(1);
+    request.request.space["parameters"]["ema_fast"]["values"] =
+        serde_json::json!((3..8).collect::<Vec<_>>());
+    request.request.space["parameters"]["ema_slow"]["values"] =
+        serde_json::json!((20..24).collect::<Vec<_>>());
+    request.request.space["parameters"]["atr_stop"]["values"] = serde_json::json!([1.5]);
+    request.request.space["parameters"]["entry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("all");
+    request.request.space["parameters"]["entry"]["values"] = serde_json::json!(["cross"]);
+
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    let state = fixture.state.clone();
+    let worker_job = job_id.clone();
+    let worker = std::thread::spawn(move || run_job_and_store(state, worker_job));
+    let started = Instant::now();
+    loop {
+        let status = handle_get_backtest_status(
+            &fixture.state,
+            &GetBacktestStatusRequest {
+                job_id: job_id.clone(),
+            },
+        );
+        if status.progress.processed_events > 0 {
+            let cancelled = handle_cancel_backtest(
+                &fixture.state,
+                &CancelBacktestRequest {
+                    job_id: job_id.clone(),
+                },
+            );
+            assert!(cancelled.success, "{:?}", cancelled.error);
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::yield_now();
+    }
+    worker.join().unwrap();
+    let cancelled = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    assert!(!cancelled.success);
+    let checkpoint_reference = cancelled
+        .checkpoint_artifact
+        .expect("cancelled search must retain a checkpoint artifact");
+    let checkpoint: qs_research::SearchCheckpoint =
+        serde_json::from_slice(&read_artifact(&fixture.state, &checkpoint_reference)).unwrap();
+    assert!(!checkpoint.completed_runs.is_empty());
+    assert!(checkpoint.completed_runs.len() < 40);
+    assert_eq!(
+        checkpoint.completed_runs.len(),
+        checkpoint.committed_runs.len()
+    );
+
+    let mut resumed_request = request.clone();
+    resumed_request.request.resume_checkpoint = Some(serde_json::to_value(&checkpoint).unwrap());
+    let resumed = handle_submit_search(&fixture.state, &resumed_request);
+    let resumed_job = resumed
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", resumed.error));
+    run_job_and_store(fixture.state.clone(), resumed_job.clone());
+    let resumed = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest {
+            job_id: resumed_job,
+        },
+    );
+    assert!(resumed.success, "{:?}", resumed.error);
+    let resumed_output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &resumed.artifact.unwrap())).unwrap();
+
+    let fresh = handle_submit_search(&fixture.state, &request);
+    let fresh_job = fresh.job_id.unwrap_or_else(|| panic!("{:?}", fresh.error));
+    run_job_and_store(fixture.state.clone(), fresh_job.clone());
+    let fresh = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest { job_id: fresh_job },
+    );
+    assert!(fresh.success, "{:?}", fresh.error);
+    let fresh_output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &fresh.artifact.unwrap())).unwrap();
+    assert_numeric_text_approx(&resumed_output.table_csv, &fresh_output.table_csv);
+    assert_json_approx(&resumed_output.evaluation, &fresh_output.evaluation);
+    assert_eq!(resumed_output.run_recipes, fresh_output.run_recipes);
+}
+
+#[test]
+fn structural_search_request_lowers_through_the_trusted_server_catalog() {
+    let fixture = fixture();
+    let mut request = search_request();
+    request.request.space = serde_json::to_value(
+        toml::from_str::<toml::Value>(
+            r#"
+family_id = "ema_cross"
+[parameters.ema_fast]
+values = [3]
+[parameters.ema_slow]
+values = [8]
+[parameters.atr_stop]
+values = [1.5]
+[parameters.entry]
+values = ["cross"]
+[[series]]
+source = "primary"
+symbol = { plan_symbol = true }
+timeframe_seconds = 60
+price_basis = "mid"
+alignment_offset_seconds = 0
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    request.request.structural = Some(serde_json::json!({
+        "family_id":"server_structural", "state_id":"flat", "transition_priority":1,
+        "atoms":[{
+            "id":"body", "material":{"id":"generated_body","key":"body_fraction","inputs":[],
+                "params":{"source":{"type":"source","value":"primary"}}},
+            "comparison":"gt", "threshold":{"type":"ratio","value":0.05}
+        }],
+        "operators":{"not":false,"and":false,"or":false,"sequence":false},
+        "sequence_source":"primary", "sequence_max_gap":2, "captures":[],
+        "limits":{"max_depth":2,"max_nodes":8,"max_candidates":8,"max_queue_bytes":65536,
+            "max_runs":16,"max_workers":1,"max_resident_bytes":1048576,"max_feed_bytes":1048576,
+            "max_cache_bytes":1048576,"max_trace_bytes":1048576,"max_trace_records":128,
+            "max_checkpoint_bytes":1048576,"max_checkpoint_records":128,"max_retained_records":128}
+    }));
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(response.success, "{:?}", response.error);
+    assert_eq!(response.summary.as_ref().unwrap().points_total, 1);
+    let output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert!(output.experiment_recipe.is_some());
+    assert_eq!(output.candidate_recipes.len(), 1);
+    assert_eq!(output.run_recipes.len(), 2);
+    assert!(output.generation_dispositions.is_some());
+    assert!(output.checkpoint.is_some());
+
+    request.request.resume_checkpoint = output.checkpoint.clone();
+    let resumed = handle_submit_search(&fixture.state, &request);
+    let resumed_id = resumed
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", resumed.error));
+    run_job_and_store(fixture.state.clone(), resumed_id.clone());
+    let response = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest { job_id: resumed_id },
+    );
+    assert!(response.success, "{:?}", response.error);
+    let resumed: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert_eq!(resumed.table_csv, output.table_csv);
+    assert_eq!(resumed.candidate_recipes, output.candidate_recipes);
+    assert_eq!(resumed.run_recipes, output.run_recipes);
+
+    request.request.resume_checkpoint = resumed.checkpoint.clone();
+    request.request.selected_rerun = Some(SearchSelectedRerunMsg {
+        experiment_recipe: output.experiment_recipe.clone().unwrap(),
+        candidate_recipe: output.candidate_recipes[0].clone(),
+        run_recipe: output.run_recipes[0].clone(),
+        role: SearchEvaluationRoleMsg::Final,
+        caller_revision: "final-r1".into(),
+        release_final: true,
+        future_horizon_millis: Some(1),
+        embargo_millis: Some(1),
+    });
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(response.success, "{:?}", response.error);
+    let final_rerun: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert!(final_rerun.selected_evidence.is_some());
+    assert!(final_rerun.trace.is_some());
+    let final_checkpoint = final_rerun.checkpoint.clone().unwrap();
+    assert_eq!(
+        final_checkpoint["split_access"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(final_checkpoint["split_access"][0]["kind"], "release");
+    assert_eq!(final_checkpoint["split_access"][1]["kind"], "access");
+
+    request.request.resume_checkpoint = Some(final_checkpoint);
+    request
+        .request
+        .selected_rerun
+        .as_mut()
+        .unwrap()
+        .caller_revision = "final-r2".into();
+    request
+        .request
+        .selected_rerun
+        .as_mut()
+        .unwrap()
+        .release_final = false;
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(response.success, "{:?}", response.error);
+    let tuned: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    let records = tuned.checkpoint.unwrap()["split_access"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2]["post_test_tuning"], true);
+}
+
+#[test]
+fn service_maps_heterogeneous_portfolio_candidates_into_shared_account_search() {
+    let fixture = fixture();
+    let mut request = search_request();
+    let document = serde_json::to_value(bound_document()).unwrap();
+    let instance = |id: &str| PortfolioInstanceMsg {
+        symbol: SYMBOL.into(),
+        strategy: ConfiguredStrategyRunMsg {
+            document: document.clone(),
+            sources: vec![primary_source()],
+            instance_id: Some(id.into()),
+            decision_latency_ms: 0,
+        },
+        profile: None,
+        profile_def: None,
+        entry_profile_routes: vec![],
+    };
+    request.request.portfolio_candidates = vec![SearchPortfolioCandidateMsg {
+        id: "two_instances".into(),
+        instances: vec![instance("one"), instance("two")],
+        direct_instances: vec![],
+        policies: None,
+        groups: None,
+    }];
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    let job_error = fixture
+        .state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job_id)
+        .and_then(|job| job.error.clone());
+    assert!(response.success, "{:?}; job={job_error:?}", response.error);
+    let output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert_eq!(output.summary.points_total, 1);
+    assert_eq!(output.run_recipes.len(), 2);
+    assert_eq!(
+        output.candidate_recipes[0]["series_by_instance"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn service_maps_mixed_configured_and_trusted_direct_portfolio_candidates() {
+    let fixture = fixture();
+    let mut request = search_request();
+    request.request.workers = Some(1);
+    request.request.portfolio_candidates = vec![SearchPortfolioCandidateMsg {
+        id: "mixed_instances".into(),
+        instances: vec![PortfolioInstanceMsg {
+            symbol: SYMBOL.into(),
+            strategy: ConfiguredStrategyRunMsg {
+                document: serde_json::to_value(bound_document()).unwrap(),
+                sources: vec![primary_source()],
+                instance_id: Some("configured".into()),
+                decision_latency_ms: 0,
+            },
+            profile: None,
+            profile_def: None,
+            entry_profile_routes: vec![],
+        }],
+        direct_instances: vec![SearchDirectPortfolioInstanceMsg {
+            instance_id: "direct".into(),
+            symbol: SYMBOL.into(),
+            factory: SearchDirectFactoryMsg {
+                name: "noop_direct".into(),
+                revision: "r1".into(),
+                points: vec![SearchDirectFactoryPointMsg {
+                    parameters: BTreeMap::from([(
+                        "warmup_bars".into(),
+                        SearchFactoryParameterMsg::Integer(1),
+                    )]),
+                }],
+            },
+            profile: None,
+        }],
+        policies: None,
+        groups: None,
+    }];
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(
+        &fixture.state,
+        &GetSearchResultRequest {
+            job_id: job_id.clone(),
+        },
+    );
+    let job_error = fixture
+        .state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job_id)
+        .and_then(|job| job.error.clone());
+    assert!(response.success, "{:?}; job={job_error:?}", response.error);
+    let output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert_eq!(output.summary.points_total, 1);
+    assert_eq!(output.run_recipes.len(), 2);
+    let per_instance = output.candidate_recipes[0]["series_by_instance"]
+        .as_object()
+        .unwrap();
+    assert!(per_instance.contains_key("configured"));
+    assert!(per_instance.contains_key("direct"));
+    assert_eq!(
+        output.candidate_recipes[0]["document"]["direct"][0]["factory"]["name"],
+        "noop_direct"
+    );
+}
+
+#[test]
+fn service_execution_variants_are_admitted_bounded_and_combined_without_ordinal_collisions() {
+    let fixture = fixture();
+    let mut request = search_request();
+    request.request.variants = vec![
+        SearchExecutionVariantMsg {
+            id: "baseline".into(),
+            config: config_msg(),
+            future: future_msg(),
+            profile: None,
+        },
+        SearchExecutionVariantMsg {
+            id: "slippage".into(),
+            config: config_msg(),
+            future: FutureQuoteConfigMsg {
+                slippage_pips: 1.0,
+                ..future_msg()
+            },
+            profile: None,
+        },
+    ];
+    let submitted = handle_submit_search(&fixture.state, &request);
+    let job_id = submitted
+        .job_id
+        .unwrap_or_else(|| panic!("{:?}", submitted.error));
+    run_job_and_store(fixture.state.clone(), job_id.clone());
+    let response = handle_get_search_result(&fixture.state, &GetSearchResultRequest { job_id });
+    assert!(response.success, "{:?}", response.error);
+    let output: SearchResultMsg =
+        serde_json::from_slice(&read_artifact(&fixture.state, &response.artifact.unwrap()))
+            .unwrap();
+    assert_eq!(output.summary.points_total, 12);
+    assert_eq!(output.summary.rows, 24);
+    let candidate_ordinals = output
+        .candidate_recipes
+        .iter()
+        .map(|value| value["ordinal"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_ordinals, (0..12).collect::<Vec<_>>());
+    let run_ordinals = output
+        .run_recipes
+        .iter()
+        .map(|value| value["ordinal"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(run_ordinals, (0..24).collect::<Vec<_>>());
 }
 
 #[test]

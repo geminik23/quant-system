@@ -5,13 +5,14 @@ use qs_backtest::data_feed::{EventMetadata, FeedEvent, MarketEvent, SeriesRoles,
 use qs_backtest::{
     AnalysisBoundary, AnalysisContext, AnalysisError, AnalysisPipeline, AnnotationError,
     AnnotationId, AnnotationLimits, AnnotationUse, BarSeriesSpec, ConfirmedPivotAnalyzer,
-    HistoricalAnalyzer, HistoricalObservationView, MAX_ANNOTATION_NOTE_BYTES,
+    ConfirmedSwingFactKind, ConfirmedSwingFactProjector, HistoricalAnalyzer,
+    HistoricalNamedInputProjector, HistoricalObservationView, MAX_ANNOTATION_NOTE_BYTES,
     MAX_OBSERVATION_SOURCE_SERIES, MAX_OBSERVATIONS_PER_BOUNDARY, MAX_PIVOT_SIDE_BARS,
     MAX_RETAINED_OBSERVATIONS, MissingIntervalPolicy, MomentumState, MultiTimeframeSeries,
-    ObservationOrigin, ObservationStoreLimits, PivotConfig, PriceBasis, PriceZone,
-    RejectionPattern, SeriesId, SeriesRequirement, StrategyAnnotation, StrategyObservationDraft,
-    StrategyObservationValue, SwingKind, SwingPoint, Timeframe, WarmupRequirement, ZoneId,
-    ZoneSide, ZoneSource, ZoneState,
+    NamedInputProjectionContext, ObservationOrigin, ObservationStore, ObservationStoreLimits,
+    PivotConfig, PriceBasis, PriceZone, RejectionPattern, SeriesId, SeriesRequirement,
+    StrategyAnnotation, StrategyObservationDraft, StrategyObservationValue, SwingKind, SwingPoint,
+    Timeframe, WarmupRequirement, ZoneId, ZoneSide, ZoneSource, ZoneState,
 };
 
 fn base_ts() -> NaiveDateTime {
@@ -689,6 +690,42 @@ fn confirmed_pivot_emits_high_and_low_only_after_actual_reveal() {
     assert_eq!(swing.price(), 1.0);
     assert!(run_pivot(&[1.0, 3.0, 3.0, 2.0], false).is_empty());
     assert!(run_pivot(&[1.0, 3.0], false).is_empty());
+}
+
+#[test]
+fn confirmed_swing_projector_retains_anchor_and_marks_only_actual_confirmation_update() {
+    let observations = run_pivot(&[1.0, 3.0, 1.0, 2.0], true);
+    let history = series("EURUSD", &["m5"], 8);
+    let store = ObservationStore::new(ObservationStoreLimits::default());
+    let projector = ConfirmedSwingFactProjector::new(
+        series_id("m5"),
+        SwingKind::High,
+        ConfirmedSwingFactKind::Price,
+    );
+    let context = NamedInputProjectionContext {
+        observed_through: base_ts() + Duration::minutes(17),
+        closed_bars: &[],
+        observations: &observations,
+        series: &history,
+        observation_history: &store,
+    };
+    let first = projector.project(context).unwrap();
+    assert_eq!(first.value, qs_strategy::Value::Price(3.0));
+    assert!(first.updated);
+    let retained = projector.project(context).unwrap();
+    assert_eq!(retained.value, qs_strategy::Value::Price(3.0));
+    assert!(!retained.updated);
+    let confirmed = ConfirmedSwingFactProjector::new(
+        series_id("m5"),
+        SwingKind::High,
+        ConfirmedSwingFactKind::ConfirmedAt,
+    )
+    .project(context)
+    .unwrap();
+    assert_eq!(
+        confirmed.value,
+        qs_strategy::Value::Timestamp(base_ts() + Duration::minutes(17))
+    );
 }
 
 #[test]

@@ -444,6 +444,10 @@ pub enum Expr {
     Not {
         value: Box<Expr>,
     },
+    /// Evaluate comparisons and Boolean operators with strict Missing propagation.
+    Strict {
+        value: Box<Expr>,
+    },
     Add {
         left: Box<Expr>,
         right: Box<Expr>,

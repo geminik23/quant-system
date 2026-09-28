@@ -14,11 +14,14 @@ use chrono::NaiveDateTime;
 use polars::prelude::*;
 
 use crate::convert::{
-    bars_to_dataframe, dataframe_to_bars, dataframe_to_ticks, ndt_to_date_string,
+    bars_to_dataframe, dataframe_to_bars, dataframe_to_price_bars, dataframe_to_stored_ticks,
+    dataframe_to_ticks, ndt_to_date_string, price_bars_to_dataframe, stored_ticks_to_dataframe,
     ticks_to_dataframe,
 };
 use crate::error::{DataError, Result};
-use crate::models::{Bar, BarQueryOpts, QueryOpts, StatRow, Tick};
+use crate::models::{
+    Bar, BarQueryOpts, PriceBar, QueryOpts, SeriesDescriptor, StatRow, StoredTick, Tick,
+};
 use crate::scanner::{ParquetScanBounds, ParquetTickScan};
 
 /// Parquet-based storage backend for tick and bar data.
@@ -77,6 +80,92 @@ impl ParquetStore {
         Ok(total_inserted)
     }
 
+    /// Persist enhanced ticks without timestamp deduplication.
+    pub fn insert_stored_ticks(&self, ticks: &[StoredTick]) -> Result<usize> {
+        let mut groups: HashMap<(String, String, String), Vec<StoredTick>> = HashMap::new();
+        for tick in ticks {
+            tick.validate()?;
+            groups
+                .entry((
+                    tick.tick.exchange.clone(),
+                    tick.tick.symbol.clone(),
+                    ndt_to_date_string(&tick.tick.ts),
+                ))
+                .or_default()
+                .push(tick.clone());
+        }
+        let mut inserted = 0usize;
+        for ((exchange, symbol, date), mut incoming) in groups {
+            let dir = self.enhanced_tick_dir(&exchange, &symbol);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("{date}.parquet"));
+            let mut rows = if path.exists() {
+                dataframe_to_stored_ticks(&read_parquet_file(&path)?)?
+            } else {
+                Vec::new()
+            };
+            let before = rows.len();
+            merge_stored_ticks(&mut rows, &mut incoming)?;
+            rows.sort_by_key(|row| (row.tick.ts, row.source_ordinal));
+            let mut frame = stored_ticks_to_dataframe(&rows)?;
+            write_parquet_file(&path, &mut frame)?;
+            inserted = inserted
+                .checked_add(rows.len() - before)
+                .ok_or_else(|| DataError::Other("insert count overflowed".into()))?;
+        }
+        Ok(inserted)
+    }
+
+    pub fn query_stored_ticks(&self, exchange: &str, symbol: &str) -> Result<Vec<StoredTick>> {
+        self.query_stored_ticks_bounded(exchange, symbol, usize::MAX, usize::MAX, || false)
+    }
+
+    pub fn query_stored_ticks_bounded<F>(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        max_rows: usize,
+        max_resident_bytes: usize,
+        mut is_cancelled: F,
+    ) -> Result<Vec<StoredTick>>
+    where
+        F: FnMut() -> bool,
+    {
+        if max_rows == 0 || max_resident_bytes == 0 {
+            return Err(DataError::Other(
+                "enhanced tick query limits must be positive".into(),
+            ));
+        }
+        ensure_not_cancelled(&mut is_cancelled)?;
+        let dir = self.enhanced_tick_dir(exchange, symbol);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::new();
+        for path in list_date_files_cancellable(&dir, None, None, &mut is_cancelled)? {
+            ensure_not_cancelled(&mut is_cancelled)?;
+            let frame = read_parquet_file(&path)?;
+            let admitted = rows
+                .len()
+                .checked_add(frame.height())
+                .ok_or_else(|| DataError::Other("enhanced tick row count overflowed".into()))?;
+            check_enhanced_query_bound::<StoredTick>(admitted, max_rows, max_resident_bytes)?;
+            let partition = dataframe_to_stored_ticks(&frame)?;
+            let bytes = stored_tick_bytes(&rows)?
+                .checked_add(stored_tick_bytes(&partition)?)
+                .ok_or_else(|| DataError::Other("enhanced tick byte count overflowed".into()))?;
+            if bytes > max_resident_bytes {
+                return Err(DataError::Other(
+                    "enhanced tick query exceeds resident-byte limit".into(),
+                ));
+            }
+            rows.extend(partition);
+            ensure_not_cancelled(&mut is_cancelled)?;
+        }
+        rows.sort_by_key(|row| (row.tick.ts, row.source_ordinal));
+        Ok(rows)
+    }
+
     /// Import bars, deduplicating against existing data per date partition.
     /// Returns the number of rows actually inserted (after dedup).
     pub fn insert_bars(&self, bars: &[Bar]) -> Result<usize> {
@@ -121,6 +210,115 @@ impl ParquetStore {
         }
 
         Ok(total_inserted)
+    }
+
+    pub fn insert_price_bars(
+        &self,
+        descriptor: &SeriesDescriptor,
+        bars: &[PriceBar],
+    ) -> Result<usize> {
+        descriptor.validate()?;
+        if !descriptor.verified {
+            return Err(DataError::Other(
+                "new price-only writes require a verified descriptor".into(),
+            ));
+        }
+        let dir = self.price_bar_dir(
+            &descriptor.exchange,
+            &descriptor.symbol,
+            descriptor.timeframe_seconds,
+        );
+        fs::create_dir_all(&dir)?;
+        persist_descriptor(&dir, descriptor)?;
+        let mut groups: HashMap<String, Vec<PriceBar>> = HashMap::new();
+        for bar in bars {
+            bar.validate()?;
+            groups
+                .entry(ndt_to_date_string(&bar.ts))
+                .or_default()
+                .push(bar.clone());
+        }
+        let mut inserted = 0usize;
+        for (date, mut incoming) in groups {
+            let path = dir.join(format!("{date}.parquet"));
+            let mut rows = if path.exists() {
+                dataframe_to_price_bars(&read_parquet_file(&path)?)?
+            } else {
+                Vec::new()
+            };
+            let before = rows.len();
+            for bar in incoming.drain(..) {
+                if let Some(existing) = rows.iter().find(|value| value.ts == bar.ts) {
+                    if existing != &bar {
+                        return Err(DataError::Other(
+                            "conflicting price-only bar at one bucket".into(),
+                        ));
+                    }
+                } else {
+                    rows.push(bar)
+                }
+            }
+            rows.sort_by_key(|bar| (bar.available_at, bar.ts));
+            let mut frame = price_bars_to_dataframe(&rows)?;
+            write_parquet_file(&path, &mut frame)?;
+            inserted += rows.len() - before;
+        }
+        Ok(inserted)
+    }
+
+    pub fn query_price_bars(&self, descriptor: &SeriesDescriptor) -> Result<Vec<PriceBar>> {
+        self.query_price_bars_bounded(descriptor, usize::MAX, usize::MAX, || false)
+    }
+
+    pub fn query_price_bars_bounded<F>(
+        &self,
+        descriptor: &SeriesDescriptor,
+        max_rows: usize,
+        max_resident_bytes: usize,
+        mut is_cancelled: F,
+    ) -> Result<Vec<PriceBar>>
+    where
+        F: FnMut() -> bool,
+    {
+        descriptor.validate()?;
+        if max_rows == 0 || max_resident_bytes == 0 {
+            return Err(DataError::Other(
+                "price-bar query limits must be positive".into(),
+            ));
+        }
+        ensure_not_cancelled(&mut is_cancelled)?;
+        let dir = self.price_bar_dir(
+            &descriptor.exchange,
+            &descriptor.symbol,
+            descriptor.timeframe_seconds,
+        );
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        verify_descriptor(&dir, descriptor)?;
+        let mut rows = Vec::new();
+        for path in list_date_files_cancellable(&dir, None, None, &mut is_cancelled)? {
+            ensure_not_cancelled(&mut is_cancelled)?;
+            let frame = read_parquet_file(&path)?;
+            let admitted = rows
+                .len()
+                .checked_add(frame.height())
+                .ok_or_else(|| DataError::Other("price-bar row count overflowed".into()))?;
+            check_enhanced_query_bound::<PriceBar>(admitted, max_rows, max_resident_bytes)?;
+            let partition = dataframe_to_price_bars(&frame)?;
+            let bytes = price_bar_bytes(&rows)?
+                .checked_add(price_bar_bytes(&partition)?)
+                .ok_or_else(|| DataError::Other("price-bar byte count overflowed".into()))?;
+            if bytes > max_resident_bytes {
+                return Err(DataError::Other(
+                    "price-bar query exceeds resident-byte limit".into(),
+                ));
+            }
+            rows.extend(partition);
+            ensure_not_cancelled(&mut is_cancelled)?;
+        }
+        rows.sort_by_key(|bar| bar.ts);
+        Ok(rows)
     }
 
     // ── Query ───────────────────────────────────────────────────
@@ -387,12 +585,40 @@ impl ParquetStore {
         &self.root
     }
 
+    pub(crate) fn verify_price_bar_series(&self, descriptor: &SeriesDescriptor) -> Result<()> {
+        descriptor.validate()?;
+        let directory = self.price_bar_dir(
+            &descriptor.exchange,
+            &descriptor.symbol,
+            descriptor.timeframe_seconds,
+        );
+        if directory.exists() {
+            verify_descriptor(&directory, descriptor)?;
+        }
+        Ok(())
+    }
+
     /// Build tick directory path for a given exchange+symbol.
     fn tick_dir(&self, exchange: &str, symbol: &str) -> PathBuf {
         self.root
             .join("ticks")
             .join(format!("exchange={exchange}"))
             .join(format!("symbol={symbol}"))
+    }
+
+    fn enhanced_tick_dir(&self, exchange: &str, symbol: &str) -> PathBuf {
+        self.root
+            .join("ordered_ticks")
+            .join(format!("exchange={exchange}"))
+            .join(format!("symbol={symbol}"))
+    }
+
+    fn price_bar_dir(&self, exchange: &str, symbol: &str, timeframe_seconds: u64) -> PathBuf {
+        self.root
+            .join("price_bars")
+            .join(format!("exchange={exchange}"))
+            .join(format!("symbol={symbol}"))
+            .join(format!("timeframe_seconds={timeframe_seconds}"))
     }
 
     /// Build bar directory path for a given exchange+symbol+timeframe.
@@ -666,6 +892,47 @@ fn parse_partition_value(dir_name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn check_enhanced_query_bound<T>(
+    rows: usize,
+    max_rows: usize,
+    max_resident_bytes: usize,
+) -> Result<()> {
+    if rows > max_rows
+        || rows
+            .checked_mul(std::mem::size_of::<T>())
+            .is_none_or(|bytes| bytes > max_resident_bytes)
+    {
+        Err(DataError::Other(
+            "enhanced query exceeds its row or resident-byte limit".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn stored_tick_bytes(rows: &[StoredTick]) -> Result<usize> {
+    rows.iter().try_fold(0usize, |bytes, row| {
+        bytes
+            .checked_add(std::mem::size_of::<StoredTick>())
+            .and_then(|value| value.checked_add(row.tick.exchange.len()))
+            .and_then(|value| value.checked_add(row.tick.symbol.len()))
+            .and_then(|value| {
+                value.checked_add(row.source_identity.as_ref().map_or(0, String::len))
+            })
+            .ok_or_else(|| DataError::Other("enhanced tick byte count overflowed".into()))
+    })
+}
+
+fn price_bar_bytes(rows: &[PriceBar]) -> Result<usize> {
+    rows.iter().try_fold(0usize, |bytes, row| {
+        bytes
+            .checked_add(std::mem::size_of::<PriceBar>())
+            .and_then(|value| value.checked_add(row.exchange.len()))
+            .and_then(|value| value.checked_add(row.symbol.len()))
+            .ok_or_else(|| DataError::Other("price-bar byte count overflowed".into()))
+    })
+}
+
 fn ensure_not_cancelled(is_cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
     if is_cancelled() {
         Err(DataError::Cancelled)
@@ -819,6 +1086,70 @@ fn atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn merge_stored_ticks(
+    existing: &mut Vec<StoredTick>,
+    incoming: &mut Vec<StoredTick>,
+) -> Result<()> {
+    let mut ordinals = existing
+        .iter()
+        .map(|row| row.source_ordinal)
+        .collect::<std::collections::BTreeSet<_>>();
+    for row in incoming.drain(..) {
+        if !ordinals.insert(row.source_ordinal) {
+            return Err(DataError::Other(
+                "duplicate persisted source ordinal".into(),
+            ));
+        }
+        if let (Some(source), Some(sequence)) = (&row.source_identity, row.provider_sequence)
+            && let Some(previous) = existing.iter().find(|value| {
+                value.source_identity.as_ref() == Some(source)
+                    && value.provider_sequence == Some(sequence)
+            })
+        {
+            if previous.tick == row.tick {
+                continue;
+            }
+            return Err(DataError::Other(
+                "conflicting payload for provider sequence".into(),
+            ));
+        }
+        existing.push(row);
+    }
+    Ok(())
+}
+
+fn persist_descriptor(dir: &Path, descriptor: &SeriesDescriptor) -> Result<()> {
+    let path = dir.join("_descriptor.json");
+    if path.exists() {
+        return verify_descriptor(dir, descriptor);
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(descriptor)
+            .map_err(|error| DataError::Other(error.to_string()))?,
+    )?;
+    Ok(())
+}
+fn verify_descriptor(dir: &Path, descriptor: &SeriesDescriptor) -> Result<()> {
+    let path = dir.join("_descriptor.json");
+    if !path.exists() {
+        if descriptor.verified {
+            return Err(DataError::Other(
+                "verified descriptor metadata is absent".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let stored: SeriesDescriptor = serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| DataError::Other(error.to_string()))?;
+    if &stored != descriptor {
+        return Err(DataError::Other(
+            "series descriptor conflicts with stored metadata".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Concat two tick DataFrames, dedup on (exchange, symbol, ts), sort by ts.

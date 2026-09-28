@@ -240,6 +240,9 @@ pub struct EventMetadata {
     pub series_rank: u32,
     /// Physical source-row ordinal when supplied by a streaming source, otherwise the emitted event ordinal.
     pub row_sequence: u64,
+    /// Actual instant at which a stored sample became observable when it differs from its sample timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<NaiveDateTime>,
 }
 
 impl EventMetadata {
@@ -248,7 +251,13 @@ impl EventMetadata {
             roles,
             series_rank,
             row_sequence,
+            available_at: None,
         }
+    }
+
+    pub const fn with_available_at(mut self, available_at: NaiveDateTime) -> Self {
+        self.available_at = Some(available_at);
+        self
     }
 }
 
@@ -264,10 +273,23 @@ impl FeedEvent {
         Self { event, metadata }
     }
 
+    pub fn retained_bytes_upper_bound(&self) -> usize {
+        let symbol_capacity = match &self.event {
+            MarketEvent::Tick { symbol, .. } | MarketEvent::Bar { symbol, .. } => symbol.capacity(),
+        };
+        std::mem::size_of::<Self>().saturating_add(symbol_capacity)
+    }
+
+    pub fn available_at(&self) -> NaiveDateTime {
+        self.metadata
+            .available_at
+            .unwrap_or_else(|| self.event.ts())
+    }
+
     /// Ordering key used by deterministic feeds.
     pub fn ordering_key(&self) -> (NaiveDateTime, u32, u64) {
         (
-            self.event.ts(),
+            self.available_at(),
             self.metadata.series_rank,
             self.metadata.row_sequence,
         )
@@ -279,6 +301,7 @@ impl FeedEvent {
 pub struct SequencedMarketEvent {
     pub event: MarketEvent,
     pub source_row_ordinal: u64,
+    pub available_at: Option<NaiveDateTime>,
 }
 
 impl SequencedMarketEvent {
@@ -286,24 +309,36 @@ impl SequencedMarketEvent {
         Self {
             event,
             source_row_ordinal,
+            available_at: None,
         }
+    }
+
+    pub const fn with_available_at(mut self, available_at: NaiveDateTime) -> Self {
+        self.available_at = Some(available_at);
+        self
     }
 }
 
 /// Converts an event source item into an event and optional physical ordinal.
 pub trait EventSourceItem {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>);
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>);
 }
 
 impl EventSourceItem for MarketEvent {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>) {
-        (self, None)
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>) {
+        (self, None, None)
     }
 }
 
 impl EventSourceItem for SequencedMarketEvent {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>) {
-        (self.event, Some(self.source_row_ordinal))
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>) {
+        (self.event, Some(self.source_row_ordinal), self.available_at)
     }
 }
 
@@ -439,12 +474,12 @@ where
                 None => return Ok(None),
             },
         };
-        let ts = first.event.ts();
+        let ts = first.available_at();
         let mut events = vec![first];
 
         loop {
             match self.pull_event()? {
-                Some(event) if event.event.ts() == ts => events.push(event),
+                Some(event) if event.available_at() == ts => events.push(event),
                 Some(event) => {
                     self.pending = Some(event);
                     break;
@@ -471,8 +506,8 @@ where
                 return Err(EventBatchFeedError::Source(error));
             }
         };
-        let (event, source_row_ordinal) = item.into_event_and_ordinal();
-        let current = event.ts();
+        let (event, source_row_ordinal, available_at) = item.into_event_ordinal_and_availability();
+        let current = available_at.unwrap_or_else(|| event.ts());
         if let Some(previous) = self.last_source_ts
             && current < previous
         {
@@ -491,10 +526,9 @@ where
             }
         };
         self.last_source_ts = Some(current);
-        Ok(Some(FeedEvent::new(
-            event,
-            EventMetadata::new(self.roles, self.series_rank, row_sequence),
-        )))
+        let metadata = EventMetadata::new(self.roles, self.series_rank, row_sequence);
+        let metadata = available_at.map_or(metadata, |value| metadata.with_available_at(value));
+        Ok(Some(FeedEvent::new(event, metadata)))
     }
 }
 
@@ -644,11 +678,11 @@ where
             });
         }
         for event in &batch.events {
-            if event.event.ts() != batch.ts {
+            if event.available_at() != batch.ts {
                 return Err(KWayMergeError::TimestampMismatch {
                     series_rank,
                     batch_ts: batch.ts,
-                    event_ts: event.event.ts(),
+                    event_ts: event.available_at(),
                 });
             }
         }
@@ -725,12 +759,12 @@ impl VecFeed {
 
     /// Return all remaining events at the next timestamp.
     pub fn next_timestamp_batch(&mut self) -> Option<TimestampBatch> {
-        let ts = self.events.get(self.index)?.event.ts();
+        let ts = self.events.get(self.index)?.available_at();
         let start = self.index;
         while self
             .events
             .get(self.index)
-            .is_some_and(|event| event.event.ts() == ts)
+            .is_some_and(|event| event.available_at() == ts)
         {
             self.index += 1;
         }
@@ -754,6 +788,14 @@ impl VecFeed {
     /// Reset the feed to the beginning.
     pub fn reset(&mut self) {
         self.index = 0;
+    }
+}
+
+impl FallibleBatchFeed for VecFeed {
+    type Error = std::convert::Infallible;
+
+    fn next_batch(&mut self) -> Result<Option<TimestampBatch>, Self::Error> {
+        Ok(self.next_timestamp_batch())
     }
 }
 

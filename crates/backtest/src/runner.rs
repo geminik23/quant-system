@@ -288,6 +288,29 @@ trait FutureReplayHook {
     fn reads_completed_bars_only(&self) -> bool {
         false
     }
+    /// Whether a stored-bar batch must also run a post-settlement callback after its completed-bar callback.
+    fn retains_post_bar_boundary(&self) -> bool {
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn on_pre_bar_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &mut Vec<FutureEffect>,
+        pending_events: &mut Vec<StrategyFeedbackEvent>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        self.on_boundary(
+            batch,
+            engine,
+            lifecycle,
+            positions,
+            pending_effects,
+            pending_events,
+        )
+    }
     /// Supervision state of a multi-instance replay, which the replay consults before scheduling new exposure.
     fn portfolio_state(&mut self) -> Option<&mut portfolio_replay::PortfolioReplayState> {
         None
@@ -372,7 +395,7 @@ impl FutureReplayHook for StaticReplayHook {
     }
 }
 
-struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
+struct StrategyReplayDriver<'a, S: HistoricalStrategy + ?Sized> {
     strategy: &'a mut S,
     requirements: crate::strategy::StrategyRequirements,
     series: MultiTimeframeSeries,
@@ -387,7 +410,7 @@ struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
     failure: Option<StrategyDriverError<S::Error>>,
 }
 
-impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
+impl<'a, S: HistoricalStrategy + ?Sized> StrategyReplayDriver<'a, S> {
     fn new(
         strategy: &'a mut S,
         series: MultiTimeframeSeries,
@@ -438,7 +461,7 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
     }
 }
 
-impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
+impl<S: HistoricalStrategy + ?Sized> FutureReplayHook for StrategyReplayDriver<'_, S> {
     fn observes_position_economics(&self) -> bool {
         false
     }
@@ -706,9 +729,28 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
         self.warmup_complete
     }
 
-    /// Configured strategies accept stored bars as completed bars; the series validates their geometry and rejects anything it cannot place.
-    fn preflight_primary_events(&mut self, _events: &[FeedEvent]) -> bool {
-        true
+    /// Configured strategies accept stored bars as completed bars; count-dependent documents reject unknown counts before replay.
+    fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool {
+        if !self
+            .adapter
+            .configured_requirements()
+            .count_required_sources
+            .is_empty()
+            && events.iter().any(|event| {
+                matches!(
+                    event.event,
+                    MarketEvent::Bar {
+                        tick_count: None,
+                        ..
+                    }
+                )
+            })
+        {
+            self.reject_generated_configuration(None, "configured strategy requires tick count but a primary stored bar has unknown count".into());
+            false
+        } else {
+            true
+        }
     }
 
     fn reject_generated_configuration(&mut self, _instance: Option<usize>, reason: String) {
@@ -1509,7 +1551,7 @@ impl BacktestRunner {
     ) -> Result<StrategyBacktestResult, StrategyReplayError<Infallible, S::Error>>
     where
         F: DataFeed,
-        S: HistoricalStrategy,
+        S: HistoricalStrategy + ?Sized,
     {
         crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
         MultiTimeframeSeries::new(series_specs.clone())?;
@@ -1573,7 +1615,7 @@ impl BacktestRunner {
     ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, S::Error>>
     where
         F: FallibleBatchFeed,
-        S: HistoricalStrategy,
+        S: HistoricalStrategy + ?Sized,
     {
         crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
         let future = self.future_config.clone().unwrap_or_default();
@@ -2399,10 +2441,24 @@ impl BacktestRunner {
                     .get(feed_event.event.symbol())
                     .copied();
                 // A bar executes on its open, range, and close; a bar of a longer duration than the symbol's execution bars only feeds strategy series, and a bar whose prices cannot be quoted is an invalid quote like any other.
+                let available_at = feed_event.available_at();
+                let delayed_bar = match &feed_event.event {
+                    MarketEvent::Bar {
+                        ts,
+                        timeframe_seconds: Some(seconds),
+                        ..
+                    } => ts
+                        .checked_add_signed(chrono::Duration::seconds(*seconds as i64))
+                        .is_some_and(|nominal_close| available_at > nominal_close),
+                    _ => false,
+                };
                 let prices = match feed_event.event.bar_execution_prices(fallback) {
                     None => None,
                     Some(prices) => match prices.executable() {
-                        Some(prices) => Some(prices),
+                        Some(mut prices) => {
+                            prices.ts = available_at;
+                            Some(prices)
+                        }
                         None => {
                             invalid_quotes += 1;
                             processed_events += 1;
@@ -2419,20 +2475,22 @@ impl BacktestRunner {
                     },
                 };
                 let bar = prices.filter(|bar| {
-                    match (
-                        bar_execution_timeframes.get(&bar.symbol),
-                        bar.timeframe_seconds,
-                    ) {
-                        (Some(execution), Some(seconds)) => *execution == seconds,
-                        _ => true,
-                    }
+                    !delayed_bar
+                        && match (
+                            bar_execution_timeframes.get(&bar.symbol),
+                            bar.timeframe_seconds,
+                        ) {
+                            (Some(execution), Some(seconds)) => *execution == seconds,
+                            _ => true,
+                        }
                 });
                 let series_only =
                     bar.is_none() && matches!(feed_event.event, MarketEvent::Bar { .. });
-                let quote = match &bar {
+                let mut quote = match &bar {
                     Some(bar) => bar.open_quote(),
                     None => feed_event.event.to_quote_with_spread_fallback(fallback),
                 };
+                quote.ts = available_at;
                 if bar.is_some() && quote.bid == quote.ask {
                     zero_spread_bar_quotes += 1;
                 }
@@ -2548,12 +2606,20 @@ impl BacktestRunner {
                     .any(|event| matches!(event.event, MarketEvent::Bar { .. }));
             let mut boundary_events = Some(primary_events);
             if bar_batch {
+                let pre_events = if hook.retains_post_bar_boundary() {
+                    boundary_events
+                        .as_ref()
+                        .expect("boundary events are available")
+                        .clone()
+                } else {
+                    boundary_events
+                        .take()
+                        .expect("boundary events are taken once")
+                };
                 self.run_future_boundary(
                     hook,
                     batch_ts,
-                    boundary_events
-                        .take()
-                        .expect("boundary events are taken once"),
+                    pre_events,
                     &boundary_excursions,
                     &primary_quotes,
                     &batch_quotes,
@@ -3166,14 +3232,25 @@ impl BacktestRunner {
         };
         let generated = {
             let positions = BoundaryPositionFacts::new(boundary_excursions, future_executor);
-            hook.on_boundary(
-                &strategy_batch,
-                &self.engine,
-                lifecycle,
-                &positions,
-                &mut self.committed_feedback,
-                &mut self.committed_feedback_events,
-            )
+            if decided_before_quotes {
+                hook.on_pre_bar_boundary(
+                    &strategy_batch,
+                    &self.engine,
+                    lifecycle,
+                    &positions,
+                    &mut self.committed_feedback,
+                    &mut self.committed_feedback_events,
+                )
+            } else {
+                hook.on_boundary(
+                    &strategy_batch,
+                    &self.engine,
+                    lifecycle,
+                    &positions,
+                    &mut self.committed_feedback,
+                    &mut self.committed_feedback_events,
+                )
+            }
             .ok_or(FutureBatchReplayError::Dynamic)?
         };
         if !generated.is_empty() {

@@ -316,6 +316,7 @@ fn validate_expr_template(
             }
         }
         Expr::Not { value }
+        | Expr::Strict { value }
         | Expr::Abs { value }
         | Expr::IsPresent { value }
         | Expr::IsMissing { value } => validate_expr_template(value, declarations, path)?,
@@ -370,6 +371,7 @@ fn template_type_hint(
         | Expr::Not { .. }
         | Expr::IsPresent { .. }
         | Expr::IsMissing { .. } => Some(ValueType::required(ScalarType::Bool)),
+        Expr::Strict { .. } => Some(ValueType::optional(ScalarType::Bool)),
         Expr::Abs { value } => template_type_hint(value, declarations),
         Expr::Min { left, right } | Expr::Max { left, right } => {
             let left = template_type_hint(left, declarations)?;
@@ -720,6 +722,9 @@ pub fn bind_expr(
             bind_expr(case, binding, &format!("{path}.cases.{selected}"))?
         }
         Expr::Not { value } => Expr::Not {
+            value: Box::new(child(value, "value")?),
+        },
+        Expr::Strict { value } => Expr::Strict {
             value: Box::new(child(value, "value")?),
         },
         Expr::Abs { value } => Expr::Abs {

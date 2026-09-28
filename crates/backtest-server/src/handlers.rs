@@ -134,6 +134,8 @@ pub struct BacktestJob {
     pub result: Option<BacktestResultMsg>,
     /// Complete result artifact when the full inline object was released.
     pub artifact: Option<ResultArtifactRefMsg>,
+    /// Separately labeled resumable checkpoint for a cancelled search.
+    pub checkpoint_artifact: Option<ResultArtifactRefMsg>,
     /// True when the complete result is present in `result`.
     pub inline_complete: bool,
     /// True after the job artifact has been deleted following delivery.
@@ -512,6 +514,9 @@ fn delete_job_artifacts(state: &ServerState, removed: &[BacktestJob]) {
         if !job.artifact_consumed
             && let Some(artifact) = job.artifact.as_ref()
         {
+            let _ = state.artifact_store.delete(&artifact.artifact_id);
+        }
+        if let Some(artifact) = job.checkpoint_artifact.as_ref() {
             let _ = state.artifact_store.delete(&artifact.artifact_id);
         }
     }
@@ -2008,6 +2013,7 @@ fn admit_job(
         progress: initial_progress,
         result: None,
         artifact: None,
+        checkpoint_artifact: None,
         inline_complete: false,
         artifact_consumed: false,
         error: None,
@@ -2237,6 +2243,13 @@ pub fn handle_delete_result_artifact(
                 job.artifact = None;
                 job.artifact_consumed = true;
                 job.inline_complete = false;
+            }
+            for job in jobs.values_mut().filter(|job| {
+                job.checkpoint_artifact
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.artifact_id == req.artifact_id)
+            }) {
+                job.checkpoint_artifact = None;
             }
             if deleted {
                 DeleteResultArtifactResponse {

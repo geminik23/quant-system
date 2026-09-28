@@ -370,6 +370,13 @@ impl StrategyObservationValue {
             _ => None,
         }
     }
+
+    pub fn swing(&self) -> Option<&SwingPoint> {
+        match self {
+            Self::Swing(swing) => Some(swing),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]

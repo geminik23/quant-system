@@ -17,14 +17,27 @@ use crate::{
     TradeSlotState, TransitionConfig, Value, ValueType,
 };
 
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
+
 type TypedIndexMap = BTreeMap<String, (usize, ValueType)>;
 type LookbackMap = BTreeMap<SourceId, usize>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputScalar {
+    Bool(bool),
     Integer(i64),
     Number(f64),
     Price(f64),
+    Ratio(f64),
+    Percent(f64),
+    PricePerObservation(f64),
+    PricePerObservationSquared(f64),
+    RatioPerObservation(f64),
+    RatioPerObservationSquared(f64),
+    LogReturn(f64),
+    LogReturnVariance(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +95,7 @@ impl StrategyOutput {
 
 struct CompiledMaterial {
     id: String,
+    numeric_descriptor: Option<crate::NumericDescriptor>,
     inputs: Vec<CompiledExpr>,
     input_provenance: Vec<CompiledInputProvenance>,
     evaluator: Box<dyn MaterialEvaluator>,
@@ -215,6 +229,7 @@ struct RequirementCollector {
     named_order: Vec<String>,
     named: BTreeMap<String, ValueType>,
     direct_lookbacks: LookbackMap,
+    count_required_sources: BTreeSet<SourceId>,
     needs_feedback: bool,
 }
 
@@ -224,6 +239,7 @@ impl RequirementCollector {
             named_order: Vec::new(),
             named: BTreeMap::new(),
             direct_lookbacks: BTreeMap::new(),
+            count_required_sources: BTreeSet::new(),
             needs_feedback: false,
         }
     }
@@ -359,6 +375,7 @@ impl ConfiguredStrategy {
                         })
                 })
                 .collect(),
+            count_required_sources: collected.count_required_sources.into_iter().collect(),
             named_inputs: collected
                 .named_order
                 .iter()
@@ -416,6 +433,17 @@ impl ConfiguredStrategy {
     /// Instance identity; together with the strategy ID it scopes every generated campaign, trade, and command identifier.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Effective numeric contracts in dependency order, keyed by configured material ID.
+    /// Factories without a descriptor are omitted rather than assigned inferred semantics.
+    pub fn numeric_descriptors(&self) -> impl Iterator<Item = (&str, &crate::NumericDescriptor)> {
+        self.materials.iter().filter_map(|material| {
+            material
+                .numeric_descriptor
+                .as_ref()
+                .map(|descriptor| (material.id.as_str(), descriptor))
+        })
     }
 
     pub fn input_requirements(&self) -> &ConfiguredStrategyRequirements {
@@ -603,7 +631,7 @@ impl ConfiguredStrategy {
                     selected = Some(transition.clone());
                     break;
                 }
-                Value::Bool(false) => {}
+                Value::Bool(false) | Value::Missing(ScalarType::Bool) => {}
                 value => {
                     return Err(EvaluationError::TypeMismatch {
                         path: "transition.when".into(),
@@ -805,9 +833,12 @@ fn collect_expr_requirements(
 ) -> Result<(), CompileError> {
     match expression {
         Expr::Input { field, value_type } => collector.add_named(field, *value_type, path)?,
-        Expr::Bar { source, .. } => {
+        Expr::Bar { source, field } => {
             require_source(sources, source, path)?;
             collector.add_source(source, 1);
+            if *field == crate::BarField::Volume {
+                collector.count_required_sources.insert(source.clone());
+            }
         }
         Expr::Feedback { .. } => collector.needs_feedback = true,
         Expr::Eq { left, right }
@@ -831,6 +862,7 @@ fn collect_expr_requirements(
             }
         }
         Expr::Not { value }
+        | Expr::Strict { value }
         | Expr::Abs { value }
         | Expr::IsPresent { value }
         | Expr::IsMissing { value } => {
@@ -1019,6 +1051,38 @@ fn compile_materials(
             inputs.push(compiled_input);
             input_types.push(value_type);
         }
+        let mut numeric_descriptor = factory
+            .numeric_descriptor(&material.params, &input_types)
+            .map_err(|reason| CompileError::MaterialFactory {
+                path: format!("materials[{original}].descriptor"),
+                reason,
+            })?;
+        if let Some(descriptor) = &numeric_descriptor {
+            descriptor
+                .validate(&input_types)
+                .map_err(|reason| CompileError::MaterialFactory {
+                    path: format!("materials[{original}].descriptor"),
+                    reason,
+                })?;
+            let source = &descriptor.source_clock;
+            require_source(
+                sources,
+                source,
+                &format!("materials[{original}].descriptor.source_clock"),
+            )?;
+            if matches!(
+                descriptor.calculation,
+                crate::NumericCalculation::ObservedSma { .. }
+                    | crate::NumericCalculation::SmaSeededEma { .. }
+            ) && !matches!(inputs.as_slice(), [CompiledExpr::Bar(input_source, _)] if input_source == source)
+                && !matches!(inputs.as_slice(), [CompiledExpr::Input(_, _)])
+            {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("materials[{original}].inputs"),
+                    reason: "source-clocked scalar calculation requires direct clock bar data or a typed named input".into(),
+                });
+            }
+        }
         let provenance = inputs
             .iter()
             .map(CompiledExpr::provenance)
@@ -1031,6 +1095,14 @@ fn compile_materials(
                 reason,
             })?;
         validate_trigger(&trigger, &provenance, original)?;
+        if let Some(descriptor) = &numeric_descriptor
+            && !matches!(&trigger, MaterialUpdateTrigger::Source(source) if source == &descriptor.source_clock)
+        {
+            return Err(CompileError::InvalidConfig {
+                path: format!("materials[{original}].descriptor"),
+                reason: "numeric descriptor disagrees with the factory source trigger".into(),
+            });
+        }
         let build = factory
             .build(&material.params, &input_types)
             .map_err(|reason| CompileError::MaterialFactory {
@@ -1043,6 +1115,11 @@ fn compile_materials(
             crate::MAX_MATERIAL_STATE_BYTES,
         )?;
         let mut upstream = LookbackMap::new();
+        if let Some(descriptor) = &numeric_descriptor
+            && matches!(descriptor.inputs, crate::NumericInputs::Scalar(_))
+        {
+            merge_lookback(&mut upstream, descriptor.source_clock.clone(), 1);
+        }
         for item in &provenance {
             for source in &item.sources {
                 merge_lookback(&mut upstream, source.clone(), 1);
@@ -1052,11 +1129,26 @@ fn compile_materials(
             }
         }
         let lookbacks = apply_lookback_contract(build.lookback, upstream, original, sources)?;
+        if let Some(descriptor) = &mut numeric_descriptor {
+            let actual_lookback = lookbacks.get(&descriptor.source_clock).copied();
+            if build.output_type != descriptor.output_type
+                || build.max_state_bytes > descriptor.max_state_bytes
+                || lookbacks.len() != 1
+                || actual_lookback.is_none_or(|actual| actual < descriptor.required_lookback)
+            {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("materials[{original}].descriptor"),
+                    reason: "numeric descriptor disagrees with the factory output, state bound, or effective lookback".into(),
+                });
+            }
+            descriptor.required_lookback = actual_lookback.unwrap();
+        }
         merge_lookbacks(&mut aggregate, &lookbacks);
         let index = compiled.len();
         map.insert(material.id.clone(), (index, build.output_type));
         compiled.push(CompiledMaterial {
             id: material.id.clone(),
+            numeric_descriptor,
             inputs,
             input_provenance: provenance,
             evaluator: build.evaluator,
@@ -1309,7 +1401,11 @@ fn compile_transition(
     let (when, when_type) = compile_expr(&config.when, scope, &format!("{path}.when"))?;
     require_type(
         when_type,
-        ValueType::required(ScalarType::Bool),
+        if matches!(config.when, Expr::Strict { .. }) {
+            ValueType::optional(ScalarType::Bool)
+        } else {
+            ValueType::required(ScalarType::Bool)
+        },
         &format!("{path}.when"),
     )?;
     let assignments = config
@@ -1395,15 +1491,24 @@ fn compile_named(
             }
             let (value, value_type) =
                 compile_expr(&item.value, scope, &format!("{path}[{index}].value"))?;
-            if value_type.optional
-                || !matches!(
-                    value_type.scalar,
-                    ScalarType::Integer | ScalarType::Number | ScalarType::Price
-                )
-            {
+            if !matches!(
+                value_type.scalar,
+                ScalarType::Bool
+                    | ScalarType::Integer
+                    | ScalarType::Number
+                    | ScalarType::Price
+                    | ScalarType::Ratio
+                    | ScalarType::Percent
+                    | ScalarType::PricePerObservation
+                    | ScalarType::PricePerObservationSquared
+                    | ScalarType::RatioPerObservation
+                    | ScalarType::RatioPerObservationSquared
+                    | ScalarType::LogReturn
+                    | ScalarType::LogReturnVariance
+            ) {
                 return Err(CompileError::InvalidConfig {
                     path: format!("{path}[{index}].value"),
-                    reason: "output values must be required Integer, Number, or Price".into(),
+                    reason: "output values must be numeric".into(),
                 });
             }
             Ok(CompiledNamedExpr {
@@ -1966,11 +2071,30 @@ fn evaluate_outputs(
         .map(|item| {
             let value = item.value.eval(scope, "output.value")?;
             let value = match value {
+                Value::Bool(value) => OutputScalar::Bool(value),
                 Value::Integer(value) if value.unsigned_abs() <= (1_u64 << 53) => {
                     OutputScalar::Integer(value)
                 }
                 Value::Number(value) if value.is_finite() => OutputScalar::Number(value),
                 Value::Price(value) if value.is_finite() => OutputScalar::Price(value),
+                Value::Ratio(value) if value.is_finite() => OutputScalar::Ratio(value),
+                Value::Percent(value) if value.is_finite() => OutputScalar::Percent(value),
+                Value::PricePerObservation(value) if value.is_finite() => {
+                    OutputScalar::PricePerObservation(value)
+                }
+                Value::PricePerObservationSquared(value) if value.is_finite() => {
+                    OutputScalar::PricePerObservationSquared(value)
+                }
+                Value::RatioPerObservation(value) if value.is_finite() => {
+                    OutputScalar::RatioPerObservation(value)
+                }
+                Value::RatioPerObservationSquared(value) if value.is_finite() => {
+                    OutputScalar::RatioPerObservationSquared(value)
+                }
+                Value::LogReturn(value) if value.is_finite() => OutputScalar::LogReturn(value),
+                Value::LogReturnVariance(value) if value.is_finite() => {
+                    OutputScalar::LogReturnVariance(value)
+                }
                 Value::Integer(_) => {
                     return Err(EvaluationError::InvalidAction {
                         path: "output.value".into(),
@@ -2100,14 +2224,16 @@ fn validate_input(
 }
 
 fn validate_bar(bar: &crate::CompletedBar) -> Result<(), EvaluationError> {
-    if ![bar.open, bar.high, bar.low, bar.close, bar.volume]
+    if ![bar.open, bar.high, bar.low, bar.close]
         .into_iter()
         .all(f64::is_finite)
+        || bar
+            .volume
+            .is_some_and(|volume| !volume.is_finite() || volume < 0.0)
         || bar.open <= 0.0
         || bar.high <= 0.0
         || bar.low <= 0.0
         || bar.close <= 0.0
-        || bar.volume < 0.0
         || bar.high < bar.low
         || bar.high < bar.open.max(bar.close)
         || bar.low > bar.open.min(bar.close)
@@ -2373,7 +2499,18 @@ fn ensure_runtime_type(
         });
     }
     match value {
-        Value::Number(value) | Value::Price(value) if !value.is_finite() => {
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value)
+            if !value.is_finite() =>
+        {
             Err(EvaluationError::NonFinite { path: path.into() })
         }
         Value::Text(value) => {

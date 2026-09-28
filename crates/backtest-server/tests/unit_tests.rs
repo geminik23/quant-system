@@ -1901,6 +1901,7 @@ fn job_cleanup_and_admission_eviction_delete_owned_artifacts() {
                 progress: BacktestProgress::default(),
                 result: None,
                 artifact: Some(artifact.clone()),
+                checkpoint_artifact: None,
                 inline_complete: false,
                 artifact_consumed: false,
                 error: None,

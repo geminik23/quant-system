@@ -59,6 +59,10 @@ pub enum ResearchError {
     #[error("research batch was cancelled")]
     Cancelled,
 
+    /// The caller cancelled after at least one complete run; only those complete outcomes are retained.
+    #[error("research batch was cancelled after completing part of the workload")]
+    CancelledWithPartial(Box<crate::ResearchBatch>),
+
     /// Stored market data could not be loaded.
     #[error(transparent)]
     Load(#[from] qs_market_loader::MarketLoadError),

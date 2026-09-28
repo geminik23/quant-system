@@ -501,7 +501,13 @@ fn a_controlled_batch_reports_each_run_and_stops_when_cancelled() {
         )
         .err()
         .unwrap();
-        assert!(matches!(error, qs_research::ResearchError::Cancelled));
+        let qs_research::ResearchError::CancelledWithPartial(partial) = error else {
+            panic!("completed runs must be retained when cancellation is observed");
+        };
+        assert_eq!(
+            partial.run_recipes().len(),
+            completed.load(Ordering::SeqCst)
+        );
         assert!(completed.load(Ordering::SeqCst) < 12);
     }
 }

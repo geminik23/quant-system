@@ -14,17 +14,18 @@ use qs_backtest::{
     HistoricalVolumeProjection, ManagementProfile, MarketEvent, MissingIntervalPolicy,
     NamedInputProjectionContext, NamedInputProjectionError, ObservationStoreLimits,
     PendingOrderLifecycleState, PriceBasis, ProjectedNamedInput, SeriesId, SeriesRequirement,
-    StoplossMode, StrategyDescriptor, StrategyId, StrategyReplayError, StrategyRetentionLimits,
-    Timeframe, VecFeed, WarmupRequirement,
+    SourceBarFactKind, SourceBarFactProjector, StoplossMode, StrategyDescriptor, StrategyId,
+    StrategyReplayError, StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
 };
 use qs_core::{OrderType, Side};
 use qs_strategy::{
     ActionTemplate, CompletedBarRequirement, ConfiguredActionKind, DecisionKind, DecisionTemplate,
     Expr, Literal, MATERIAL_BAR_FIELD, MATERIAL_CANCELLATION_APPLIED, MATERIAL_EMA,
-    MATERIAL_POSITION_PENDING, MaterialArgs, MaterialBuild, MaterialConfig, MaterialEvalContext,
-    MaterialEvaluator, MaterialFactory, MaterialLibrary, MaterialLookback, MaterialParams,
-    MaterialUpdateTrigger, NamedExpr, NoteKind, NoteTemplate, ScalarType, SourceId, StateConfig,
-    StrategyConfig, TransitionConfig, Value, ValueType,
+    MATERIAL_POSITION_PENDING, MATERIAL_SETUP_LONG_SINGLE_KEEP_FIRST, MATERIAL_STRICT_EMA,
+    MATERIAL_STRICT_SMA, MaterialArg, MaterialArgs, MaterialBuild, MaterialConfig,
+    MaterialEvalContext, MaterialEvaluator, MaterialFactory, MaterialLibrary, MaterialLookback,
+    MaterialParams, MaterialUpdateTrigger, NamedExpr, NoteKind, NoteTemplate, ScalarType, SourceId,
+    StateConfig, StrategyConfig, TransitionConfig, Value, ValueType,
 };
 use qs_symbols::SymbolSpec;
 use support::configured as shared;
@@ -209,6 +210,54 @@ impl HistoricalNamedInputProjector for ReadyProjector {
         Ok(ProjectedNamedInput {
             value: Value::Bool(true),
             updated: true,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetupInputKind {
+    Reset,
+    Gap,
+    Breakout,
+    Retest,
+    Level,
+    Normalization,
+    Close,
+    Tolerance,
+    Ordinal,
+}
+struct SetupInputProjector(SetupInputKind);
+impl HistoricalNamedInputProjector for SetupInputProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::required(match self.0 {
+            SetupInputKind::Reset
+            | SetupInputKind::Gap
+            | SetupInputKind::Breakout
+            | SetupInputKind::Retest => ScalarType::Bool,
+            SetupInputKind::Level | SetupInputKind::Close | SetupInputKind::Tolerance => {
+                ScalarType::Price
+            }
+            SetupInputKind::Normalization => ScalarType::Number,
+            SetupInputKind::Ordinal => ScalarType::Integer,
+        })
+    }
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let ordinal = (context.observed_through - ts(0)).num_minutes();
+        let value = match self.0 {
+            SetupInputKind::Reset | SetupInputKind::Gap => Value::Bool(false),
+            SetupInputKind::Breakout => Value::Bool(ordinal == 3),
+            SetupInputKind::Retest => Value::Bool(ordinal == 4),
+            SetupInputKind::Level | SetupInputKind::Close => Value::Price(1.0),
+            SetupInputKind::Tolerance => Value::Price(0.0),
+            SetupInputKind::Normalization => Value::Number(2.0),
+            SetupInputKind::Ordinal => Value::Integer(ordinal),
+        };
+        Ok(ProjectedNamedInput {
+            value,
+            updated: !context.closed_bars.is_empty(),
         })
     }
 }
@@ -947,6 +996,320 @@ fn configured_entry_uses_completed_bar_warmup_and_preserves_command_id() {
         "5:alpha|10:instance_a|command:1"
     );
     assert_eq!(result.replay.action_dispositions[0].signal_ts, Some(ts(1)));
+}
+
+#[test]
+fn strict_average_enters_only_after_its_completed_bar_history_is_ready() {
+    for key in [MATERIAL_STRICT_SMA, MATERIAL_STRICT_EMA] {
+        assert_strict_average_entry(key, &[1.0, 1.1, 1.2, 1.3, 1.4, 1.5], 3, 1.1);
+    }
+}
+
+#[test]
+fn strict_average_historical_entry_uses_nonmonotonic_seed_and_recursive_update() {
+    assert_strict_average_entry(MATERIAL_STRICT_SMA, &[1.2, 1.5, 1.1, 1.6, 1.3, 1.8], 4, 1.4);
+    assert_strict_average_entry(
+        MATERIAL_STRICT_EMA,
+        &[1.2, 1.5, 1.1, 1.6, 1.3, 1.8],
+        4,
+        43.0 / 30.0,
+    );
+}
+
+fn assert_strict_average_entry(
+    key: &str,
+    prices: &[f64],
+    entry_minute: i64,
+    expected_average: f64,
+) {
+    let mut document = strategy_config(true, None);
+    document.materials.push(MaterialConfig {
+        id: "average".into(),
+        key: key.into(),
+        inputs: vec![Expr::Bar {
+            source: source(),
+            field: qs_strategy::BarField::Close,
+        }],
+        params: MaterialArgs::new([
+            ("source", MaterialArg::Source(source())),
+            ("period", MaterialArg::Integer(3)),
+        ]),
+    });
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::Gt {
+            left: Box::new(Expr::Bar {
+                source: source(),
+                field: qs_strategy::BarField::Close,
+            }),
+            right: Box::new(Expr::Material {
+                id: "average".into(),
+            }),
+        }),
+    };
+    let condition = document.states[0].transitions[0].when.clone();
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::All {
+            items: vec![
+                condition,
+                Expr::Le {
+                    left: Box::new(Expr::Abs {
+                        value: Box::new(Expr::Sub {
+                            left: Box::new(Expr::Material {
+                                id: "average".into(),
+                            }),
+                            right: Box::new(expr_literal(Literal::Price(expected_average))),
+                        }),
+                    }),
+                    right: Box::new(expr_literal(Literal::Price(1e-12))),
+                },
+            ],
+        }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("alpha").unwrap(), "r1", "Alpha").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec(3, 32))],
+            vec![],
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(
+        prices
+            .iter()
+            .enumerate()
+            .map(|(minute, price)| MarketEvent::Tick {
+                symbol: SYMBOL.into(),
+                ts: ts(minute as i64),
+                bid: *price,
+                ask: price + 0.0002,
+            })
+            .collect(),
+    );
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.decisions.records.len(), 1);
+    assert_eq!(
+        result.decisions.records[0].emitted_signals()[0].ts(),
+        ts(entry_minute)
+    );
+
+    assert_eq!(adapter.configured_strategy().state_id(), "entered");
+}
+
+#[test]
+fn delayed_retest_historical_lifecycle_never_enters_on_the_capture_bar() {
+    let input = |name: &str, scalar| Expr::Input {
+        field: name.into(),
+        value_type: ValueType::required(scalar),
+    };
+    let mut document = strategy_config(true, None);
+    document.materials.push(MaterialConfig {
+        id: "setup".into(),
+        key: MATERIAL_SETUP_LONG_SINGLE_KEEP_FIRST.into(),
+        inputs: vec![
+            input("reset", ScalarType::Bool),
+            input("gap", ScalarType::Bool),
+            input("breakout", ScalarType::Bool),
+            input("retest", ScalarType::Bool),
+            input("level", ScalarType::Price),
+            input("normalization", ScalarType::Number),
+            input("close", ScalarType::Price),
+            input("tolerance", ScalarType::Price),
+            input("ordinal", ScalarType::Integer),
+        ],
+        params: MaterialArgs::new([
+            ("source", MaterialArg::Source(source())),
+            ("expiry", MaterialArg::Integer(3)),
+        ]),
+    });
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::Material { id: "setup".into() }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let kinds = [
+        ("reset", SetupInputKind::Reset),
+        ("gap", SetupInputKind::Gap),
+        ("breakout", SetupInputKind::Breakout),
+        ("retest", SetupInputKind::Retest),
+        ("level", SetupInputKind::Level),
+        ("normalization", SetupInputKind::Normalization),
+        ("close", SetupInputKind::Close),
+        ("tolerance", SetupInputKind::Tolerance),
+        ("ordinal", SetupInputKind::Ordinal),
+    ];
+    let bindings = kinds
+        .into_iter()
+        .map(|(name, kind)| {
+            ConfiguredNamedInputBinding::new(name, Box::new(SetupInputProjector(kind)))
+        })
+        .collect();
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("setup").unwrap(), "r1", "Setup").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec(1, 16))],
+            bindings,
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(
+        (0..7)
+            .map(|minute| MarketEvent::Tick {
+                symbol: SYMBOL.into(),
+                ts: ts(minute),
+                bid: 1.0 + minute as f64 * 0.001,
+                ask: 1.0002 + minute as f64 * 0.001,
+            })
+            .collect(),
+    );
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.decisions.records.len(), 1);
+    assert_eq!(result.decisions.records[0].emitted_signals()[0].ts(), ts(4));
+}
+
+#[test]
+fn source_bar_facts_preserve_actual_delayed_availability_without_backdating() {
+    let mut document = strategy_config(true, None);
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::All {
+            items: vec![
+                Expr::Gt {
+                    left: Box::new(Expr::Input {
+                        field: "available_at".into(),
+                        value_type: ValueType::optional(ScalarType::Timestamp),
+                    }),
+                    right: Box::new(Expr::Input {
+                        field: "close_time".into(),
+                        value_type: ValueType::optional(ScalarType::Timestamp),
+                    }),
+                },
+                Expr::Ge {
+                    left: Box::new(Expr::Input {
+                        field: "ordinal".into(),
+                        value_type: ValueType::optional(ScalarType::Integer),
+                    }),
+                    right: Box::new(expr_literal(Literal::Integer(1))),
+                },
+            ],
+        }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let series_id = SeriesId::new("m5").unwrap();
+    let requirement = SeriesRequirement::new(
+        series_id.clone(),
+        SYMBOL,
+        Timeframe::minutes(5).unwrap(),
+        PriceBasis::Bid,
+        WarmupRequirement::bars(1).unwrap(),
+    )
+    .unwrap();
+    let spec = BarSeriesSpec::new(requirement, 16, 0, MissingIntervalPolicy::Skip).unwrap();
+    let named = vec![
+        ConfiguredNamedInputBinding::new(
+            "ordinal",
+            Box::new(SourceBarFactProjector::new(
+                series_id.clone(),
+                SourceBarFactKind::Ordinal,
+            )),
+        ),
+        ConfiguredNamedInputBinding::new(
+            "close_time",
+            Box::new(SourceBarFactProjector::new(
+                series_id.clone(),
+                SourceBarFactKind::CloseTime,
+            )),
+        ),
+        ConfiguredNamedInputBinding::new(
+            "available_at",
+            Box::new(SourceBarFactProjector::new(
+                series_id,
+                SourceBarFactKind::AvailableAt,
+            )),
+        ),
+    ];
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("alpha").unwrap(), "r1", "Alpha").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec)],
+            named,
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(vec![
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(0),
+            bid: 1.0,
+            ask: 1.0002,
+        },
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(17),
+            bid: 1.2,
+            ask: 1.2002,
+        },
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(22),
+            bid: 1.3,
+            ask: 1.3002,
+        },
+    ]);
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result.decisions.records[0].emitted_signals()[0].ts(),
+        ts(17)
+    );
 }
 
 #[test]
