@@ -98,6 +98,28 @@ pub struct ClosedBar {
 }
 
 impl ClosedBar {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        series_id: SeriesId,
+        symbol: impl Into<String>,
+        open_time: NaiveDateTime,
+        close_time: NaiveDateTime,
+        high: f64,
+        low: f64,
+    ) -> Self {
+        Self {
+            series_id,
+            symbol: symbol.into(),
+            open_time,
+            close_time,
+            open: low,
+            high,
+            low,
+            close: high,
+            tick_count: Some(1),
+        }
+    }
+
     pub fn series_id(&self) -> &SeriesId {
         &self.series_id
     }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::rpc_types::{
     BacktestConfigMsg, ConfiguredStrategyRunMsg, ConfiguredStrategyRunSpec, EntryProfileRouteMsg,
-    FutureQuoteConfigMsg, PortfolioInstanceMsg, PortfolioRunSpec, ProfileRef,
+    FutureQuoteConfigMsg, HistoricalInputsMsg, PortfolioInstanceMsg, PortfolioRunSpec, ProfileRef,
     ProviderEvaluationOptionsMsg, ResultDeliveryMsg, RunConfiguredStrategyRequest,
     RunPortfolioRequest, SearchRunSpec, SearchWindowsMsg, SourceBindingMsg,
     SubmitConfiguredStrategyRequest, SubmitPortfolioRequest, SubmitSearchRequest,
@@ -36,6 +36,8 @@ struct InstanceFile {
     #[serde(default)]
     entry_profile_routes: Vec<RouteFile>,
     series: Vec<SourceBindingMsg>,
+    #[serde(default)]
+    historical_inputs: Option<HistoricalInputsMsg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +68,8 @@ struct RunFile {
     entry_profile_routes: Vec<RouteFile>,
     #[serde(default)]
     series: Vec<SourceBindingMsg>,
+    #[serde(default)]
+    historical_inputs: Option<HistoricalInputsMsg>,
     #[serde(default)]
     windows: Option<SearchWindowsMsg>,
     config: BacktestConfigMsg,
@@ -123,6 +127,7 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
         if file.symbol.is_some()
             || !file.symbols.is_empty()
             || !file.series.is_empty()
+            || file.historical_inputs.is_some()
             || file.instance_id.is_some()
             || file.profile.is_some()
             || !file.entry_profile_routes.is_empty()
@@ -140,6 +145,7 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
                     sources: instance.series.clone(),
                     instance_id: Some(instance.instance_id.clone()),
                     decision_latency_ms: instance.decision_latency_ms,
+                    historical_inputs: instance.historical_inputs.clone(),
                 },
                 profile: instance.profile.clone(),
                 profile_def: None,
@@ -203,6 +209,7 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
                                 sources: file.series,
                                 instance_id: file.instance_id,
                                 decision_latency_ms: file.decision_latency_ms,
+                                historical_inputs: file.historical_inputs,
                             },
                             profile: file.profile,
                             profile_def: None,
@@ -224,8 +231,14 @@ pub fn build_request(text: &str, base: &Path) -> Result<StrategyClientRequest, S
             if symbols.is_empty() {
                 return Err("a search requires symbol or symbols".into());
             }
-            if !file.series.is_empty() || file.instance_id.is_some() {
-                return Err("a search takes its series from the space document".into());
+            if !file.series.is_empty()
+                || file.instance_id.is_some()
+                || file.historical_inputs.is_some()
+            {
+                return Err(
+                    "a search takes its series and historical inputs from the space document"
+                        .into(),
+                );
             }
             if file.from.is_some() || file.to.is_some() {
                 return Err("a search takes its range from [windows]".into());
@@ -348,6 +361,30 @@ sizing = { type = "FixedLot", lots = 0.1 }
             &run.request.entry_profile_routes[0].profile,
             ProfileRef::Named(name) if name == "trail"
         ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_run_file_carries_document_driven_full_day_calendar_inputs() {
+        let base = directory();
+        let text = format!(
+            "strategy = \"strategy.toml\"\nsymbol = \"EURUSD\"\nfrom = \"2026-01-01T00:00:00\"\nto = \"2026-01-02T00:00:00\"\n{COMMON}\n[[series]]\nsource = \"primary\"\ntimeframe_seconds = 60\nprice_basis = \"mid\"\n\n[historical_inputs.calendars.main]\nid = \"main\"\ntimezone = \"UTC\"\n\n[[historical_inputs.inputs]]\nname = \"in_full_day\"\nsource = \"primary\"\ncalendar = \"main\"\nfeature = \"session_membership\"\nchild_seconds = 60\nmaximum_history = 2\n"
+        );
+        let StrategyClientRequest::Run(request) = build_request(&text, &base).unwrap() else {
+            panic!("a strategy run file builds a run request");
+        };
+        let inputs = request
+            .request
+            .request
+            .strategy
+            .historical_inputs
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            inputs.calendars["main"].sessions,
+            crate::rpc_types::SessionScheduleMsg::FullDay
+        ));
+        assert_eq!(inputs.inputs[0].name, "in_full_day");
         std::fs::remove_dir_all(base).unwrap();
     }
 

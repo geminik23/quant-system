@@ -252,6 +252,7 @@ fn heterogeneous_candidates_run_distinct_documents_in_one_account() {
             symbol: SYMBOL.into(),
             document: family.config(point),
             geometry: family.geometry(SYMBOL, point),
+            historical_inputs: vec![],
             profiles: None,
         })
         .collect::<Vec<_>>();
@@ -300,6 +301,7 @@ fn mixed_configured_and_direct_instances_run_in_one_account_with_instance_recipe
             symbol: SYMBOL.into(),
             document: family.config(&point),
             geometry: family.geometry(SYMBOL, &point),
+            historical_inputs: vec![],
             profiles: None,
         }],
         direct: vec![HeterogeneousDirectInstanceSpec {

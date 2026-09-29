@@ -33,8 +33,13 @@ pub use annotation::{
     MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES, MAX_ANNOTATIONS, StrategyAnnotation,
 };
 pub use calendar::{
-    CalendarBar, CalendarError, CalendarFeatureKind, CalendarFeatureProjector, IanaTradingCalendar,
-    OpeningRange, ResolvedSession,
+    CalendarAdmissionLimits, CalendarBar, CalendarError, CalendarFeatureKind,
+    CalendarFeatureProjector, CalendarInputSpec, CalendarTimeBasis,
+    ConfiguredCalendarFeatureProjector, ConfiguredCalendarInput, ConfiguredTradingCalendar,
+    DEFAULT_CALENDAR_SESSION_ID, IanaTradingCalendar, LocalMarketIntervalSpec, MarketScheduleSpec,
+    NamedSessionSpec, OpeningRange, ResolvedSession, ResolvedSessionOccurrence, ResolvedTradingDay,
+    SessionOccurrenceId, SessionScheduleSpec, SessionSpanSpec, TradingCalendarSpec,
+    WeeklyMarketIntervalSpec,
 };
 pub use config::{
     MAX_DECISION_RECORDS, MAX_REASON_BYTES, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,

@@ -91,10 +91,16 @@ pub fn snapshot_bindings(bindings: &ConfiguredHistoricalBindings) -> Vec<SeriesB
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputProjectorSnapshot {
+    #[serde(default = "default_projector_owner")]
+    pub owner: String,
     pub symbol: String,
     pub name: String,
     pub kind: String,
     pub configuration: serde_json::Value,
+}
+
+fn default_projector_owner() -> String {
+    "configured".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

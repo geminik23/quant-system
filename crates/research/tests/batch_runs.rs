@@ -1,23 +1,75 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use qs_backtest::Timeframe;
 use qs_research::families::EmaCrossFamily;
 use qs_research::{
-    CheckpointDependency, CompletedRunCheckpoint, DataWindow, EndpointBounds, EvaluationRole,
-    ExperimentId, ExperimentOptions, FeatureCache, FeatureCacheKey, FrozenSelection,
-    ProtectedExperiment, ResearchAdmissionLimits, ResearchError, ResearchPlan, RunStatus,
-    SearchCheckpoint, SplitAccessKind, SymbolEvents, WindowPlan, cached_market_midpoints,
+    AdmittedMarketView, CachedMidpointProjectorSelection, CheckpointDependency,
+    CompletedRunCheckpoint, DataWindow, EndpointBounds, EvaluationRole, ExperimentId,
+    ExperimentOptions, FeatureCache, FeatureCacheKey, FrozenSelection, NamedProjectorSelection,
+    ProjectedStrategyFamily, ProtectedExperiment, ResearchAdmissionLimits, ResearchError,
+    ResearchPlan, RunStatus, SearchCheckpoint, SeriesGeometry, SplitAccessKind, StrategyFamily,
+    SymbolEvents, WindowPlan, cached_market_midpoints_for_view, project_cached_midpoints_to_bars,
     rerun_selected_candidate_protected, run_batch, run_batch_controlled_with_experiment_resume,
     run_batch_with_experiment,
 };
+use qs_strategy::{Expr, ParameterBinding, ScalarType, StrategyConfig, ValueType};
 use support::{SYMBOL, at, config, synthetic_ticks};
 
 fn family() -> EmaCrossFamily {
     EmaCrossFamily::new(3..=4, 8..=9, vec![10, 20], Timeframe::minutes(1).unwrap())
         .with_atr_period(5)
+}
+
+#[derive(Clone)]
+struct CachedInputFamily(EmaCrossFamily);
+
+impl StrategyFamily for CachedInputFamily {
+    type Params = <EmaCrossFamily as StrategyFamily>::Params;
+
+    fn family_id(&self) -> &str {
+        "cached_input_ema"
+    }
+
+    fn points(&self) -> Vec<Self::Params> {
+        self.0.points()
+    }
+
+    fn parameter_binding(&self, point: &Self::Params) -> ParameterBinding {
+        self.0.parameter_binding(point)
+    }
+
+    fn config(&self, point: &Self::Params) -> StrategyConfig {
+        let mut config = self.0.config(point);
+        let flat = config
+            .states
+            .iter_mut()
+            .find(|state| state.id == "flat")
+            .expect("EMA family has flat state");
+        let transition = flat
+            .transitions
+            .first_mut()
+            .expect("EMA family has entry transition");
+        transition.when = Expr::All {
+            items: vec![
+                transition.when.clone(),
+                Expr::IsPresent {
+                    value: Box::new(Expr::Input {
+                        field: "cached_midpoint".into(),
+                        value_type: ValueType::optional(ScalarType::Price),
+                    }),
+                },
+            ],
+        };
+        config
+    }
+
+    fn geometry(&self, symbol: &str, point: &Self::Params) -> Vec<SeriesGeometry> {
+        self.0.geometry(symbol, point)
+    }
 }
 
 fn windows() -> WindowPlan {
@@ -82,12 +134,19 @@ fn cancellation_retains_only_complete_runs_for_checkpoint_publication() {
 }
 
 #[test]
-fn immutable_market_feature_cache_preserves_replay_economics_and_clone_isolation() {
+fn immutable_market_feature_cache_is_consumed_with_disabled_miss_hit_parity() {
     let events = events();
-    let baseline = run_batch(&plan(1), &family(), &events).unwrap();
-    let source = &events[SYMBOL];
+    let source = events[SYMBOL].clone();
+    let view = AdmittedMarketView::new(
+        "synthetic-minute-ticks",
+        SYMBOL,
+        at(0),
+        at(960),
+        source.clone(),
+    )
+    .unwrap();
     let key = FeatureCacheKey {
-        dataset_reference: "synthetic-minute-ticks".into(),
+        dataset_reference: "caller-label-is-provenance-only".into(),
         symbol: SYMBOL.into(),
         from: at(0),
         to: at(960),
@@ -101,18 +160,71 @@ fn immutable_market_feature_cache_preserves_replay_economics_and_clone_isolation
         clock: "event_availability".into(),
         availability_policy: "actual".into(),
     };
-    let bytes = FeatureCache::entry_bytes_upper_bound(&key, source.len()).unwrap();
-    let mut cache = FeatureCache::new(bytes).unwrap();
-    let mut first = cached_market_midpoints(&mut cache, key.clone(), source).unwrap();
-    let second = cached_market_midpoints(&mut cache, key, source).unwrap();
-    assert_eq!(first, second);
-    first[0] = None;
-    assert_ne!(first, second);
-    assert_eq!(cache.len(), 1);
+    let entry_bytes = FeatureCache::entry_bytes_upper_bound(&key, source.len()).unwrap() + 4096;
+    let consumer_bytes = source.len() * std::mem::size_of::<Option<f64>>();
+    let mut cache = FeatureCache::new(entry_bytes).unwrap();
+    let miss =
+        cached_market_midpoints_for_view(&mut cache, &view, key.clone(), consumer_bytes).unwrap();
+    let hit = cached_market_midpoints_for_view(&mut cache, &view, key, consumer_bytes).unwrap();
+    assert!(!miss.cache_hit);
+    assert!(hit.cache_hit);
+    assert_eq!(miss.values, hit.values);
 
-    let cached = run_batch(&plan(1), &family(), &events).unwrap();
-    assert_eq!(cached.table(), baseline.table());
-    assert_eq!(cached.position_outcomes(), baseline.position_outcomes());
+    let direct = source
+        .iter()
+        .map(|event| {
+            let quote = event.event.to_quote();
+            Some(quote.bid / 2.0 + quote.ask / 2.0)
+        })
+        .collect::<Vec<_>>();
+    let selection = |values: Vec<Option<f64>>| {
+        let samples = project_cached_midpoints_to_bars(&view, &values, 60, 0).unwrap();
+        NamedProjectorSelection::CachedMidpoint(CachedMidpointProjectorSelection {
+            name: "cached_midpoint".into(),
+            source: "primary".into(),
+            view_reference: "synthetic-minute-ticks".into(),
+            samples: Arc::new(samples),
+        })
+    };
+    let base_family = CachedInputFamily(EmaCrossFamily::new(
+        3..=3,
+        8..=8,
+        vec![10],
+        Timeframe::minutes(1).unwrap(),
+    ));
+    let disabled = run_batch(
+        &plan(1),
+        &ProjectedStrategyFamily::new(base_family.clone(), vec![selection(direct)]).unwrap(),
+        &events,
+    )
+    .unwrap();
+    let miss_batch = run_batch(
+        &plan(1),
+        &ProjectedStrategyFamily::new(base_family.clone(), vec![selection(miss.values)]).unwrap(),
+        &events,
+    )
+    .unwrap();
+    let hit_batch = run_batch(
+        &plan(1),
+        &ProjectedStrategyFamily::new(base_family.clone(), vec![selection(hit.values)]).unwrap(),
+        &events,
+    )
+    .unwrap();
+    assert!(!disabled.position_outcomes().is_empty());
+    assert_eq!(disabled.table(), miss_batch.table());
+    assert_eq!(disabled.table(), hit_batch.table());
+    assert_eq!(disabled.position_outcomes(), miss_batch.position_outcomes());
+    assert_eq!(disabled.position_outcomes(), hit_batch.position_outcomes());
+    assert_eq!(disabled.run_recipes(), miss_batch.run_recipes());
+
+    let missing_values = vec![None; source.len()];
+    let negative = run_batch(
+        &plan(1),
+        &ProjectedStrategyFamily::new(base_family, vec![selection(missing_values)]).unwrap(),
+        &events,
+    )
+    .unwrap();
+    assert!(negative.position_outcomes().is_empty());
 }
 
 #[test]

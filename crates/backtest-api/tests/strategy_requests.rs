@@ -85,6 +85,42 @@ fn rejects<T: serde::de::DeserializeOwned>(mut value: Value, pointer: &str) {
 }
 
 #[test]
+fn configured_calendar_inputs_decode_strictly_with_a_full_day_default() {
+    let mut value = configured();
+    value["request"]["from"] = json!("2026-01-01T00:00:00");
+    value["request"]["to"] = json!("2026-01-02T00:00:00");
+    value["request"]["strategy"]["historical_inputs"] = json!({
+        "calendars": {
+            "main": {
+                "id": "main",
+                "timezone": "UTC"
+            }
+        },
+        "inputs": [{
+            "name": "in_full_day",
+            "source": "primary",
+            "calendar": "main",
+            "feature": "session_membership",
+            "child_seconds": 60,
+            "maximum_history": 2
+        }]
+    });
+    let decoded: RunConfiguredStrategyRequest = serde_json::from_value(value.clone()).unwrap();
+    let historical = decoded.request.strategy.historical_inputs.unwrap();
+    assert!(matches!(
+        historical.calendars["main"].sessions,
+        qs_backtest_api::SessionScheduleMsg::FullDay
+    ));
+    assert_eq!(historical.calendars["main"].day_boundary, "00:00:00");
+
+    rejects::<RunConfiguredStrategyRequest>(
+        value.clone(),
+        "/request/strategy/historical_inputs/calendars/main",
+    );
+    rejects::<RunConfiguredStrategyRequest>(value, "/request/strategy/historical_inputs/inputs/0");
+}
+
+#[test]
 fn configured_requests_reject_unknown_fields_at_every_level_but_carry_documents_as_values() {
     let decoded: RunConfiguredStrategyRequest = serde_json::from_value(configured()).unwrap();
     assert_eq!(

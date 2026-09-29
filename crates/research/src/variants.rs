@@ -4,7 +4,9 @@ use crate::{
     run_batch_controlled_with_experiment,
 };
 use qs_backtest::runner::BacktestConfig;
-use qs_backtest::{FutureQuoteConfig, PreparedEntryProfiles};
+use qs_backtest::{
+    ConfiguredCalendarInput, ConfiguredHistoricalBindings, FutureQuoteConfig, PreparedEntryProfiles,
+};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone)]
 pub struct ExecutionVariant {
@@ -259,7 +261,73 @@ pub struct HeterogeneousInstanceSpec {
     pub symbol: String,
     pub document: qs_strategy::StrategyConfig,
     pub geometry: Vec<crate::SeriesGeometry>,
+    pub historical_inputs: Vec<ConfiguredCalendarInput>,
     pub profiles: Option<PreparedEntryProfiles>,
+}
+
+fn configured_instance_bindings(
+    instance: &HeterogeneousInstanceSpec,
+    requirements: &qs_strategy::ConfiguredStrategyRequirements,
+) -> Result<ConfiguredHistoricalBindings, ResearchError> {
+    let base = ConfiguredHistoricalBindings::from_geometry(instance.geometry.clone(), requirements)
+        .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+    let (sources, mut named, volume) = base.into_parts();
+    let required = requirements
+        .named_inputs
+        .iter()
+        .map(|requirement| requirement.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for input in &instance.historical_inputs {
+        if !required.contains(input.name.as_str()) {
+            continue;
+        }
+        if named.iter().any(|binding| binding.name() == input.name) {
+            return Err(ResearchError::InvalidPlan(format!(
+                "named input '{}' has more than one projector",
+                input.name
+            )));
+        }
+        named.push(
+            input
+                .binding()
+                .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?,
+        );
+    }
+    Ok(ConfiguredHistoricalBindings::new(sources, named, volume))
+}
+
+fn configured_instance_history_start(
+    instance: &HeterogeneousInstanceSpec,
+    evaluation_start: chrono::NaiveDateTime,
+) -> Result<chrono::NaiveDateTime, ResearchError> {
+    instance
+        .historical_inputs
+        .iter()
+        .try_fold(evaluation_start, |start, input| {
+            input
+                .history_start(evaluation_start)
+                .map(|candidate| start.min(candidate))
+                .map_err(|error| ResearchError::InvalidPlan(error.to_string()))
+        })
+}
+
+fn calendar_input_snapshot(
+    input: &ConfiguredCalendarInput,
+    symbol: &str,
+    owner: &str,
+) -> crate::InputProjectorSnapshot {
+    crate::InputProjectorSnapshot {
+        owner: owner.into(),
+        symbol: symbol.into(),
+        name: input.name.clone(),
+        kind: "calendar".into(),
+        configuration: serde_json::json!({
+            "source": input.source,
+            "calendar": input.calendar,
+            "input": input.input,
+            "limits": input.limits,
+        }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -299,8 +367,8 @@ pub fn run_mixed_heterogeneous_portfolios(
     };
     use qs_backtest::{
         AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
-        ConfiguredHistoricalBindings, ConfiguredInstance, DirectPortfolioInstance,
-        ObservationStoreLimits, StrategyDescriptor, StrategyId, StrategyRetentionLimits, VecFeed,
+        ConfiguredInstance, DirectPortfolioInstance, ObservationStoreLimits, StrategyDescriptor,
+        StrategyId, StrategyRetentionLimits, VecFeed,
     };
     limits.new_checked()?;
     if candidates.is_empty() || candidates.len() > limits.max_variants {
@@ -358,6 +426,7 @@ pub fn run_mixed_heterogeneous_portfolios(
         let mut run_recipes = Vec::new();
         let mut series_by_instance = BTreeMap::new();
         let mut factory_selections = Vec::new();
+        let mut input_projectors = Vec::new();
         for (window_index, window) in windows.iter().enumerate() {
             let mut configured = Vec::new();
             let mut direct = Vec::new();
@@ -370,17 +439,22 @@ pub fn run_mixed_heterogeneous_portfolios(
                     instance.symbol.clone(),
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
-                let bindings = ConfiguredHistoricalBindings::from_geometry(
-                    instance.geometry.clone(),
-                    strategy.input_requirements(),
-                )
-                .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                let bindings =
+                    configured_instance_bindings(instance, strategy.input_requirements())?;
+                for input in &instance.historical_inputs {
+                    let snapshot =
+                        calendar_input_snapshot(input, &instance.symbol, &instance.instance_id);
+                    if !input_projectors.contains(&snapshot) {
+                        input_projectors.push(snapshot);
+                    }
+                }
                 series_by_instance
                     .entry(instance.instance_id.clone())
                     .or_insert_with(|| snapshot_bindings(&bindings));
                 let start = bindings
                     .warmup_start(window.from())
-                    .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                    .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?
+                    .min(configured_instance_history_start(instance, window.from())?);
                 let descriptor = StrategyDescriptor::new(
                     StrategyId::new(instance.document.strategy_id.clone())
                         .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?,
@@ -388,13 +462,16 @@ pub fn run_mixed_heterogeneous_portfolios(
                     instance.document.title.clone(),
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
-                let adapter = BacktestConfiguredStrategyAdapter::new(
+                let mut adapter = BacktestConfiguredStrategyAdapter::new(
                     strategy,
                     descriptor,
                     bindings,
                     base.decision_latency_ms,
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                if !instance.historical_inputs.is_empty() {
+                    adapter.set_evaluation_start(Some(window.from()));
+                }
                 let analysis = AnalysisPipeline::new(
                     vec![],
                     ObservationStoreLimits::default(),
@@ -552,7 +629,7 @@ pub fn run_mixed_heterogeneous_portfolios(
             registered_factory: None,
             series_by_symbol: BTreeMap::new(),
             series_by_instance,
-            input_projectors: Vec::new(),
+            input_projectors,
             admission_error: None,
         };
         let experiment = ExperimentRecipe {
@@ -624,8 +701,8 @@ pub fn run_heterogeneous_portfolios_controlled(
     };
     use qs_backtest::{
         AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
-        ConfiguredHistoricalBindings, ConfiguredInstance, ObservationStoreLimits,
-        StrategyDescriptor, StrategyId, StrategyRetentionLimits, VecFeed,
+        ConfiguredInstance, ObservationStoreLimits, StrategyDescriptor, StrategyId,
+        StrategyRetentionLimits, VecFeed,
     };
     limits.new_checked()?;
     if candidates.is_empty() || candidates.len() > limits.max_variants {
@@ -671,6 +748,7 @@ pub fn run_heterogeneous_portfolios_controlled(
         let mut positions = Vec::new();
         let mut run_recipes = Vec::new();
         let mut series_by_symbol = BTreeMap::new();
+        let mut input_projectors = Vec::new();
         for (window_index, window) in windows.iter().enumerate() {
             if is_cancelled() {
                 return Err(ResearchError::Cancelled);
@@ -685,15 +763,20 @@ pub fn run_heterogeneous_portfolios_controlled(
                     instance.symbol.clone(),
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
-                let bindings = ConfiguredHistoricalBindings::from_geometry(
-                    instance.geometry.clone(),
-                    strategy.input_requirements(),
-                )
-                .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                let bindings =
+                    configured_instance_bindings(instance, strategy.input_requirements())?;
+                for input in &instance.historical_inputs {
+                    let snapshot =
+                        calendar_input_snapshot(input, &instance.symbol, &instance.instance_id);
+                    if !input_projectors.contains(&snapshot) {
+                        input_projectors.push(snapshot);
+                    }
+                }
                 series_by_symbol.insert(instance.instance_id.clone(), snapshot_bindings(&bindings));
                 let start = bindings
                     .warmup_start(window.from())
-                    .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                    .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?
+                    .min(configured_instance_history_start(instance, window.from())?);
                 let descriptor = StrategyDescriptor::new(
                     StrategyId::new(instance.document.strategy_id.clone())
                         .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?,
@@ -701,13 +784,16 @@ pub fn run_heterogeneous_portfolios_controlled(
                     instance.document.title.clone(),
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
-                let adapter = BacktestConfiguredStrategyAdapter::new(
+                let mut adapter = BacktestConfiguredStrategyAdapter::new(
                     strategy,
                     descriptor,
                     bindings,
                     base.decision_latency_ms,
                 )
                 .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                if !instance.historical_inputs.is_empty() {
+                    adapter.set_evaluation_start(Some(window.from()));
+                }
                 let analysis = AnalysisPipeline::new(
                     vec![],
                     ObservationStoreLimits::default(),
@@ -827,7 +913,7 @@ pub fn run_heterogeneous_portfolios_controlled(
             registered_factory: None,
             series_by_symbol: BTreeMap::new(),
             series_by_instance: series_by_symbol,
-            input_projectors: Vec::new(),
+            input_projectors,
             admission_error: None,
         };
         let experiment = ExperimentRecipe {

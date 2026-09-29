@@ -25,7 +25,9 @@ use qs_backtest::{
     SeriesGeometry, StrategyDescriptor, StrategyId, StrategyRetentionLimits, Timeframe, VecFeed,
 };
 use qs_research::{DataWindow, DeclaredSpace, ResearchPlan, StrategyFamily, WindowPlan, run_batch};
-use qs_strategy::{ConfiguredStrategy, MaterialLibrary, SourceId, StrategyConfig};
+use qs_strategy::{
+    ConfiguredStrategy, Expr, MaterialLibrary, ScalarType, SourceId, StrategyConfig, ValueType,
+};
 use qs_symbols::SymbolRegistry;
 
 const EXCHANGE: &str = "fixture";
@@ -234,6 +236,7 @@ fn run_request(document: serde_json::Value) -> RunConfiguredStrategyRequest {
                 sources: vec![primary_source()],
                 instance_id: None,
                 decision_latency_ms: 0,
+                historical_inputs: None,
             },
             profile: None,
             profile_def: None,
@@ -268,6 +271,56 @@ fn account_plan() -> RunCurrencyPlan {
 }
 
 /// The same run done in process over the same stored ticks.
+fn configured_calendar_inputs() -> HistoricalInputsMsg {
+    HistoricalInputsMsg {
+        calendars: BTreeMap::from([(
+            "main".into(),
+            TradingCalendarMsg {
+                id: "main".into(),
+                timezone: "UTC".into(),
+                day_boundary: "00:00:00".into(),
+                sessions: SessionScheduleMsg::FullDay,
+                market: MarketScheduleMsg::Continuous,
+            },
+        )]),
+        inputs: vec![CalendarInputMsg {
+            name: "in_full_day".into(),
+            source: "primary".into(),
+            calendar: "main".into(),
+            feature: CalendarFeatureMsg::SessionMembership,
+            session: None,
+            time_basis: CalendarTimeBasisMsg::DecisionTime,
+            opening_range_minutes: 5,
+            child_seconds: 60,
+            alignment_offset_seconds: 0,
+            maximum_history: 2,
+        }],
+        limits: None,
+    }
+}
+
+fn document_requiring_calendar_input() -> StrategyConfig {
+    let mut document = bound_document();
+    let entry = document
+        .states
+        .iter_mut()
+        .find(|state| state.id == "flat")
+        .and_then(|state| state.transitions.first_mut())
+        .unwrap();
+    entry.when = Expr::All {
+        items: vec![
+            entry.when.clone(),
+            Expr::IsPresent {
+                value: Box::new(Expr::Input {
+                    field: "in_full_day".into(),
+                    value_type: ValueType::optional(ScalarType::Bool),
+                }),
+            },
+        ],
+    };
+    document
+}
+
 fn in_process_run(fixture: &Fixture, document: StrategyConfig) -> qs_backtest::BacktestResult {
     let strategy = ConfiguredStrategy::compile(
         document.clone(),
@@ -365,6 +418,27 @@ fn service_run_matches_the_in_process_run_and_returns_the_strategy_output() {
     );
     assert_eq!(output.requirements["entries"][0]["slot"], "primary");
     assert!(!output.decisions["records"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn document_driven_calendar_input_runs_without_a_registered_strategy_factory() {
+    let fixture = fixture();
+    let document = document_requiring_calendar_input();
+    let mut request = run_request(document_value(&document));
+    request.request.strategy.historical_inputs = Some(configured_calendar_inputs());
+    let response = handle_run_configured_strategy(&fixture.state, &request);
+    assert!(response.success, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert!(result.total_positions > 0);
+    let output = result.strategy.unwrap();
+    assert!(output.historical_inputs.is_some());
+    assert_eq!(output.document, document_value(&document));
+
+    let mut missing_bound = request;
+    missing_bound.request.from = None;
+    let rejected = handle_run_configured_strategy(&fixture.state, &missing_bound);
+    assert!(!rejected.success);
+    assert!(rejected.error.unwrap().contains("finite from and to"));
 }
 
 #[test]
@@ -1079,6 +1153,7 @@ fn service_maps_heterogeneous_portfolio_candidates_into_shared_account_search() 
             sources: vec![primary_source()],
             instance_id: Some(id.into()),
             decision_latency_ms: 0,
+            historical_inputs: None,
         },
         profile: None,
         profile_def: None,
@@ -1138,6 +1213,7 @@ fn service_maps_mixed_configured_and_trusted_direct_portfolio_candidates() {
                 sources: vec![primary_source()],
                 instance_id: Some("configured".into()),
                 decision_latency_ms: 0,
+                historical_inputs: None,
             },
             profile: None,
             profile_def: None,

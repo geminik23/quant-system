@@ -7,6 +7,7 @@
 //! `resume-final`. The data is deterministic synthetic input and carries no economic claim.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -123,6 +124,51 @@ fn windows() -> WindowPlan {
 
 fn family() -> EmaCrossFamily {
     EmaCrossFamily::new(3..=3, 8..=8, vec![10], Timeframe::minutes(1).unwrap()).with_atr_period(3)
+}
+
+#[derive(Clone)]
+struct CachedWorkflowFamily(EmaCrossFamily);
+
+impl StrategyFamily for CachedWorkflowFamily {
+    type Params = <EmaCrossFamily as StrategyFamily>::Params;
+
+    fn family_id(&self) -> &str {
+        "cached_workflow"
+    }
+
+    fn points(&self) -> Vec<Self::Params> {
+        self.0.points()
+    }
+
+    fn parameter_binding(&self, point: &Self::Params) -> ParameterBinding {
+        self.0.parameter_binding(point)
+    }
+
+    fn config(&self, point: &Self::Params) -> StrategyConfig {
+        let mut config = self.0.config(point);
+        let transition = config
+            .states
+            .iter_mut()
+            .find(|state| state.id == "flat")
+            .and_then(|state| state.transitions.first_mut())
+            .expect("EMA family entry transition");
+        transition.when = Expr::All {
+            items: vec![
+                transition.when.clone(),
+                Expr::IsPresent {
+                    value: Box::new(Expr::Input {
+                        field: "cached_midpoint".into(),
+                        value_type: ValueType::optional(ScalarType::Price),
+                    }),
+                },
+            ],
+        };
+        config
+    }
+
+    fn geometry(&self, symbol: &str, point: &Self::Params) -> Vec<SeriesGeometry> {
+        self.0.geometry(symbol, point)
+    }
 }
 
 fn plan() -> ResearchPlan {
@@ -283,6 +329,7 @@ fn mixed() -> Result<(), Box<dyn std::error::Error>> {
         symbol: SYMBOL.into(),
         document: family.config(&point),
         geometry: family.geometry(SYMBOL, &point),
+        historical_inputs: vec![],
         profiles: None,
     };
     let direct = HeterogeneousDirectInstanceSpec {
@@ -448,18 +495,41 @@ fn cache() -> Result<(), Box<dyn std::error::Error>> {
         clock: "event_availability".into(),
         availability_policy: "actual".into(),
     };
-    let bytes = FeatureCache::entry_bytes_upper_bound(&key, events.len())?;
+    let bytes = FeatureCache::entry_bytes_upper_bound(&key, events.len())? + 4096;
+    let consumer_bytes = events.len() * std::mem::size_of::<Option<f64>>();
     let mut cache = FeatureCache::new(bytes)?;
+    let view = AdmittedMarketView::new("synthetic", SYMBOL, at(0), at(620), events.clone())?;
     let started = Instant::now();
-    let produced = cached_market_midpoints(&mut cache, key.clone(), &events)?;
+    let produced =
+        cached_market_midpoints_for_view(&mut cache, &view, key.clone(), consumer_bytes)?;
     let produced_micros = started.elapsed().as_micros();
     let started = Instant::now();
-    let reused = cached_market_midpoints(&mut cache, key, &events)?;
+    let reused = cached_market_midpoints_for_view(&mut cache, &view, key, consumer_bytes)?;
     let clone_micros = started.elapsed().as_micros();
-    assert_eq!(produced, reused);
+    assert!(!produced.cache_hit && reused.cache_hit);
+    assert_eq!(produced.values, reused.values);
+    let samples = project_cached_midpoints_to_bars(&view, &reused.values, 60, 0)?;
+    let projected = ProjectedStrategyFamily::new(
+        CachedWorkflowFamily(family()),
+        vec![NamedProjectorSelection::CachedMidpoint(
+            CachedMidpointProjectorSelection {
+                name: "cached_midpoint".into(),
+                source: "primary".into(),
+                view_reference: "synthetic".into(),
+                samples: Arc::new(samples),
+            },
+        )],
+    )?;
+    let batch = run_batch(
+        &plan(),
+        &projected,
+        &BTreeMap::from([(SYMBOL.into(), events)]),
+    )?;
+    assert!(!batch.position_outcomes().is_empty());
     println!(
-        "feature cache values: {}, produce_us: {}, staged_clone_us: {}",
-        produced.len(),
+        "feature cache values: {}, replay_rows: {}, produce_us: {}, hit_clone_us: {}",
+        produced.values.len(),
+        batch.rows().len(),
         produced_micros,
         clone_micros
     );

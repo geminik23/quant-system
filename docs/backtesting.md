@@ -178,7 +178,11 @@ A configured source is fed either by ticks or by stored bars, never both. A lega
 
 An open trade slot reports the entry fill time, the campaign's favorable and adverse excursion in account currency, and a positive initial risk on the same basis completed positions use for R. Excursion is read as of the start of the boundary's batch, before that batch's own quotes are marked, so the value never includes a price the strategy's bars do not yet include; it is missing until the position has been marked once. `bars_since_open` counts completed bars of one source after entry, and `weekday` and `seconds_of_day` follow the input time. `FixedUtcSessionProjector` is a neutral named-input projector that reports whether the boundary lies inside fixed UTC windows; venue or daylight-saving sessions remain caller-owned projectors.
 
-Neutral conformance covers no-op, EMA crossover, EMA/ATR lifecycle, pending cancellation, custom materials, routed and run-default profile parity with direct signals, profile preflight rejection, stored-bar and tick parity of completed bars and decisions, open-position time, excursion, and initial-risk rules at exact boundaries, calendar and session inputs, final feedback, direct-signal economic parity, aligned-EOD materialized/streaming full-result parity, and strict research serde. Live runtime orchestration and persisted configured state remain unavailable.
+Configured run and portfolio instance documents may include strict `historical_inputs`. A selected calendar requires an explicit IANA timezone; omitting its sessions creates one `full_day` analytical session, while custom mode replaces that default with bounded named sessions. The adapter loads the required prior history, continues indicator/calendar ingestion before the requested `from`, and suppresses configured state transitions and commands until the evaluation boundary. Exact previous-period and final opening-range values require an explicit market-availability schedule and complete aligned children. Session definitions do not filter the market feed or create automatic entries, exits, daily-loss resets, or swap boundaries.
+
+The same server binary accepts different configured strategy documents and historical-input blocks without registering a strategy name. A single/portfolio request selecting these inputs must provide finite `from` and `to`; malformed or oversized definitions reject before data loading. Search calendars belong to the strict space document rather than a competing run-level override. The optional direct-Rust catalog remains a separate trusted-code extension and its bundled no-op entry is conformance only.
+
+Neutral conformance covers no-op, EMA crossover, EMA/ATR lifecycle, pending cancellation, custom materials, routed and run-default profile parity with direct signals, profile preflight rejection, stored-bar and tick parity of completed bars and decisions, open-position time, excursion, initial-risk rules, document-driven full-day/custom calendar inputs, final feedback, direct-signal economic parity, aligned-EOD materialized/streaming parity, and strict research serde. Live runtime orchestration and persisted configured state remain unavailable.
 
 ## Portfolios of configured strategies
 
@@ -262,7 +266,7 @@ max_loss = { account_percent = 2.0 }
 reset_at_utc = "22:00:00"
 ```
 
-The `[strategies]` section of the server configuration bounds document size, retained history per run, search workers, search runs, and portfolio instances.
+The `[strategies]` section of the server configuration bounds document size, retained source history, search workers/runs, portfolio instances, and calendar sessions, intervals, exceptions, history, resolved children, and owned bytes. Request calendar limits may tighten but cannot exceed those caps.
 
 ## Operational boundaries
 

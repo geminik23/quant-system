@@ -3,6 +3,8 @@ use chrono::NaiveDateTime;
 use qs_backtest::evaluation::PositionOutcome;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FeatureCacheKey {
     pub dataset_reference: String,
@@ -128,6 +130,9 @@ impl FeatureCache {
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
     }
+    pub fn maximum_bytes(&self) -> usize {
+        self.maximum_bytes
+    }
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -191,6 +196,179 @@ fn compact_key(key: &mut FeatureCacheKey) {
         .collect();
 }
 
+static NEXT_MARKET_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct AdmittedMarketView {
+    authority: u64,
+    dataset_reference: String,
+    symbol: String,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+    events: Arc<[qs_backtest::data_feed::FeedEvent]>,
+}
+
+impl AdmittedMarketView {
+    pub fn new(
+        dataset_reference: impl Into<String>,
+        symbol: impl Into<String>,
+        from: NaiveDateTime,
+        to: NaiveDateTime,
+        events: Arc<[qs_backtest::data_feed::FeedEvent]>,
+    ) -> Result<Self, ResearchError> {
+        let dataset_reference = dataset_reference.into();
+        let symbol = symbol.into();
+        if dataset_reference.is_empty()
+            || dataset_reference.len() > MAX_CACHE_KEY_TEXT_BYTES
+            || symbol.is_empty()
+            || symbol.len() > MAX_CACHE_KEY_TEXT_BYTES
+            || to <= from
+            || events.is_empty()
+        {
+            return Err(ResearchError::InvalidPlan(
+                "immutable market view identity, range, and events are required".into(),
+            ));
+        }
+        let mut previous = None;
+        for event in events.iter() {
+            if event.event.symbol() != symbol
+                || event.available_at() < from
+                || event.available_at() >= to
+                || previous.is_some_and(|value| event.available_at() < value)
+            {
+                return Err(ResearchError::InvalidPlan(
+                    "immutable market view events differ from its admitted symbol, range, or order"
+                        .into(),
+                ));
+            }
+            previous = Some(event.available_at());
+        }
+        let authority = NEXT_MARKET_VIEW_ID.fetch_add(1, Ordering::Relaxed);
+        if authority == 0 {
+            return Err(ResearchError::InvalidPlan(
+                "immutable market view authority overflowed".into(),
+            ));
+        }
+        Ok(Self {
+            authority,
+            dataset_reference,
+            symbol,
+            from,
+            to,
+            events,
+        })
+    }
+
+    pub fn events(&self) -> &[qs_backtest::data_feed::FeedEvent] {
+        &self.events
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CachedFeatureSample {
+    pub value: Option<f64>,
+    pub available_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedFeatureValues {
+    pub values: Vec<Option<f64>>,
+    pub cache_hit: bool,
+}
+
+pub fn project_cached_midpoints_to_bars(
+    view: &AdmittedMarketView,
+    values: &[Option<f64>],
+    timeframe_seconds: u64,
+    alignment_offset_seconds: i64,
+) -> Result<BTreeMap<NaiveDateTime, CachedFeatureSample>, ResearchError> {
+    if values.len() != view.events.len() {
+        return Err(ResearchError::InvalidPlan(
+            "cached feature values differ from the admitted event count".into(),
+        ));
+    }
+    let duration = i64::try_from(timeframe_seconds)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ResearchError::InvalidPlan("feature timeframe is invalid".into()))?;
+    let mut samples = BTreeMap::new();
+    for (event, value) in view.events.iter().zip(values.iter().copied()) {
+        let timestamp = event.event.ts().and_utc().timestamp();
+        let bucket = (timestamp - alignment_offset_seconds)
+            .div_euclid(duration)
+            .checked_mul(duration)
+            .and_then(|value| value.checked_add(alignment_offset_seconds))
+            .and_then(|value| chrono::DateTime::from_timestamp(value, 0))
+            .map(|value| value.naive_utc())
+            .ok_or_else(|| ResearchError::InvalidPlan("feature bucket overflowed".into()))?;
+        samples.insert(
+            bucket,
+            CachedFeatureSample {
+                value,
+                available_at: event.available_at(),
+            },
+        );
+    }
+    Ok(samples)
+}
+
+pub fn cached_market_midpoints_for_view(
+    cache: &mut FeatureCache,
+    view: &AdmittedMarketView,
+    mut key: FeatureCacheKey,
+    maximum_consumer_bytes: usize,
+) -> Result<CachedFeatureValues, ResearchError> {
+    if maximum_consumer_bytes == 0 {
+        return Err(ResearchError::InvalidPlan(
+            "cache consumer byte limit must be positive".into(),
+        ));
+    }
+    key.dataset_reference = view.dataset_reference.clone();
+    key.symbol = view.symbol.clone();
+    key.from = view.from;
+    key.to = view.to;
+    key.parameters
+        .insert("admitted_view_authority".into(), view.authority.to_string());
+    validate_key(&key)?;
+    if key.output != "midpoint"
+        || key.price_basis != "mid"
+        || key.seed_policy != "none"
+        || key.missing_policy != "explicit"
+        || key.availability_policy != "actual"
+    {
+        return Err(ResearchError::InvalidPlan(
+            "unsupported admitted midpoint calculation contract".into(),
+        ));
+    }
+    let entry_bytes = FeatureCache::entry_bytes_upper_bound(&key, view.events.len())?;
+    let consumer_bytes = view
+        .events
+        .len()
+        .checked_mul(std::mem::size_of::<Option<f64>>())
+        .ok_or_else(|| ResearchError::InvalidPlan("cache consumer byte count overflowed".into()))?;
+    if entry_bytes > cache.maximum_bytes() || consumer_bytes > maximum_consumer_bytes {
+        return Err(ResearchError::InvalidPlan(
+            "market feature exceeds retained or consumer byte admission".into(),
+        ));
+    }
+    if let Some(values) = cache.get(&key) {
+        return Ok(CachedFeatureValues {
+            values: values.to_vec(),
+            cache_hit: true,
+        });
+    }
+    let values = produce_market_midpoints(&key, view.events())?;
+    cache.insert(key.clone(), values)?;
+    let values = cache
+        .get(&key)
+        .ok_or_else(|| ResearchError::InvalidPlan("inserted cache value is missing".into()))?
+        .to_vec();
+    Ok(CachedFeatureValues {
+        values,
+        cache_hit: false,
+    })
+}
+
 /// Produce one immutable market-only midpoint series and reuse it only under the full cache key.
 pub fn cached_market_midpoints(
     cache: &mut FeatureCache,
@@ -206,6 +384,15 @@ pub fn cached_market_midpoints(
     if let Some(values) = cache.get(&key) {
         return Ok(values.to_vec());
     }
+    let values = produce_market_midpoints(&key, events)?;
+    cache.insert(key.clone(), values.clone())?;
+    Ok(values)
+}
+
+fn produce_market_midpoints(
+    key: &FeatureCacheKey,
+    events: &[qs_backtest::data_feed::FeedEvent],
+) -> Result<Vec<Option<f64>>, ResearchError> {
     let mut values = Vec::with_capacity(events.len());
     for event in events {
         if event.event.symbol() != key.symbol
@@ -225,7 +412,6 @@ pub fn cached_market_midpoints(
                 .then_some(quote.bid / 2.0 + quote.ask / 2.0),
         );
     }
-    cache.insert(key.clone(), values.clone())?;
     Ok(values)
 }
 
@@ -433,14 +619,30 @@ impl SearchCheckpoint {
                 "checkpoint run cannot be completed and failed".into(),
             ));
         }
-        if self
-            .committed_runs
-            .keys()
-            .any(|run| !self.completed_runs.contains(run))
+        if self.completed_runs.len() != self.committed_runs.len()
+            || self
+                .completed_runs
+                .iter()
+                .any(|run| !self.committed_runs.contains_key(run))
         {
             return Err(ResearchError::InvalidPlan(
-                "checkpoint outcome must belong to a completed run".into(),
+                "every completed checkpoint run must retain one committed outcome".into(),
             ));
+        }
+        for (ordinal, committed) in &self.committed_runs {
+            if committed.recipe.ordinal != *ordinal {
+                return Err(ResearchError::InvalidPlan(
+                    "committed checkpoint run recipe ordinal is inconsistent".into(),
+                ));
+            }
+            if !self
+                .candidate_recipes
+                .contains_key(&committed.recipe.candidate_ordinal)
+            {
+                return Err(ResearchError::InvalidPlan(
+                    "committed checkpoint run has no retained candidate recipe".into(),
+                ));
+            }
         }
         if self
             .completed_candidates

@@ -1,7 +1,9 @@
 use chrono::{Duration, NaiveDate};
+use qs_backtest::data_feed::{EventMetadata, FeedEvent, MarketEvent, SeriesRoles};
 use qs_backtest::evaluation::PositionOutcome;
 use qs_research::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 fn start() -> chrono::NaiveDateTime {
     NaiveDate::from_ymd_opt(2026, 1, 1)
         .unwrap()
@@ -58,6 +60,37 @@ fn empty_cache_values_still_consume_key_and_container_budget() {
     assert!(cache.insert(oversized, vec![]).is_err());
 }
 #[test]
+fn admitted_view_rejects_retained_and_consumer_budgets_before_cache_insertion() {
+    let events = Arc::<[FeedEvent]>::from(vec![FeedEvent::new(
+        MarketEvent::Tick {
+            symbol: "EURUSD".into(),
+            ts: start(),
+            bid: 1.0,
+            ask: 1.2,
+        },
+        EventMetadata::new(SeriesRoles::PRIMARY, 0, 0),
+    )]);
+    let view = AdmittedMarketView::new(
+        "dataset",
+        "EURUSD",
+        start(),
+        start() + Duration::minutes(1),
+        events,
+    )
+    .unwrap();
+    let mut cache = FeatureCache::new(1).unwrap();
+    let mut admitted_key = key("midpoint");
+    admitted_key.price_basis = "mid".into();
+    admitted_key.seed_policy = "none".into();
+    admitted_key.missing_policy = "explicit".into();
+    admitted_key.availability_policy = "actual".into();
+    let error = cached_market_midpoints_for_view(&mut cache, &view, admitted_key, 1).unwrap_err();
+    assert!(error.to_string().contains("byte admission"));
+    assert!(cache.is_empty());
+    assert_eq!(cache.used_bytes(), 0);
+}
+
+#[test]
 fn traces_bound_records_and_bytes_without_changing_economic_state() {
     let limits = TraceLimits::new(1, 4096).unwrap();
     let mut trace = BoundedTrace::default();
@@ -98,7 +131,7 @@ fn checkpoint_resume_rejects_dependency_changes_and_overlap() {
         frozen_selection: None,
         frontier: 7,
         completed_candidates: BTreeSet::from([1, 2]),
-        completed_runs: BTreeSet::from([1, 2]),
+        completed_runs: BTreeSet::new(),
         committed_runs: BTreeMap::new(),
         failures: BTreeMap::from([(3, "failed".into())]),
         generated: 8,
@@ -112,10 +145,14 @@ fn checkpoint_resume_rejects_dependency_changes_and_overlap() {
         SearchCheckpoint::decode(&bytes, limits, &dependency).unwrap(),
         checkpoint
     );
+    let mut missing_outcome = checkpoint.clone();
+    missing_outcome.completed_runs.insert(1);
+    assert!(missing_outcome.validate(limits).is_err());
     let mut changed = dependency.clone();
     changed.caller_revision = "r2".into();
     assert!(SearchCheckpoint::decode(&bytes, limits, &changed).is_err());
     let mut overlap = checkpoint;
+    overlap.completed_runs.insert(1);
     overlap.failures.insert(1, "duplicate".into());
     assert!(overlap.validate(limits).is_err());
 }

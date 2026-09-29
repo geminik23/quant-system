@@ -7,12 +7,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use qs_backtest::data_feed::FallibleBatchFeed;
 use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BarSeriesSpec,
-    ConfiguredHistoricalBindings, ConfiguredInstance, ConfiguredStrategyAdapterError,
-    HistoricalStrategy, MAX_PORTFOLIO_INSTANCES, MissingIntervalPolicy, ObservationStoreLimits,
-    PortfolioReplayError, PriceBasis, RunCurrencyPlan, SeriesGeometry, SeriesId, SeriesRequirement,
-    StrategyContext, StrategyDescriptor, StrategyEvent, StrategyId, StrategyOutput,
-    StrategyReplayError, StrategyRequirements, StrategyRetentionLimits,
-    Timeframe as SeriesTimeframe, WarmupRequirement,
+    CalendarAdmissionLimits, CalendarFeatureKind, CalendarInputSpec, CalendarTimeBasis,
+    ConfiguredCalendarInput, ConfiguredHistoricalBindings, ConfiguredInstance,
+    ConfiguredStrategyAdapterError, HistoricalStrategy, LocalMarketIntervalSpec,
+    MAX_PORTFOLIO_INSTANCES, MarketScheduleSpec, MissingIntervalPolicy, NamedSessionSpec,
+    ObservationStoreLimits, PortfolioReplayError, PriceBasis, RunCurrencyPlan, SeriesGeometry,
+    SeriesId, SeriesRequirement, SessionScheduleSpec, SessionSpanSpec, StrategyContext,
+    StrategyDescriptor, StrategyEvent, StrategyId, StrategyOutput, StrategyReplayError,
+    StrategyRequirements, StrategyRetentionLimits, Timeframe as SeriesTimeframe,
+    TradingCalendarSpec, WarmupRequirement, WeeklyMarketIntervalSpec,
 };
 use qs_market_loader::{
     MarketLoadLimits, MarketStreamError, open_ordered_stored_tick_stream, open_price_bar_stream,
@@ -29,7 +32,8 @@ use qs_research::{
     load_symbol_bars, load_symbol_ticks, run_batch_controlled_with_experiment_resume,
     run_direct_factory_batch_controlled_resume, run_execution_variants_controlled,
     run_heterogeneous_portfolios_controlled, run_mixed_heterogeneous_portfolios,
-    validate_bar_window_alignment_with_limits, validate_batch_with_limits,
+    selected_candidate_data_range, validate_bar_window_alignment_with_limits,
+    validate_batch_with_limits,
 };
 use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
 use qs_strategy::{
@@ -62,6 +66,8 @@ pub struct AcceptedConfiguredRun {
     future: FutureQuoteConfigMsg,
     evaluation: ProviderEvaluationOptionsMsg,
     profiles: PreparedEntryProfiles,
+    historical_inputs: Vec<ConfiguredCalendarInput>,
+    historical_inputs_value: Option<serde_json::Value>,
     delivery: ResultDeliveryMsg,
 }
 
@@ -267,11 +273,59 @@ impl StrategyFamily for SearchFamily {
             _ => unreachable!(),
         }
     }
+    fn history_start(
+        &self,
+        symbol: &str,
+        point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+    ) -> std::result::Result<NaiveDateTime, String> {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => {
+                value.history_start(symbol, point, evaluation_start)
+            }
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.history_start(symbol, point, evaluation_start)
+            }
+            _ => Ok(evaluation_start),
+        }
+    }
+    fn history_start_for_requirements(
+        &self,
+        symbol: &str,
+        point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+        requirements: &ConfiguredStrategyRequirements,
+    ) -> std::result::Result<NaiveDateTime, String> {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => {
+                value.history_start_for_requirements(symbol, point, evaluation_start, requirements)
+            }
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.history_start_for_requirements(symbol, point, evaluation_start, requirements)
+            }
+            _ => Ok(evaluation_start),
+        }
+    }
     fn library(&self) -> MaterialLibrary {
         match self {
             Self::Declared(value) => value.library(),
             Self::Structural(value) => value.library(),
             Self::Direct => MaterialLibrary::builtins(),
+        }
+    }
+    fn input_projector_recipe(
+        &self,
+        symbol: &str,
+        point: &Self::Params,
+    ) -> Vec<qs_research::InputProjectorSnapshot> {
+        match (self, point) {
+            (Self::Declared(value), SearchPoint::Declared(point)) => {
+                value.input_projector_recipe(symbol, point)
+            }
+            (Self::Structural(value), SearchPoint::Structural(point)) => {
+                value.input_projector_recipe(symbol, point)
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -426,12 +480,27 @@ fn prepare_configured_run(
         .iter()
         .map(|binding| geometry_from_msg(binding, &symbol, bar_seconds))
         .collect::<Result<Vec<_>>>()?;
+    let from = parse_optional_datetime(&spec.from)?;
+    let to = parse_optional_datetime(&spec.to)?;
+    if let (Some(from), Some(to)) = (from, to)
+        && from >= to
+    {
+        return Err(invalid(format!("from {from} must be before to {to}")));
+    }
+    let historical_inputs =
+        historical_inputs_from_msg(spec.strategy.historical_inputs.as_ref(), limits)?;
+    if !historical_inputs.is_empty() && (from.is_none() || to.is_none()) {
+        return Err(invalid(
+            "configured historical inputs require finite from and to bounds".into(),
+        ));
+    }
     let adapter = build_adapter(
         &document,
         &instance_id,
         &symbol,
         geometry.clone(),
         spec.strategy.decision_latency_ms,
+        &historical_inputs,
         limits,
     )?;
     let profiles = resolve_entry_profiles(
@@ -451,13 +520,6 @@ fn prepare_configured_run(
     let symbols = [symbol.clone()];
     config_from_msg(&spec.config, &state.symbol_registry, &symbols)?;
     evaluation_options_from_msg_for_symbols(&req.evaluation, &state.symbol_registry, &symbols)?;
-    let from = parse_optional_datetime(&spec.from)?;
-    let to = parse_optional_datetime(&spec.to)?;
-    if let (Some(from), Some(to)) = (from, to)
-        && from >= to
-    {
-        return Err(invalid(format!("from {from} must be before to {to}")));
-    }
     if bar_seconds.is_some() {
         validate_server_bar_bounds("configured run", &geometry, from, to)?;
     }
@@ -480,6 +542,14 @@ fn prepare_configured_run(
         future: req.future.clone(),
         evaluation: req.evaluation.clone(),
         profiles,
+        historical_inputs_value: spec
+            .strategy
+            .historical_inputs
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+        historical_inputs,
         delivery: req.result_delivery,
     })
 }
@@ -497,8 +567,12 @@ fn execute_configured_run(
         &run.symbol,
         run.geometry.clone(),
         run.decision_latency_ms,
+        &run.historical_inputs,
         &state.strategies.limits,
     )?;
+    if !run.historical_inputs.is_empty() {
+        adapter.set_evaluation_start(run.from);
+    }
     let loading_start = match run.from {
         Some(from) => Some(
             ConfiguredHistoricalBindings::from_geometry(
@@ -506,7 +580,8 @@ fn execute_configured_run(
                 adapter.configured_requirements(),
             )
             .and_then(|bindings| bindings.warmup_start(from))
-            .map_err(|error| invalid(error.to_string()))?,
+            .map_err(|error| invalid(error.to_string()))?
+            .min(configured_history_start(&run.historical_inputs, from)?),
         ),
         None => None,
     };
@@ -631,6 +706,7 @@ fn execute_configured_run(
             .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
         research: serde_json::to_value(&output.research)
             .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+        historical_inputs: run.historical_inputs_value.clone(),
     });
     Ok(message)
 }
@@ -646,6 +722,14 @@ fn requirements_value(
             .map(|item| serde_json::json!({
                 "source": item.source.as_str(),
                 "required_lookback": item.required_lookback,
+            }))
+            .collect::<Vec<_>>(),
+        "named_inputs": requirements
+            .named_inputs
+            .iter()
+            .map(|item| serde_json::json!({
+                "name": item.name,
+                "value_type": format!("{:?}", item.value_type).to_lowercase(),
             }))
             .collect::<Vec<_>>(),
         "trade_slots": requirements.trade_slots,
@@ -748,6 +832,8 @@ struct AcceptedPortfolioInstance {
     instance_id: String,
     decision_latency_ms: u64,
     profiles: PreparedEntryProfiles,
+    historical_inputs: Vec<ConfiguredCalendarInput>,
+    historical_inputs_value: Option<serde_json::Value>,
 }
 
 /// A validated portfolio run, kept until its worker starts.
@@ -907,12 +993,16 @@ fn prepare_portfolio_run(
             .map(|binding| geometry_from_msg(binding, &symbol, bar_seconds))
             .collect::<Result<Vec<_>>>()
             .map_err(context)?;
+        let historical_inputs =
+            historical_inputs_from_msg(item.strategy.historical_inputs.as_ref(), limits)
+                .map_err(context)?;
         let adapter = build_adapter(
             &document,
             &instance_id,
             &symbol,
             geometry.clone(),
             item.strategy.decision_latency_ms,
+            &historical_inputs,
             limits,
         )
         .map_err(context)?;
@@ -944,6 +1034,14 @@ fn prepare_portfolio_run(
             instance_id,
             decision_latency_ms: item.strategy.decision_latency_ms,
             profiles,
+            historical_inputs_value: item
+                .strategy
+                .historical_inputs
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| BacktestServerError::Serde(error.to_string()))?,
+            historical_inputs,
         });
     }
     if retained > limits.max_retained_bars {
@@ -1001,6 +1099,15 @@ fn prepare_portfolio_run(
     {
         return Err(invalid(format!("from {from} must be before to {to}")));
     }
+    if instances
+        .iter()
+        .any(|instance| !instance.historical_inputs.is_empty())
+        && (from.is_none() || to.is_none())
+    {
+        return Err(invalid(
+            "portfolio historical inputs require finite from and to bounds".into(),
+        ));
+    }
     if bar_seconds.is_some() {
         for (index, instance) in instances.iter().enumerate() {
             validate_server_bar_bounds(
@@ -1047,15 +1154,21 @@ fn execute_portfolio_run(
             &instance.symbol,
             instance.geometry.clone(),
             instance.decision_latency_ms,
+            &instance.historical_inputs,
             &state.strategies.limits,
         )?;
+        let mut adapter = adapter;
+        if !instance.historical_inputs.is_empty() {
+            adapter.set_evaluation_start(run.from);
+        }
         if let Some(from) = run.from {
             let start = ConfiguredHistoricalBindings::from_geometry(
                 instance.geometry.clone(),
                 adapter.configured_requirements(),
             )
             .and_then(|bindings| bindings.warmup_start(from))
-            .map_err(|error| invalid(error.to_string()))?;
+            .map_err(|error| invalid(error.to_string()))?
+            .min(configured_history_start(&instance.historical_inputs, from)?);
             loading_start = Some(loading_start.map_or(start, |current| current.min(start)));
             instance_starts.push(Some(start));
         } else {
@@ -1216,6 +1329,7 @@ fn execute_portfolio_run(
                 data_mode: data_mode(&run.data_type).into(),
                 decisions: to_json(&instance.decisions)?,
                 research: to_json(&instance.research)?,
+                historical_inputs: accepted.historical_inputs_value.clone(),
             },
         });
     }
@@ -1508,6 +1622,21 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
                 .map_err(research_error)
         })
         .transpose()?;
+    if let Some(declared) = &declared {
+        declared
+            .validate_calendar_limits(
+                CalendarAdmissionLimits::new(
+                    limits.max_calendar_sessions,
+                    limits.max_calendar_intervals,
+                    limits.max_calendar_exceptions,
+                    limits.max_calendar_history,
+                    limits.max_calendar_children,
+                    limits.max_calendar_bytes,
+                )
+                .map_err(|error| invalid(error.to_string()))?,
+            )
+            .map_err(invalid)?;
+    }
     let mut checkpoint_limits =
         CheckpointLimits::new(limits.max_document_bytes, limits.max_search_runs)
             .map_err(research_error)?;
@@ -1568,6 +1697,9 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
         };
         let (generated, generation) =
             GeneratedStructuralFamily::new(&structural).map_err(research_error)?;
+        let generated = generated
+            .with_projectors(declared.projector_selections().map_err(invalid)?)
+            .map_err(research_error)?;
         (
             SearchFamily::Structural(generated),
             Some(
@@ -1679,12 +1811,15 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
                 .iter()
                 .map(|binding| geometry_from_msg(binding, &symbol, bar_seconds))
                 .collect::<Result<Vec<_>>>()?;
+            let historical_inputs =
+                historical_inputs_from_msg(item.strategy.historical_inputs.as_ref(), limits)?;
             let adapter = build_adapter(
                 &document,
                 &instance_id,
                 &symbol,
                 geometry.clone(),
                 item.strategy.decision_latency_ms,
+                &historical_inputs,
                 limits,
             )?;
             let profiles = resolve_entry_profiles(
@@ -1701,6 +1836,7 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
                 symbol,
                 document,
                 geometry,
+                historical_inputs,
                 profiles: (!profiles.is_empty()).then_some(profiles),
             });
         }
@@ -1939,7 +2075,9 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
             "the structural search exceeds its declared run limit".into(),
         ));
     }
-    let range = if direct_factory.is_some() {
+    let mut range = if let Some(selected) = &selected_rerun {
+        selected_candidate_data_range(&selected.candidate, &selected.run).map_err(research_error)?
+    } else if direct_factory.is_some() {
         let pairs = plan
             .window_plan
             .pairs_with_limit(admission_limits.max_window_pairs)
@@ -1963,6 +2101,43 @@ fn prepare_search(state: &ServerState, req: &SubmitSearchRequest) -> Result<Acce
             .map_err(research_error)?
             .ok_or_else(|| invalid("the search schedules no runs".into()))?
     };
+    let windows = plan
+        .window_plan
+        .pairs_with_limit(admission_limits.max_window_pairs)
+        .map_err(research_error)?;
+    for instance in portfolio_candidates
+        .iter()
+        .flat_map(|candidate| candidate.instances.iter())
+        .chain(
+            mixed_portfolio_candidates
+                .iter()
+                .flat_map(|candidate| candidate.configured.iter()),
+        )
+    {
+        let adapter = build_adapter(
+            &instance.document,
+            &instance.instance_id,
+            &instance.symbol,
+            instance.geometry.clone(),
+            plan.decision_latency_ms,
+            &instance.historical_inputs,
+            limits,
+        )?;
+        for window in windows
+            .iter()
+            .flat_map(|pair| [&pair.in_sample, &pair.out_of_sample])
+        {
+            let source_start = ConfiguredHistoricalBindings::from_geometry(
+                instance.geometry.clone(),
+                adapter.configured_requirements(),
+            )
+            .and_then(|bindings| bindings.warmup_start(window.from()))
+            .map_err(|error| invalid(error.to_string()))?;
+            let calendar_start =
+                configured_history_start(&instance.historical_inputs, window.from())?;
+            range.0 = range.0.min(source_start.min(calendar_start));
+        }
+    }
     let default_market_bytes = limits
         .max_retained_bars
         .checked_mul(std::mem::size_of::<qs_backtest::data_feed::FeedEvent>())
@@ -2253,6 +2428,56 @@ fn execute_search(
     let family = search.family.clone();
     let (from, to) = search.range;
     let total_symbols = search.plan.symbols.len() as u64;
+    let mut frozen_selection = search
+        .resume_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.frozen_selection.clone());
+    let mut split_access = search
+        .resume_checkpoint
+        .as_ref()
+        .map_or_else(Vec::new, |checkpoint| checkpoint.split_access.clone());
+    let mut selected_protected = None;
+    if let Some(selected) = &search.selected_rerun {
+        let frozen = match frozen_selection.clone() {
+            Some(frozen)
+                if frozen.candidate == selected.candidate
+                    && frozen.experiment == selected.experiment =>
+            {
+                frozen
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "selected rerun differs from the persisted frozen selection".into(),
+                ));
+            }
+            None => qs_research::FrozenSelection {
+                candidate: selected.candidate.clone(),
+                experiment: selected.experiment.clone(),
+                caller_revision: selected.caller_revision.clone(),
+                future_horizon_millis: selected.future_horizon_millis,
+                embargo_millis: selected.embargo_millis,
+            },
+        };
+        let mut protected = qs_research::ProtectedExperiment::restore(frozen, split_access)
+            .map_err(research_error)?;
+        let window = DataWindow::new(
+            selected.run.window.clone(),
+            selected.run.from,
+            selected.run.to,
+        )
+        .map_err(research_error)?;
+        if selected.release_final && !protected.is_final_released() {
+            protected
+                .release_final_for(&window, &selected.caller_revision)
+                .map_err(research_error)?;
+        }
+        protected
+            .access(selected.role, &window, &selected.caller_revision, true)
+            .map_err(research_error)?;
+        frozen_selection = protected.frozen().cloned();
+        split_access = protected.records().to_vec();
+        selected_protected = Some(protected);
+    }
     let mut events = BTreeMap::new();
     for (index, symbol) in search.plan.symbols.iter().enumerate() {
         ensure_not_cancelled(Some(cancellation))?;
@@ -2344,14 +2569,6 @@ fn execute_search(
             },
         )
     };
-    let mut frozen_selection = search
-        .resume_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.frozen_selection.clone());
-    let mut split_access = search
-        .resume_checkpoint
-        .as_ref()
-        .map_or_else(Vec::new, |checkpoint| checkpoint.split_access.clone());
     let batch = if let Some(factory) = &search.direct_factory {
         ensure_not_cancelled(Some(cancellation))?;
         let completed = search
@@ -2442,48 +2659,15 @@ fn execute_search(
         ensure_not_cancelled(Some(cancellation))?;
         batch
     } else if let Some(selected) = &search.selected_rerun {
-        let frozen = match frozen_selection.clone() {
-            Some(frozen)
-                if frozen.candidate == selected.candidate
-                    && frozen.experiment == selected.experiment =>
-            {
-                frozen
-            }
-            Some(_) => {
-                return Err(invalid(
-                    "selected rerun differs from the persisted frozen selection".into(),
-                ));
-            }
-            None => qs_research::FrozenSelection {
-                candidate: selected.candidate.clone(),
-                experiment: selected.experiment.clone(),
-                caller_revision: selected.caller_revision.clone(),
-                future_horizon_millis: selected.future_horizon_millis,
-                embargo_millis: selected.embargo_millis,
-            },
-        };
-        let mut protected = qs_research::ProtectedExperiment::restore(frozen, split_access)
-            .map_err(research_error)?;
-        let window = DataWindow::new(
-            selected.run.window.clone(),
-            selected.run.from,
-            selected.run.to,
-        )
-        .map_err(research_error)?;
-        if selected.release_final && !protected.is_final_released() {
-            protected
-                .release_final_for(&window, &selected.caller_revision)
-                .map_err(research_error)?;
-        }
-        let batch = qs_research::rerun_selected_candidate_protected(
+        let protected = selected_protected
+            .take()
+            .expect("selected rerun access was admitted before market loading");
+        let batch = qs_research::rerun_selected_candidate(
             &search.plan,
             &selected.experiment,
             &selected.candidate,
             &selected.run,
             &events,
-            &mut protected,
-            selected.role,
-            &selected.caller_revision,
         )
         .map_err(research_error)?;
         frozen_selection = protected.frozen().cloned();
@@ -2928,6 +3112,248 @@ fn geometry_from_msg(
     ))
 }
 
+fn historical_inputs_from_msg(
+    message: Option<&HistoricalInputsMsg>,
+    server: &crate::config::StrategiesSection,
+) -> Result<Vec<ConfiguredCalendarInput>> {
+    let Some(message) = message else {
+        return Ok(Vec::new());
+    };
+    let server_limits = CalendarAdmissionLimits::new(
+        server.max_calendar_sessions,
+        server.max_calendar_intervals,
+        server.max_calendar_exceptions,
+        server.max_calendar_history,
+        server.max_calendar_children,
+        server.max_calendar_bytes,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let limits = match message.limits {
+        Some(value)
+            if value.max_sessions > server_limits.max_sessions
+                || value.max_market_intervals > server_limits.max_market_intervals
+                || value.max_exceptions > server_limits.max_exceptions
+                || value.max_history_occurrences > server_limits.max_history_occurrences
+                || value.max_resolved_children > server_limits.max_resolved_children
+                || value.max_owned_bytes > server_limits.max_owned_bytes =>
+        {
+            return Err(invalid(
+                "calendar request limits cannot exceed the server limits".into(),
+            ));
+        }
+        Some(value) => CalendarAdmissionLimits::new(
+            value.max_sessions.min(server_limits.max_sessions),
+            value
+                .max_market_intervals
+                .min(server_limits.max_market_intervals),
+            value.max_exceptions.min(server_limits.max_exceptions),
+            value
+                .max_history_occurrences
+                .min(server_limits.max_history_occurrences),
+            value
+                .max_resolved_children
+                .min(server_limits.max_resolved_children),
+            value.max_owned_bytes.min(server_limits.max_owned_bytes),
+        )
+        .map_err(|error| invalid(error.to_string()))?,
+        None => server_limits,
+    };
+    let calendars = message
+        .calendars
+        .iter()
+        .map(|(id, calendar)| {
+            if id != &calendar.id {
+                return Err(invalid(format!(
+                    "calendar map key '{id}' differs from calendar id '{}'",
+                    calendar.id
+                )));
+            }
+            let day_boundary = parse_local_time(&calendar.day_boundary)?;
+            let sessions = match &calendar.sessions {
+                SessionScheduleMsg::FullDay => SessionScheduleSpec::FullDay,
+                SessionScheduleMsg::Custom { items } => SessionScheduleSpec::Custom {
+                    items: items
+                        .iter()
+                        .map(|item| {
+                            let span = match &item.span {
+                                SessionSpanMsg::FullDay => SessionSpanSpec::FullDay,
+                                SessionSpanMsg::Timed {
+                                    start,
+                                    end,
+                                    end_day_offset,
+                                } => SessionSpanSpec::Timed {
+                                    start: parse_local_time(start)?,
+                                    end: parse_local_time(end)?,
+                                    end_day_offset: *end_day_offset,
+                                },
+                            };
+                            Ok(NamedSessionSpec {
+                                id: item.id.clone(),
+                                timezone: item.timezone.clone(),
+                                span,
+                                weekdays: item.weekdays.iter().copied().collect(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                },
+            };
+            let market = match &calendar.market {
+                MarketScheduleMsg::Unspecified => MarketScheduleSpec::Unspecified,
+                MarketScheduleMsg::Continuous => MarketScheduleSpec::Continuous,
+                MarketScheduleMsg::Weekly {
+                    intervals,
+                    exceptions,
+                } => MarketScheduleSpec::Weekly {
+                    intervals: intervals
+                        .iter()
+                        .map(|item| {
+                            Ok(WeeklyMarketIntervalSpec {
+                                weekday: item.weekday,
+                                start: parse_local_time(&item.start)?,
+                                end: parse_local_time(&item.end)?,
+                                end_day_offset: item.end_day_offset,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    exceptions: exceptions
+                        .iter()
+                        .map(|(date, items)| {
+                            let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                                .map_err(|error| {
+                                    invalid(format!("calendar exception date: {error}"))
+                                })?;
+                            let items = items
+                                .iter()
+                                .map(|item| {
+                                    Ok(LocalMarketIntervalSpec {
+                                        start: parse_local_time(&item.start)?,
+                                        end: parse_local_time(&item.end)?,
+                                        end_day_offset: item.end_day_offset,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok((date, items))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()?,
+                },
+            };
+            Ok((
+                id.clone(),
+                TradingCalendarSpec {
+                    id: calendar.id.clone(),
+                    timezone: calendar.timezone.clone(),
+                    day_boundary,
+                    sessions,
+                    market,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    if calendars.len() > server.max_calendar_sessions
+        || message.inputs.len() > server.max_calendar_sessions
+    {
+        return Err(invalid(
+            "calendar or historical-input count exceeds the server limit".into(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    let configured = message
+        .inputs
+        .iter()
+        .map(|input| {
+            if !names.insert(input.name.clone()) {
+                return Err(invalid(format!(
+                    "duplicate historical input '{}'",
+                    input.name
+                )));
+            }
+            let calendar = calendars.get(&input.calendar).ok_or_else(|| {
+                invalid(format!(
+                    "historical input '{}' references unknown calendar '{}'",
+                    input.name, input.calendar
+                ))
+            })?;
+            let configured = ConfiguredCalendarInput {
+                name: input.name.clone(),
+                source: input.source.clone(),
+                calendar: calendar.clone(),
+                input: CalendarInputSpec {
+                    calendar_id: input.calendar.clone(),
+                    kind: calendar_feature_from_msg(input.feature),
+                    session_id: input.session.clone(),
+                    time_basis: match input.time_basis {
+                        CalendarTimeBasisMsg::SourceOpen => CalendarTimeBasis::SourceOpen,
+                        CalendarTimeBasisMsg::DecisionTime => CalendarTimeBasis::DecisionTime,
+                    },
+                    opening_range_minutes: input.opening_range_minutes,
+                    child_seconds: input.child_seconds,
+                    alignment_offset_seconds: input.alignment_offset_seconds,
+                    maximum_history: input.maximum_history,
+                },
+                limits,
+            };
+            configured
+                .binding()
+                .map_err(|error| invalid(format!("historical input '{}': {error}", input.name)))?;
+            Ok(configured)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let total_bytes = configured.iter().try_fold(0usize, |total, input| {
+        input
+            .estimated_owned_bytes()
+            .map_err(|error| invalid(error.to_string()))
+            .and_then(|bytes| {
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("calendar aggregate byte count overflowed".into()))
+            })
+    })?;
+    if total_bytes > server.max_calendar_bytes {
+        return Err(invalid(format!(
+            "calendar inputs need an estimated {total_bytes} bytes, above the server limit of {}",
+            server.max_calendar_bytes
+        )));
+    }
+    Ok(configured)
+}
+
+fn configured_history_start(
+    inputs: &[ConfiguredCalendarInput],
+    evaluation_start: NaiveDateTime,
+) -> Result<NaiveDateTime> {
+    inputs.iter().try_fold(evaluation_start, |start, input| {
+        input
+            .history_start(evaluation_start)
+            .map(|candidate| start.min(candidate))
+            .map_err(|error| invalid(error.to_string()))
+    })
+}
+
+fn parse_local_time(value: &str) -> Result<chrono::NaiveTime> {
+    chrono::NaiveTime::parse_from_str(value, "%H:%M:%S")
+        .map_err(|error| invalid(format!("calendar local time '{value}': {error}")))
+}
+
+fn calendar_feature_from_msg(value: CalendarFeatureMsg) -> CalendarFeatureKind {
+    match value {
+        CalendarFeatureMsg::LocalSecondOfDay => CalendarFeatureKind::LocalSecondOfDay,
+        CalendarFeatureMsg::SessionElapsedSeconds => CalendarFeatureKind::SessionElapsedSeconds,
+        CalendarFeatureMsg::SessionMembership => CalendarFeatureKind::SessionMembership,
+        CalendarFeatureMsg::PreviousSessionHigh => CalendarFeatureKind::PreviousSessionHigh,
+        CalendarFeatureMsg::PreviousSessionLow => CalendarFeatureKind::PreviousSessionLow,
+        CalendarFeatureMsg::PreviousDayHigh => CalendarFeatureKind::PreviousDayHigh,
+        CalendarFeatureMsg::PreviousDayLow => CalendarFeatureKind::PreviousDayLow,
+        CalendarFeatureMsg::PreviousWeekHigh => CalendarFeatureKind::PreviousWeekHigh,
+        CalendarFeatureMsg::PreviousWeekLow => CalendarFeatureKind::PreviousWeekLow,
+        CalendarFeatureMsg::OpeningRangeHighSoFar => CalendarFeatureKind::OpeningRangeHighSoFar,
+        CalendarFeatureMsg::OpeningRangeLowSoFar => CalendarFeatureKind::OpeningRangeLowSoFar,
+        CalendarFeatureMsg::OpeningRangeHighFinal => CalendarFeatureKind::OpeningRangeHighFinal,
+        CalendarFeatureMsg::OpeningRangeLowFinal => CalendarFeatureKind::OpeningRangeLowFinal,
+        CalendarFeatureMsg::PastSameSlotRangeRatio => CalendarFeatureKind::PastSameSlotRangeRatio,
+        CalendarFeatureMsg::PastSameSlotCount => CalendarFeatureKind::PastSameSlotCount,
+    }
+}
+
 /// Compile the document with the built-in material library and bind its sources, rejecting anything the adapter or the retained-history limit would refuse.
 fn build_adapter(
     document: &StrategyConfig,
@@ -2935,6 +3361,7 @@ fn build_adapter(
     symbol: &str,
     geometry: Vec<SeriesGeometry>,
     decision_latency_ms: u64,
+    historical_inputs: &[ConfiguredCalendarInput],
     limits: &crate::config::StrategiesSection,
 ) -> Result<BacktestConfiguredStrategyAdapter> {
     let strategy = ConfiguredStrategy::compile(
@@ -2944,9 +3371,32 @@ fn build_adapter(
         symbol,
     )
     .map_err(|error| invalid(format!("strategy does not compile: {error}")))?;
-    let bindings =
-        ConfiguredHistoricalBindings::from_geometry(geometry, strategy.input_requirements())
-            .map_err(|error| invalid(format!("source binding: {error}")))?;
+    let base = ConfiguredHistoricalBindings::from_geometry(geometry, strategy.input_requirements())
+        .map_err(|error| invalid(format!("source binding: {error}")))?;
+    let (sources, mut named, volume) = base.into_parts();
+    let required = strategy
+        .input_requirements()
+        .named_inputs
+        .iter()
+        .map(|requirement| requirement.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for input in historical_inputs {
+        if !required.contains(input.name.as_str()) {
+            continue;
+        }
+        if named.iter().any(|binding| binding.name() == input.name) {
+            return Err(invalid(format!(
+                "named input '{}' has more than one projector",
+                input.name
+            )));
+        }
+        named.push(
+            input
+                .binding()
+                .map_err(|error| invalid(format!("historical input '{}': {error}", input.name)))?,
+        );
+    }
+    let bindings = ConfiguredHistoricalBindings::new(sources, named, volume);
     let retained = bindings
         .sources()
         .iter()

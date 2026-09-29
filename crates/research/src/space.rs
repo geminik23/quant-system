@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::error::ResearchError;
 use crate::family::StrategyFamily;
 use crate::geometry::SeriesGeometry;
+use crate::projectors::HistoricalInputsDocument;
 
 #[derive(Debug, Clone)]
 struct BoundPoint {
@@ -62,6 +63,7 @@ pub struct DeclaredSpace {
     family_id: String,
     points: Vec<BoundPoint>,
     series: Vec<SeriesGeometryConfig>,
+    historical_inputs: HistoricalInputsDocument,
     library: MaterialLibrary,
 }
 
@@ -150,6 +152,27 @@ impl DeclaredSpace {
         )
     }
 
+    pub fn projector_selections(&self) -> Result<Vec<crate::NamedProjectorSelection>, String> {
+        self.historical_inputs.calendar_selections()
+    }
+
+    pub fn validate_calendar_limits(
+        &self,
+        limits: qs_backtest::CalendarAdmissionLimits,
+    ) -> Result<(), String> {
+        let requested = self.historical_inputs.limits;
+        if requested.max_sessions > limits.max_sessions
+            || requested.max_market_intervals > limits.max_market_intervals
+            || requested.max_exceptions > limits.max_exceptions
+            || requested.max_history_occurrences > limits.max_history_occurrences
+            || requested.max_resolved_children > limits.max_resolved_children
+            || requested.max_owned_bytes > limits.max_owned_bytes
+        {
+            return Err("declared calendar limits exceed the server limits".into());
+        }
+        Ok(())
+    }
+
     fn build(
         template: StrategyTemplate,
         space: SpaceDocument,
@@ -161,6 +184,13 @@ impl DeclaredSpace {
             .map_err(|error| ResearchError::InvalidDocument(error.to_string()))?;
         validate_constraints(&space.constraints)?;
         validate_series(&space.series, template.document())?;
+        for selection in space
+            .historical_inputs
+            .calendar_selections()
+            .map_err(ResearchError::InvalidPlan)?
+        {
+            selection.binding().map_err(ResearchError::InvalidPlan)?;
+        }
         let dimensions = binding_dimensions(template.document(), &space, limits)?;
         let mut points = Vec::new();
         for_each_binding(&dimensions, |binding| {
@@ -206,6 +236,7 @@ impl DeclaredSpace {
             family_id: space.family_id,
             points,
             series: space.series,
+            historical_inputs: space.historical_inputs,
             library,
         })
     }
@@ -239,8 +270,92 @@ impl StrategyFamily for DeclaredSpace {
             .expect("declared geometry was validated for every enumerated point")
     }
 
+    fn bindings(
+        &self,
+        symbol: &str,
+        point: &Self::Params,
+        requirements: &qs_strategy::ConfiguredStrategyRequirements,
+    ) -> Result<qs_backtest::ConfiguredHistoricalBindings, String> {
+        let base = qs_backtest::ConfiguredHistoricalBindings::from_geometry(
+            self.geometry(symbol, point),
+            requirements,
+        )
+        .map_err(|error| error.to_string())?;
+        let (sources, mut named, volume) = base.into_parts();
+        let required = requirements
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for selection in self.historical_inputs.calendar_selections()? {
+            let name = selection.snapshot(symbol, "configured").name;
+            if !required.contains(name.as_str()) {
+                continue;
+            }
+            if named.iter().any(|binding| binding.name() == name) {
+                return Err(format!("named input '{name}' has more than one projector"));
+            }
+            named.push(selection.binding()?);
+        }
+        Ok(qs_backtest::ConfiguredHistoricalBindings::new(
+            sources, named, volume,
+        ))
+    }
+
+    fn history_start(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: chrono::NaiveDateTime,
+    ) -> Result<chrono::NaiveDateTime, String> {
+        self.historical_inputs
+            .calendar_selections()?
+            .iter()
+            .try_fold(evaluation_start, |start, selection| {
+                selection
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+
+    fn history_start_for_requirements(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: chrono::NaiveDateTime,
+        requirements: &qs_strategy::ConfiguredStrategyRequirements,
+    ) -> Result<chrono::NaiveDateTime, String> {
+        let required = requirements
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        self.historical_inputs
+            .calendar_selections()?
+            .iter()
+            .filter(|selection| required.contains(selection.name()))
+            .try_fold(evaluation_start, |start, selection| {
+                selection
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+
     fn library(&self) -> MaterialLibrary {
         self.library.clone()
+    }
+
+    fn input_projector_recipe(
+        &self,
+        symbol: &str,
+        _point: &Self::Params,
+    ) -> Vec<crate::InputProjectorSnapshot> {
+        self.historical_inputs
+            .calendar_selections()
+            .expect("historical inputs were validated")
+            .iter()
+            .map(|selection| selection.snapshot(symbol, "configured"))
+            .collect()
     }
 }
 
@@ -252,6 +367,8 @@ struct SpaceDocument {
     #[serde(default)]
     constraints: Vec<Expr>,
     series: Vec<SeriesGeometryConfig>,
+    #[serde(default)]
+    historical_inputs: HistoricalInputsDocument,
 }
 
 #[derive(Debug, Clone, Deserialize)]

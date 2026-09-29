@@ -10,8 +10,9 @@ use qs_backtest::evaluation::{
 use qs_backtest::report::BacktestResult;
 use qs_backtest::{
     AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
-    ConfiguredInstance, INSTANCE_POSITION_TAG, ObservationStoreLimits, StrategyDescriptor,
-    StrategyId, StrategyResearchLimits, SupervisorOutput, VecFeed,
+    ConfiguredHistoricalBindings, ConfiguredInstance, INSTANCE_POSITION_TAG,
+    ObservationStoreLimits, StrategyDescriptor, StrategyId, StrategyResearchLimits,
+    SupervisorOutput, VecFeed,
 };
 use qs_core::CloseReason;
 use qs_strategy::{ConfiguredStrategy, ParameterBinding, StrategyConfig, parameter_value_label};
@@ -20,6 +21,7 @@ use serde::Serialize;
 use crate::error::{ResearchError, RunFailure};
 use crate::family::StrategyFamily;
 use crate::plan::{ResearchAdmissionLimits, ResearchPlan};
+use crate::projectors::NamedProjectorSelection;
 use crate::recipe::{
     CandidateRecipe, EndpointBounds, ExperimentOptions, ExperimentRecipe, RunCoverage, RunRecipe,
     SeriesBindingSnapshot, snapshot_bindings,
@@ -39,6 +41,8 @@ struct RecipeFamily {
     binding: ParameterBinding,
     document: StrategyConfig,
     geometry: BTreeMap<String, Vec<crate::SeriesGeometry>>,
+    projectors: Vec<NamedProjectorSelection>,
+    projector_snapshots: Vec<crate::InputProjectorSnapshot>,
 }
 impl StrategyFamily for RecipeFamily {
     type Params = ();
@@ -56,6 +60,84 @@ impl StrategyFamily for RecipeFamily {
     }
     fn geometry(&self, symbol: &str, _: &Self::Params) -> Vec<crate::SeriesGeometry> {
         self.geometry.get(symbol).cloned().unwrap_or_default()
+    }
+    fn bindings(
+        &self,
+        symbol: &str,
+        _: &Self::Params,
+        requirements: &qs_strategy::ConfiguredStrategyRequirements,
+    ) -> Result<ConfiguredHistoricalBindings, String> {
+        let base =
+            ConfiguredHistoricalBindings::from_geometry(self.geometry(symbol, &()), requirements)
+                .map_err(|error| error.to_string())?;
+        let (sources, mut named, volume) = base.into_parts();
+        let required = requirements
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for projector in &self.projectors {
+            if !required.contains(projector.name()) {
+                continue;
+            }
+            if named
+                .iter()
+                .any(|binding| binding.name() == projector.name())
+            {
+                return Err(format!(
+                    "named input '{}' has more than one projector",
+                    projector.name()
+                ));
+            }
+            named.push(projector.binding()?);
+        }
+        Ok(ConfiguredHistoricalBindings::new(sources, named, volume))
+    }
+    fn history_start(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+    ) -> Result<NaiveDateTime, String> {
+        self.projectors
+            .iter()
+            .try_fold(evaluation_start, |start, projector| {
+                projector
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+    fn history_start_for_requirements(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+        requirements: &qs_strategy::ConfiguredStrategyRequirements,
+    ) -> Result<NaiveDateTime, String> {
+        let required = requirements
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        self.projectors
+            .iter()
+            .filter(|projector| required.contains(projector.name()))
+            .try_fold(evaluation_start, |start, projector| {
+                projector
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+    fn input_projector_recipe(
+        &self,
+        symbol: &str,
+        _: &Self::Params,
+    ) -> Vec<crate::InputProjectorSnapshot> {
+        self.projector_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.symbol == symbol)
+            .cloned()
+            .collect()
     }
 }
 
@@ -279,6 +361,42 @@ pub fn rerun_selected_candidate_protected(
     rerun_selected_candidate(plan, experiment, candidate, run, events)
 }
 
+pub fn selected_candidate_data_range(
+    candidate: &CandidateRecipe,
+    run: &RunRecipe,
+) -> Result<(NaiveDateTime, NaiveDateTime), ResearchError> {
+    let snapshots = candidate.series_by_symbol.get(&run.symbol).ok_or_else(|| {
+        ResearchError::InvalidPlan("candidate recipe has no series for rerun symbol".into())
+    })?;
+    let mut start = run.from;
+    for snapshot in snapshots {
+        let bars = i64::try_from(snapshot.warmup_bars)
+            .map_err(|_| ResearchError::InvalidPlan("rerun warmup exceeds i64".into()))?;
+        let duration = i64::try_from(snapshot.timeframe_seconds)
+            .map_err(|_| ResearchError::InvalidPlan("rerun timeframe exceeds i64".into()))?;
+        let seconds = duration
+            .checked_mul(bars)
+            .ok_or_else(|| ResearchError::InvalidPlan("rerun warmup span overflowed".into()))?;
+        start = start
+            .checked_sub_signed(chrono::Duration::seconds(seconds))
+            .ok_or_else(|| ResearchError::InvalidPlan("rerun warmup start overflowed".into()))?;
+    }
+    for snapshot in candidate
+        .input_projectors
+        .iter()
+        .filter(|snapshot| snapshot.symbol == run.symbol)
+    {
+        let projector =
+            NamedProjectorSelection::from_snapshot(snapshot).map_err(ResearchError::InvalidPlan)?;
+        start = start.min(
+            projector
+                .history_start(run.from)
+                .map_err(ResearchError::InvalidPlan)?,
+        );
+    }
+    Ok((start, run.to))
+}
+
 pub fn rerun_selected_candidate(
     plan: &ResearchPlan,
     experiment: &ExperimentRecipe,
@@ -353,11 +471,28 @@ pub fn rerun_selected_candidate(
             ))
         })
         .collect::<Result<Vec<_>, ResearchError>>()?;
+    let projector_snapshots = candidate
+        .input_projectors
+        .iter()
+        .filter(|snapshot| {
+            snapshot.symbol == run.symbol
+                && (snapshot.owner == "configured"
+                    || snapshot.owner == format!("p{}", candidate.ordinal))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let projectors = projector_snapshots
+        .iter()
+        .map(NamedProjectorSelection::from_snapshot)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ResearchError::InvalidPlan)?;
     let family = RecipeFamily {
         family_id: candidate.family_id.clone(),
         binding: ParameterBinding::new(candidate.parameters.clone()),
         document: document.clone(),
         geometry: BTreeMap::from([(run.symbol.clone(), geometry)]),
+        projectors,
+        projector_snapshots,
     };
     let window = DataWindow::new(run.window.clone(), run.from, run.to)?;
     let admitted = AdmittedPoint {
@@ -906,7 +1041,18 @@ where
                 continue;
             }
         };
-        input_projectors.extend(family.input_projector_recipe(symbol, &candidate.point));
+        let required = strategy
+            .input_requirements()
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        input_projectors.extend(
+            family
+                .input_projector_recipe(symbol, &candidate.point)
+                .into_iter()
+                .filter(|snapshot| required.contains(snapshot.name.as_str())),
+        );
         match family.bindings(symbol, &candidate.point, strategy.input_requirements()) {
             Ok(bindings) => {
                 series_by_symbol.insert(symbol.clone(), snapshot_bindings(&bindings));
@@ -1006,9 +1152,18 @@ where
                 .bindings(symbol, &point, strategy.input_requirements())
                 .map_err(ResearchError::InvalidDocument)?;
             for window in &windows {
-                let window_start = bindings
+                let source_start = bindings
                     .warmup_start(window.from())
                     .map_err(|error| ResearchError::InvalidPlan(error.to_string()))?;
+                let calendar_start = family
+                    .history_start_for_requirements(
+                        symbol,
+                        &point,
+                        window.from(),
+                        strategy.input_requirements(),
+                    )
+                    .map_err(ResearchError::InvalidPlan)?;
+                let window_start = source_start.min(calendar_start);
                 start = Some(start.map_or(window_start, |current| current.min(window_start)));
             }
         }
@@ -1280,7 +1435,16 @@ where
         .map_err(RunFailure::Bind)?;
     let binding_snapshots =
         BTreeMap::from([(spec.symbol.to_owned(), snapshot_bindings(&bindings))]);
-    let warmup_start = warmup_start(&bindings, spec.window.from())?;
+    let warmup_start = warmup_start(&bindings, spec.window.from())?.min(
+        family
+            .history_start_for_requirements(
+                spec.symbol,
+                &spec.candidate.point,
+                spec.window.from(),
+                strategy.input_requirements(),
+            )
+            .map_err(RunFailure::Bind)?,
+    );
     let descriptor = StrategyDescriptor::new(
         StrategyId::new(strategy_id.clone())
             .map_err(|error| RunFailure::Compile(error.to_string()))?,
@@ -1296,6 +1460,19 @@ where
         plan.decision_latency_ms,
     )
     .map_err(|error| RunFailure::Bind(error.to_string()))?;
+    let required_named = adapter
+        .configured_requirements()
+        .named_inputs
+        .iter()
+        .map(|requirement| requirement.name.clone())
+        .collect::<BTreeSet<_>>();
+    if family
+        .input_projector_recipe(spec.symbol, &spec.candidate.point)
+        .iter()
+        .any(|snapshot| required_named.contains(&snapshot.name))
+    {
+        adapter.set_evaluation_start(Some(spec.window.from()));
+    }
 
     let slice = slice_events(events, spec.window, warmup_start);
     let coverage = input_coverage(&slice, spec.window)?;
@@ -1366,7 +1543,16 @@ where
             .bindings(symbol, &spec.candidate.point, strategy.input_requirements())
             .map_err(RunFailure::Bind)?;
         binding_snapshots.insert(symbol.clone(), snapshot_bindings(&bindings));
-        let start = warmup_start(&bindings, spec.window.from())?;
+        let start = warmup_start(&bindings, spec.window.from())?.min(
+            family
+                .history_start_for_requirements(
+                    symbol,
+                    &spec.candidate.point,
+                    spec.window.from(),
+                    strategy.input_requirements(),
+                )
+                .map_err(RunFailure::Bind)?,
+        );
         let descriptor = StrategyDescriptor::new(
             StrategyId::new(strategy_id.clone())
                 .map_err(|error| RunFailure::Compile(error.to_string()))?,
@@ -1374,13 +1560,26 @@ where
             strategy_id,
         )
         .map_err(|error| RunFailure::Compile(error.to_string()))?;
-        let adapter = BacktestConfiguredStrategyAdapter::new(
+        let mut adapter = BacktestConfiguredStrategyAdapter::new(
             strategy,
             descriptor,
             bindings,
             plan.decision_latency_ms,
         )
         .map_err(|error| RunFailure::Bind(error.to_string()))?;
+        let required_named = adapter
+            .configured_requirements()
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.clone())
+            .collect::<BTreeSet<_>>();
+        if family
+            .input_projector_recipe(symbol, &spec.candidate.point)
+            .iter()
+            .any(|snapshot| required_named.contains(&snapshot.name))
+        {
+            adapter.set_evaluation_start(Some(spec.window.from()));
+        }
         let analysis = AnalysisPipeline::new(
             Vec::new(),
             ObservationStoreLimits::default(),

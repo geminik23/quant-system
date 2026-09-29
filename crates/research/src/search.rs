@@ -8,7 +8,8 @@ use qs_strategy::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CandidateRecipe, DataWindow, ExperimentRecipe, ResearchError, SeriesGeometry, StrategyFamily,
+    CandidateRecipe, DataWindow, ExperimentRecipe, NamedProjectorSelection, ResearchError,
+    SeriesGeometry, StrategyFamily,
 };
 use qs_backtest::{
     ConfiguredHistoricalBindings, ConfiguredNamedInputBinding, SourceBarFactKind,
@@ -819,6 +820,7 @@ pub struct GeneratedStructuralFamily {
     candidates: Vec<StructuralCandidate>,
     geometry_by_symbol: BTreeMap<String, Vec<SeriesGeometry>>,
     sequence_source: SourceId,
+    projectors: Vec<NamedProjectorSelection>,
 }
 
 impl GeneratedStructuralFamily {
@@ -830,9 +832,27 @@ impl GeneratedStructuralFamily {
                 candidates: generation.candidates.clone(),
                 geometry_by_symbol: spec.geometry_by_symbol.clone(),
                 sequence_source: spec.sequence_source.clone(),
+                projectors: Vec::new(),
             },
             generation,
         ))
+    }
+
+    pub fn with_projectors(
+        mut self,
+        projectors: Vec<NamedProjectorSelection>,
+    ) -> Result<Self, ResearchError> {
+        let mut names = BTreeSet::new();
+        for projector in &projectors {
+            if !names.insert(projector.name().to_owned()) {
+                return Err(ResearchError::InvalidPlan(format!(
+                    "duplicate structural projector '{}'",
+                    projector.name()
+                )));
+            }
+        }
+        self.projectors = projectors;
+        Ok(self)
     }
 }
 
@@ -887,21 +907,30 @@ impl StrategyFamily for GeneratedStructuralFamily {
             .iter()
             .map(|requirement| {
                 let kind = match requirement.name.as_str() {
-                    "source_ordinal" => SourceBarFactKind::Ordinal,
-                    "source_open_time" => SourceBarFactKind::OpenTime,
-                    "source_close_time" => SourceBarFactKind::CloseTime,
-                    "source_available_at" => SourceBarFactKind::AvailableAt,
-                    "source_gap_before" => SourceBarFactKind::GapBefore,
-                    name => {
-                        return Err(format!(
-                            "structural generated family has no trusted projector for '{name}'"
-                        ));
-                    }
+                    "source_ordinal" => Some(SourceBarFactKind::Ordinal),
+                    "source_open_time" => Some(SourceBarFactKind::OpenTime),
+                    "source_close_time" => Some(SourceBarFactKind::CloseTime),
+                    "source_available_at" => Some(SourceBarFactKind::AvailableAt),
+                    "source_gap_before" => Some(SourceBarFactKind::GapBefore),
+                    _ => None,
                 };
-                Ok(ConfiguredNamedInputBinding::new(
-                    requirement.name.clone(),
-                    Box::new(SourceBarFactProjector::new(series_id.clone(), kind)),
-                ))
+                if let Some(kind) = kind {
+                    return Ok(ConfiguredNamedInputBinding::new(
+                        requirement.name.clone(),
+                        Box::new(SourceBarFactProjector::new(series_id.clone(), kind)),
+                    ));
+                }
+                let projector = self
+                    .projectors
+                    .iter()
+                    .find(|projector| projector.name() == requirement.name)
+                    .ok_or_else(|| {
+                        format!(
+                            "structural generated family has no trusted projector for '{}'",
+                            requirement.name
+                        )
+                    })?;
+                projector.binding()
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(ConfiguredHistoricalBindings::new(
@@ -909,6 +938,54 @@ impl StrategyFamily for GeneratedStructuralFamily {
             named,
             base.volume(),
         ))
+    }
+
+    fn history_start(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+    ) -> Result<NaiveDateTime, String> {
+        self.projectors
+            .iter()
+            .try_fold(evaluation_start, |start, projector| {
+                projector
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+
+    fn history_start_for_requirements(
+        &self,
+        _symbol: &str,
+        _point: &Self::Params,
+        evaluation_start: NaiveDateTime,
+        requirements: &qs_strategy::ConfiguredStrategyRequirements,
+    ) -> Result<NaiveDateTime, String> {
+        let required = requirements
+            .named_inputs
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<BTreeSet<_>>();
+        self.projectors
+            .iter()
+            .filter(|projector| required.contains(projector.name()))
+            .try_fold(evaluation_start, |start, projector| {
+                projector
+                    .history_start(evaluation_start)
+                    .map(|candidate| start.min(candidate))
+            })
+    }
+
+    fn input_projector_recipe(
+        &self,
+        symbol: &str,
+        _point: &Self::Params,
+    ) -> Vec<crate::InputProjectorSnapshot> {
+        self.projectors
+            .iter()
+            .map(|projector| projector.snapshot(symbol, "configured"))
+            .collect()
     }
 }
 

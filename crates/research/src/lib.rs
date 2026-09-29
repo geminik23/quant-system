@@ -24,10 +24,11 @@ pub mod families;
 
 pub use error::{ResearchError, RunFailure};
 pub use experiment::{
-    BoundedTrace, CheckpointDependency, CheckpointLimits, CompletedRunCheckpoint,
-    ConcentrationBucket, FeatureCache, FeatureCacheKey, SearchCheckpoint,
-    SelectedCandidateEvidence, TraceLimits, TraceRecord, UncertaintyAssessment,
-    cached_market_midpoints, selected_candidate_evidence,
+    AdmittedMarketView, BoundedTrace, CachedFeatureSample, CachedFeatureValues,
+    CheckpointDependency, CheckpointLimits, CompletedRunCheckpoint, ConcentrationBucket,
+    FeatureCache, FeatureCacheKey, SearchCheckpoint, SelectedCandidateEvidence, TraceLimits,
+    TraceRecord, UncertaintyAssessment, cached_market_midpoints, cached_market_midpoints_for_view,
+    project_cached_midpoints_to_bars, selected_candidate_evidence,
 };
 pub use factory::{
     DirectFactoryPoint, DirectResearchFactory, DirectRunCandidate, DirectStrategyError,
@@ -42,7 +43,8 @@ pub use loader::{
 };
 pub use plan::{PortfolioPlan, ResearchAdmissionLimits, ResearchPlan};
 pub use projectors::{
-    CalendarProjectorSelection, NamedProjectorSelection, ProjectedStrategyFamily,
+    CachedMidpointProjectorSelection, CalendarInputDocument, CalendarProjectorSelection,
+    HistoricalInputsDocument, NamedProjectorSelection, ProjectedStrategyFamily,
     QuoteProjectorSelection,
 };
 pub use qs_market_loader::{CountCapability, MarketLoadLimits, SeriesDescriptor, StoredPriceBasis};
@@ -55,8 +57,9 @@ pub use runner::{
     BatchProgress, ResearchBatch, SymbolEvents, batch_data_range, batch_data_range_with_limits,
     rerun_selected_candidate, rerun_selected_candidate_protected, run_batch, run_batch_controlled,
     run_batch_controlled_with_experiment, run_batch_controlled_with_experiment_resume,
-    run_batch_controlled_with_limits, run_batch_with_experiment, validate_bar_window_alignment,
-    validate_bar_window_alignment_with_limits, validate_batch, validate_batch_with_limits,
+    run_batch_controlled_with_limits, run_batch_with_experiment, selected_candidate_data_range,
+    validate_bar_window_alignment, validate_bar_window_alignment_with_limits, validate_batch,
+    validate_batch_with_limits,
 };
 pub use search::{
     CaptureCandidate, EvaluationRole, FrozenSelection, GeneratedStructuralFamily,

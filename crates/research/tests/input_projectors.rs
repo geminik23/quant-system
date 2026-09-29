@@ -1,10 +1,13 @@
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::NaiveTime;
-use qs_backtest::{PriceBasis, Timeframe};
+use qs_backtest::{
+    CalendarAdmissionLimits, CalendarInputSpec, MarketScheduleSpec, PriceBasis,
+    SessionScheduleSpec, Timeframe, TradingCalendarSpec,
+};
 use qs_market_loader::{QuoteStatisticKind, StoredTick};
 use qs_research::*;
 use qs_strategy::{
@@ -118,16 +121,24 @@ fn calendar_and_quote_projectors_are_fresh_consumed_and_recorded_in_recipes() {
             NamedProjectorSelection::Calendar(CalendarProjectorSelection {
                 name: "previous_session_high".into(),
                 source: "primary".into(),
-                timezone: "UTC".into(),
-                session_open: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                session_close: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                holidays: BTreeSet::new(),
-                early_closes: BTreeMap::new(),
-                kind: qs_backtest::CalendarFeatureKind::PreviousSessionHigh,
-                opening_range_minutes: 5,
-                child_seconds: 60,
-                alignment_offset_seconds: 0,
-                maximum_history: 16,
+                calendar: TradingCalendarSpec {
+                    id: "main".into(),
+                    timezone: "UTC".into(),
+                    day_boundary: NaiveTime::MIN,
+                    sessions: SessionScheduleSpec::FullDay,
+                    market: MarketScheduleSpec::Continuous,
+                },
+                input: CalendarInputSpec {
+                    calendar_id: "main".into(),
+                    kind: qs_backtest::CalendarFeatureKind::PreviousSessionHigh,
+                    session_id: None,
+                    time_basis: Default::default(),
+                    opening_range_minutes: 5,
+                    child_seconds: 60,
+                    alignment_offset_seconds: 0,
+                    maximum_history: 16,
+                },
+                limits: CalendarAdmissionLimits::default(),
             }),
             NamedProjectorSelection::Quote(QuoteProjectorSelection {
                 name: "spread_p90".into(),
@@ -171,4 +182,83 @@ fn calendar_and_quote_projectors_are_fresh_consumed_and_recorded_in_recipes() {
             .iter()
             .any(|projector| projector.kind == "quote_statistics")
     );
+}
+
+#[test]
+fn declared_space_carries_document_driven_calendar_inputs() {
+    let historical_inputs = HistoricalInputsDocument {
+        calendars: BTreeMap::from([(
+            "main".into(),
+            TradingCalendarSpec {
+                id: "main".into(),
+                timezone: "UTC".into(),
+                day_boundary: NaiveTime::MIN,
+                sessions: SessionScheduleSpec::FullDay,
+                market: MarketScheduleSpec::Continuous,
+            },
+        )]),
+        inputs: vec![CalendarInputDocument {
+            name: "previous_session_high".into(),
+            source: "primary".into(),
+            calendar: "main".into(),
+            input: CalendarInputSpec {
+                calendar_id: "main".into(),
+                kind: qs_backtest::CalendarFeatureKind::PreviousSessionHigh,
+                session_id: None,
+                time_basis: Default::default(),
+                opening_range_minutes: 5,
+                child_seconds: 60,
+                alignment_offset_seconds: 0,
+                maximum_history: 2,
+            },
+        }],
+        limits: CalendarAdmissionLimits::default(),
+    };
+    let space = serde_json::json!({
+        "family_id": "declared_calendar",
+        "parameters": {},
+        "constraints": [],
+        "series": [{
+            "source": "primary",
+            "symbol": { "plan_symbol": true },
+            "timeframe_seconds": 60,
+            "price_basis": "bid",
+            "alignment_offset_seconds": 0
+        }],
+        "historical_inputs": historical_inputs
+    });
+    let mut document = NamedInputFamily.config(&());
+    document.states[0].transitions[0].when = Expr::IsPresent {
+        value: Box::new(Expr::Input {
+            field: "previous_session_high".into(),
+            value_type: ValueType::optional(ScalarType::Price),
+        }),
+    };
+    let declared = DeclaredSpace::from_documents(document, space).unwrap();
+    let events = BTreeMap::from([(SYMBOL.into(), synthetic_ticks(3_000))]);
+    let plan = ResearchPlan::new(
+        vec![SYMBOL.into()],
+        WindowPlan::Fixed {
+            in_sample: DataWindow::new("is", at(1_500), at(1_800)).unwrap(),
+            out_of_sample: DataWindow::new("oos", at(1_800), at(2_100)).unwrap(),
+        },
+        config(),
+    );
+    let batch = run_batch(&plan, &declared, &events).unwrap();
+    assert!(
+        batch.rows().iter().all(|row| row.status.is_completed()),
+        "{:?}",
+        batch.rows()
+    );
+    assert_eq!(batch.candidate_recipes()[0].input_projectors.len(), 1);
+    let rerun = rerun_selected_candidate(
+        &plan,
+        batch.experiment_recipe(),
+        &batch.candidate_recipes()[0],
+        &batch.run_recipes()[0],
+        &events,
+    )
+    .unwrap();
+    assert!(rerun.rows()[0].status.is_completed());
+    assert_eq!(rerun.candidate_recipes()[0], batch.candidate_recipes()[0]);
 }

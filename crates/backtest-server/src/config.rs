@@ -155,6 +155,18 @@ pub struct StrategiesSection {
     /// Most configured strategy instances one portfolio run may replay together; `max_retained_bars` bounds their combined retained history.
     #[serde(default = "default_max_portfolio_instances")]
     pub max_portfolio_instances: usize,
+    #[serde(default = "default_max_calendar_sessions")]
+    pub max_calendar_sessions: usize,
+    #[serde(default = "default_max_calendar_intervals")]
+    pub max_calendar_intervals: usize,
+    #[serde(default = "default_max_calendar_exceptions")]
+    pub max_calendar_exceptions: usize,
+    #[serde(default = "default_max_calendar_history")]
+    pub max_calendar_history: usize,
+    #[serde(default = "default_max_calendar_children")]
+    pub max_calendar_children: usize,
+    #[serde(default = "default_max_calendar_bytes")]
+    pub max_calendar_bytes: usize,
 }
 
 impl Default for StrategiesSection {
@@ -166,6 +178,12 @@ impl Default for StrategiesSection {
             max_search_generation_points: default_max_search_generation_points(),
             max_search_runs: default_max_search_runs(),
             max_portfolio_instances: default_max_portfolio_instances(),
+            max_calendar_sessions: default_max_calendar_sessions(),
+            max_calendar_intervals: default_max_calendar_intervals(),
+            max_calendar_exceptions: default_max_calendar_exceptions(),
+            max_calendar_history: default_max_calendar_history(),
+            max_calendar_children: default_max_calendar_children(),
+            max_calendar_bytes: default_max_calendar_bytes(),
         }
     }
 }
@@ -192,6 +210,30 @@ fn default_max_search_runs() -> usize {
 
 fn default_max_portfolio_instances() -> usize {
     16
+}
+
+fn default_max_calendar_sessions() -> usize {
+    32
+}
+
+fn default_max_calendar_intervals() -> usize {
+    64
+}
+
+fn default_max_calendar_exceptions() -> usize {
+    366
+}
+
+fn default_max_calendar_history() -> usize {
+    512
+}
+
+fn default_max_calendar_children() -> usize {
+    1_000_000
+}
+
+fn default_max_calendar_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 /// Large-result artifact storage settings.

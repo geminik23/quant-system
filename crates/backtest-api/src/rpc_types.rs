@@ -650,6 +650,156 @@ pub struct SourceBindingMsg {
     pub alignment_offset_seconds: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalInputsMsg {
+    pub calendars: BTreeMap<String, TradingCalendarMsg>,
+    pub inputs: Vec<CalendarInputMsg>,
+    #[serde(default)]
+    pub limits: Option<CalendarLimitsMsg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TradingCalendarMsg {
+    pub id: String,
+    pub timezone: String,
+    #[serde(default = "default_day_boundary")]
+    pub day_boundary: String,
+    #[serde(default)]
+    pub sessions: SessionScheduleMsg,
+    #[serde(default)]
+    pub market: MarketScheduleMsg,
+}
+
+fn default_day_boundary() -> String {
+    "00:00:00".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionScheduleMsg {
+    #[default]
+    FullDay,
+    Custom {
+        items: Vec<NamedSessionMsg>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedSessionMsg {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    pub span: SessionSpanMsg,
+    #[serde(default)]
+    pub weekdays: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionSpanMsg {
+    FullDay,
+    Timed {
+        start: String,
+        end: String,
+        end_day_offset: u8,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MarketScheduleMsg {
+    #[default]
+    Unspecified,
+    Continuous,
+    Weekly {
+        intervals: Vec<WeeklyMarketIntervalMsg>,
+        #[serde(default)]
+        exceptions: BTreeMap<String, Vec<LocalMarketIntervalMsg>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklyMarketIntervalMsg {
+    pub weekday: u8,
+    pub start: String,
+    pub end: String,
+    pub end_day_offset: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMarketIntervalMsg {
+    pub start: String,
+    pub end: String,
+    pub end_day_offset: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarInputMsg {
+    pub name: String,
+    pub source: String,
+    pub calendar: String,
+    pub feature: CalendarFeatureMsg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub time_basis: CalendarTimeBasisMsg,
+    #[serde(default = "default_opening_range_minutes")]
+    pub opening_range_minutes: u32,
+    pub child_seconds: u64,
+    #[serde(default)]
+    pub alignment_offset_seconds: i64,
+    pub maximum_history: usize,
+}
+
+fn default_opening_range_minutes() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarFeatureMsg {
+    LocalSecondOfDay,
+    SessionElapsedSeconds,
+    SessionMembership,
+    PreviousSessionHigh,
+    PreviousSessionLow,
+    PreviousDayHigh,
+    PreviousDayLow,
+    PreviousWeekHigh,
+    PreviousWeekLow,
+    OpeningRangeHighSoFar,
+    OpeningRangeLowSoFar,
+    OpeningRangeHighFinal,
+    OpeningRangeLowFinal,
+    PastSameSlotRangeRatio,
+    PastSameSlotCount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarTimeBasisMsg {
+    #[default]
+    SourceOpen,
+    DecisionTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarLimitsMsg {
+    pub max_sessions: usize,
+    pub max_market_intervals: usize,
+    pub max_exceptions: usize,
+    pub max_history_occurrences: usize,
+    pub max_resolved_children: usize,
+    pub max_owned_bytes: usize,
+}
+
 /// One fully bound configured strategy document and the series backing its sources.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -663,6 +813,8 @@ pub struct ConfiguredStrategyRunMsg {
     /// Decision latency in milliseconds applied to generated signals.
     #[serde(default)]
     pub decision_latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_inputs: Option<HistoricalInputsMsg>,
 }
 
 /// Execution scope for one configured strategy run over one symbol.
@@ -721,6 +873,8 @@ pub struct ConfiguredStrategyOutputMsg {
     pub decisions: serde_json::Value,
     /// Configured notes and research-only output.
     pub research: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_inputs: Option<serde_json::Value>,
 }
 
 // ── Portfolio Runs ──────────────────────────────────────────────────────────

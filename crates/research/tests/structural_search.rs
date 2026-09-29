@@ -629,7 +629,7 @@ fn resume_reconstructs_the_same_deterministic_frontier_without_duplicate_candida
         frozen_selection: None,
         frontier: 8,
         completed_candidates: std::collections::BTreeSet::from([0, 1]),
-        completed_runs: std::collections::BTreeSet::from([0, 1]),
+        completed_runs: std::collections::BTreeSet::new(),
         committed_runs: BTreeMap::new(),
         failures: BTreeMap::new(),
         generated: 8,

@@ -127,13 +127,39 @@ Run tags carry parameter values, symbol, window, and data mode onto every comple
 
 `StructuralSearchSpec` enumerates a finite declared atom/operator universe in stable breadth-first order and recomposes prior levels through the requested depth. Node, candidate, and retained-frontier byte limits are checked before recursive child clones and expansion allocation; budget exhaustion is reported as incomplete, never exhaustive success. Commutative ordering is canonical, sequence remains directional, exact close-price aliases share one canonical material, and matching same-material threshold implications are reduced only when strict/equality and floating-point behavior are preserved. Generated documents use ordinary replay economics and carry deterministic candidate ordinals; there is no automatic score or winner.
 
-`DirectResearchFactory` runs caller-compiled `HistoricalStrategy` implementations without fabricating configured documents. It creates a fresh strategy and analysis pipeline for every candidate/window and records a registered factory name/revision in candidate recipes. Its controlled runner shares typed window/run admission, cancellation, partial-complete-run retention, resume, progress, and worker-stable output semantics with configured batches. `run_execution_variants` evaluates typed replay/profile/policy snapshots. `run_heterogeneous_portfolios` executes independently configured instances against one FutureQuote account; `run_mixed_heterogeneous_portfolios` combines configured and caller-compiled direct instances while keeping configured completed-bar callbacks before settlement and direct bar-reading callbacks after settlement, so a direct strategy cannot fill at the open of a bar whose close it already observed.
+Configured strategy documents, typed parameter spaces, and bounded structural documents are the normal authoring and remote execution path; changing supported rules, parameters, calendars, or session selections does not require registering a strategy name in server Rust. `DirectResearchFactory` is the optional caller-compiled extension path for `HistoricalStrategy` implementations. It creates fresh state for every candidate/window and records an exact factory name/revision. The server's shipped `noop_direct@r1` entry verifies this trusted mechanism but does not trade and is not a production strategy catalog; arbitrary remote code and plugin upload are prohibited. Configured/direct mixed portfolios retain their distinct pre-/post-settlement callback timing.
 
 ## Time, setup, calendar, and enhanced quote facts
 
 Source facts are supplied through `SourceBarFactProjector`: source ordinal, scheduled open/close, actual `available_at`, and explicit gap-before facts remain distinct. Confirmed swings retain anchor and confirmation times through `ConfirmedSwingFactProjector`. Temporal materials include strict cross, delta/rise/fall, hold/count/share/streak, bars-since, sequence, and the `single_keep_first`, `replace_latest`, and bounded queue setup policies. Setup capture, tolerance, normalization and level are frozen; creation-bar retest is impossible; expiry and opposite-close invalidation use the documented strict boundaries.
 
-`IanaTradingCalendar` keeps UTC authoritative, resolves DST gaps to the first existing local instant, chooses earliest fold instant for opens and latest for closes, and derives trading day/week from the session-open date. `CalendarFeatureProjector` exposes local/session time, prior session/day/week levels, causal final/so-far opening ranges, and bounded past-same-slot range normalization through fresh named-input state. Final opening range remains unavailable until every resolved child exists and is actually revealed.
+The compatibility `IanaTradingCalendar` keeps its original one-window behavior. New document-driven calendar inputs use `ConfiguredTradingCalendar`: an omitted session schedule expands to exactly one `full_day` session spanning adjacent resolved trading-day boundaries, while explicit custom mode uses only its bounded named sessions. Full day is 24 hours in UTC and the actual 23/25-hour local day across DST. Trading-day/week aggregates are independent from analytical sessions, so overlapping named sessions never double-count or redefine daily values. Previous-session facts target the most recent completed occurrence of the selected session ID; previous-day/week facts require the immediately preceding eligible period and never fall back to older observed data. Exact previous/final values require an explicit market schedule and complete aligned, actually revealed children; an unspecified schedule cannot prove completeness. Sessions are analytical inputs only and do not themselves permit or prohibit trading.
+
+A declared space can bind a strategy input to the default full-day session without a hardcoded strategy factory:
+
+```toml
+[historical_inputs.calendars.main]
+id = "main"
+timezone = "UTC"
+market = { mode = "continuous" }
+# sessions omitted: exactly one effective full_day session
+
+[[historical_inputs.inputs]]
+name = "previous_session_high"
+source = "primary"
+calendar = "main"
+
+[historical_inputs.inputs.input]
+calendar_id = "main"
+kind = "previous_session_high"
+child_seconds = 60
+alignment_offset_seconds = 0
+maximum_history = 2
+```
+
+Use `sessions = { mode = "custom", items = [...] }` to replace the default with named sessions. In custom mode, every session-dependent input names its session explicitly; an empty custom list, unknown ID, duplicate input name, invalid local time, incompatible bar boundary, or oversized calendar state rejects before replay.
+
+Calendar configuration is carried through configured single/portfolio requests and through a declared search space's `historical_inputs`. The service requires finite `from`/`to` bounds when configured historical inputs are selected, loads their bounded history, and gates strategy transitions until the evaluation start while still warming indicators and calendar state. Effective expanded defaults are retained in candidate recipes; selected configured reruns reconstruct supported calendar projectors before choosing the load range. Unknown projector kinds or projectors whose external data authority cannot be restored reject explicitly.
 
 Enhanced quote storage persists source ordinals and preserves equal timestamps. Provider sequence is used as identity only with a source identity; repeated equal payloads count as duplicates and conflicting payloads reject. `QuoteStatisticsProjector` performs a row-bounded exact query over one immutable ordered-tick slice and exposes accepted/rejected/coverage counts, spread statistics, activity/interarrival/path/extrema/TWAP, captured-level crossings and distinct breakout durations, plus half-open time-at-price bins as typed named inputs. These are quote statistics, not trade volume, order flow, or VWAP. The legacy CSV importer reports observed fractional precision and simultaneous rows but has no provider sequence or persisted ordinal and writes through timestamp-deduplicated legacy paths, so those partitions are never relabeled as complete exact quote paths.
 
@@ -154,4 +180,4 @@ cargo run -p qs-research --example unified_workflows -- all
 
 `ema_grid` writes deterministic synthetic ticks into a temporary Parquet store, loads them through `qs-market-loader`, reads the two TOML documents, runs the declared space with commission charged, writes `target/research/ema_grid.csv`, and prints pooled breakdown counts by entry condition and window.
 
-`unified_workflows` is a compact executable acceptance fixture. Its modes are `bar-inputs`, `direct`, `variants`, `mixed`, `temporal`, `cache`, and `resume-final`; `all` runs every mode. It covers counted and unknown-count bars, a direct factory, execution variants, mixed configured/direct timing, generated capture, immutable feature-cache production/reuse, cancellation resume, and protected final release/rerun. All example data is synthetic and has no economic meaning.
+`unified_workflows` is a compact executable acceptance fixture. Its modes are `bar-inputs`, `direct`, `variants`, `mixed`, `temporal`, `cache`, and `resume-final`; `all` runs every mode. Its cache mode admits an immutable market view, proves miss/hit reuse, and consumes the cached midpoint as a real configured Entry condition with nonempty economic output. The remaining modes cover counted and unknown-count bars, optional direct factories, variants, mixed timing, generated capture, cancellation resume, and protected final reruns. All data is synthetic and carries no profitability claim.

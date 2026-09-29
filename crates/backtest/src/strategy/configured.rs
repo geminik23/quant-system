@@ -517,6 +517,7 @@ pub struct BacktestConfiguredStrategyAdapter {
     requirements: StrategyRequirements,
     bindings: ConfiguredHistoricalBindings,
     command_routes: BTreeMap<String, CommandRoute>,
+    evaluation_start: Option<NaiveDateTime>,
     first_ready_at: Option<NaiveDateTime>,
 }
 
@@ -556,6 +557,7 @@ impl BacktestConfiguredStrategyAdapter {
             requirements,
             bindings,
             command_routes: BTreeMap::new(),
+            evaluation_start: None,
             first_ready_at: None,
         })
     }
@@ -582,6 +584,10 @@ impl BacktestConfiguredStrategyAdapter {
 
     pub fn first_ready_at(&self) -> Option<NaiveDateTime> {
         self.first_ready_at
+    }
+
+    pub fn set_evaluation_start(&mut self, evaluation_start: Option<NaiveDateTime>) {
+        self.evaluation_start = evaluation_start;
     }
 
     pub fn configured_strategy(&self) -> &ConfiguredStrategy {
@@ -699,6 +705,10 @@ impl BacktestConfiguredStrategyAdapter {
         retention: StrategyRetentionLimits,
         research: StrategyResearchLimits,
     ) -> Result<ConfiguredBoundaryOutput, ConfiguredStrategyAdapterError> {
+        let ready = ready
+            && self
+                .evaluation_start
+                .is_none_or(|start| observed_through >= start);
         if ready && self.first_ready_at.is_none() {
             self.first_ready_at = Some(observed_through);
         }

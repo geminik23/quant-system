@@ -12,6 +12,16 @@ use super::{
     HistoricalNamedInputProjector, NamedInputProjectionContext, NamedInputProjectionError,
     ProjectedNamedInput, SeriesId,
 };
+
+mod configured;
+
+pub use configured::{
+    CalendarAdmissionLimits, CalendarInputSpec, CalendarTimeBasis,
+    ConfiguredCalendarFeatureProjector, ConfiguredCalendarInput, ConfiguredTradingCalendar,
+    DEFAULT_CALENDAR_SESSION_ID, LocalMarketIntervalSpec, MarketScheduleSpec, NamedSessionSpec,
+    ResolvedSessionOccurrence, ResolvedTradingDay, SessionOccurrenceId, SessionScheduleSpec,
+    SessionSpanSpec, TradingCalendarSpec, WeeklyMarketIntervalSpec,
+};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSession {
     pub trading_day: NaiveDate,
@@ -49,6 +59,10 @@ pub enum CalendarError {
     TimestampOverflow,
     #[error("opening-range bars overlap, mismatch, or exceed bounds")]
     InvalidChildren,
+    #[error("invalid calendar configuration: {0}")]
+    InvalidConfiguration(String),
+    #[error("calendar resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
 #[derive(Debug, Clone)]
 pub struct IanaTradingCalendar {
@@ -252,6 +266,7 @@ pub enum CalendarFeatureKind {
     OpeningRangeLowFinal,
     PastSameSlotRangeRatio,
     PastSameSlotCount,
+    SessionMembership,
 }
 
 impl CalendarFeatureKind {
@@ -261,6 +276,7 @@ impl CalendarFeatureKind {
                 ScalarType::Integer
             }
             Self::PastSameSlotRangeRatio => ScalarType::Ratio,
+            Self::SessionMembership => ScalarType::Bool,
             _ => ScalarType::Price,
         }
     }
@@ -319,7 +335,11 @@ impl CalendarFeatureProjector {
         alignment_offset_seconds: i64,
         maximum_slot_history: usize,
     ) -> Result<Self, CalendarError> {
-        if opening_range_minutes == 0 || child_seconds < 60 || maximum_slot_history == 0 {
+        if opening_range_minutes == 0
+            || child_seconds < 60
+            || i64::try_from(child_seconds).is_err()
+            || maximum_slot_history == 0
+        {
             return Err(CalendarError::InvalidChildGeometry);
         }
         Ok(Self {
@@ -393,7 +413,9 @@ impl HistoricalNamedInputProjector for CalendarFeatureProjector {
                 "calendar bar precedes its resolved session",
             ));
         }
-        let slot = u32::try_from(elapsed / i64::try_from(self.child_seconds).unwrap())
+        let child_seconds = i64::try_from(self.child_seconds)
+            .map_err(|_| NamedInputProjectionError::new("calendar child duration exceeds i64"))?;
+        let slot = u32::try_from(elapsed / child_seconds)
             .map_err(|_| NamedInputProjectionError::new("calendar slot exceeds u32"))?;
         let prior_slot = state.slot_ranges.get(&slot).cloned().unwrap_or_default();
         let current_range = bar.high() - bar.low();
@@ -507,6 +529,7 @@ impl HistoricalNamedInputProjector for CalendarFeatureProjector {
                 i64::try_from(prior_slot.len())
                     .map_err(|_| NamedInputProjectionError::new("same-slot history exceeds i64"))?,
             ),
+            CalendarFeatureKind::SessionMembership => Value::Bool(true),
         };
         let history = state.slot_ranges.entry(slot).or_default();
         history.push(current_range);

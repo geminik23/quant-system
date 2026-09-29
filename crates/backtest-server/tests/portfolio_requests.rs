@@ -213,6 +213,7 @@ fn instance_msg(symbol: &str, instance_id: Option<&str>) -> PortfolioInstanceMsg
             }],
             instance_id: instance_id.map(Into::into),
             decision_latency_ms: 0,
+            historical_inputs: None,
         },
         profile: None,
         profile_def: None,
