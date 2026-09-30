@@ -19,11 +19,12 @@ pub(crate) enum CompiledExpr {
     Binary(BinaryOp, Box<Self>, Box<Self>, ValueType),
     List(BoolListOp, Vec<Self>),
     Not(Box<Self>),
+    Strict(Box<Self>),
     Abs(Box<Self>, ValueType),
     Presence(Box<Self>, bool),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryOp {
     Eq,
     Ne,
@@ -64,7 +65,7 @@ pub(crate) fn compile_expr(
     path: &str,
 ) -> Result<(CompiledExpr, ValueType), CompileError> {
     let mut nodes = 0;
-    compile_inner(expr, scope, path, 1, &mut nodes)
+    compile_inner(expr, scope, path, 1, &mut nodes, false)
 }
 
 fn compile_inner(
@@ -73,6 +74,7 @@ fn compile_inner(
     path: &str,
     depth: usize,
     nodes: &mut usize,
+    strict: bool,
 ) -> Result<(CompiledExpr, ValueType), CompileError> {
     *nodes += 1;
     if *nodes > crate::MAX_EXPR_NODES {
@@ -90,7 +92,14 @@ fn compile_inner(
         });
     }
     let child = |value: &Expr, suffix: &str, nodes: &mut usize| {
-        compile_inner(value, scope, &format!("{path}.{suffix}"), depth + 1, nodes)
+        compile_inner(
+            value,
+            scope,
+            &format!("{path}.{suffix}"),
+            depth + 1,
+            nodes,
+            strict,
+        )
     };
     match expr {
         Expr::Literal { value } => {
@@ -112,6 +121,10 @@ fn compile_inner(
                 path: path.into(),
                 reference: id.clone(),
             }),
+        Expr::Param { .. } | Expr::Select { .. } => Err(CompileError::InvalidConfig {
+            path: path.into(),
+            reason: "strategy parameter expressions must be bound before compilation".into(),
+        }),
         Expr::Input { field, value_type } => {
             crate::validate_id(field).map_err(|reason| CompileError::InvalidIdentifier {
                 path: format!("{path}.field"),
@@ -138,16 +151,7 @@ fn compile_inner(
                     reference: slot.clone(),
                 });
             }
-            let ty = match field {
-                PositionField::Exists | PositionField::IsPending | PositionField::IsOpen => {
-                    ValueType::required(ScalarType::Bool)
-                }
-                PositionField::EntryPrice | PositionField::Stoploss => {
-                    ValueType::optional(ScalarType::Price)
-                }
-                PositionField::Side => ValueType::optional(ScalarType::Side),
-                PositionField::RemainingSize => ValueType::optional(ScalarType::Number),
-            };
+            let ty = crate::material::position_field_type(*field);
             Ok((CompiledExpr::Position(slot.clone(), *field), ty))
         }
         Expr::Feedback {
@@ -175,41 +179,83 @@ fn compile_inner(
             ValueType::required(ScalarType::Bool),
         )),
         Expr::Eq { left, right } => {
-            binary_compare(BinaryOp::Eq, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Eq, left, right, scope, path, depth, nodes, strict)
         }
         Expr::Ne { left, right } => {
-            binary_compare(BinaryOp::Ne, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Ne, left, right, scope, path, depth, nodes, strict)
         }
         Expr::Lt { left, right } => {
-            binary_compare(BinaryOp::Lt, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Lt, left, right, scope, path, depth, nodes, strict)
         }
         Expr::Le { left, right } => {
-            binary_compare(BinaryOp::Le, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Le, left, right, scope, path, depth, nodes, strict)
         }
         Expr::Gt { left, right } => {
-            binary_compare(BinaryOp::Gt, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Gt, left, right, scope, path, depth, nodes, strict)
         }
         Expr::Ge { left, right } => {
-            binary_compare(BinaryOp::Ge, left, right, scope, path, depth, nodes)
+            binary_compare(BinaryOp::Ge, left, right, scope, path, depth, nodes, strict)
         }
-        Expr::Add { left, right } => {
-            binary_arithmetic(BinaryOp::Add, left, right, scope, path, depth, nodes)
-        }
-        Expr::Sub { left, right } => {
-            binary_arithmetic(BinaryOp::Sub, left, right, scope, path, depth, nodes)
-        }
-        Expr::Mul { left, right } => {
-            binary_arithmetic(BinaryOp::Mul, left, right, scope, path, depth, nodes)
-        }
-        Expr::Div { left, right } => {
-            binary_arithmetic(BinaryOp::Div, left, right, scope, path, depth, nodes)
-        }
-        Expr::Min { left, right } => {
-            binary_same_numeric(BinaryOp::Min, left, right, scope, path, depth, nodes)
-        }
-        Expr::Max { left, right } => {
-            binary_same_numeric(BinaryOp::Max, left, right, scope, path, depth, nodes)
-        }
+        Expr::Add { left, right } => binary_arithmetic(
+            BinaryOp::Add,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
+        Expr::Sub { left, right } => binary_arithmetic(
+            BinaryOp::Sub,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
+        Expr::Mul { left, right } => binary_arithmetic(
+            BinaryOp::Mul,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
+        Expr::Div { left, right } => binary_arithmetic(
+            BinaryOp::Div,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
+        Expr::Min { left, right } => binary_same_numeric(
+            BinaryOp::Min,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
+        Expr::Max { left, right } => binary_same_numeric(
+            BinaryOp::Max,
+            left,
+            right,
+            scope,
+            path,
+            depth,
+            nodes,
+            strict,
+        ),
         Expr::All { items } | Expr::Any { items } => {
             if items.is_empty() {
                 return Err(CompileError::InvalidConfig {
@@ -225,8 +271,16 @@ fn compile_inner(
                     &format!("{path}.items[{index}]"),
                     depth + 1,
                     nodes,
+                    strict,
                 )?;
-                expect(ty, ValueType::required(ScalarType::Bool), path)?;
+                expect(
+                    ty,
+                    ValueType {
+                        scalar: ScalarType::Bool,
+                        optional: strict,
+                    },
+                    path,
+                )?;
                 compiled.push(value);
             }
             let op = if matches!(expr, Expr::All { .. }) {
@@ -236,19 +290,63 @@ fn compile_inner(
             };
             Ok((
                 CompiledExpr::List(op, compiled),
-                ValueType::required(ScalarType::Bool),
+                ValueType {
+                    scalar: ScalarType::Bool,
+                    optional: strict,
+                },
             ))
         }
         Expr::Not { value } => {
             let (value, ty) = child(value, "value", nodes)?;
-            expect(ty, ValueType::required(ScalarType::Bool), path)?;
-            Ok((CompiledExpr::Not(Box::new(value)), ty))
+            expect(
+                ty,
+                ValueType {
+                    scalar: ScalarType::Bool,
+                    optional: strict,
+                },
+                path,
+            )?;
+            Ok((
+                CompiledExpr::Not(Box::new(value)),
+                ValueType {
+                    scalar: ScalarType::Bool,
+                    optional: strict,
+                },
+            ))
+        }
+        Expr::Strict { value } => {
+            let (value, ty) = compile_inner(
+                value,
+                scope,
+                &format!("{path}.value"),
+                depth + 1,
+                nodes,
+                true,
+            )?;
+            if ty.scalar != ScalarType::Bool {
+                return mismatch(path, ValueType::optional(ScalarType::Bool), ty);
+            }
+            Ok((
+                CompiledExpr::Strict(Box::new(value)),
+                ValueType::optional(ScalarType::Bool),
+            ))
         }
         Expr::Abs { value } => {
             let (value, ty) = child(value, "value", nodes)?;
             if !matches!(
                 ty.scalar,
-                ScalarType::Integer | ScalarType::Number | ScalarType::Price | ScalarType::Duration
+                ScalarType::Integer
+                    | ScalarType::Number
+                    | ScalarType::Price
+                    | ScalarType::Ratio
+                    | ScalarType::Percent
+                    | ScalarType::PricePerObservation
+                    | ScalarType::PricePerObservationSquared
+                    | ScalarType::RatioPerObservation
+                    | ScalarType::RatioPerObservationSquared
+                    | ScalarType::LogReturn
+                    | ScalarType::LogReturnVariance
+                    | ScalarType::Duration
             ) {
                 return mismatch(path, ValueType::required(ScalarType::Number), ty);
             }
@@ -264,6 +362,7 @@ fn compile_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binary_compare(
     op: BinaryOp,
     left: &Expr,
@@ -272,11 +371,32 @@ fn binary_compare(
     path: &str,
     depth: usize,
     nodes: &mut usize,
+    strict: bool,
 ) -> Result<(CompiledExpr, ValueType), CompileError> {
-    let (left, lt) = compile_inner(left, scope, &format!("{path}.left"), depth + 1, nodes)?;
-    let (right, rt) = compile_inner(right, scope, &format!("{path}.right"), depth + 1, nodes)?;
+    let (left, lt) = compile_inner(
+        left,
+        scope,
+        &format!("{path}.left"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
+    let (right, rt) = compile_inner(
+        right,
+        scope,
+        &format!("{path}.right"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
     if lt.scalar != rt.scalar {
         return mismatch(path, lt, rt);
+    }
+    if !strict && (left.contains_strict() || right.contains_strict()) {
+        return Err(CompileError::InvalidConfig {
+            path: path.into(),
+            reason: "a strict predicate cannot be compared by a legacy comparison; put the entire predicate under strict".into(),
+        });
     }
     if matches!(
         op,
@@ -288,13 +408,17 @@ fn binary_compare(
             reason: "type is not ordered".into(),
         });
     }
-    let ty = ValueType::required(ScalarType::Bool);
+    let ty = ValueType {
+        scalar: ScalarType::Bool,
+        optional: strict,
+    };
     Ok((
         CompiledExpr::Binary(op, Box::new(left), Box::new(right), ty),
         ty,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binary_same_numeric(
     op: BinaryOp,
     left: &Expr,
@@ -303,13 +427,37 @@ fn binary_same_numeric(
     path: &str,
     depth: usize,
     nodes: &mut usize,
+    strict: bool,
 ) -> Result<(CompiledExpr, ValueType), CompileError> {
-    let (left, lt) = compile_inner(left, scope, &format!("{path}.left"), depth + 1, nodes)?;
-    let (right, rt) = compile_inner(right, scope, &format!("{path}.right"), depth + 1, nodes)?;
+    let (left, lt) = compile_inner(
+        left,
+        scope,
+        &format!("{path}.left"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
+    let (right, rt) = compile_inner(
+        right,
+        scope,
+        &format!("{path}.right"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
     if lt.scalar != rt.scalar
         || !matches!(
             lt.scalar,
-            ScalarType::Integer | ScalarType::Number | ScalarType::Price | ScalarType::Duration
+            ScalarType::Integer
+                | ScalarType::Number
+                | ScalarType::Price
+                | ScalarType::Ratio
+                | ScalarType::Percent
+                | ScalarType::PricePerObservation
+                | ScalarType::PricePerObservationSquared
+                | ScalarType::LogReturn
+                | ScalarType::LogReturnVariance
+                | ScalarType::Duration
         )
     {
         return mismatch(path, lt, rt);
@@ -324,6 +472,7 @@ fn binary_same_numeric(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binary_arithmetic(
     op: BinaryOp,
     left: &Expr,
@@ -332,9 +481,24 @@ fn binary_arithmetic(
     path: &str,
     depth: usize,
     nodes: &mut usize,
+    strict: bool,
 ) -> Result<(CompiledExpr, ValueType), CompileError> {
-    let (left, lt) = compile_inner(left, scope, &format!("{path}.left"), depth + 1, nodes)?;
-    let (right, rt) = compile_inner(right, scope, &format!("{path}.right"), depth + 1, nodes)?;
+    let (left, lt) = compile_inner(
+        left,
+        scope,
+        &format!("{path}.left"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
+    let (right, rt) = compile_inner(
+        right,
+        scope,
+        &format!("{path}.right"),
+        depth + 1,
+        nodes,
+        strict,
+    )?;
     let scalar =
         arithmetic_type(op, lt.scalar, rt.scalar).ok_or_else(|| CompileError::InvalidConfig {
             path: path.into(),
@@ -363,9 +527,51 @@ fn arithmetic_type(op: BinaryOp, left: ScalarType, right: ScalarType) -> Option<
             Some(Number)
         }
         (BinaryOp::Add | BinaryOp::Sub, Price, Price) => Some(Price),
+        (BinaryOp::Add | BinaryOp::Sub, Ratio, Ratio) => Some(Ratio),
+        (BinaryOp::Add | BinaryOp::Sub, Percent, Percent) => Some(Percent),
+        (BinaryOp::Add | BinaryOp::Sub, PricePerObservation, PricePerObservation) => {
+            Some(PricePerObservation)
+        }
+        (BinaryOp::Add | BinaryOp::Sub, PricePerObservationSquared, PricePerObservationSquared) => {
+            Some(PricePerObservationSquared)
+        }
+        (BinaryOp::Add | BinaryOp::Sub, RatioPerObservation, RatioPerObservation) => {
+            Some(RatioPerObservation)
+        }
+        (BinaryOp::Add | BinaryOp::Sub, RatioPerObservationSquared, RatioPerObservationSquared) => {
+            Some(RatioPerObservationSquared)
+        }
+        (BinaryOp::Add | BinaryOp::Sub, LogReturn, LogReturn) => Some(LogReturn),
+        (BinaryOp::Add | BinaryOp::Sub, LogReturnVariance, LogReturnVariance) => {
+            Some(LogReturnVariance)
+        }
         (BinaryOp::Mul, Price, Number)
         | (BinaryOp::Mul, Number, Price)
         | (BinaryOp::Div, Price, Number) => Some(Price),
+        (BinaryOp::Mul, Ratio, Number)
+        | (BinaryOp::Mul, Number, Ratio)
+        | (BinaryOp::Div, Ratio, Number) => Some(Ratio),
+        (BinaryOp::Mul, Percent, Number)
+        | (BinaryOp::Mul, Number, Percent)
+        | (BinaryOp::Div, Percent, Number) => Some(Percent),
+        (BinaryOp::Mul, PricePerObservation, Number)
+        | (BinaryOp::Mul, Number, PricePerObservation)
+        | (BinaryOp::Div, PricePerObservation, Number) => Some(PricePerObservation),
+        (BinaryOp::Mul, PricePerObservationSquared, Number)
+        | (BinaryOp::Mul, Number, PricePerObservationSquared)
+        | (BinaryOp::Div, PricePerObservationSquared, Number) => Some(PricePerObservationSquared),
+        (BinaryOp::Mul, RatioPerObservation, Number)
+        | (BinaryOp::Mul, Number, RatioPerObservation)
+        | (BinaryOp::Div, RatioPerObservation, Number) => Some(RatioPerObservation),
+        (BinaryOp::Mul, RatioPerObservationSquared, Number)
+        | (BinaryOp::Mul, Number, RatioPerObservationSquared)
+        | (BinaryOp::Div, RatioPerObservationSquared, Number) => Some(RatioPerObservationSquared),
+        (BinaryOp::Mul, LogReturn, Number)
+        | (BinaryOp::Mul, Number, LogReturn)
+        | (BinaryOp::Div, LogReturn, Number) => Some(LogReturn),
+        (BinaryOp::Mul, LogReturnVariance, Number)
+        | (BinaryOp::Mul, Number, LogReturnVariance)
+        | (BinaryOp::Div, LogReturnVariance, Number) => Some(LogReturnVariance),
         (BinaryOp::Div, Price, Price) => Some(Number),
         (BinaryOp::Add | BinaryOp::Sub, Duration, Duration) => Some(Duration),
         (BinaryOp::Add, Timestamp, Duration)
@@ -406,11 +612,15 @@ pub(crate) struct CompiledInputProvenance {
 }
 
 impl CompiledExpr {
-    pub(crate) fn direct_material_index(&self) -> Option<usize> {
-        if let Self::Material(index) = self {
-            Some(*index)
-        } else {
-            None
+    fn contains_strict(&self) -> bool {
+        match self {
+            Self::Strict(_) => true,
+            Self::Binary(_, left, right, _) => left.contains_strict() || right.contains_strict(),
+            Self::List(_, items) => items.iter().any(Self::contains_strict),
+            Self::Not(value) | Self::Abs(value, _) => value.contains_strict(),
+            // Explicit presence diagnostics consume optionality instead of coercing it.
+            Self::Presence(_, _) => false,
+            _ => false,
         }
     }
 
@@ -431,7 +641,10 @@ impl CompiledExpr {
             Self::Bar(source, _) => {
                 provenance.sources.insert(source.clone());
             }
-            Self::Not(value) | Self::Abs(value, _) | Self::Presence(value, _) => {
+            Self::Not(value)
+            | Self::Strict(value)
+            | Self::Abs(value, _)
+            | Self::Presence(value, _) => {
                 value.collect_provenance(provenance);
             }
             Self::Binary(_, left, right, _) => {
@@ -500,6 +713,7 @@ impl CompiledExpr {
                 }))
             }
             Self::Not(value) => Ok(Value::Bool(!bool_value(value.eval(scope, path)?, path)?)),
+            Self::Strict(value) => value.eval_strict(scope, path),
             Self::Abs(value, ty) => {
                 let value = value.eval(scope, path)?;
                 if value.is_missing() {
@@ -512,6 +726,24 @@ impl CompiledExpr {
                         .ok_or_else(|| EvaluationError::ArithmeticOverflow { path: path.into() }),
                     Value::Number(value) => Value::Number(value.abs()).finite(path),
                     Value::Price(value) => Value::Price(value.abs()).finite(path),
+                    Value::Ratio(value) => Value::Ratio(value.abs()).finite(path),
+                    Value::Percent(value) => Value::Percent(value.abs()).finite(path),
+                    Value::PricePerObservation(value) => {
+                        Value::PricePerObservation(value.abs()).finite(path)
+                    }
+                    Value::PricePerObservationSquared(value) => {
+                        Value::PricePerObservationSquared(value.abs()).finite(path)
+                    }
+                    Value::RatioPerObservation(value) => {
+                        Value::RatioPerObservation(value.abs()).finite(path)
+                    }
+                    Value::RatioPerObservationSquared(value) => {
+                        Value::RatioPerObservationSquared(value.abs()).finite(path)
+                    }
+                    Value::LogReturn(value) => Value::LogReturn(value.abs()).finite(path),
+                    Value::LogReturnVariance(value) => {
+                        Value::LogReturnVariance(value.abs()).finite(path)
+                    }
                     Value::Duration(value) => value
                         .num_milliseconds()
                         .checked_abs()
@@ -527,6 +759,62 @@ impl CompiledExpr {
             Self::Presence(value, present) => Ok(Value::Bool(
                 value.eval(scope, path)?.is_missing() != *present,
             )),
+        }
+    }
+
+    fn eval_strict(&self, scope: &EvalScope<'_>, path: &str) -> Result<Value, EvaluationError> {
+        match self {
+            Self::Strict(value) => value.eval_strict(scope, path),
+            Self::Presence(value, present) => Ok(Value::Bool(
+                value.eval_strict(scope, path)?.is_missing() != *present,
+            )),
+            Self::Binary(op, left, right, _)
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                ) =>
+            {
+                let left = left.eval_strict(scope, path)?;
+                let right = right.eval_strict(scope, path)?;
+                if left.is_missing() || right.is_missing() {
+                    Ok(Value::Missing(ScalarType::Bool))
+                } else {
+                    compare(*op, left, right, path)
+                }
+            }
+            Self::Not(value) => match value.eval_strict(scope, path)? {
+                Value::Bool(value) => Ok(Value::Bool(!value)),
+                Value::Missing(ScalarType::Bool) => Ok(Value::Missing(ScalarType::Bool)),
+                value => bool_value(value, path).map(|value| Value::Bool(!value)),
+            },
+            Self::List(op, items) => {
+                let mut invalid = false;
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.eval_strict(scope, path)? {
+                        Value::Bool(value) => values.push(value),
+                        Value::Missing(ScalarType::Bool) => invalid = true,
+                        other => {
+                            bool_value(other, path)?;
+                            unreachable!("a boolean value was validated")
+                        }
+                    }
+                }
+                if invalid {
+                    Ok(Value::Missing(ScalarType::Bool))
+                } else {
+                    Ok(Value::Bool(match op {
+                        BoolListOp::All => values.into_iter().all(|value| value),
+                        BoolListOp::Any => values.into_iter().any(|value| value),
+                    }))
+                }
+            }
+            _ => self.eval(scope, path),
         }
     }
 }
@@ -551,7 +839,18 @@ fn validate_input_value(
         return Err(EvaluationError::MissingRequired { path: path.into() });
     }
     match &value {
-        Value::Number(number) | Value::Price(number) if !number.is_finite() => {
+        Value::Number(number)
+        | Value::Price(number)
+        | Value::Ratio(number)
+        | Value::Percent(number)
+        | Value::PricePerObservation(number)
+        | Value::PricePerObservationSquared(number)
+        | Value::RatioPerObservation(number)
+        | Value::RatioPerObservationSquared(number)
+        | Value::LogReturn(number)
+        | Value::LogReturnVariance(number)
+            if !number.is_finite() =>
+        {
             Err(EvaluationError::NonFinite { path: path.into() })
         }
         Value::Text(text) => {
@@ -617,6 +916,40 @@ fn eval_binary(
         return Ok(Value::Missing(ty.scalar));
     }
     use BinaryOp::*;
+    if is_semantic_float(ty.scalar) {
+        if left.scalar_type() == ty.scalar
+            && right.scalar_type() == ty.scalar
+            && matches!(op, Add | Sub)
+        {
+            let a = float_value(&left).unwrap();
+            let b = float_value(&right).unwrap();
+            return typed_float(ty.scalar, if op == Add { a + b } else { a - b }).finite(path);
+        }
+        let (value, factor) = if left.scalar_type() == ty.scalar
+            && matches!(&right, Value::Number(_))
+        {
+            (float_value(&left).unwrap(), float_value(&right).unwrap())
+        } else if op == Mul && right.scalar_type() == ty.scalar && matches!(&left, Value::Number(_))
+        {
+            (float_value(&right).unwrap(), float_value(&left).unwrap())
+        } else {
+            (0.0, f64::NAN)
+        };
+        if factor.is_finite() && matches!(op, Mul | Div) {
+            if op == Div && factor == 0.0 {
+                return Err(EvaluationError::DivisionByZero { path: path.into() });
+            }
+            return typed_float(
+                ty.scalar,
+                if op == Mul {
+                    value * factor
+                } else {
+                    value / factor
+                },
+            )
+            .finite(path);
+        }
+    }
     let result = match (op, left, right) {
         (Add, Value::Integer(a), Value::Integer(b)) => a.checked_add(b).map(Value::Integer),
         (Sub, Value::Integer(a), Value::Integer(b)) => a.checked_sub(b).map(Value::Integer),
@@ -663,9 +996,16 @@ fn compare(op: BinaryOp, left: Value, right: Value, path: &str) -> Result<Value,
     let ordering = match (&left, &right) {
         (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
         (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
-        (Value::Number(a), Value::Number(b)) | (Value::Price(a), Value::Price(b)) => {
-            a.partial_cmp(b)
-        }
+        (Value::Number(a), Value::Number(b))
+        | (Value::Price(a), Value::Price(b))
+        | (Value::Ratio(a), Value::Ratio(b))
+        | (Value::Percent(a), Value::Percent(b))
+        | (Value::PricePerObservation(a), Value::PricePerObservation(b))
+        | (Value::PricePerObservationSquared(a), Value::PricePerObservationSquared(b))
+        | (Value::RatioPerObservation(a), Value::RatioPerObservation(b))
+        | (Value::RatioPerObservationSquared(a), Value::RatioPerObservationSquared(b))
+        | (Value::LogReturn(a), Value::LogReturn(b))
+        | (Value::LogReturnVariance(a), Value::LogReturnVariance(b)) => a.partial_cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
         (Value::Duration(a), Value::Duration(b)) => a.partial_cmp(b),
         (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
@@ -689,6 +1029,50 @@ fn compare(op: BinaryOp, left: Value, right: Value, path: &str) -> Result<Value,
         _ => false,
     }))
 }
+fn is_semantic_float(scalar: ScalarType) -> bool {
+    matches!(
+        scalar,
+        ScalarType::Ratio
+            | ScalarType::Percent
+            | ScalarType::PricePerObservation
+            | ScalarType::PricePerObservationSquared
+            | ScalarType::RatioPerObservation
+            | ScalarType::RatioPerObservationSquared
+            | ScalarType::LogReturn
+            | ScalarType::LogReturnVariance
+    )
+}
+
+fn float_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn typed_float(scalar: ScalarType, value: f64) -> Value {
+    match scalar {
+        ScalarType::Ratio => Value::Ratio(value),
+        ScalarType::Percent => Value::Percent(value),
+        ScalarType::PricePerObservation => Value::PricePerObservation(value),
+        ScalarType::PricePerObservationSquared => Value::PricePerObservationSquared(value),
+        ScalarType::RatioPerObservation => Value::RatioPerObservation(value),
+        ScalarType::RatioPerObservationSquared => Value::RatioPerObservationSquared(value),
+        ScalarType::LogReturn => Value::LogReturn(value),
+        ScalarType::LogReturnVariance => Value::LogReturnVariance(value),
+        _ => unreachable!("not a semantic floating-point scalar"),
+    }
+}
+
 fn min_max(op: BinaryOp, left: Value, right: Value, path: &str) -> Result<Value, EvaluationError> {
     let less = match compare(BinaryOp::Lt, left.clone(), right.clone(), path)? {
         Value::Bool(value) => value,
@@ -737,7 +1121,13 @@ fn collect_material_refs_inner(
     };
     match expr {
         Expr::Material { id } => refs.push(id.clone()),
+        Expr::Select { cases, .. } => {
+            for (name, case) in cases {
+                visit(case, &format!("cases.{name}"))?;
+            }
+        }
         Expr::Not { value }
+        | Expr::Strict { value }
         | Expr::Abs { value }
         | Expr::IsPresent { value }
         | Expr::IsMissing { value } => visit(value, "value")?,

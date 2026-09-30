@@ -11,9 +11,9 @@ pub mod error;
 mod fx_loader;
 pub mod handlers;
 mod instrument_catalog;
-mod market_loader;
 mod replay_plan;
 pub mod rpc_types;
+pub mod strategy_client;
 
 pub use artifact_store::ArtifactStore;
 pub use config::ServerConfig;

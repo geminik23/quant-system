@@ -18,6 +18,8 @@ pub struct ServerConfig {
     pub artifacts: ArtifactsSection,
     #[serde(default)]
     pub logging: LoggingSection,
+    #[serde(default)]
+    pub strategies: StrategiesSection,
 }
 
 /// Service listener and transport settings.
@@ -130,6 +132,108 @@ impl Default for JobsSection {
             max_retained_jobs: default_max_retained_jobs(),
         }
     }
+}
+
+/// Limits for configured strategy runs and server-side parameter searches.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrategiesSection {
+    /// Largest accepted strategy, template, or space document, measured as its JSON encoding in bytes.
+    #[serde(default = "default_max_document_bytes")]
+    pub max_document_bytes: usize,
+    /// Largest total retained history one configured run may bind across all of its sources, in bars.
+    #[serde(default = "default_max_retained_bars")]
+    pub max_retained_bars: usize,
+    /// Most worker threads one search may use; a request asking for more is capped here.
+    #[serde(default = "default_max_search_workers")]
+    pub max_search_workers: usize,
+    /// Most pre-constraint parameter combinations one search may enumerate.
+    #[serde(default = "default_max_search_generation_points")]
+    pub max_search_generation_points: usize,
+    /// Most runs, counted as points times symbols times windows, one search may schedule.
+    #[serde(default = "default_max_search_runs")]
+    pub max_search_runs: usize,
+    /// Most configured strategy instances one portfolio run may replay together; `max_retained_bars` bounds their combined retained history.
+    #[serde(default = "default_max_portfolio_instances")]
+    pub max_portfolio_instances: usize,
+    #[serde(default = "default_max_calendar_sessions")]
+    pub max_calendar_sessions: usize,
+    #[serde(default = "default_max_calendar_intervals")]
+    pub max_calendar_intervals: usize,
+    #[serde(default = "default_max_calendar_exceptions")]
+    pub max_calendar_exceptions: usize,
+    #[serde(default = "default_max_calendar_history")]
+    pub max_calendar_history: usize,
+    #[serde(default = "default_max_calendar_children")]
+    pub max_calendar_children: usize,
+    #[serde(default = "default_max_calendar_bytes")]
+    pub max_calendar_bytes: usize,
+}
+
+impl Default for StrategiesSection {
+    fn default() -> Self {
+        Self {
+            max_document_bytes: default_max_document_bytes(),
+            max_retained_bars: default_max_retained_bars(),
+            max_search_workers: default_max_search_workers(),
+            max_search_generation_points: default_max_search_generation_points(),
+            max_search_runs: default_max_search_runs(),
+            max_portfolio_instances: default_max_portfolio_instances(),
+            max_calendar_sessions: default_max_calendar_sessions(),
+            max_calendar_intervals: default_max_calendar_intervals(),
+            max_calendar_exceptions: default_max_calendar_exceptions(),
+            max_calendar_history: default_max_calendar_history(),
+            max_calendar_children: default_max_calendar_children(),
+            max_calendar_bytes: default_max_calendar_bytes(),
+        }
+    }
+}
+
+fn default_max_document_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_max_retained_bars() -> usize {
+    200_000
+}
+
+fn default_max_search_workers() -> usize {
+    4
+}
+
+fn default_max_search_generation_points() -> usize {
+    100_000
+}
+
+fn default_max_search_runs() -> usize {
+    20_000
+}
+
+fn default_max_portfolio_instances() -> usize {
+    16
+}
+
+fn default_max_calendar_sessions() -> usize {
+    32
+}
+
+fn default_max_calendar_intervals() -> usize {
+    64
+}
+
+fn default_max_calendar_exceptions() -> usize {
+    366
+}
+
+fn default_max_calendar_history() -> usize {
+    512
+}
+
+fn default_max_calendar_children() -> usize {
+    1_000_000
+}
+
+fn default_max_calendar_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 /// Large-result artifact storage settings.

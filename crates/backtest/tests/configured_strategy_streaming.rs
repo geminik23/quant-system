@@ -82,3 +82,53 @@ fn materialized_and_streaming_configured_replay_match() {
         streaming_adapter.configured_strategy().state_id()
     );
 }
+
+#[test]
+fn controlled_configured_replay_reports_progress_and_stops_when_cancelled() {
+    use std::cell::Cell;
+
+    let completed = {
+        let mut adapter = lifecycle_adapter();
+        let mut stream = BatchFeed {
+            batches: VecDeque::from(scenario_batches()),
+        };
+        let progress = Cell::new(0usize);
+        BacktestRunner::new_future(runner_config(), FutureQuoteConfig::default())
+            .run_configured_strategy_future_streaming_controlled(
+                &mut stream,
+                Some(ts(9)),
+                &mut adapter,
+                analysis(),
+                StrategyRetentionLimits::default(),
+                None,
+                || false,
+                |_| progress.set(progress.get() + 1),
+            )
+            .unwrap();
+        progress.get()
+    };
+    assert!(completed > 0, "an uncancelled run reports progress");
+
+    let mut adapter = lifecycle_adapter();
+    let mut stream = BatchFeed {
+        batches: VecDeque::from(scenario_batches()),
+    };
+    let polls = Cell::new(0usize);
+    let error = BacktestRunner::new_future(runner_config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future_streaming_controlled(
+            &mut stream,
+            Some(ts(9)),
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() > 3
+            },
+            |_| {},
+        )
+        .err()
+        .unwrap();
+    assert!(matches!(error, qs_backtest::StrategyReplayError::Cancelled));
+}

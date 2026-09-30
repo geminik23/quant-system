@@ -1,10 +1,11 @@
 //! Historical binding for reusable configured strategies.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDateTime;
-use qs_core::TradeEngine;
 use qs_core::types::{Effect, PositionStatus};
+use qs_core::{ManagementProfile, RuleConfigDef, StoplossMode, TradeEngine};
 use qs_strategy::{
     CommandFact, CommandFeedback, CommandTerminalStatus, ConfiguredActionKind, ConfiguredCommand,
     ConfiguredStrategy, ConfiguredStrategyRequirements, DecisionKind, MAX_GENERATED_ID_BYTES,
@@ -13,7 +14,10 @@ use qs_strategy::{
     Value, ValueType,
 };
 
+use crate::future_executor::FutureExecutor;
 use crate::ledger::ActionDispositionStatus;
+use crate::portfolio::CampaignExcursion;
+use crate::profile::PreparedEntryProfiles;
 
 use super::{
     BarSeriesSpec, ClosedBar, HistoricalObservationView, HistoricalSeriesView, JournalKind,
@@ -28,6 +32,7 @@ const MAX_EXACT_F64_INTEGER: u64 = 1_u64 << 53;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoricalVolumeProjection {
     TickCountExact,
+    OptionalTickCount,
 }
 
 /// Complete historical binding for one logical configured source.
@@ -73,13 +78,190 @@ pub struct ProjectedNamedInput {
 }
 
 /// Pure historical projection for one configured named input.
-pub trait HistoricalNamedInputProjector {
+///
+/// A projector must be movable between threads. It is a deterministic transformation over a borrowed context, so an implementation that could not move holds shared state it has no reason to hold. The bound also keeps one projector implementation usable by both the historical adapter and a later live adapter, which must run inside its own task.
+pub trait HistoricalNamedInputProjector: Send {
     fn output_type(&self) -> ValueType;
 
     fn project(
         &self,
         context: NamedInputProjectionContext<'_>,
     ) -> Result<ProjectedNamedInput, NamedInputProjectionError>;
+}
+
+/// One explicitly selected causal fact from a completed historical source bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceBarFactKind {
+    Ordinal,
+    OpenTime,
+    CloseTime,
+    AvailableAt,
+    GapBefore,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceBarFactState {
+    last_open: Option<NaiveDateTime>,
+    last_close: Option<NaiveDateTime>,
+    ordinal: u64,
+}
+
+/// Projects source-bar timing and explicit gap facts without using host time or callback count.
+pub struct SourceBarFactProjector {
+    series_id: SeriesId,
+    kind: SourceBarFactKind,
+    state: RefCell<SourceBarFactState>,
+}
+
+impl SourceBarFactProjector {
+    pub fn new(series_id: SeriesId, kind: SourceBarFactKind) -> Self {
+        Self {
+            series_id,
+            kind,
+            state: RefCell::new(SourceBarFactState::default()),
+        }
+    }
+}
+
+impl HistoricalNamedInputProjector for SourceBarFactProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::optional(match self.kind {
+            SourceBarFactKind::Ordinal => qs_strategy::ScalarType::Integer,
+            SourceBarFactKind::OpenTime
+            | SourceBarFactKind::CloseTime
+            | SourceBarFactKind::AvailableAt => qs_strategy::ScalarType::Timestamp,
+            SourceBarFactKind::GapBefore => qs_strategy::ScalarType::Bool,
+        })
+    }
+
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let Some(bar) = context
+            .closed_bars
+            .iter()
+            .find(|bar| bar.series_id() == &self.series_id)
+        else {
+            return Ok(ProjectedNamedInput {
+                value: Value::Missing(self.output_type().scalar),
+                updated: false,
+            });
+        };
+        let mut state = self.state.borrow_mut();
+        let is_new = state.last_open != Some(bar.open_time());
+        let previous_close = state.last_close;
+        if is_new {
+            state.ordinal = state
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| NamedInputProjectionError::new("source ordinal overflowed"))?;
+            state.last_open = Some(bar.open_time());
+            state.last_close = Some(bar.close_time());
+        }
+        let value = match self.kind {
+            SourceBarFactKind::Ordinal => Value::Integer(
+                i64::try_from(state.ordinal)
+                    .map_err(|_| NamedInputProjectionError::new("source ordinal exceeds i64"))?,
+            ),
+            SourceBarFactKind::OpenTime => Value::Timestamp(bar.open_time()),
+            SourceBarFactKind::CloseTime => Value::Timestamp(bar.close_time()),
+            SourceBarFactKind::AvailableAt => Value::Timestamp(context.observed_through),
+            SourceBarFactKind::GapBefore => {
+                Value::Bool(previous_close.is_some_and(|close| close != bar.open_time()))
+            }
+        };
+        Ok(ProjectedNamedInput {
+            value,
+            updated: is_new,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmedSwingFactKind {
+    Price,
+    AnchorOpenTime,
+    AnchorCloseTime,
+    ConfirmedAt,
+}
+
+/// Retains the latest confirmed high or low swing while preserving its actual confirmation update.
+pub struct ConfirmedSwingFactProjector {
+    series_id: SeriesId,
+    swing_kind: super::SwingKind,
+    fact: ConfirmedSwingFactKind,
+    retained: RefCell<Option<(u64, Value)>>,
+}
+
+impl ConfirmedSwingFactProjector {
+    pub fn new(
+        series_id: SeriesId,
+        swing_kind: super::SwingKind,
+        fact: ConfirmedSwingFactKind,
+    ) -> Self {
+        Self {
+            series_id,
+            swing_kind,
+            fact,
+            retained: RefCell::new(None),
+        }
+    }
+}
+
+impl HistoricalNamedInputProjector for ConfirmedSwingFactProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::optional(match self.fact {
+            ConfirmedSwingFactKind::Price => qs_strategy::ScalarType::Price,
+            _ => qs_strategy::ScalarType::Timestamp,
+        })
+    }
+
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let newest = context
+            .observations
+            .iter()
+            .filter(|observation| observation.source_series().contains(&self.series_id))
+            .filter_map(|observation| {
+                observation
+                    .value()
+                    .swing()
+                    .map(|swing| (observation.sequence(), swing))
+            })
+            .filter(|(_, swing)| swing.kind() == self.swing_kind)
+            .max_by_key(|(sequence, _)| *sequence);
+        let mut retained = self.retained.borrow_mut();
+        let updated = newest.is_some_and(|(sequence, _)| {
+            retained
+                .as_ref()
+                .is_none_or(|(previous, _)| sequence > *previous)
+        });
+        if let Some((sequence, swing)) = newest
+            && updated
+        {
+            let value = match self.fact {
+                ConfirmedSwingFactKind::Price => Value::Price(swing.price()),
+                ConfirmedSwingFactKind::AnchorOpenTime => {
+                    Value::Timestamp(swing.anchor_open_time())
+                }
+                ConfirmedSwingFactKind::AnchorCloseTime => {
+                    Value::Timestamp(swing.anchor_close_time())
+                }
+                ConfirmedSwingFactKind::ConfirmedAt => Value::Timestamp(swing.confirmed_at()),
+            };
+            *retained = Some((sequence, value));
+        }
+        Ok(ProjectedNamedInput {
+            value: retained
+                .as_ref()
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Missing(self.output_type().scalar)),
+            updated,
+        })
+    }
 }
 
 /// Binding from a configured input name to a historical projector.
@@ -135,6 +317,16 @@ impl ConfiguredHistoricalBindings {
 
     pub fn volume(&self) -> HistoricalVolumeProjection {
         self.volume
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ConfiguredSourceBinding>,
+        Vec<ConfiguredNamedInputBinding>,
+        HistoricalVolumeProjection,
+    ) {
+        (self.sources, self.named_inputs, self.volume)
     }
 }
 
@@ -225,6 +417,21 @@ pub enum ConfiguredStrategyAdapterPreflightError {
     TradeIdentityCapacity { actual: usize, required: usize },
 }
 
+/// Management-profile routing failure for a configured strategy, detected before feed polling.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfiguredEntryProfileError {
+    #[error("entry class `{entry_class}` on trade slot `{slot}` has no management-profile route")]
+    UnroutedEntryClass { entry_class: String, slot: String },
+    #[error(
+        "management profile `{profile}` manages the stoploss of trade slot `{slot}`, which the strategy also moves"
+    )]
+    StoplossOwnerConflict {
+        profile: String,
+        slot: String,
+        entry_class: Option<String>,
+    },
+}
+
 /// Runtime historical projection or configured evaluation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfiguredStrategyAdapterError {
@@ -233,6 +440,8 @@ pub enum ConfiguredStrategyAdapterError {
         source_id: SourceId,
         timestamp: NaiveDateTime,
     },
+    #[error("source '{source_id}' requires a tick count but the bar count is unknown")]
+    MissingTickCount { source_id: SourceId },
     #[error("tick count {tick_count} cannot be represented exactly as f64")]
     TickCountNotExactlyRepresentable { tick_count: u64 },
     #[error("named input '{name}' projection failed: {source}")]
@@ -270,6 +479,37 @@ pub(crate) struct ConfiguredBoundaryOutput {
     pub commands: Vec<ConfiguredCommand>,
 }
 
+/// Open-position economics a configured boundary may observe.
+///
+/// Excursion is the campaign's extreme as of the start of the boundary's batch, before that batch's own quotes are marked, so a stored bar's close cannot reach the strategy before the bar closes. Initial risk is the basis completed positions report for R normalization.
+pub(crate) struct BoundaryPositionFacts<'a> {
+    excursions: &'a BTreeMap<String, CampaignExcursion>,
+    executor: &'a FutureExecutor,
+}
+
+impl<'a> BoundaryPositionFacts<'a> {
+    pub(crate) fn new(
+        excursions: &'a BTreeMap<String, CampaignExcursion>,
+        executor: &'a FutureExecutor,
+    ) -> Self {
+        Self {
+            excursions,
+            executor,
+        }
+    }
+
+    fn excursion(&self, position_id: &str) -> Option<CampaignExcursion> {
+        self.excursions
+            .get(position_id)
+            .copied()
+            .filter(|excursion| excursion.observations > 0)
+    }
+
+    fn initial_risk(&self, position_id: &str) -> Option<f64> {
+        self.executor.open_initial_risk(position_id)
+    }
+}
+
 /// Historical runtime adapter for one reusable configured strategy instance.
 pub struct BacktestConfiguredStrategyAdapter {
     strategy: ConfiguredStrategy,
@@ -277,6 +517,8 @@ pub struct BacktestConfiguredStrategyAdapter {
     requirements: StrategyRequirements,
     bindings: ConfiguredHistoricalBindings,
     command_routes: BTreeMap<String, CommandRoute>,
+    evaluation_start: Option<NaiveDateTime>,
+    first_ready_at: Option<NaiveDateTime>,
 }
 
 impl BacktestConfiguredStrategyAdapter {
@@ -315,6 +557,8 @@ impl BacktestConfiguredStrategyAdapter {
             requirements,
             bindings,
             command_routes: BTreeMap::new(),
+            evaluation_start: None,
+            first_ready_at: None,
         })
     }
 
@@ -338,12 +582,50 @@ impl BacktestConfiguredStrategyAdapter {
         self.bindings.sources.iter().map(|binding| &binding.series)
     }
 
+    pub fn first_ready_at(&self) -> Option<NaiveDateTime> {
+        self.first_ready_at
+    }
+
+    pub fn set_evaluation_start(&mut self, evaluation_start: Option<NaiveDateTime>) {
+        self.evaluation_start = evaluation_start;
+    }
+
     pub fn configured_strategy(&self) -> &ConfiguredStrategy {
         &self.strategy
     }
 
     pub fn into_configured_strategy(self) -> ConfiguredStrategy {
         self.strategy
+    }
+
+    /// Check that every Entry the strategy can emit resolves to a profile the same way replay will select it, and that no selected profile manages a stop the strategy also moves.
+    pub fn preflight_entry_profiles(
+        &self,
+        profiles: &PreparedEntryProfiles,
+    ) -> Result<(), ConfiguredEntryProfileError> {
+        let requirements = self.strategy.input_requirements();
+        for entry in &requirements.entries {
+            let profile = match entry.entry_class.as_ref() {
+                Some(entry_class) => Some(profiles.routes().get(entry_class).ok_or_else(|| {
+                    ConfiguredEntryProfileError::UnroutedEntryClass {
+                        entry_class: entry_class.clone(),
+                        slot: entry.slot.clone(),
+                    }
+                })?),
+                None => profiles.default_profile(),
+            };
+            if let Some(profile) = profile
+                && profile_manages_stoploss(profile)
+                && requirements.stop_managed_slots.contains(&entry.slot)
+            {
+                return Err(ConfiguredEntryProfileError::StoplossOwnerConflict {
+                    profile: profile.name.clone(),
+                    slot: entry.slot.clone(),
+                    entry_class: entry.entry_class.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn preflight(
@@ -418,10 +700,18 @@ impl BacktestConfiguredStrategyAdapter {
         series: &dyn HistoricalSeriesView,
         observation_history: &dyn HistoricalObservationView,
         engine: &TradeEngine,
+        positions: &BoundaryPositionFacts<'_>,
         feedback_events: &[StrategyFeedbackEvent],
         retention: StrategyRetentionLimits,
         research: StrategyResearchLimits,
     ) -> Result<ConfiguredBoundaryOutput, ConfiguredStrategyAdapterError> {
+        let ready = ready
+            && self
+                .evaluation_start
+                .is_none_or(|start| observed_through >= start);
+        if ready && self.first_ready_at.is_none() {
+            self.first_ready_at = Some(observed_through);
+        }
         let feedback = self.project_feedback(feedback_events)?;
         let input = StrategyInput {
             time: observed_through,
@@ -434,7 +724,7 @@ impl BacktestConfiguredStrategyAdapter {
                 series,
                 observation_history,
             })?,
-            trade_slots: self.project_trade_slots(engine)?,
+            trade_slots: self.project_trade_slots(engine, positions)?,
             feedback,
         };
         let output = self.strategy.evaluate(&input)?;
@@ -505,15 +795,18 @@ impl BacktestConfiguredStrategyAdapter {
                             close: bar.close(),
                             volume: match self.bindings.volume {
                                 HistoricalVolumeProjection::TickCountExact => {
-                                    if bar.tick_count() > MAX_EXACT_F64_INTEGER {
+                                    let tick_count = match bar.tick_count() {
+                                        Some(count) => count,
+                                        None => return Some(Err(ConfiguredStrategyAdapterError::MissingTickCount { source_id: requirement.source.clone() })),
+                                    };
+                                    if tick_count > MAX_EXACT_F64_INTEGER {
                                         return Some(Err(
-                                            ConfiguredStrategyAdapterError::TickCountNotExactlyRepresentable {
-                                                tick_count: bar.tick_count(),
-                                            },
+                                            ConfiguredStrategyAdapterError::TickCountNotExactlyRepresentable { tick_count },
                                         ));
                                     }
-                                    bar.tick_count() as f64
+                                    Some(tick_count as f64)
                                 }
+                                HistoricalVolumeProjection::OptionalTickCount => bar.tick_count().map(|count| count as f64)
                             },
                         },
                     })
@@ -561,34 +854,54 @@ impl BacktestConfiguredStrategyAdapter {
     fn project_trade_slots(
         &self,
         engine: &TradeEngine,
+        positions: &BoundaryPositionFacts<'_>,
     ) -> Result<Vec<TradeSlotFacts>, ConfiguredStrategyAdapterError> {
         self.strategy
             .input_requirements()
             .trade_slots
             .iter()
             .map(|slot| {
-                let state = self
+                let position = self
                     .strategy
                     .trade_id_for_slot(slot)
                     .and_then(|trade_id| engine.manager.id_by_trade_id(trade_id))
-                    .and_then(|position_id| engine.get_position(&position_id))
-                    .map(|position| match position.data.status {
+                    .and_then(|position_id| {
+                        engine
+                            .get_position(&position_id)
+                            .map(|position| (position_id, position))
+                    });
+                let state = match position {
+                    None => TradeSlotState::Vacant,
+                    Some((position_id, position)) => match position.data.status {
                         PositionStatus::Pending => TradeSlotState::Pending {
                             side: position.data.side,
                             requested_price: position.data.pending_price,
                             stoploss: position.current_stoploss(),
                         },
-                        PositionStatus::Open => TradeSlotState::Open {
-                            side: position.data.side,
-                            entry_price: position.data.average_entry(),
-                            remaining_size: position.data.remaining_size(),
-                            stoploss: position.current_stoploss(),
-                        },
+                        PositionStatus::Open => {
+                            let opened_at = position.data.open_ts.ok_or_else(|| {
+                                ConfiguredStrategyAdapterError::TradeSlot {
+                                    slot: slot.clone(),
+                                    reason: "open position has no entry fill time".into(),
+                                }
+                            })?;
+                            let excursion = positions.excursion(&position_id);
+                            TradeSlotState::Open {
+                                side: position.data.side,
+                                entry_price: position.data.average_entry(),
+                                remaining_size: position.data.remaining_size(),
+                                stoploss: position.current_stoploss(),
+                                opened_at,
+                                favorable_excursion: excursion.map(|excursion| excursion.mfe),
+                                adverse_excursion: excursion.map(|excursion| excursion.mae),
+                                initial_risk: positions.initial_risk(&position_id),
+                            }
+                        }
                         PositionStatus::Closed | PositionStatus::Cancelled => {
                             TradeSlotState::Vacant
                         }
-                    })
-                    .unwrap_or(TradeSlotState::Vacant);
+                    },
+                };
                 Ok(TradeSlotFacts {
                     slot: slot.clone(),
                     state,
@@ -798,10 +1111,34 @@ fn value_matches_type(value: &Value, expected: ValueType) -> bool {
         return false;
     }
     match value {
-        Value::Number(value) | Value::Price(value) => value.is_finite(),
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value) => value.is_finite(),
         Value::Text(value) => !value.is_empty() && value.len() <= MAX_TEXT_BYTES,
         _ => true,
     }
+}
+
+/// A profile owns the stop when it replaces the signal stop or attaches a rule that moves the stop while the position is open.
+fn profile_manages_stoploss(profile: &ManagementProfile) -> bool {
+    !matches!(profile.stoploss_mode, StoplossMode::FromSignal)
+        || profile.rules.iter().any(|rule| {
+            matches!(
+                rule,
+                RuleConfigDef::FixedStoploss { .. }
+                    | RuleConfigDef::TrailingStop { .. }
+                    | RuleConfigDef::BreakevenWhen { .. }
+                    | RuleConfigDef::BreakevenWhenOffset { .. }
+                    | RuleConfigDef::BreakevenAfterTargets { .. }
+            )
+        })
 }
 
 fn map_effect(action: ConfiguredActionKind, effect: &Effect) -> Result<Option<CommandFact>, ()> {
@@ -870,13 +1207,23 @@ fn map_note(
     let mut values = BTreeMap::new();
     for output in note.values {
         let value = match output.value {
+            OutputScalar::Bool(value) => f64::from(value),
             OutputScalar::Integer(value) => {
                 if value.unsigned_abs() > MAX_EXACT_F64_INTEGER {
                     return Err(ConfiguredStrategyAdapterError::IntegerOutputPrecision);
                 }
                 value as f64
             }
-            OutputScalar::Number(value) | OutputScalar::Price(value) => value,
+            OutputScalar::Number(value)
+            | OutputScalar::Price(value)
+            | OutputScalar::Ratio(value)
+            | OutputScalar::Percent(value)
+            | OutputScalar::PricePerObservation(value)
+            | OutputScalar::PricePerObservationSquared(value)
+            | OutputScalar::RatioPerObservation(value)
+            | OutputScalar::RatioPerObservationSquared(value)
+            | OutputScalar::LogReturn(value)
+            | OutputScalar::LogReturnVariance(value) => value,
         };
         values.insert(output.name, value);
     }

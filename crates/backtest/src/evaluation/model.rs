@@ -93,6 +93,25 @@ pub struct ExcursionInput {
     pub adverse_r: Option<f64>,
 }
 
+/// Per-position commission and swap already applied to `outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PositionCostsInput {
+    /// Account-currency commission charged on this position's entry and exit fills.
+    pub commission: f64,
+    /// Account-currency swap charged while this position was open.
+    pub swap: f64,
+}
+
+impl PositionCostsInput {
+    pub fn total(self) -> f64 {
+        self.commission + self.swap
+    }
+
+    pub fn is_charged(self) -> bool {
+        self.commission != 0.0 || self.swap != 0.0
+    }
+}
+
 /// Optional per-position execution observations.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionDiagnosticsInput {
@@ -140,6 +159,9 @@ pub struct PositionOutcome {
     pub excursions: Option<ExcursionInput>,
     #[serde(default)]
     pub execution: Option<ExecutionDiagnosticsInput>,
+    /// Costs already subtracted from `outcome`, when the run charged any.
+    #[serde(default)]
+    pub costs: Option<PositionCostsInput>,
 }
 
 impl PositionOutcome {
@@ -349,17 +371,19 @@ pub enum EvaluationSection {
     RMetrics,
     Excursions,
     Execution,
+    Costs,
     Robustness,
     Breakdowns,
 }
 
 impl EvaluationSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Coverage,
         Self::PositionPerformance,
         Self::RMetrics,
         Self::Excursions,
         Self::Execution,
+        Self::Costs,
         Self::Robustness,
         Self::Breakdowns,
     ];
@@ -560,6 +584,24 @@ pub struct ExcursionMetricsSection {
     pub median_adverse_r: MetricValue<f64>,
 }
 
+/// Commission and swap actually charged across the selected positions.
+///
+/// Every outcome in this evaluation is already net of these amounts, so the section exists to show how large the deduction was, not to adjust anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostMetricsSection {
+    pub positions_with_costs: usize,
+    pub total_commission: f64,
+    pub total_swap: f64,
+    pub total_cost: f64,
+    /// Sum of outcomes before costs.
+    pub gross_outcome: f64,
+    /// Sum of outcomes after costs, matching the outcomes used everywhere else in this report.
+    pub net_outcome: f64,
+    /// `total_cost / gross_outcome.abs()`, unavailable when the gross outcome is zero.
+    pub cost_share_of_gross: MetricValue<f64>,
+    pub mean_cost_per_position: MetricValue<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionDiagnosticsSection {
     pub positions_with_diagnostics: usize,
@@ -697,6 +739,8 @@ pub struct EvaluationReport {
     pub excursions: Option<ExcursionMetricsSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionDiagnosticsSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub costs: Option<CostMetricsSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub robustness: Option<IntrinsicRobustnessSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

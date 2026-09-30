@@ -5,22 +5,23 @@
 //! streak analysis, duration stats, monthly returns, and breakdowns by symbol,
 //! group, side, and close reason.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
+use qs_core::CostKind;
 use qs_core::types::{CloseReason, GroupId, PositionId, Side};
 
 use crate::artifacts::{
-    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts, NetPnlOutcome,
-    OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
+    CloseEvent, CompletedPosition, CostEvent, ExecutionMetadata, FutureBacktestArtifacts,
+    NetPnlOutcome, OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
     PendingOrderSnapshot, RecordedFill,
 };
 use crate::evaluation::{
     EvaluationOptions, EvaluationReport, EvaluationRequest, ExcursionInput,
-    ExecutionDiagnosticsInput, LifecycleCounts, OutcomeClassification, PositionDimensions,
-    PositionOutcome, PositionSide, evaluate,
+    ExecutionDiagnosticsInput, LifecycleCounts, OutcomeClassification, PositionCostsInput,
+    PositionDimensions, PositionOutcome, PositionSide, evaluate,
 };
 use crate::ledger::{ActionDisposition, ActionDispositionStatus};
 use crate::mtm::MtmOutputSummary;
@@ -64,7 +65,21 @@ pub struct TradeResult {
     pub entry_price: f64,
     pub exit_price: f64,
     pub size: f64,
+    /// Realized profit and loss for this close, already net of `commission` and `swap`.
     pub pnl: f64,
+    /// Account-currency commission settled on this row and already subtracted from `pnl`.
+    ///
+    /// This close's own exit commission always settles here. The row that fully closes a position additionally settles that position's entry commission, because entry commission belongs to the position rather than to any one close. Summing this column over a position therefore reproduces [`CompletedPosition::commission_total`], while an individual row of a partially closed position carries only its own exit commission.
+    #[serde(default)]
+    pub commission: f64,
+    /// Account-currency swap settled on this row and already subtracted from `pnl`.
+    ///
+    /// Swap accrues to a position rather than to a close, so it settles entirely on the row that fully closes the position and is zero on every other row.
+    #[serde(default)]
+    pub swap: f64,
+    /// Profit and loss before `commission` and `swap`, present only when either was settled.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
     pub open_ts: NaiveDateTime,
     pub close_ts: NaiveDateTime,
     pub close_reason: CloseReason,
@@ -110,6 +125,17 @@ pub struct SubsetStats {
     pub largest_win: f64,
     /// Largest single losing trade (as positive number).
     pub largest_loss: f64,
+    /// Commission settled on this subset's rows.
+    ///
+    /// A subset that contains every row of a position reports that position's complete commission, because the row that fully closes a position settles its entry commission. A subset that splits a position reports only the commission settled on the rows it kept.
+    #[serde(default)]
+    pub commission: f64,
+    /// Swap settled on this subset's rows, under the same subset rule as `commission`.
+    #[serde(default)]
+    pub swap: f64,
+    /// Subset profit and loss before `commission` and `swap`, present only when either was settled.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
 }
 
 impl SubsetStats {
@@ -181,6 +207,10 @@ impl SubsetStats {
             .map(|t| t.pnl.abs())
             .fold(0.0_f64, f64::max);
 
+        let commission: f64 = trades.iter().map(|t| t.commission).sum();
+        let swap: f64 = trades.iter().map(|t| t.swap).sum();
+        let gross_pnl = (commission != 0.0 || swap != 0.0).then_some(total_pnl + commission + swap);
+
         Self {
             total_trades,
             winning_trades,
@@ -197,6 +227,9 @@ impl SubsetStats {
             expectancy,
             largest_win,
             largest_loss,
+            commission,
+            swap,
+            gross_pnl,
         }
     }
 
@@ -935,6 +968,21 @@ pub struct BacktestResult {
     pub mtm_max_drawdown_pct: Option<f64>,
     #[serde(default)]
     pub provider_evaluation: Option<EvaluationReport>,
+    /// Unfiltered normalized outcomes used to build provider evaluation.
+    #[serde(default)]
+    pub provider_positions: Vec<PositionOutcome>,
+    /// Total account-currency commission charged across every entry and exit fill.
+    #[serde(default)]
+    pub total_commission: f64,
+    /// Total account-currency swap charged across every rollover.
+    #[serde(default)]
+    pub total_swap: f64,
+    /// Realized profit and loss before commission and swap, present only when a cost was charged.
+    #[serde(default)]
+    pub gross_pnl: Option<f64>,
+    /// Commission and swap charges in application order.
+    #[serde(default)]
+    pub cost_events: Vec<CostEvent>,
 }
 
 impl BacktestResult {
@@ -1123,6 +1171,11 @@ impl BacktestResult {
             mtm_max_drawdown: None,
             mtm_max_drawdown_pct: None,
             provider_evaluation: None,
+            provider_positions: Vec::new(),
+            total_commission: 0.0,
+            total_swap: 0.0,
+            gross_pnl: None,
+            cost_events: Vec::new(),
         }
     }
 
@@ -1138,8 +1191,16 @@ impl BacktestResult {
         evaluation_options: EvaluationOptions,
     ) -> Self {
         let trade_log = future_trade_log(&artifacts);
-        let provider_evaluation = evaluate_future_positions(&artifacts, evaluation_options);
+        let (provider_evaluation, provider_positions) =
+            evaluate_future_positions(&artifacts, evaluation_options);
+        let settled: BTreeSet<&str> = artifacts
+            .completed_positions
+            .iter()
+            .filter(|position| !position.close_events.is_empty())
+            .map(|position| position.position_id.as_str())
+            .collect();
         let mut result = Self::from_trade_log(artifacts.execution.initial_balance, trade_log);
+        result.apply_cost_events(&artifacts.cost_events, &settled);
         result.replace_position_statistics(&artifacts.completed_positions);
         result.future_format_version = Some(artifacts.format_version);
         result.execution_metadata = Some(artifacts.execution);
@@ -1155,7 +1216,45 @@ impl BacktestResult {
         result.mtm_max_drawdown = artifacts.max_drawdown;
         result.mtm_max_drawdown_pct = artifacts.max_drawdown_pct;
         result.provider_evaluation = Some(provider_evaluation);
+        result.provider_positions = provider_positions;
+        result.cost_events = artifacts.cost_events;
         result
+    }
+
+    /// Fold commission and swap totals into the realized result.
+    ///
+    /// Exit commission is already inside each trade's profit and loss, so only entry commission and swap still have to be applied to the run totals. The call is a no-op when nothing was charged, which keeps cost-free runs identical to runs produced before costs existed.
+    fn apply_cost_events(&mut self, cost_events: &[CostEvent], settled: &BTreeSet<&str>) {
+        if cost_events.is_empty() {
+            return;
+        }
+        let mut commission = 0.0;
+        let mut swap = 0.0;
+        let mut outside_trade_log = 0.0;
+        for event in cost_events {
+            // A position that closed fully settles its entry commission and swap on its final trade row, so only a position still open when the run ended still has charges outside the trade log.
+            let unsettled = !settled.contains(event.position_id.as_str());
+            match event.kind {
+                CostKind::EntryCommission => {
+                    commission += event.amount;
+                    if unsettled {
+                        outside_trade_log += event.amount;
+                    }
+                }
+                CostKind::ExitCommission => commission += event.amount,
+                CostKind::Swap => {
+                    swap += event.amount;
+                    if unsettled {
+                        outside_trade_log += event.amount;
+                    }
+                }
+            }
+        }
+        self.total_commission = commission;
+        self.total_swap = swap;
+        self.total_pnl -= outside_trade_log;
+        self.gross_pnl = Some(self.total_pnl + commission + swap);
+        self.final_balance = self.initial_balance + self.total_pnl;
     }
 
     fn replace_position_statistics(&mut self, completed_positions: &[CompletedPosition]) {
@@ -1233,7 +1332,44 @@ fn position_summary_from_completed(position: &CompletedPosition) -> PositionSumm
     }
 }
 
+/// Entry commission and swap charged to one position, which belong to the position rather than to any single close.
+#[derive(Debug, Clone, Copy, Default)]
+struct PositionCostSettlement {
+    commission: f64,
+    swap: f64,
+}
+
+/// Costs that a completed position settles on its final close row, keyed by the identifier of that row.
+///
+/// Only fully closed positions appear. A position still open when the run ended has no final row to settle against, so its charges stay on the run totals alone.
+fn final_row_settlements(
+    artifacts: &FutureBacktestArtifacts,
+) -> BTreeMap<&str, PositionCostSettlement> {
+    let mut by_position: BTreeMap<&str, PositionCostSettlement> = BTreeMap::new();
+    for event in &artifacts.cost_events {
+        let entry = by_position.entry(event.position_id.as_str()).or_default();
+        match event.kind {
+            CostKind::EntryCommission => entry.commission += event.amount,
+            CostKind::Swap => entry.swap += event.amount,
+            // An exit commission is already inside its own close event's profit and loss.
+            CostKind::ExitCommission => {}
+        }
+    }
+    let mut by_row = BTreeMap::new();
+    for position in &artifacts.completed_positions {
+        let Some(settlement) = by_position.get(position.position_id.as_str()) else {
+            continue;
+        };
+        let Some(final_close) = position.close_events.last() else {
+            continue;
+        };
+        by_row.insert(final_close.id.as_str(), *settlement);
+    }
+    by_row
+}
+
 fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
+    let settlements = final_row_settlements(artifacts);
     let mut rows = Vec::with_capacity(artifacts.close_events.len());
     for event in &artifacts.close_events {
         let completed = artifacts
@@ -1256,6 +1392,13 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
         let group = completed
             .and_then(|position| position.group.clone())
             .or_else(|| open.and_then(|position| position.group.clone()));
+        let settled = settlements
+            .get(event.id.as_str())
+            .copied()
+            .unwrap_or_default();
+        let commission = event.commission + settled.commission;
+        let swap = settled.swap;
+        let pnl = event.pnl - settled.commission - settled.swap;
         rows.push(TradeResult {
             position_id: event.position_id.clone(),
             symbol: event.symbol.clone(),
@@ -1263,7 +1406,10 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
             entry_price,
             exit_price: event.price,
             size: event.size,
-            pnl: event.pnl,
+            pnl,
+            commission,
+            swap,
+            gross_pnl: (commission != 0.0 || swap != 0.0).then_some(pnl + commission + swap),
             open_ts,
             close_ts: event.ts,
             close_reason: event.reason,
@@ -1288,8 +1434,8 @@ fn future_trade_log(artifacts: &FutureBacktestArtifacts) -> Vec<TradeResult> {
 fn evaluate_future_positions(
     artifacts: &FutureBacktestArtifacts,
     options: EvaluationOptions,
-) -> EvaluationReport {
-    let positions = artifacts
+) -> (EvaluationReport, Vec<PositionOutcome>) {
+    let positions: Vec<PositionOutcome> = artifacts
         .completed_positions
         .iter()
         .map(|position| {
@@ -1350,7 +1496,16 @@ fn evaluate_future_positions(
                         .iter()
                         .map(ToString::to_string)
                         .collect(),
-                    tags: std::collections::BTreeMap::new(),
+                    // Every position of a run shares the run's labels, which is what lets a breakdown group positions across runs by parameter or window; a label of the position itself, such as its instance, joins them.
+                    tags: {
+                        let mut tags = artifacts.execution.run_tags.clone();
+                        if let Some(own) =
+                            artifacts.execution.position_tags.get(&position.position_id)
+                        {
+                            tags.extend(own.clone());
+                        }
+                        tags
+                    },
                 },
                 outcome: position.net_pnl,
                 outcome_classification: Some(match position.outcome {
@@ -1361,6 +1516,12 @@ fn evaluate_future_positions(
                 r_multiple: position.realized_r,
                 excursions,
                 execution,
+                costs: (position.commission_total != 0.0 || position.swap_total != 0.0).then_some(
+                    PositionCostsInput {
+                        commission: position.commission_total,
+                        swap: position.swap_total,
+                    },
+                ),
             }
         })
         .collect();
@@ -1403,11 +1564,12 @@ fn evaluate_future_positions(
             .count() as u64,
         open_at_end: artifacts.open_positions.len() as u64,
     };
-    evaluate(&EvaluationRequest {
-        positions,
+    let report = evaluate(&EvaluationRequest {
+        positions: positions.clone(),
         lifecycle: Some(lifecycle),
         options,
-    })
+    });
+    (report, positions)
 }
 
 fn position_fill_ratio(
@@ -1727,6 +1889,9 @@ mod tests {
                 CloseReason::Manual
             },
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         }
     }
 
@@ -1756,6 +1921,9 @@ mod tests {
             close_ts,
             close_reason: reason,
             group,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         }
     }
 
@@ -2532,6 +2700,9 @@ mod tests {
             close_ts: ts(2026, 1, 1, 11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let t2 = TradeResult {
             position_id: "p1".into(),
@@ -2545,6 +2716,9 @@ mod tests {
             close_ts: ts(2026, 1, 1, 14, 0, 0),
             close_reason: CloseReason::Stoploss,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let refs: Vec<&TradeResult> = vec![&t1, &t2];
         let ps = PositionSummary::from_trades(&refs);
@@ -2575,6 +2749,9 @@ mod tests {
             close_ts: ts_hms(11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let close_after_scale_in = TradeResult {
             position_id: "scaled".into(),
@@ -2588,6 +2765,9 @@ mod tests {
             close_ts: ts_hms(12, 0, 0),
             close_reason: CloseReason::Manual,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let trades = [&first_partial_close, &close_after_scale_in];
 
@@ -2611,6 +2791,9 @@ mod tests {
             close_ts: ts_hms(11, 0, 0),
             close_reason: CloseReason::Target,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let close_after_scale_in = TradeResult {
             position_id: "scaled".into(),
@@ -2624,6 +2807,9 @@ mod tests {
             close_ts: ts_hms(12, 0, 0),
             close_reason: CloseReason::Manual,
             group: None,
+            commission: 0.0,
+            swap: 0.0,
+            gross_pnl: None,
         };
         let trades = [&first_partial_close, &close_after_scale_in];
 
@@ -2657,6 +2843,9 @@ mod tests {
                 close_ts: ts(2026, 1, 1, 11, 0, 0),
                 close_reason: CloseReason::Target,
                 group: None,
+                commission: 0.0,
+                swap: 0.0,
+                gross_pnl: None,
             },
             TradeResult {
                 position_id: "p1".into(),
@@ -2670,6 +2859,9 @@ mod tests {
                 close_ts: ts(2026, 1, 1, 14, 0, 0),
                 close_reason: CloseReason::Stoploss,
                 group: None,
+                commission: 0.0,
+                swap: 0.0,
+                gross_pnl: None,
             },
         ];
         let result = BacktestResult::from_trade_log(10_000.0, trades);

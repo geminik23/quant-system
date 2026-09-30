@@ -7,14 +7,19 @@ use qs_backtest::data_feed::{
 use qs_backtest::runner::BacktestConfig;
 use qs_backtest::sizing::SizingPolicy;
 use qs_backtest::{
-    AnalysisPipeline, AnnotationLimits, BacktestRunner, BarSeriesSpec, FutureQuoteConfig,
-    HistoricalStrategy, MissingIntervalPolicy, ObservationStoreLimits, PositionRef, PriceBasis,
-    RawSignal, SeriesId, SeriesRequirement, StrategyContext, StrategyDecisionDraft,
-    StrategyDecisionKind, StrategyDescriptor, StrategyEvent, StrategyFeedback, StrategyId,
-    StrategyOutput, StrategyReplayError, StrategyRequirements, StrategyRetentionLimits, Timeframe,
-    VecFeed, WarmupRequirement,
+    AnalysisPipeline, AnnotationLimits, BacktestConfiguredStrategyAdapter, BacktestRunner,
+    BarSeriesSpec, ConfiguredHistoricalBindings, ConfiguredInstance, ConfiguredSourceBinding,
+    DirectPortfolioInstance, FutureQuoteConfig, HistoricalStrategy, MissingIntervalPolicy,
+    ObservationStoreLimits, PositionRef, PriceBasis, RawSignal, SeriesId, SeriesRequirement,
+    StrategyContext, StrategyDecisionDraft, StrategyDecisionKind, StrategyDescriptor,
+    StrategyEvent, StrategyFeedback, StrategyId, StrategyOutput, StrategyReplayError,
+    StrategyRequirements, StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
 };
 use qs_core::types::{Effect, FutureEffect, OrderType, Side};
+use qs_strategy::{
+    BarField, ConfiguredStrategy, Expr, Literal, MATERIAL_BAR_FIELD, MaterialArg, MaterialArgs,
+    MaterialConfig, MaterialLibrary, SourceId, StateConfig, StrategyConfig, TransitionConfig,
+};
 use qs_symbols::SymbolSpec;
 
 const SYMBOL: &str = "EURUSD";
@@ -681,6 +686,9 @@ fn tick_requirement_rejects_primary_bars() {
             low: 0.9,
             close: 1.0,
             volume: 1,
+            spread: None,
+            timeframe_seconds: None,
+            tick_count: None,
         },
         EventMetadata::new(SeriesRoles::PRIMARY, 0, 0),
     );
@@ -729,4 +737,221 @@ fn streaming_feed_errors_are_preserved() {
         .unwrap_err();
     assert!(matches!(error, StrategyReplayError::Feed("source failed")));
     assert!(strategy.callbacks.is_empty());
+}
+
+/// Enters when the newest primary bar it is handed closed above its open, which is only knowable once that bar has finished.
+struct BarReadingStrategy {
+    descriptor: StrategyDescriptor,
+    requirements: StrategyRequirements,
+    entered: bool,
+}
+
+impl HistoricalStrategy for BarReadingStrategy {
+    type Error = Infallible;
+
+    fn descriptor(&self) -> &StrategyDescriptor {
+        &self.descriptor
+    }
+
+    fn requirements(&self) -> &StrategyRequirements {
+        &self.requirements
+    }
+
+    fn on_event(
+        &mut self,
+        event: StrategyEvent<'_>,
+        context: StrategyContext<'_>,
+    ) -> Result<StrategyOutput, Self::Error> {
+        let rising = event.primary_events().iter().any(
+            |event| matches!(event.event, MarketEvent::Bar { open, close, .. } if close > open),
+        );
+        if self.entered || !rising || !context.warmup_complete() {
+            return Ok(StrategyOutput::none());
+        }
+        self.entered = true;
+        let draft = StrategyDecisionDraft::new(
+            StrategyDecisionKind::Entry,
+            "the bar closed up",
+            Some("trade-1".into()),
+            vec![entry(context.observed_through())],
+            StrategyRetentionLimits::default(),
+        )
+        .unwrap();
+        Ok(StrategyOutput::from_decision(draft))
+    }
+}
+
+fn configured_bar_observer() -> ConfiguredInstance {
+    let source = SourceId::new("bars").unwrap();
+    let document = StrategyConfig {
+        strategy_id: "configured_observer".into(),
+        title: "Configured bar observer".into(),
+        parameters: vec![],
+        initial_state: "idle".into(),
+        sources: vec![source.clone()],
+        trade_slots: vec![],
+        materials: vec![MaterialConfig {
+            id: "close".into(),
+            key: MATERIAL_BAR_FIELD.into(),
+            inputs: vec![],
+            params: MaterialArgs::new([
+                ("source", MaterialArg::Source(source.clone())),
+                ("field", MaterialArg::BarField(BarField::Close)),
+            ]),
+        }],
+        variables: vec![],
+        states: vec![
+            StateConfig {
+                id: "idle".into(),
+                transitions: vec![TransitionConfig {
+                    priority: 1,
+                    target: "done".into(),
+                    when: Expr::Gt {
+                        left: Box::new(Expr::Material { id: "close".into() }),
+                        right: Box::new(Expr::Literal {
+                            value: Literal::Price(f64::MAX),
+                        }),
+                    },
+                    assignments: vec![],
+                    decision: None,
+                    actions: vec![],
+                    notes: vec![],
+                }],
+            },
+            StateConfig {
+                id: "done".into(),
+                transitions: vec![],
+            },
+        ],
+    };
+    let strategy = ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "configured_observer",
+        SYMBOL,
+    )
+    .unwrap();
+    let bindings = ConfiguredHistoricalBindings::new(
+        vec![ConfiguredSourceBinding::new(source, spec(1))],
+        vec![],
+        qs_backtest::HistoricalVolumeProjection::TickCountExact,
+    );
+    let adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        descriptor("configured_observer"),
+        bindings,
+        0,
+    )
+    .unwrap();
+    ConfiguredInstance::new(adapter, analysis())
+}
+
+#[test]
+fn a_direct_strategy_that_reads_the_batch_bar_fills_at_the_next_bar_open() {
+    let bar = |minute: i64, row: u64, open: f64, close: f64| {
+        FeedEvent::new(
+            MarketEvent::Bar {
+                symbol: SYMBOL.into(),
+                ts: ts(minute),
+                open,
+                high: open.max(close),
+                low: open.min(close),
+                close,
+                volume: 0,
+                spread: Some(0.0002),
+                timeframe_seconds: Some(60),
+                tick_count: Some(5),
+            },
+            EventMetadata::new(SeriesRoles::PRIMARY, 0, row),
+        )
+    };
+    let mut strategy = BarReadingStrategy {
+        descriptor: descriptor("bar_reader"),
+        requirements: StrategyRequirements::new(
+            vec![SYMBOL.into()],
+            vec![requirement(1)],
+            0,
+            false,
+            true,
+        )
+        .unwrap(),
+        entered: false,
+    };
+    let mut feed = VecFeed::from_feed_events(vec![
+        bar(0, 0, 1.1000, 1.1000),
+        bar(1, 1, 1.1000, 1.1050),
+        bar(2, 2, 1.1200, 1.1210),
+    ]);
+    let result = BacktestRunner::new_future(config(false), FutureQuoteConfig::default())
+        .run_historical_strategy_future(
+            &mut feed,
+            &mut strategy,
+            vec![spec(1)],
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    // The strategy saw the rising bar stamped at minute 1, whole, so its order may not fill inside that bar.
+    let fill = &result.replay.recorded_fills[0];
+    assert_eq!(fill.signal_ts, Some(ts(1)));
+    assert_eq!(fill.execution_ts, Some(ts(2)));
+    assert!((fill.fill.price - (1.1200 + 0.0001)).abs() < 1e-9);
+}
+
+#[test]
+fn mixed_portfolio_keeps_configured_pre_settlement_and_direct_post_settlement_timing() {
+    let bar = |minute: i64, row: u64, open: f64, close: f64| {
+        FeedEvent::new(
+            MarketEvent::Bar {
+                symbol: SYMBOL.into(),
+                ts: ts(minute),
+                open,
+                high: open.max(close),
+                low: open.min(close),
+                close,
+                volume: 0,
+                spread: Some(0.0002),
+                timeframe_seconds: Some(60),
+                tick_count: Some(5),
+            },
+            EventMetadata::new(SeriesRoles::PRIMARY, 0, row),
+        )
+    };
+    let direct_strategy = BarReadingStrategy {
+        descriptor: descriptor("mixed_direct"),
+        requirements: StrategyRequirements::new(
+            vec![SYMBOL.into()],
+            vec![requirement(1)],
+            0,
+            false,
+            true,
+        )
+        .unwrap(),
+        entered: false,
+    };
+    let direct = DirectPortfolioInstance::new(
+        "mixed_direct",
+        Box::new(direct_strategy),
+        vec![spec(1)],
+        analysis(),
+    );
+    let mut feed = VecFeed::from_feed_events(vec![
+        bar(0, 0, 1.1000, 1.1000),
+        bar(1, 1, 1.1000, 1.1050),
+        bar(2, 2, 1.1200, 1.1210),
+    ]);
+    let result = BacktestRunner::new_future(config(false), FutureQuoteConfig::default())
+        .run_mixed_portfolio_future(
+            &mut feed,
+            vec![configured_bar_observer()],
+            vec![direct],
+            None,
+            StrategyRetentionLimits::default(),
+        )
+        .unwrap();
+    let fill = &result.replay.recorded_fills[0];
+    assert_eq!(fill.signal_ts, Some(ts(1)));
+    assert_eq!(fill.execution_ts, Some(ts(2)));
+    assert!((fill.fill.price - (1.1200 + 0.0001)).abs() < 1e-9);
 }

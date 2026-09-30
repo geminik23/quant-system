@@ -42,6 +42,7 @@ pub fn adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "alpha".into(),
         title: "Neutral configured strategy".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -75,6 +76,7 @@ pub fn adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.9)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -192,7 +194,7 @@ fn material(id: &str, key: &str, inputs: Vec<Expr>, params: MaterialParams) -> M
         id: id.into(),
         key: key.into(),
         inputs,
-        params,
+        params: params.into(),
     }
 }
 
@@ -298,6 +300,24 @@ pub fn historical_adapter(
     warmup: usize,
     latency_ms: u64,
 ) -> BacktestConfiguredStrategyAdapter {
+    historical_adapter_with_volume(
+        config,
+        library,
+        instance,
+        warmup,
+        latency_ms,
+        HistoricalVolumeProjection::TickCountExact,
+    )
+}
+
+pub fn historical_adapter_with_volume(
+    config: StrategyConfig,
+    library: &MaterialLibrary,
+    instance: &str,
+    warmup: usize,
+    latency_ms: u64,
+    volume: HistoricalVolumeProjection,
+) -> BacktestConfiguredStrategyAdapter {
     let strategy_id = config.strategy_id.clone();
     let strategy =
         qs_strategy::ConfiguredStrategy::compile(config, library, instance, SYMBOL).unwrap();
@@ -321,7 +341,7 @@ pub fn historical_adapter(
         ConfiguredHistoricalBindings::new(
             vec![ConfiguredSourceBinding::new(source(), series)],
             vec![],
-            HistoricalVolumeProjection::TickCountExact,
+            volume,
         ),
         latency_ms,
     )
@@ -329,9 +349,35 @@ pub fn historical_adapter(
 }
 
 pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
+    crossover_adapter_with_class(None, 0)
+}
+
+pub fn crossover_adapter_with_volume(
+    volume: HistoricalVolumeProjection,
+) -> BacktestConfiguredStrategyAdapter {
+    crossover_adapter_with_class_and_volume(None, 0, volume)
+}
+
+pub fn crossover_adapter_with_class(
+    entry_class: Option<&str>,
+    latency_ms: u64,
+) -> BacktestConfiguredStrategyAdapter {
+    crossover_adapter_with_class_and_volume(
+        entry_class,
+        latency_ms,
+        HistoricalVolumeProjection::TickCountExact,
+    )
+}
+
+fn crossover_adapter_with_class_and_volume(
+    entry_class: Option<&str>,
+    latency_ms: u64,
+    volume: HistoricalVolumeProjection,
+) -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "crossover".into(),
         title: "EMA crossover".into(),
+        parameters: vec![],
         initial_state: "flat".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -354,6 +400,7 @@ pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.5)),
                         targets: vec![],
+                        entry_class: entry_class.map(Into::into),
                     },
                     vec![],
                 )],
@@ -378,7 +425,14 @@ pub fn crossover_adapter() -> BacktestConfiguredStrategyAdapter {
             },
         ],
     };
-    historical_adapter(config, &MaterialLibrary::builtins(), "instance_a", 3, 0)
+    historical_adapter_with_volume(
+        config,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        3,
+        latency_ms,
+        volume,
+    )
 }
 
 pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
@@ -394,6 +448,7 @@ pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "lifecycle".into(),
         title: "EMA ATR lifecycle".into(),
+        parameters: vec![],
         initial_state: "flat".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -423,6 +478,7 @@ pub fn lifecycle_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: literal(Literal::Number(1.0)),
                         stoploss: literal(Literal::Price(0.5)),
                         targets: vec![],
+                        entry_class: None,
                     },
                     vec![note(NoteKind::Risk, "ATR observed at entry")],
                 )],

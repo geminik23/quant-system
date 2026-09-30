@@ -33,8 +33,17 @@ pub enum BacktestServerError {
     #[error("Backtest cancelled")]
     Cancelled,
 
+    #[error("Backtest cancelled with a resumable research checkpoint")]
+    CancelledWithCheckpoint(Box<qs_research::SearchCheckpoint>),
+
+    #[error("Configured strategy replay failed: {0}")]
+    Strategy(String),
+
     #[error("Market-data stream error: {0}")]
     MarketStream(String),
+
+    #[error("{0}")]
+    MarketLoad(#[from] qs_market_loader::MarketLoadError),
 
     #[error("Backtest engine error: {0}")]
     Engine(#[from] qs_core::CoreError),

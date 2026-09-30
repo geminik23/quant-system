@@ -6,6 +6,7 @@ use data_preprocess::parser::{
     extract_symbol_from_filename, normalize_exchange, parse_datetime_arg, parse_datetime_to_utc,
     parse_tz_offset,
 };
+use data_preprocess::{PriceBins, PriorQuoteCarry, aggregate_quote_statistics};
 
 // ── Helper ──
 
@@ -50,6 +51,268 @@ fn make_bar(exchange: &str, symbol: &str, tf: Timeframe, ts: NaiveDateTime) -> B
         volume: 0,
         spread: 10,
     }
+}
+
+fn price_bar(ts: NaiveDateTime, count: Option<u64>) -> PriceBar {
+    PriceBar {
+        exchange: "demo".into(),
+        symbol: "EURUSD".into(),
+        timeframe: Timeframe::M1,
+        ts,
+        available_at: ts + chrono::Duration::minutes(1),
+        open: 1.1,
+        high: 1.2,
+        low: 1.0,
+        close: 1.15,
+        tick_count: count,
+        spread: Some(2),
+    }
+}
+
+#[test]
+fn optional_count_conversion_and_complete_parent_aggregation_are_strict() {
+    let legacy = make_bar("demo", "EURUSD", Timeframe::M1, ndt(2026, 1, 1, 0, 0, 0));
+    assert_eq!(
+        PriceBar::try_from(legacy.clone()).unwrap().tick_count,
+        Some(200)
+    );
+    let mut invalid = legacy;
+    invalid.tick_vol = 0;
+    assert!(PriceBar::try_from(invalid).is_err());
+    assert!(Bar::try_from(price_bar(ndt(2026, 1, 1, 0, 0, 0), None)).is_err());
+    assert!(
+        Bar::try_from(price_bar(
+            ndt(2026, 1, 1, 0, 0, 0),
+            Some(i64::MAX as u64 + 1)
+        ))
+        .is_err()
+    );
+    let descriptor = SeriesDescriptor {
+        source_identity: "fixture".into(),
+        exchange: "demo".into(),
+        symbol: "EURUSD".into(),
+        timeframe_seconds: 60,
+        price_basis: StoredPriceBasis::Mid,
+        alignment_offset_seconds: 0,
+        digits: 5,
+        point_size: 0.00001,
+        count_capability: CountCapability::Optional,
+        verified: true,
+    };
+    let start = ndt(2026, 1, 1, 0, 0, 0);
+    let mut children = (0..5)
+        .map(|minute| price_bar(start + chrono::Duration::minutes(minute), Some(2)))
+        .collect::<Vec<_>>();
+    children[2].tick_count = None;
+    let parent = aggregate_price_bars(&children, Timeframe::M5, &descriptor).unwrap();
+    assert_eq!(parent.tick_count, None);
+    assert_eq!(parent.available_at, start + chrono::Duration::minutes(5));
+    assert!(aggregate_price_bars(&children[..4], Timeframe::M5, &descriptor).is_err());
+    children[2].ts += chrono::Duration::minutes(1);
+    assert!(aggregate_price_bars(&children, Timeframe::M5, &descriptor).is_err());
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn enhanced_parquet_paths_preserve_simultaneous_order_and_nullable_counts() {
+    use data_preprocess::ParquetStore;
+    let root = std::env::temp_dir().join(format!(
+        "qs-enhanced-{}-{}",
+        std::process::id(),
+        ndt(2026, 1, 1, 0, 0, 0).and_utc().timestamp()
+    ));
+    let store = ParquetStore::open(&root).unwrap();
+    let ts = ndt(2026, 1, 1, 0, 0, 0);
+    let rows = (0..3)
+        .map(|ordinal| StoredTick {
+            tick: make_tick(
+                "demo",
+                "EURUSD",
+                ts,
+                1.1 + ordinal as f64 * 0.0001,
+                1.2 + ordinal as f64 * 0.0001,
+            ),
+            source_ordinal: ordinal,
+            source_identity: None,
+            provider_sequence: None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(store.insert_stored_ticks(&rows).unwrap(), 3);
+    assert_eq!(store.query_stored_ticks("demo", "EURUSD").unwrap(), rows);
+    let provider = StoredTick {
+        tick: make_tick("demo", "EURUSD", ts, 1.3, 1.4),
+        source_ordinal: 3,
+        source_identity: Some("feed".into()),
+        provider_sequence: Some(7),
+    };
+    assert_eq!(
+        store
+            .insert_stored_ticks(std::slice::from_ref(&provider))
+            .unwrap(),
+        1
+    );
+    let mut duplicate = provider.clone();
+    duplicate.source_ordinal = 4;
+    assert_eq!(store.insert_stored_ticks(&[duplicate]).unwrap(), 0);
+    let mut conflict = provider.clone();
+    conflict.source_ordinal = 5;
+    conflict.tick.bid = Some(9.0);
+    assert!(store.insert_stored_ticks(&[conflict]).is_err());
+    let descriptor = SeriesDescriptor {
+        source_identity: "fixture".into(),
+        exchange: "demo".into(),
+        symbol: "EURUSD".into(),
+        timeframe_seconds: 60,
+        price_basis: StoredPriceBasis::Mid,
+        alignment_offset_seconds: 0,
+        digits: 5,
+        point_size: 0.00001,
+        count_capability: CountCapability::Optional,
+        verified: true,
+    };
+    let bars = vec![
+        price_bar(ts, None),
+        price_bar(ts + chrono::Duration::minutes(1), Some(4)),
+    ];
+    assert_eq!(store.insert_price_bars(&descriptor, &bars).unwrap(), 2);
+    assert_eq!(store.query_price_bars(&descriptor).unwrap(), bars);
+    let mut conflict_descriptor = descriptor.clone();
+    conflict_descriptor.digits = 4;
+    assert!(store.query_price_bars(&conflict_descriptor).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn stored_quote(ts: NaiveDateTime, ordinal: u64, bid: f64, ask: f64) -> StoredTick {
+    StoredTick {
+        tick: make_tick("demo", "EURUSD", ts, bid, ask),
+        source_ordinal: ordinal,
+        source_identity: None,
+        provider_sequence: None,
+    }
+}
+
+#[test]
+fn quote_statistics_preserve_simultaneous_activity_exact_quantiles_and_time_semantics() {
+    let from = ndt(2026, 1, 1, 0, 0, 0);
+    let to = from + chrono::Duration::seconds(10);
+    let mut ticks = vec![
+        stored_quote(from, 0, 100.0, 100.0),
+        stored_quote(from, 1, 100.0, 102.0),
+        stored_quote(from + chrono::Duration::seconds(2), 2, 102.0, 104.0),
+        stored_quote(from + chrono::Duration::seconds(4), 3, 98.0, 100.0),
+        stored_quote(from + chrono::Duration::seconds(6), 4, 104.0, 106.0),
+    ];
+    for index in 5..10 {
+        ticks.push(stored_quote(
+            from + chrono::Duration::seconds(index as i64),
+            index,
+            100.0,
+            100.0 + index as f64,
+        ));
+    }
+    let stats = aggregate_quote_statistics(
+        &ticks,
+        from,
+        to,
+        105.0,
+        Some(101.0),
+        Some(PriceBins {
+            lower: 99.0,
+            width: 2.0,
+            count: 4,
+        }),
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.accepted, 10);
+    assert_eq!(stats.quote_activity, 10);
+    assert_eq!(stats.spread_p90, Some(8.0));
+    assert_eq!(stats.coverage_millis, 10_000);
+    assert!(stats.crossings >= 2);
+    assert!(stats.elapsed_since_breakout_millis.unwrap() > stats.continuous_above_millis);
+    assert!(stats.cumulative_above_millis >= stats.continuous_above_millis);
+    assert_eq!(stats.dominant_bin, Some(2));
+    assert_eq!(stats.distance_from_dominant_center, Some(1.0));
+    let tied = aggregate_quote_statistics(
+        &[
+            stored_quote(from, 20, 100.0, 100.0),
+            stored_quote(from + chrono::Duration::seconds(5), 21, 102.0, 102.0),
+        ],
+        from,
+        to,
+        102.0,
+        None,
+        Some(PriceBins {
+            lower: 99.0,
+            width: 2.0,
+            count: 3,
+        }),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        tied.dominant_bin,
+        Some(0),
+        "equal dwell ties choose the lower bin"
+    );
+    assert_eq!(
+        stats.first_high_at,
+        Some(from + chrono::Duration::seconds(6))
+    );
+    let zero = aggregate_quote_statistics(
+        &[stored_quote(from, 0, 100.0, 100.0)],
+        from,
+        to,
+        100.0,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(zero.spread_last, Some(0.0));
+}
+
+#[test]
+fn quote_statistics_require_explicit_stale_bounded_carry_and_verified_duplicate_identity() {
+    let from = ndt(2026, 1, 1, 0, 0, 0);
+    let to = from + chrono::Duration::seconds(10);
+    let carry = PriorQuoteCarry {
+        observed_at: from - chrono::Duration::seconds(1),
+        bid: 99.0,
+        ask: 101.0,
+        stale_limit: chrono::Duration::seconds(4),
+    };
+    let stats = aggregate_quote_statistics(&[], from, to, 100.0, None, None, Some(carry)).unwrap();
+    assert_eq!(stats.coverage_millis, 3_000);
+    assert_eq!(stats.accepted, 0);
+    assert!(
+        aggregate_quote_statistics(&[], from, to, 100.0, None, None, None)
+            .unwrap()
+            .twap
+            .is_none()
+    );
+    let mut first = stored_quote(from, 0, 100.0, 101.0);
+    first.source_identity = Some("feed".into());
+    first.provider_sequence = Some(7);
+    let mut duplicate = first.clone();
+    duplicate.source_ordinal = 1;
+    let stats = aggregate_quote_statistics(
+        &[first.clone(), duplicate],
+        from,
+        to,
+        100.0,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.duplicate_provider_rows, 1);
+    let mut conflict = first.clone();
+    conflict.source_ordinal = 2;
+    conflict.tick.ask = Some(102.0);
+    assert!(
+        aggregate_quote_statistics(&[first, conflict], from, to, 100.0, None, None, None).is_err()
+    );
 }
 
 // ── Parser: filename, exchange normalization, tz offset, datetime ──
@@ -199,6 +462,42 @@ fn tick_csv_parse_and_empty_fields() {
     assert!((ticks[1].volume.unwrap() - 50.0).abs() < 0.001);
     assert!(ticks[1].flags.is_none());
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tick_csv_audit_discloses_precision_order_and_legacy_loss() {
+    let dir = std::env::temp_dir().join("dp_test_tick_csv_audit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("EURUSD_test.csv");
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "<DATE>\t<TIME>\t<BID>\t<ASK>\t<LAST>\t<VOLUME>\t<FLAGS>"
+        )
+        .unwrap();
+        writeln!(file, "2026.02.16\t19:00:00.1234567\t1.0\t1.1\t\t\t").unwrap();
+        writeln!(file, "2026.02.16\t19:00:00.1234567\t1.2\t1.3\t\t\t").unwrap();
+    }
+    let offset = parse_tz_offset("+00:00").unwrap();
+    let (_, warnings, audit) = data_preprocess::parser::tick_csv::parse_tick_csv_with_audit(
+        &path, "demo", "EURUSD", &offset,
+    )
+    .unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(audit.parsed_rows, 2);
+    assert_eq!(audit.distinct_timestamps, 1);
+    assert_eq!(audit.simultaneous_rows, 1);
+    assert_eq!(audit.maximum_fractional_digits, 7);
+    assert!(audit.parquet_precision_loss_possible());
+    assert!(!audit.provider_sequence_available);
+    assert!(!audit.stable_import_ordinal_persisted);
+    assert!(audit.legacy_timestamp_dedup);
+    assert!(!audit.exact_quote_path_capable);
+    assert!(!TickPathCapability::LegacyTimestampDeduplicated.preserves_simultaneous_rows());
+    assert!(TickPathCapability::OrderedWithoutProviderSequence.exact_quote_path_capable());
+    assert!(!TickPathCapability::OrderedWithoutProviderSequence.verifies_true_duplicates());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -554,6 +853,49 @@ mod duckdb_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].ts, ts3); // tail grabs last 2, then sort desc
         assert_eq!(rows[1].ts, ts2);
+    }
+
+    #[test]
+    fn db_enhanced_ticks_and_optional_bars_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let ts = ndt(2026, 2, 16, 17, 0, 0);
+        let rows = vec![
+            StoredTick {
+                tick: make_tick("demo", "EURUSD", ts, 1.0, 1.1),
+                source_ordinal: 0,
+                source_identity: None,
+                provider_sequence: None,
+            },
+            StoredTick {
+                tick: make_tick("demo", "EURUSD", ts, 1.2, 1.3),
+                source_ordinal: 1,
+                source_identity: None,
+                provider_sequence: None,
+            },
+        ];
+        assert_eq!(db.insert_stored_ticks(&rows).unwrap(), 2);
+        assert_eq!(db.query_stored_ticks("demo", "EURUSD").unwrap(), rows);
+        let descriptor = SeriesDescriptor {
+            source_identity: "fixture".into(),
+            exchange: "demo".into(),
+            symbol: "EURUSD".into(),
+            timeframe_seconds: 60,
+            price_basis: StoredPriceBasis::Mid,
+            alignment_offset_seconds: 0,
+            digits: 5,
+            point_size: 0.00001,
+            count_capability: CountCapability::Optional,
+            verified: true,
+        };
+        let bars = vec![
+            price_bar(ts, None),
+            price_bar(ts + chrono::Duration::minutes(1), Some(3)),
+        ];
+        assert_eq!(db.insert_price_bars(&descriptor, &bars).unwrap(), 2);
+        assert_eq!(db.query_price_bars(&descriptor).unwrap(), bars);
+        let mut conflict = descriptor.clone();
+        conflict.digits = 4;
+        assert!(db.query_price_bars(&conflict).is_err());
     }
 
     #[test]

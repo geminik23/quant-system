@@ -39,17 +39,23 @@ pub mod strategy;
 // ── Convenience re-exports ──────────────────────────────────────────────────
 
 pub use artifacts::{
-    CloseEvent, CompletedPosition, ExecutionMetadata, FutureBacktestArtifacts,
+    CloseEvent, CompletedPosition, CostEvent, ExecutionMetadata, FutureBacktestArtifacts,
     InstrumentSizingArtifact, MarketEntrySizingAudit, MarketEntrySizingBasis, NetPnlOutcome,
     OpenPositionSnapshot, PendingOrderLifecycleEvent, PendingOrderLifecycleState,
     PendingOrderSnapshot, RecordedFill, ReplayInstrumentArtifact, ReplayInstrumentManifest,
     RiskBasisStatus, RiskTranche,
 };
+pub use qs_core::{
+    CommissionModel, CostBasis, CostCharge, CostKind, CostValidationError, InstrumentCosts,
+    SwapAmount, SwapSchedule,
+};
+
 pub use currency::{
     ConversionError, ConversionLeg, ConversionLegAudit, ConversionPriceSide, ConversionQuoteBook,
     ConversionResult, ConversionRoute, FxPair, FxPairDirection, QuoteValidationError,
     RunCurrencyPlan, RunCurrencyPlanError, resolve_conversion_route, resolve_fx_pair,
 };
+pub use data_feed::BarExecutionPrices;
 pub use data_feed::{DataFeed, MarketEvent, VecFeed};
 pub use economic_support::{
     EconomicSupportError, LEGACY_ECONOMIC_GUARD_ID, LegacyEconomicModel, SupportedLegacyEconomics,
@@ -83,27 +89,35 @@ pub use runner::{
 pub use strategy::{
     AnalysisBoundary, AnalysisBoundaryOutput, AnalysisContext, AnalysisError, AnalysisPipeline,
     AnnotationError, AnnotationId, AnnotationLimits, AnnotationTimeline, AnnotationUse,
-    BacktestConfiguredStrategyAdapter, BarSeriesSpec, BarWindow, ClosedBar,
-    ConfiguredHistoricalBindings, ConfiguredNamedInputBinding, ConfiguredSourceBinding,
-    ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
-    ConfiguredStrategyAdapterPreflightError, ConfirmedPivotAnalyzer, HistoricalAnalyzer,
+    BacktestConfiguredStrategyAdapter, BarSeriesSpec, BarWindow, CalendarAdmissionLimits,
+    CalendarBar, CalendarError, CalendarFeatureKind, CalendarFeatureProjector, CalendarInputSpec,
+    CalendarTimeBasis, ClosedBar, ConfiguredCalendarFeatureProjector, ConfiguredCalendarInput,
+    ConfiguredEntryProfileError, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
+    ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
+    ConfiguredStrategyAdapterPreflightError, ConfiguredTradingCalendar, ConfirmedPivotAnalyzer,
+    ConfirmedSwingFactKind, ConfirmedSwingFactProjector, DEFAULT_CALENDAR_SESSION_ID,
+    FixedUtcSessionError, FixedUtcSessionProjector, HistoricalAnalyzer,
     HistoricalNamedInputProjector, HistoricalObservationView, HistoricalSeriesView,
-    HistoricalStrategy, HistoricalVolumeProjection, JournalKind, MAX_ANALYZERS,
-    MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES, MAX_ANNOTATIONS, MAX_CHART_REF_BYTES,
-    MAX_DECISION_LATENCY_MS, MAX_DECISION_RECORDS, MAX_EXPERIMENT_LABEL_BYTES,
-    MAX_INSTRUMENT_BYTES, MAX_JOURNAL_PER_CALLBACK, MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS,
-    MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES, MAX_OBSERVATION_SOURCE_SERIES,
-    MAX_OBSERVATIONS_PER_BOUNDARY, MAX_PIVOT_SIDE_BARS, MAX_REASON_BYTES, MAX_RETAINED_BARS,
-    MAX_RETAINED_OBSERVATIONS, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
-    MAX_STRATEGY_ID_BYTES, MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES,
-    MAX_TRADE_ID_BYTES, MAX_WARMUP_BARS, MAX_ZONE_ID_BYTES, MissingIntervalPolicy, MomentumState,
-    MultiTimeframeSeries, NamedInputProjectionContext, NamedInputProjectionError,
+    HistoricalStrategy, HistoricalVolumeProjection, IanaTradingCalendar, JournalKind,
+    LocalMarketIntervalSpec, MAX_ANALYZERS, MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES,
+    MAX_ANNOTATIONS, MAX_CHART_REF_BYTES, MAX_DECISION_LATENCY_MS, MAX_DECISION_RECORDS,
+    MAX_EXPERIMENT_LABEL_BYTES, MAX_INSTRUMENT_BYTES, MAX_JOURNAL_PER_CALLBACK,
+    MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,
+    MAX_OBSERVATION_SOURCE_SERIES, MAX_OBSERVATIONS_PER_BOUNDARY, MAX_PIVOT_SIDE_BARS,
+    MAX_REASON_BYTES, MAX_RETAINED_BARS, MAX_RETAINED_OBSERVATIONS, MAX_SERIES_ID_BYTES,
+    MAX_SESSION_WINDOWS, MAX_SIGNALS_PER_CALLBACK, MAX_STRATEGY_ID_BYTES,
+    MAX_STRATEGY_REVISION_BYTES, MAX_STRATEGY_TITLE_BYTES, MAX_TRADE_ID_BYTES, MAX_WARMUP_BARS,
+    MAX_ZONE_ID_BYTES, MarketScheduleSpec, MissingIntervalPolicy, MomentumState,
+    MultiTimeframeSeries, NamedInputProjectionContext, NamedInputProjectionError, NamedSessionSpec,
     ObservationOrigin, ObservationSelection, ObservationStore, ObservationStoreLimits,
-    ObservationWindow, PivotConfig, PriceBasis, PriceZone, ProjectedNamedInput, RejectionPattern,
-    SeriesError, SeriesId, SeriesRequirement, SeriesViewError, SeriesWarmupState, Strategy,
-    StrategyAnnotation, StrategyBacktestResult, StrategyComparisonMetrics,
-    StrategyComparisonSnapshot, StrategyConfigError, StrategyContext, StrategyDecisionDraft,
-    StrategyDecisionKind, StrategyDecisionOutput, StrategyDecisionRecord, StrategyDecisionRecorder,
+    ObservationWindow, OpeningRange, PivotConfig, PriceBasis, PriceZone, ProjectedNamedInput,
+    RejectionPattern, ResolvedSession, ResolvedSessionOccurrence, ResolvedTradingDay, SeriesError,
+    SeriesGeometry, SeriesGeometryError, SeriesId, SeriesRequirement, SeriesViewError,
+    SeriesWarmupState, SessionOccurrenceId, SessionScheduleSpec, SessionSpanSpec,
+    SourceBarFactKind, SourceBarFactProjector, Strategy, StrategyAnnotation,
+    StrategyBacktestResult, StrategyComparisonMetrics, StrategyComparisonSnapshot,
+    StrategyConfigError, StrategyContext, StrategyDecisionDraft, StrategyDecisionKind,
+    StrategyDecisionOutput, StrategyDecisionRecord, StrategyDecisionRecorder,
     StrategyDecisionRetention, StrategyDescriptor, StrategyDomainError, StrategyEvent,
     StrategyExperimentComparison, StrategyExperimentError, StrategyFeedback, StrategyFeedbackEvent,
     StrategyId, StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput,
@@ -111,5 +125,12 @@ pub use strategy::{
     StrategyObservationDraft, StrategyObservationValue, StrategyOutput, StrategyReplayError,
     StrategyReplayInputError, StrategyRequirements, StrategyResearchLimits, StrategyResearchOutput,
     StrategyRetentionLimits, StrategyRuntimeError, SwingKind, SwingPoint, Timeframe,
-    WarmupRequirement, ZoneId, ZoneSide, ZoneSource, ZoneState,
+    TradingCalendarSpec, WarmupRequirement, WeeklyMarketIntervalSpec, ZoneId, ZoneSide, ZoneSource,
+    ZoneState,
+};
+pub use strategy::{
+    ConfiguredInstance, DirectPortfolioInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES,
+    MixedPortfolioBacktestResult, MixedPortfolioReplayError, PortfolioBacktestResult,
+    PortfolioInstanceOutput, PortfolioReplayError, SupervisorEvent, SupervisorHaltAction,
+    SupervisorOutput,
 };

@@ -13,9 +13,11 @@ use std::time::SystemTime;
 use chrono::{NaiveDate, NaiveDateTime};
 use polars::prelude::*;
 
-use crate::convert::{dataframe_to_bars, dataframe_to_ticks};
+use crate::convert::{
+    dataframe_to_bars, dataframe_to_price_bars, dataframe_to_stored_ticks, dataframe_to_ticks,
+};
 use crate::error::{DataError, Result};
-use crate::models::{Bar, Tick};
+use crate::models::{Bar, PriceBar, SeriesDescriptor, StoredTick, Tick};
 use crate::parquet_store::ParquetStore;
 
 /// Default maximum number of rows decoded by one cursor read.
@@ -67,6 +69,18 @@ impl Timestamped for Tick {
 impl Timestamped for Bar {
     fn timestamp(&self) -> NaiveDateTime {
         self.ts
+    }
+}
+
+impl Timestamped for StoredTick {
+    fn timestamp(&self) -> NaiveDateTime {
+        self.tick.ts
+    }
+}
+
+impl Timestamped for PriceBar {
+    fn timestamp(&self) -> NaiveDateTime {
+        self.available_at
     }
 }
 
@@ -866,6 +880,129 @@ impl ParquetBarCursor {
     }
 }
 
+/// Immutable description of persisted ordered-tick partitions.
+#[derive(Debug, Clone)]
+pub struct ParquetStoredTickScan {
+    inner: PartitionScan,
+}
+
+impl ParquetStoredTickScan {
+    pub fn describe_cancellable<F>(
+        root: impl AsRef<Path>,
+        exchange: &str,
+        symbol: &str,
+        bounds: ParquetScanBounds,
+        mut is_cancelled: F,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> bool,
+    {
+        let directory = root
+            .as_ref()
+            .join("ordered_ticks")
+            .join(format!("exchange={exchange}"))
+            .join(format!("symbol={symbol}"));
+        Ok(Self {
+            inner: PartitionScan::describe(&directory, bounds, &mut is_cancelled)?,
+        })
+    }
+
+    pub fn cursor_with_read_size(&self, rows_per_read: usize) -> Result<ParquetStoredTickCursor> {
+        Ok(ParquetStoredTickCursor {
+            inner: PartitionCursor::open(
+                self.inner.clone(),
+                rows_per_read,
+                read_stored_tick_partition,
+            )?,
+        })
+    }
+}
+
+/// Slice-bounded cursor over persisted ordered ticks.
+pub struct ParquetStoredTickCursor {
+    inner: PartitionCursor<StoredTick>,
+}
+
+impl ParquetStoredTickCursor {
+    pub fn next_stored_tick_with_ordinal_cancellable<F>(
+        &mut self,
+        mut is_cancelled: F,
+    ) -> Result<Option<ParquetScannedRow<StoredTick>>>
+    where
+        F: FnMut() -> bool,
+    {
+        self.inner.next_row(&mut is_cancelled)
+    }
+
+    pub fn rows_per_read(&self) -> usize {
+        self.inner.rows_per_read()
+    }
+}
+
+/// Immutable description of availability-ordered price-bar partitions.
+#[derive(Debug, Clone)]
+pub struct ParquetPriceBarScan {
+    inner: PartitionScan,
+}
+
+impl ParquetPriceBarScan {
+    pub fn describe_cancellable<F>(
+        root: impl AsRef<Path>,
+        descriptor: &SeriesDescriptor,
+        bounds: ParquetScanBounds,
+        mut is_cancelled: F,
+    ) -> Result<Self>
+    where
+        F: FnMut() -> bool,
+    {
+        descriptor.validate()?;
+        let directory = root
+            .as_ref()
+            .join("price_bars")
+            .join(format!("exchange={}", descriptor.exchange))
+            .join(format!("symbol={}", descriptor.symbol))
+            .join(format!(
+                "timeframe_seconds={}",
+                descriptor.timeframe_seconds
+            ));
+        let discovery_bounds = ParquetScanBounds::default();
+        let mut inner = PartitionScan::describe(&directory, discovery_bounds, &mut is_cancelled)?;
+        inner.bounds = bounds.validate()?;
+        Ok(Self { inner })
+    }
+
+    pub fn cursor_with_read_size(&self, rows_per_read: usize) -> Result<ParquetPriceBarCursor> {
+        Ok(ParquetPriceBarCursor {
+            inner: PartitionCursor::open(
+                self.inner.clone(),
+                rows_per_read,
+                read_price_bar_partition,
+            )?,
+        })
+    }
+}
+
+/// Slice-bounded cursor whose order is each price bar's actual availability.
+pub struct ParquetPriceBarCursor {
+    inner: PartitionCursor<PriceBar>,
+}
+
+impl ParquetPriceBarCursor {
+    pub fn next_price_bar_with_ordinal_cancellable<F>(
+        &mut self,
+        mut is_cancelled: F,
+    ) -> Result<Option<ParquetScannedRow<PriceBar>>>
+    where
+        F: FnMut() -> bool,
+    {
+        self.inner.next_row(&mut is_cancelled)
+    }
+
+    pub fn rows_per_read(&self) -> usize {
+        self.inner.rows_per_read()
+    }
+}
+
 impl ParquetStore {
     /// Create an ascending tick cursor over this store.
     pub fn scan_ticks(
@@ -928,6 +1065,47 @@ impl ParquetStore {
             bounds,
             is_cancelled,
         )
+    }
+
+    pub fn scan_stored_ticks_cancellable<F>(
+        &self,
+        exchange: &str,
+        symbol: &str,
+        bounds: ParquetScanBounds,
+        rows_per_read: usize,
+        is_cancelled: F,
+    ) -> Result<ParquetStoredTickCursor>
+    where
+        F: FnMut() -> bool,
+    {
+        ParquetStoredTickScan::describe_cancellable(
+            self.root_path(),
+            exchange,
+            symbol,
+            bounds,
+            is_cancelled,
+        )?
+        .cursor_with_read_size(rows_per_read)
+    }
+
+    pub fn scan_price_bars_cancellable<F>(
+        &self,
+        descriptor: &SeriesDescriptor,
+        bounds: ParquetScanBounds,
+        rows_per_read: usize,
+        is_cancelled: F,
+    ) -> Result<ParquetPriceBarCursor>
+    where
+        F: FnMut() -> bool,
+    {
+        self.verify_price_bar_series(descriptor)?;
+        ParquetPriceBarScan::describe_cancellable(
+            self.root_path(),
+            descriptor,
+            bounds,
+            is_cancelled,
+        )?
+        .cursor_with_read_size(rows_per_read)
     }
 }
 
@@ -1028,6 +1206,20 @@ fn read_bar_partition(file: File, offset: usize, rows: usize) -> Result<Vec<Bar>
         .with_slice(Some((offset, rows)))
         .finish()?;
     dataframe_to_bars(&dataframe)
+}
+
+fn read_stored_tick_partition(file: File, offset: usize, rows: usize) -> Result<Vec<StoredTick>> {
+    let dataframe = ParquetReader::new(file)
+        .with_slice(Some((offset, rows)))
+        .finish()?;
+    dataframe_to_stored_ticks(&dataframe)
+}
+
+fn read_price_bar_partition(file: File, offset: usize, rows: usize) -> Result<Vec<PriceBar>> {
+    let dataframe = ParquetReader::new(file)
+        .with_slice(Some((offset, rows)))
+        .finish()?;
+    dataframe_to_price_bars(&dataframe)
 }
 
 fn tick_has_valid_quote(tick: &Tick) -> bool {

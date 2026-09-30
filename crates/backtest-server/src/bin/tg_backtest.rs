@@ -222,6 +222,10 @@ struct Args {
     #[arg(long)]
     entry_profile_map: Option<PathBuf>,
 
+    /// TOML file containing per-symbol commission and swap. Omit to charge nothing.
+    #[arg(long)]
+    costs_file: Option<PathBuf>,
+
     /// Initial account balance.
     #[arg(long, default_value_t = 10_000.0)]
     balance: f64,
@@ -422,6 +426,28 @@ fn parse_raw_signal_line(
 
     serde_json::from_value(value)
         .map_err(|error| format!("line {line_number}: failed to parse raw signal: {error}").into())
+}
+
+/// Read per-symbol commission and swap, rejecting unknown keys.
+///
+/// The file is one table per canonical symbol. Values are validated again by the server, so this only has to produce well-formed wire values.
+fn load_costs(
+    path: Option<&Path>,
+) -> Result<BTreeMap<String, InstrumentCostsMsg>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(BTreeMap::new());
+    };
+    let content = std::fs::read_to_string(path)?;
+    let costs: BTreeMap<String, InstrumentCostsMsg> = toml::from_str(&content)?;
+    for (symbol, entry) in &costs {
+        if symbol.trim().is_empty() {
+            return Err("cost symbol must not be empty".into());
+        }
+        if entry.commission.is_none() && entry.swap.is_none() {
+            return Err(format!("costs for {symbol} declare neither commission nor swap").into());
+        }
+    }
+    Ok(costs)
 }
 
 /// Read and recursively validate entry-profile routes without losing unknown TOML keys.
@@ -1809,6 +1835,7 @@ fn zero_trade_provider_result(
     source_coverage: Option<SourceCoverageCountsMsg>,
     request_symbol: &str,
     request_symbols: &[String],
+    costs: BTreeMap<String, InstrumentCostsMsg>,
 ) -> Result<BacktestResultMsg, Box<dyn std::error::Error>> {
     let evaluation = provider_evaluation_options(args, source_coverage);
     let registry = SymbolRegistry::empty();
@@ -1836,6 +1863,7 @@ fn zero_trade_provider_result(
         close_on_finish: Some(true),
         fill_model: Some("BidAsk".into()),
         sizing: None,
+        costs,
     };
     let future_msg = future_config_message(args);
     let account_currency = args
@@ -1927,6 +1955,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let loaded_signal_count = raw_signals.len();
     let entry_profile_routes = load_entry_profile_routes(args.entry_profile_map.as_deref())?;
+    // Costs are read before any transport work so an invalid file fails immediately.
+    let costs = load_costs(args.costs_file.as_deref())?;
     println!(
         "  Loaded {} raw signals from {}",
         loaded_signal_count, args.input
@@ -1965,6 +1995,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 source_coverage,
                 &request_symbol,
                 &request_symbols,
+                costs.clone(),
             )?;
             present_result(&result, &args, false)?;
             print_header("Done");
@@ -2057,6 +2088,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 close_on_finish: Some(true),
                 fill_model: Some("BidAsk".into()),
                 sizing,
+                costs: costs.clone(),
             },
         };
 

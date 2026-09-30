@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use qs_core::profile::*;
 
@@ -78,7 +78,7 @@ impl From<ProfileValidationError> for ProfileRegistryError {
 }
 
 /// Immutable per-run management-profile selection.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct PreparedEntryProfiles {
     default: Option<ManagementProfile>,
     routes: BTreeMap<String, ManagementProfile>,

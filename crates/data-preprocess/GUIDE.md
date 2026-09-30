@@ -7,7 +7,7 @@ Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar
 | Backend | Feature Flag | Default | Build Time | Description |
 |---------|-------------|---------|------------|-------------|
 | **Parquet + Polars** | `parquet` | ✅ Yes | ~30s | Hive-partitioned Parquet files. No C++ compilation. zstd compressed. |
-| **DuckDB** | `duckdb-backend` | No | ~150s | Embedded columnar database. Opt-in for SQL exploration. |
+| **DuckDB** | `duckdb-backend` | No | Native build, environment dependent | Embedded columnar database. Opt-in for SQL exploration. |
 
 ### Parquet Directory Layout (Hive-Style Partitioning)
 
@@ -26,7 +26,9 @@ Historical market data storage and preprocessing CLI. Imports tick and OHLCV bar
                 └── 2026-01-16.parquet
 ```
 
-Each file covers one date for one exchange+symbol (or exchange+symbol+timeframe for bars). Files are sorted by timestamp ascending and compressed with zstd.
+Each legacy file covers one date for one exchange+symbol (or exchange+symbol+timeframe for bars). Files are sorted by timestamp ascending and compressed with zstd.
+
+The additive library-only enhanced paths use `ordered_ticks/` and `price_bars/`. `StoredTick` persists a source ordinal and preserves equal timestamps; provider sequence is treated as duplicate identity only together with a source identity, and conflicting payloads reject. `PriceBar` stores nullable `tick_count`, actual `available_at`, and a verified `SeriesDescriptor`; unknown count is never represented by zero, one, volume, or another sentinel. Enhanced paths support both bounded materialization and fingerprinted slice-bounded cursors. `ParquetStoredTickCursor` and `ParquetPriceBarCursor` decode at most the admitted rows per read, validate partition generations and monotonic order between slices, and check cancellation without materializing the full dataset. Materialized compatibility queries still check row and resident-byte limits while accumulating partitions and include owned string storage in retained-byte accounting. Replay metadata keeps `available_at` separate from the nominal bucket timestamp, so delayed bars are ordered by actual publication and cannot replay their old range as a new executable bar. The legacy `Tick` and `Bar { tick_vol: i64 }` APIs and partitions remain unchanged. New enhanced writes require verified descriptors, while a caller may read metadata-free legacy data only as an explicitly unverified assertion.
 
 ## Quick Start
 
@@ -81,10 +83,51 @@ Global options:
 
 Commands:
   input          Import market data from CSV file(s)
+  resample       Build stored bars from stored ticks
   remove         Remove data by exchange / symbol / type / date range
   stats          Show summary statistics
   view           Query and display stored data
 ```
+
+### `resample`
+
+```
+data-preprocess resample [OPTIONS]
+
+  -e, --exchange <EX>              Exchange name (REQUIRED)
+  -s, --symbol <SYM>               Symbol to resample (REQUIRED)
+  -t, --timeframe <TF>             Target timeframe: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (REQUIRED)
+      --price-basis <BASIS>        bid | ask | mid [default: mid]
+      --align-offset-seconds <N>   Bucket alignment offset [default: 0]
+      --digits <N>                 Price decimal digits, used for the spread in points [default: 5]
+      --from <DATETIME>            Inclusive start (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+      --to <DATETIME>              Inclusive end
+      --flush-partial              Also write the final, still-incomplete bucket
+```
+
+Reads stored ticks and writes stored bars using the same bucket arithmetic, quote-acceptance rule, and accumulation the replay engine applies when it builds bars in memory. Bars produced here are therefore identical to the bars a tick-driven replay would derive from the same input, which lets a parameter search run over bars and a confirmation run over ticks without disagreeing.
+
+Each bar records the average bid/ask spread observed while it formed, expressed in points for the given digit count, so bar-driven replay can execute against a realistic two-sided quote instead of a zero spread.
+
+Replay treats a bar's close as the midpoint and rebuilds the quote as `close ± spread / 2`. Bars stored on the `mid` basis therefore reconstruct the original two-sided quote; bars stored on `bid` or `ask` reconstruct a quote whose centre sits half a spread away from the real midpoint, which shifts every stop, target, and pending-order trigger by that amount. Use `bid` or `ask` only to match a strategy series that analyses that side, and confirm on ticks.
+
+Bars count accepted ticks in `tick_vol` and leave `volume` at zero, matching the tick-count volume the replay engine projects. Ticks must arrive in chronological order; any tick belonging to an already-closed bucket is dropped and reported at the end of the run.
+
+An interval with no accepted tick produces no bar, so market closures simply have no bars. The final incomplete bucket is dropped unless `--flush-partial` is given, because the replay engine never emits an incomplete bar. Monthly bars have no fixed duration and are rejected. Weekly buckets align to the Unix epoch week unless an alignment offset moves them.
+
+```bash
+# Hourly bars for one symbol over a date range
+data-preprocess --data-dir /data/forex resample \
+  --exchange icmarkets --symbol EURUSD --timeframe 1h \
+  --digits 5 --from 2025-01-01 --to 2026-09-04
+
+# Daily bars that close at 22:00 UTC
+data-preprocess --data-dir /data/forex resample \
+  --exchange icmarkets --symbol EURUSD --timeframe 1d \
+  --align-offset-seconds 79200 --digits 5
+```
+
+Resampling reads the Parquet tick store; it is unavailable on the DuckDB backend.
 
 ### `input tick`
 
@@ -155,9 +198,12 @@ Tab-delimited, with header. Filename convention: `{SYMBOL}_*.csv`
 - **Exchanges** are always stored lowercase (`ctrader`, `binance`)
 - **Symbols** are always stored uppercase (`BTCUSD`, `EURUSD`)
 - **Timestamps** are stored in UTC — source timezone is converted on import
-- **Deduplication** uses `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
+- **Legacy deduplication** uses `(exchange, symbol, ts)` for ticks and `(exchange, symbol, timeframe, ts)` for bars
   - Parquet: read-merge-write per date partition file (bounded to one file per dedup operation)
   - DuckDB: `INSERT OR IGNORE` with UNIQUE constraints
+  - `parse_tick_csv_with_audit` reports parsed/distinct/simultaneous row counts and the greatest observed fractional-second precision. The legacy CSV has no provider sequence and the legacy write path persists no source ordinal, so its audit always marks exact quote-path capability false. More than six fractional digits also warns that the Parquet microsecond representation may lose timestamp precision.
+  - Existing legacy partitions remain readable but may already have discarded simultaneous rows; conversion cannot reconstruct them and must not mark them complete.
+- **Enhanced ordered ticks** use persisted `(timestamp, source_ordinal)` order without timestamp deduplication. A provider sequence is duplicate identity only when paired with a nonempty source identity; without it, even identical simultaneous payloads remain distinct.
 
 ## Library Usage
 

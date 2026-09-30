@@ -8,6 +8,8 @@ pub mod models;
 #[cfg(feature = "parquet")]
 pub mod parquet_store;
 pub mod parser;
+pub mod quote_stats;
+pub mod resample;
 #[cfg(feature = "parquet")]
 pub mod scanner;
 
@@ -17,7 +19,10 @@ pub use error::{DataError, Result};
 pub use models::*;
 #[cfg(feature = "parquet")]
 pub use parquet_store::ParquetStore;
+pub use quote_stats::{PriceBins, PriorQuoteCarry, QuoteStatistics, aggregate_quote_statistics};
+pub use resample::{BarAggregator, BucketSpec, PriceBasis, bucket_bounds};
 #[cfg(feature = "parquet")]
 pub use scanner::{
-    DEFAULT_PARQUET_SCAN_ROWS, ParquetBarCursor, ParquetScanBounds, ParquetTickCursor,
+    DEFAULT_PARQUET_SCAN_ROWS, ParquetBarCursor, ParquetPriceBarCursor, ParquetScanBounds,
+    ParquetStoredTickCursor, ParquetTickCursor,
 };

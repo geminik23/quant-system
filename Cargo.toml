@@ -8,16 +8,20 @@ members = [
     "crates/market-data",
     "crates/market-data-api",
     "crates/data-preprocess",
+    "crates/market-loader",
+    "crates/research",
+    "crates/risk",
     "crates/symbols",
     "crates/backtest-server",
     "crates/service",
     "crates/service-xrpc",
     "crates/signal-parser",
     "crates/strategy",
+    "crates/execution",
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0"
 rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -28,16 +32,20 @@ readme = "README.md"
 criterion = "0.5"
 
 # Workspace crates
-qs-core = { package = "quant-system-core", path = "crates/core", version = "0.3.2" }
-qs-instruments = { path = "crates/instruments", version = "0.3.2" }
-qs-backtest = { path = "crates/backtest", version = "0.3.2" }
-qs-backtest-api = { path = "crates/backtest-api", version = "0.3.2" }
-qs-data-preprocess = { path = "crates/data-preprocess", version = "0.3.2", default-features = false }
-qs-market-data-api = { path = "crates/market-data-api", version = "0.3.2" }
-qs-service = { path = "crates/service", version = "0.3.2" }
-qs-service-xrpc = { path = "crates/service-xrpc", version = "0.3.2" }
-qs-symbols = { path = "crates/symbols", version = "0.3.2" }
-qs-strategy = { path = "crates/strategy", version = "0.3.2" }
+qs-core = { package = "quant-system-core", path = "crates/core", version = "0.4.0" }
+qs-instruments = { path = "crates/instruments", version = "0.4.0" }
+qs-backtest = { path = "crates/backtest", version = "0.4.0" }
+qs-backtest-api = { path = "crates/backtest-api", version = "0.4.0" }
+qs-data-preprocess = { path = "crates/data-preprocess", version = "0.4.0", default-features = false }
+qs-market-data-api = { path = "crates/market-data-api", version = "0.4.0" }
+qs-market-loader = { path = "crates/market-loader", version = "0.4.0" }
+qs-research = { path = "crates/research", version = "0.4.0" }
+qs-risk = { path = "crates/risk", version = "0.4.0" }
+qs-service = { path = "crates/service", version = "0.4.0" }
+qs-service-xrpc = { path = "crates/service-xrpc", version = "0.4.0" }
+qs-symbols = { path = "crates/symbols", version = "0.4.0" }
+qs-strategy = { path = "crates/strategy", version = "0.4.0" }
+qs-execution = { path = "crates/execution", version = "0.4.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -65,6 +73,7 @@ thiserror = "2.0"
 
 # Time & IDs
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 nanoid = "0.4"
 
 # IPC / RPC

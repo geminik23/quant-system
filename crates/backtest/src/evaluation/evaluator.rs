@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::stats::{mean, median, quantile_sorted, sample_standard_deviation};
 use super::{
     BootstrapConfig, BreakdownBucket, BreakdownDimension, BreakdownRowSummary, BreakdownValue,
-    CoverageSection, CumulativeRPoint, EvaluationBreakdown, EvaluationPositionRows,
-    EvaluationReport, EvaluationRequest, EvaluationSection, ExcursionMetricsSection,
-    ExecutionDiagnosticsSection, IntrinsicRobustnessSection, LifecycleCounts, MetricValue,
-    OutcomeClassification, PnlConcentrationSection, PositionOutcome, PositionPerformanceSection,
-    RMetricsSection, RQuantiles, RemovalImpact, RollingOutcome, RollingOutcomes,
-    bootstrap_mean_confidence, wilson_interval,
+    CostMetricsSection, CoverageSection, CumulativeRPoint, EvaluationBreakdown,
+    EvaluationPositionRows, EvaluationReport, EvaluationRequest, EvaluationSection,
+    ExcursionMetricsSection, ExecutionDiagnosticsSection, IntrinsicRobustnessSection,
+    LifecycleCounts, MetricValue, OutcomeClassification, PnlConcentrationSection, PositionOutcome,
+    PositionPerformanceSection, RMetricsSection, RQuantiles, RemovalImpact, RollingOutcome,
+    RollingOutcomes, bootstrap_mean_confidence, wilson_interval,
 };
 
 /// Evaluates normalized provider outcomes without coupling to a backtest report.
@@ -44,6 +44,7 @@ pub fn evaluate(request: &EvaluationRequest) -> EvaluationReport {
             .then(|| excursion_metrics(&selected)),
         execution: section_requested(EvaluationSection::Execution)
             .then(|| execution_metrics(&selected)),
+        costs: section_requested(EvaluationSection::Costs).then(|| cost_metrics(&selected)),
         robustness: section_requested(EvaluationSection::Robustness)
             .then(|| robustness(&selected, request.rolling_window)),
         breakdowns,
@@ -522,6 +523,46 @@ fn excursion_metrics(positions: &[&PositionOutcome]) -> ExcursionMetricsSection 
         median_favorable_r: observed_median(&favorable, "favorable excursion"),
         mean_adverse_r: observed_mean(&adverse, "adverse excursion"),
         median_adverse_r: observed_median(&adverse, "adverse excursion"),
+    }
+}
+
+fn cost_metrics(positions: &[&PositionOutcome]) -> CostMetricsSection {
+    let charged: Vec<&&PositionOutcome> = positions
+        .iter()
+        .filter(|position| position.costs.is_some_and(|costs| costs.is_charged()))
+        .collect();
+    let total_commission: f64 = charged
+        .iter()
+        .filter_map(|position| position.costs.map(|costs| costs.commission))
+        .sum();
+    let total_swap: f64 = charged
+        .iter()
+        .filter_map(|position| position.costs.map(|costs| costs.swap))
+        .sum();
+    let total_cost = total_commission + total_swap;
+    let net_outcome: f64 = positions.iter().map(|position| position.outcome).sum();
+    let gross_outcome = net_outcome + total_cost;
+
+    let cost_share_of_gross = if gross_outcome == 0.0 {
+        MetricValue::not_applicable("gross outcome is zero")
+    } else {
+        MetricValue::available(total_cost / gross_outcome.abs())
+    };
+    let per_position: Vec<f64> = charged
+        .iter()
+        .filter_map(|position| position.costs.map(|costs| costs.total()))
+        .filter(|value| value.is_finite())
+        .collect();
+
+    CostMetricsSection {
+        positions_with_costs: charged.len(),
+        total_commission,
+        total_swap,
+        total_cost,
+        gross_outcome,
+        net_outcome,
+        cost_share_of_gross,
+        mean_cost_per_position: observed_mean(&per_position, "position cost"),
     }
 }
 

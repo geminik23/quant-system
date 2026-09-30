@@ -9,10 +9,12 @@ use crate::{
     AddProfileRequest, AddProfileResponse, BacktestEvent, BacktestStatusResponse,
     CancelBacktestResponse, DeleteResultArtifactRequest, DeleteResultArtifactResponse,
     GetBacktestResultResponse, GetResultArtifactChunkRequest, GetResultArtifactChunkResponse,
-    ListProfilesResponse, ListSymbolsRequest, ListSymbolsResponse, PingResponse,
-    ReloadProfilesResponse, RemoveProfileRequest, RemoveProfileResponse, RunBacktestMultiRequest,
-    RunBacktestMultiResponse, RunBacktestRequest, RunBacktestResponse, SubmitBacktestRequest,
-    SubmitBacktestResponse,
+    GetSearchResultResponse, ListProfilesResponse, ListSymbolsRequest, ListSymbolsResponse,
+    PingResponse, ReloadProfilesResponse, RemoveProfileRequest, RemoveProfileResponse,
+    RunBacktestMultiRequest, RunBacktestMultiResponse, RunBacktestRequest, RunBacktestResponse,
+    RunConfiguredStrategyRequest, RunPortfolioRequest, SubmitBacktestRequest,
+    SubmitBacktestResponse, SubmitConfiguredStrategyRequest, SubmitPortfolioRequest,
+    SubmitSearchRequest,
 };
 
 pub type BacktestEventStream =
@@ -61,6 +63,37 @@ pub trait BacktestDiscoveryClient: Send + Sync {
         &self,
         request: ListSymbolsRequest,
     ) -> Result<ListSymbolsResponse, BacktestClientError>;
+}
+
+/// Provider-neutral client port for configured strategy runs, portfolio runs, and server-side parameter searches.
+///
+/// Submitted jobs share the retained-job workflow: status, watch, cancel, results, and artifacts go through [`BacktestClient`] with the returned job ID.
+#[async_trait]
+pub trait BacktestStrategyClient: Send + Sync {
+    async fn run_configured_strategy(
+        &self,
+        request: RunConfiguredStrategyRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError>;
+    async fn submit_configured_strategy(
+        &self,
+        request: SubmitConfiguredStrategyRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError>;
+    async fn run_portfolio(
+        &self,
+        request: RunPortfolioRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError>;
+    async fn submit_portfolio(
+        &self,
+        request: SubmitPortfolioRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError>;
+    async fn submit_search(
+        &self,
+        request: SubmitSearchRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError>;
+    async fn search_result(
+        &self,
+        job_id: &str,
+    ) -> Result<GetSearchResultResponse, BacktestClientError>;
 }
 
 /// Provider-neutral client port for runtime profile administration.

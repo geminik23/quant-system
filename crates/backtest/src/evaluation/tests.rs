@@ -27,6 +27,7 @@ fn position(
         r_multiple,
         excursions: None,
         execution: None,
+        costs: None,
     }
 }
 

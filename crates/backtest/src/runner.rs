@@ -30,6 +30,7 @@ use qs_instruments::{
     Decimal, DecimalGrid, EconomicsModelId, InstrumentSpec, ListingStatus, PositiveDecimal,
     QuantityUnit,
 };
+use serde::Serialize;
 
 use crate::artifacts::{
     EntryProfileResolutionAudit, EntryProfileSelectionSource, EntryResolutionStage,
@@ -38,7 +39,9 @@ use crate::artifacts::{
     ReplayInstrumentManifest,
 };
 use crate::currency::{ConversionQuoteBook, RunCurrencyPlan};
-use crate::data_feed::{DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch};
+use crate::data_feed::{
+    BarExecutionPrices, DataFeed, FallibleBatchFeed, FeedEvent, MarketEvent, TimestampBatch,
+};
 use crate::economic_support::{LEGACY_ECONOMIC_GUARD_ID, resolve_legacy_economics};
 use crate::evaluation::EvaluationOptions;
 use crate::executor::BacktestExecutor;
@@ -53,6 +56,7 @@ use crate::profile::{
 };
 use crate::report::BacktestResult;
 use crate::sizing::{SizingPolicy, compute_native_loss_per_lot, compute_size};
+use crate::strategy::configured::BoundaryPositionFacts;
 use crate::strategy::{
     AnalysisBoundary, AnalysisPipeline, BacktestConfiguredStrategyAdapter, BarSeriesSpec,
     ConfiguredStrategyAdapterError, HistoricalStrategy, MultiTimeframeSeries, Strategy,
@@ -64,7 +68,7 @@ use crate::strategy::{
 
 /// Future-quote execution settings. Existing runners remain on legacy semantics
 /// unless [`BacktestRunner::run_raw_signals_future`] is used.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FutureQuoteConfig {
     /// Signal processing latency added before an action becomes eligible.
     pub signal_latency_ms: i64,
@@ -124,6 +128,19 @@ pub enum StreamingReplayError<E> {
 
 const REPLAY_PROGRESS_INTERVAL: usize = 256;
 
+mod portfolio_replay;
+
+/// Upper bound on the quotes one leg of a bar's range walk may settle.
+const MAX_BAR_LEG_STEPS: usize = 100_000;
+
+/// Which price of a quote a trigger level is compared against.
+#[derive(Debug, Clone, Copy)]
+enum QuoteSide {
+    Bid,
+    Ask,
+    Mid,
+}
+
 fn should_report_progress(processed: usize, total: usize) -> bool {
     processed == total || processed.is_multiple_of(REPLAY_PROGRESS_INTERVAL)
 }
@@ -135,7 +152,11 @@ pub(crate) struct ScheduledSignal {
     effective_ts: NaiveDateTime,
     signal: RawSignal,
     action_id: Option<String>,
+    /// Whether `action_id` names exactly one action; a base identifier instead prefixes every action a bulk signal resolves to.
+    explicit_action_id: bool,
     requires_later_quote: bool,
+    /// Portfolio instance that generated the signal, which selects its entry profiles and labels its positions.
+    instance: Option<usize>,
 }
 
 impl ScheduledSignal {
@@ -152,13 +173,23 @@ impl ScheduledSignal {
             effective_ts,
             signal,
             action_id: None,
+            explicit_action_id: false,
             requires_later_quote,
+            instance: None,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_action_id(mut self, action_id: impl Into<String>) -> Self {
         self.action_id = Some(action_id.into());
+        self.explicit_action_id = true;
+        self
+    }
+
+    /// Identify the signal by a base identifier that each resolved action extends, as a bulk signal needs.
+    fn with_action_base(mut self, base: impl Into<String>) -> Self {
+        self.action_id = Some(base.into());
+        self.explicit_action_id = false;
         self
     }
 
@@ -246,12 +277,51 @@ trait FutureReplayHook {
     fn is_active(&self) -> bool;
     fn output_ready(&self) -> bool;
     fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool;
-    fn reject_generated_configuration(&mut self, reason: String);
+    fn reject_generated_configuration(&mut self, instance: Option<usize>, reason: String);
+    /// Whether the boundary reads open-position economics, which makes the replay snapshot campaign excursion at the start of every batch.
+    fn observes_position_economics(&self) -> bool;
+    /// Stored-bar duration that drives execution for each symbol whose series the hook declares. A primary bar of another duration still reaches the hook's series but is not executed, so a symbol read at several bar lengths is executed once, on its shortest bars. A symbol absent from the map executes every bar it receives.
+    fn bar_execution_timeframes(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
+    /// Whether the hook's strategies read a stored bar only once its bucket has closed. Such a hook decides on a bar batch before the new bars trade, so its orders may fill at their open; a hook that reads the batch's own bars, as a direct strategy does through its primary events, decides after the bars settle and fills at the next bar, because it has already seen the bar's close.
+    fn reads_completed_bars_only(&self) -> bool {
+        false
+    }
+    /// Whether a stored-bar batch must also run a post-settlement callback after its completed-bar callback.
+    fn retains_post_bar_boundary(&self) -> bool {
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn on_pre_bar_boundary(
+        &mut self,
+        batch: &TimestampBatch,
+        engine: &TradeEngine,
+        lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
+        pending_effects: &mut Vec<FutureEffect>,
+        pending_events: &mut Vec<StrategyFeedbackEvent>,
+    ) -> Option<Vec<ScheduledSignal>> {
+        self.on_boundary(
+            batch,
+            engine,
+            lifecycle,
+            positions,
+            pending_effects,
+            pending_events,
+        )
+    }
+    /// Supervision state of a multi-instance replay, which the replay consults before scheduling new exposure.
+    fn portfolio_state(&mut self) -> Option<&mut portfolio_replay::PortfolioReplayState> {
+        None
+    }
+    #[allow(clippy::too_many_arguments)]
     fn on_boundary(
         &mut self,
         batch: &TimestampBatch,
         engine: &TradeEngine,
         lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>>;
@@ -262,9 +332,28 @@ trait FutureReplayHook {
     ) -> bool;
 }
 
+/// Shortest declared series duration per symbol, which is the bar length a strategy-driven replay executes on.
+fn shortest_series_per_symbol(
+    requirements: &crate::strategy::StrategyRequirements,
+) -> BTreeMap<String, u64> {
+    let mut shortest = BTreeMap::<String, u64>::new();
+    for series in requirements.series() {
+        let seconds = series.timeframe().duration_seconds();
+        shortest
+            .entry(series.symbol().to_owned())
+            .and_modify(|current| *current = (*current).min(seconds))
+            .or_insert(seconds);
+    }
+    shortest
+}
+
 struct StaticReplayHook;
 
 impl FutureReplayHook for StaticReplayHook {
+    fn observes_position_economics(&self) -> bool {
+        false
+    }
+
     fn is_active(&self) -> bool {
         false
     }
@@ -277,7 +366,7 @@ impl FutureReplayHook for StaticReplayHook {
         true
     }
 
-    fn reject_generated_configuration(&mut self, _reason: String) {
+    fn reject_generated_configuration(&mut self, _instance: Option<usize>, _reason: String) {
         unreachable!("static replay does not generate strategy signals");
     }
 
@@ -286,6 +375,7 @@ impl FutureReplayHook for StaticReplayHook {
         _batch: &TimestampBatch,
         _engine: &TradeEngine,
         _lifecycle: &LifecycleLedger,
+        _positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -305,7 +395,7 @@ impl FutureReplayHook for StaticReplayHook {
     }
 }
 
-struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
+struct StrategyReplayDriver<'a, S: HistoricalStrategy + ?Sized> {
     strategy: &'a mut S,
     requirements: crate::strategy::StrategyRequirements,
     series: MultiTimeframeSeries,
@@ -320,7 +410,7 @@ struct StrategyReplayDriver<'a, S: HistoricalStrategy> {
     failure: Option<StrategyDriverError<S::Error>>,
 }
 
-impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
+impl<'a, S: HistoricalStrategy + ?Sized> StrategyReplayDriver<'a, S> {
     fn new(
         strategy: &'a mut S,
         series: MultiTimeframeSeries,
@@ -371,7 +461,15 @@ impl<'a, S: HistoricalStrategy> StrategyReplayDriver<'a, S> {
     }
 }
 
-impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
+impl<S: HistoricalStrategy + ?Sized> FutureReplayHook for StrategyReplayDriver<'_, S> {
+    fn observes_position_economics(&self) -> bool {
+        false
+    }
+
+    fn bar_execution_timeframes(&self) -> BTreeMap<String, u64> {
+        shortest_series_per_symbol(&self.requirements)
+    }
+
     fn is_active(&self) -> bool {
         true
     }
@@ -395,7 +493,7 @@ impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
         true
     }
 
-    fn reject_generated_configuration(&mut self, reason: String) {
+    fn reject_generated_configuration(&mut self, _instance: Option<usize>, reason: String) {
         self.failure = Some(StrategyDriverError::InvalidGeneratedSignal {
             signal_index: 0,
             reason,
@@ -407,6 +505,7 @@ impl<S: HistoricalStrategy> FutureReplayHook for StrategyReplayDriver<'_, S> {
         batch: &TimestampBatch,
         engine: &TradeEngine,
         lifecycle: &LifecycleLedger,
+        _positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -610,6 +709,18 @@ impl<'a> ConfiguredStrategyReplayDriver<'a> {
 }
 
 impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
+    fn observes_position_economics(&self) -> bool {
+        true
+    }
+
+    fn bar_execution_timeframes(&self) -> BTreeMap<String, u64> {
+        shortest_series_per_symbol(&self.requirements)
+    }
+
+    fn reads_completed_bars_only(&self) -> bool {
+        true
+    }
+
     fn is_active(&self) -> bool {
         true
     }
@@ -618,21 +729,31 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
         self.warmup_complete
     }
 
+    /// Configured strategies accept stored bars as completed bars; count-dependent documents reject unknown counts before replay.
     fn preflight_primary_events(&mut self, events: &[FeedEvent]) -> bool {
-        if let Some(event) = events
-            .iter()
-            .find(|event| matches!(event.event, MarketEvent::Bar { .. }))
+        if !self
+            .adapter
+            .configured_requirements()
+            .count_required_sources
+            .is_empty()
+            && events.iter().any(|event| {
+                matches!(
+                    event.event,
+                    MarketEvent::Bar {
+                        tick_count: None,
+                        ..
+                    }
+                )
+            })
         {
-            self.failure = Some(StrategyDriverError::TickExecutionRequired {
-                symbol: event.event.symbol().to_owned(),
-                timestamp: event.event.ts(),
-            });
-            return false;
+            self.reject_generated_configuration(None, "configured strategy requires tick count but a primary stored bar has unknown count".into());
+            false
+        } else {
+            true
         }
-        true
     }
 
-    fn reject_generated_configuration(&mut self, reason: String) {
+    fn reject_generated_configuration(&mut self, _instance: Option<usize>, reason: String) {
         self.failure = Some(StrategyDriverError::InvalidGeneratedSignal {
             signal_index: 0,
             reason,
@@ -644,6 +765,7 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
         batch: &TimestampBatch,
         engine: &TradeEngine,
         _lifecycle: &LifecycleLedger,
+        positions: &BoundaryPositionFacts<'_>,
         pending_effects: &mut Vec<FutureEffect>,
         pending_events: &mut Vec<StrategyFeedbackEvent>,
     ) -> Option<Vec<ScheduledSignal>> {
@@ -668,6 +790,7 @@ impl FutureReplayHook for ConfiguredStrategyReplayDriver<'_> {
             &self.series,
             self.analysis.observations(),
             engine,
+            positions,
             pending_events,
             self.limits,
             self.research_limits,
@@ -842,7 +965,7 @@ impl<F: DataFeed> FallibleBatchFeed for DataFeedBatchAdapter<'_, F> {
 }
 
 /// Configuration for a backtest run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BacktestConfig {
     /// Starting account balance.
     pub initial_balance: f64,
@@ -871,6 +994,18 @@ pub struct BacktestConfig {
     pub symbol_specs: HashMap<String, qs_symbols::SymbolSpec>,
     /// Optional explicit instrument specifications and stored-series bindings pinned for this run.
     pub instrument_manifest: Option<ReplayInstrumentManifest>,
+    /// Per-symbol symmetric bid/ask spread in price units, applied to bars that carry no recorded spread.
+    ///
+    /// Stored bars normally carry the average spread observed while they formed. This map covers feeds that cannot supply one; without it such bars execute at a zero spread, and the run reports how often that happened.
+    pub bar_spread_fallback: HashMap<String, f64>,
+    /// Caller-supplied labels recorded with the run and attached to every completed position.
+    ///
+    /// A batch of runs uses these to say what distinguishes one run from another, such as the parameter values or the data window, so that evaluation can break results down by them afterwards. They are inert: the engine never reads a tag to decide anything. Keys and values are bounded and validated before replay starts, and they are kept separate from the engine's own diagnostic tags so neither can overwrite the other.
+    pub run_tags: BTreeMap<String, String>,
+    /// Per-symbol commission and swap specification.
+    ///
+    /// An empty map charges nothing and reproduces runs made before costs existed. Point-denominated swap additionally requires a matching `symbol_specs` entry, because the price point size comes from its digit count.
+    pub costs: HashMap<String, qs_core::InstrumentCosts>,
 }
 
 impl Default for BacktestConfig {
@@ -883,6 +1018,9 @@ impl Default for BacktestConfig {
             sizing: None,
             symbol_specs: HashMap::new(),
             instrument_manifest: None,
+            bar_spread_fallback: HashMap::new(),
+            run_tags: BTreeMap::new(),
+            costs: HashMap::new(),
         }
     }
 }
@@ -901,6 +1039,8 @@ pub struct BacktestRunner {
     committed_feedback: Vec<FutureEffect>,
     committed_feedback_events: Vec<StrategyFeedbackEvent>,
     entry_profiles: Option<PreparedEntryProfiles>,
+    /// Entry profiles of each portfolio instance, selected by the instance a signal came from.
+    instance_profiles: Vec<PreparedEntryProfiles>,
 }
 
 impl BacktestRunner {
@@ -921,6 +1061,7 @@ impl BacktestRunner {
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
             entry_profiles: None,
+            instance_profiles: Vec::new(),
         }
     }
 
@@ -942,6 +1083,7 @@ impl BacktestRunner {
             committed_feedback: Vec::new(),
             committed_feedback_events: Vec::new(),
             entry_profiles: None,
+            instance_profiles: Vec::new(),
         }
     }
 
@@ -1409,7 +1551,7 @@ impl BacktestRunner {
     ) -> Result<StrategyBacktestResult, StrategyReplayError<Infallible, S::Error>>
     where
         F: DataFeed,
-        S: HistoricalStrategy,
+        S: HistoricalStrategy + ?Sized,
     {
         crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
         MultiTimeframeSeries::new(series_specs.clone())?;
@@ -1473,7 +1615,7 @@ impl BacktestRunner {
     ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, S::Error>>
     where
         F: FallibleBatchFeed,
-        S: HistoricalStrategy,
+        S: HistoricalStrategy + ?Sized,
     {
         crate::strategy::replay::validate_series_specs(strategy.requirements(), &series_specs)?;
         let future = self.future_config.clone().unwrap_or_default();
@@ -1546,14 +1688,7 @@ impl BacktestRunner {
     where
         F: DataFeed,
     {
-        if profile.is_some()
-            || self
-                .entry_profiles
-                .as_ref()
-                .is_some_and(|profiles| !profiles.is_empty())
-        {
-            return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
-        }
+        self.preflight_configured_entry_profiles(adapter, profile)?;
         adapter
             .preflight(retention, self.strategy_research_limits)
             .map_err(StrategyReplayInputError::ConfiguredAdapter)?;
@@ -1597,14 +1732,14 @@ impl BacktestRunner {
             adapter,
             analysis,
             retention,
-            None,
+            profile,
         )
     }
 
     /// Run a configured strategy from complete ordered timestamp batches.
     #[allow(clippy::too_many_arguments)]
     pub fn run_configured_strategy_future_streaming<F>(
-        mut self,
+        self,
         feed: &mut F,
         primary_eod: Option<NaiveDateTime>,
         adapter: &mut BacktestConfiguredStrategyAdapter,
@@ -1615,14 +1750,37 @@ impl BacktestRunner {
     where
         F: FallibleBatchFeed,
     {
-        if profile.is_some()
-            || self
-                .entry_profiles
-                .as_ref()
-                .is_some_and(|profiles| !profiles.is_empty())
-        {
-            return Err(StrategyReplayInputError::ConfiguredManagementProfileUnsupported.into());
-        }
+        self.run_configured_strategy_future_streaming_controlled(
+            feed,
+            primary_eod,
+            adapter,
+            analysis,
+            retention,
+            profile,
+            || false,
+            |_| {},
+        )
+    }
+
+    /// Run a configured strategy from complete ordered timestamp batches with cooperative cancellation and replay progress, as the retained-job service does for raw-signal replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_configured_strategy_future_streaming_controlled<F, C, P>(
+        mut self,
+        feed: &mut F,
+        primary_eod: Option<NaiveDateTime>,
+        adapter: &mut BacktestConfiguredStrategyAdapter,
+        analysis: AnalysisPipeline,
+        retention: StrategyRetentionLimits,
+        profile: Option<&ManagementProfile>,
+        mut is_cancelled: C,
+        mut on_progress: P,
+    ) -> Result<StrategyBacktestResult, StrategyReplayError<F::Error, ConfiguredStrategyAdapterError>>
+    where
+        F: FallibleBatchFeed,
+        C: FnMut() -> bool,
+        P: FnMut(ReplayProgress),
+    {
+        self.preflight_configured_entry_profiles(adapter, profile)?;
         adapter
             .preflight(retention, self.strategy_research_limits)
             .map_err(StrategyReplayInputError::ConfiguredAdapter)?;
@@ -1641,13 +1799,11 @@ impl BacktestRunner {
             retention,
             self.strategy_research_limits,
         );
-        let mut is_cancelled = || false;
-        let mut on_progress = |_| {};
         let replay = match self.run_raw_signals_future_batches(
             feed,
             primary_eod,
             Vec::new(),
-            None,
+            profile,
             future,
             None,
             0,
@@ -1660,9 +1816,7 @@ impl BacktestRunner {
             Err(FutureBatchReplayError::Feed(error)) => {
                 return Err(StrategyReplayError::Feed(error));
             }
-            Err(FutureBatchReplayError::Cancelled) => {
-                unreachable!("configured strategy replay is not cancellable")
-            }
+            Err(FutureBatchReplayError::Cancelled) => return Err(StrategyReplayError::Cancelled),
             Err(FutureBatchReplayError::Dynamic) => {
                 let error = hook.finish().expect_err("dynamic failure stores its cause");
                 return Err(map_strategy_driver_error(error));
@@ -1675,6 +1829,29 @@ impl BacktestRunner {
             decisions,
             research,
         })
+    }
+
+    /// Validate a supplied run default profile and check the configured strategy's entries against the profiles replay will select, so an unrouted class or a stop-owner conflict fails before any feed is read.
+    fn preflight_configured_entry_profiles(
+        &self,
+        adapter: &BacktestConfiguredStrategyAdapter,
+        profile: Option<&ManagementProfile>,
+    ) -> Result<(), StrategyReplayInputError> {
+        if let Some(profile) = profile {
+            profile
+                .validate()
+                .map_err(|error| StrategyReplayInputError::ManagementProfile(error.to_string()))?;
+        }
+        let run_default;
+        let profiles = match self.entry_profiles.as_ref() {
+            Some(profiles) => profiles,
+            None => {
+                run_default = PreparedEntryProfiles::default_only(profile.cloned());
+                &run_default
+            }
+        };
+        adapter.preflight_entry_profiles(profiles)?;
+        Ok(())
     }
 
     fn validate_entry_profile_routes(&self, signals: &[RawSignal]) -> Result<(), String> {
@@ -1701,12 +1878,14 @@ impl BacktestRunner {
         &self,
         signal: &RawSignal,
         fallback: Option<&ManagementProfile>,
+        instance: Option<usize>,
     ) -> Result<SelectedEntryProfile, EntryProfileRoutingError> {
         let entry_class = match signal {
             RawSignal::Entry { entry_class, .. } => entry_class.clone(),
             _ => None,
         };
-        if let Some(profiles) = self.entry_profiles.as_ref() {
+        let instance_profiles = instance.and_then(|instance| self.instance_profiles.get(instance));
+        if let Some(profiles) = instance_profiles.or(self.entry_profiles.as_ref()) {
             let profile = profiles.select(signal)?.cloned();
             let source = if entry_class.is_some() {
                 EntryProfileSelectionSource::Mapped
@@ -1766,7 +1945,7 @@ impl BacktestRunner {
                     Side::Sell => quote.bid,
                 });
             }
-            let selected_profile = match self.select_entry_profile(&signal, profile) {
+            let selected_profile = match self.select_entry_profile(&signal, profile, None) {
                 Ok(profile) => profile,
                 Err(_) => return,
             };
@@ -2205,7 +2384,11 @@ impl BacktestRunner {
             contract_sizes.clone(),
             future.pnl_epsilon,
         )
-        .with_currency_plan(future.currency_plan.clone());
+        .with_currency_plan(future.currency_plan.clone())
+        .with_costs(
+            self.config.costs.clone(),
+            effective_point_sizes(&self.config),
+        );
         let mut portfolio =
             PortfolioRecorder::new(self.config.initial_balance, contract_sizes.clone())
                 .with_fill_model(self.config.fill_model)
@@ -2225,9 +2408,12 @@ impl BacktestRunner {
             }
         }
         let mut last_quote_ts = BTreeMap::<String, NaiveDateTime>::new();
+        let mut unconverted_cost_events = 0u64;
+        let mut zero_spread_bar_quotes = 0u64;
         let mut last_processed_primary_ts = None;
         let mut effective_terminal_ts = primary_eod;
         let mut terminated_quiescently = false;
+        let bar_execution_timeframes = hook.bar_execution_timeframes();
 
         while let Some(mut batch) =
             FallibleBatchFeed::next_batch(feed).map_err(FutureBatchReplayError::Feed)?
@@ -2239,12 +2425,75 @@ impl BacktestRunner {
             batch
                 .events
                 .sort_by_key(|event| (event.metadata.series_rank, event.metadata.row_sequence));
+            let boundary_excursions = if hook.observes_position_economics() {
+                portfolio.open_campaign_excursions()
+            } else {
+                BTreeMap::new()
+            };
             let mut accepted = Vec::new();
             for feed_event in batch.events {
                 if is_cancelled() {
                     return Err(FutureBatchReplayError::Cancelled);
                 }
-                let quote = feed_event.event.to_quote();
+                let fallback = self
+                    .config
+                    .bar_spread_fallback
+                    .get(feed_event.event.symbol())
+                    .copied();
+                // A bar executes on its open, range, and close; a bar of a longer duration than the symbol's execution bars only feeds strategy series, and a bar whose prices cannot be quoted is an invalid quote like any other.
+                let available_at = feed_event.available_at();
+                let delayed_bar = match &feed_event.event {
+                    MarketEvent::Bar {
+                        ts,
+                        timeframe_seconds: Some(seconds),
+                        ..
+                    } => ts
+                        .checked_add_signed(chrono::Duration::seconds(*seconds as i64))
+                        .is_some_and(|nominal_close| available_at > nominal_close),
+                    _ => false,
+                };
+                let prices = match feed_event.event.bar_execution_prices(fallback) {
+                    None => None,
+                    Some(prices) => match prices.executable() {
+                        Some(mut prices) => {
+                            prices.ts = available_at;
+                            Some(prices)
+                        }
+                        None => {
+                            invalid_quotes += 1;
+                            processed_events += 1;
+                            if should_report_progress(processed_events, total_events) {
+                                on_progress(ReplayProgress {
+                                    processed_events,
+                                    total_events,
+                                    processed_signals,
+                                    total_signals,
+                                });
+                            }
+                            continue;
+                        }
+                    },
+                };
+                let bar = prices.filter(|bar| {
+                    !delayed_bar
+                        && match (
+                            bar_execution_timeframes.get(&bar.symbol),
+                            bar.timeframe_seconds,
+                        ) {
+                            (Some(execution), Some(seconds)) => *execution == seconds,
+                            _ => true,
+                        }
+                });
+                let series_only =
+                    bar.is_none() && matches!(feed_event.event, MarketEvent::Bar { .. });
+                let mut quote = match &bar {
+                    Some(bar) => bar.open_quote(),
+                    None => feed_event.event.to_quote_with_spread_fallback(fallback),
+                };
+                quote.ts = available_at;
+                if bar.is_some() && quote.bid == quote.ask {
+                    zero_spread_bar_quotes += 1;
+                }
                 if ExecutionPricer::validate_quote(&quote).is_err()
                     || last_quote_ts
                         .get(&quote.symbol)
@@ -2263,18 +2512,18 @@ impl BacktestRunner {
                     continue;
                 }
                 last_quote_ts.insert(quote.symbol.clone(), quote.ts);
-                accepted.push((feed_event, quote));
+                accepted.push((feed_event, quote, bar, series_only));
             }
             let accepted_primary_events = accepted
                 .iter()
-                .filter(|(event, _)| event.metadata.roles.primary)
-                .map(|(event, _)| event.clone())
+                .filter(|(event, ..)| event.metadata.roles.primary)
+                .map(|(event, ..)| event.clone())
                 .collect::<Vec<_>>();
             if !hook.preflight_primary_events(&accepted_primary_events) {
                 return Err(FutureBatchReplayError::Dynamic);
             }
 
-            for (feed_event, quote) in &accepted {
+            for (feed_event, quote, ..) in &accepted {
                 if is_cancelled() {
                     return Err(FutureBatchReplayError::Cancelled);
                 }
@@ -2287,6 +2536,16 @@ impl BacktestRunner {
                     invalid_quotes += 1;
                 }
             }
+            // Overnight financing is charged for every rollover instant already crossed, before any fill or signal at this timestamp can change what is open.
+            unconverted_cost_events += future_executor.charge_rollovers(
+                batch_ts,
+                &mut portfolio,
+                Some(&conversion_quotes),
+            );
+            if let Some(state) = hook.portfolio_state() {
+                state.begin_batch(batch_ts, future_executor.balance());
+            }
+
             let valuation_only = accepted
                 .iter()
                 .any(|event| event.0.metadata.roles.conversion)
@@ -2296,11 +2555,16 @@ impl BacktestRunner {
             let mut primary_quotes = Vec::new();
             let mut primary_events = Vec::new();
             let mut batch_quotes = BTreeMap::new();
-            for (feed_event, quote) in accepted {
+            let mut executed_bars = Vec::new();
+            for (feed_event, quote, bar, series_only) in accepted {
                 if is_cancelled() {
                     return Err(FutureBatchReplayError::Cancelled);
                 }
-                if !feed_event.metadata.roles.primary {
+                if !feed_event.metadata.roles.primary || series_only {
+                    if feed_event.metadata.roles.primary {
+                        last_processed_primary_ts = Some(quote.ts);
+                        primary_events.push(feed_event);
+                    }
                     processed_events += 1;
                     if should_report_progress(processed_events, total_events) {
                         on_progress(ReplayProgress {
@@ -2315,6 +2579,9 @@ impl BacktestRunner {
 
                 last_processed_primary_ts = Some(quote.ts);
                 primary_events.push(feed_event);
+                if let Some(bar) = bar {
+                    executed_bars.push(bar);
+                }
                 portfolio.record_quote(quote.clone());
                 if hook.output_ready() {
                     observe_future_equity(
@@ -2330,6 +2597,46 @@ impl BacktestRunner {
                 }
                 batch_quotes.insert(quote.symbol.clone(), quote.clone());
                 primary_quotes.push(quote);
+            }
+
+            // A strategy that reads a stored bar only after its bucket closes decides on a bar batch before the new bars trade, so its orders can fill at their open. A tick batch, and a strategy that reads the batch's own bars, keep deciding after the quotes settle.
+            let bar_batch = hook.reads_completed_bars_only()
+                && primary_events
+                    .iter()
+                    .any(|event| matches!(event.event, MarketEvent::Bar { .. }));
+            let mut boundary_events = Some(primary_events);
+            if bar_batch {
+                let pre_events = if hook.retains_post_bar_boundary() {
+                    boundary_events
+                        .as_ref()
+                        .expect("boundary events are available")
+                        .clone()
+                } else {
+                    boundary_events
+                        .take()
+                        .expect("boundary events are taken once")
+                };
+                self.run_future_boundary(
+                    hook,
+                    batch_ts,
+                    pre_events,
+                    &boundary_excursions,
+                    &primary_quotes,
+                    &batch_quotes,
+                    profile,
+                    &future,
+                    true,
+                    last_mtm_candidate
+                        .as_ref()
+                        .and_then(|point: &EquityPoint| point.drawdown_pct),
+                    &mut scheduled,
+                    &mut queued,
+                    &mut lifecycle,
+                    &mut future_executor,
+                    &mut portfolio,
+                    &pricer,
+                    &conversion_quotes,
+                )?;
             }
 
             if let Some(representative_quote) = primary_quotes.first() {
@@ -2497,50 +2804,46 @@ impl BacktestRunner {
                 }
             }
 
-            let strategy_batch = TimestampBatch {
-                ts: batch_ts,
-                events: primary_events,
-            };
-            let generated = hook
-                .on_boundary(
-                    &strategy_batch,
-                    &self.engine,
-                    &lifecycle,
-                    &mut self.committed_feedback,
-                    &mut self.committed_feedback_events,
-                )
-                .ok_or(FutureBatchReplayError::Dynamic)?;
-            if !generated.is_empty() {
-                let generated_signals = generated
-                    .iter()
-                    .map(|scheduled| scheduled.signal.clone())
-                    .collect::<Vec<_>>();
-                if let Err(error) =
-                    validate_replay_config(&self.config, Some(&future), &generated_signals)
-                {
-                    hook.reject_generated_configuration(error);
-                    return Err(FutureBatchReplayError::Dynamic);
+            // Each bar trades through its range after its open, and its close marks what remains.
+            for bar in &executed_bars {
+                if is_cancelled() {
+                    return Err(FutureBatchReplayError::Cancelled);
                 }
+                invalid_quotes += self.settle_future_bar_range(
+                    bar,
+                    &mut lifecycle,
+                    &mut future_executor,
+                    &mut portfolio,
+                    &pricer,
+                    &conversion_quotes,
+                );
             }
-            for generated_signal in generated {
-                if generated_signal.effective_ts <= batch_ts
-                    && let Some(representative_quote) = primary_quotes.first()
-                {
-                    self.schedule_future_signal(
-                        generated_signal,
-                        profile,
-                        representative_quote,
-                        &batch_quotes,
-                        &mut queued,
-                        &mut lifecycle,
-                        &mut future_executor,
-                        &mut portfolio,
-                        &pricer,
-                        &conversion_quotes,
-                    );
-                } else {
-                    scheduled.push_back(generated_signal);
-                }
+            for bar in &executed_bars {
+                portfolio.record_quote(bar.close_quote());
+            }
+
+            if let Some(events) = boundary_events.take() {
+                self.run_future_boundary(
+                    hook,
+                    batch_ts,
+                    events,
+                    &boundary_excursions,
+                    &primary_quotes,
+                    &batch_quotes,
+                    profile,
+                    &future,
+                    false,
+                    last_mtm_candidate
+                        .as_ref()
+                        .and_then(|point: &EquityPoint| point.drawdown_pct),
+                    &mut scheduled,
+                    &mut queued,
+                    &mut lifecycle,
+                    &mut future_executor,
+                    &mut portfolio,
+                    &pricer,
+                    &conversion_quotes,
+                )?;
             }
 
             for quote in &primary_quotes {
@@ -2640,7 +2943,9 @@ impl BacktestRunner {
             }
             let action_id = signal.resolved_action_id();
             if signal.signal.is_entry() {
-                let selected = self.select_entry_profile(&signal.signal, profile).ok();
+                let selected = self
+                    .select_entry_profile(&signal.signal, profile, signal.instance)
+                    .ok();
                 let stage = match &signal.signal {
                     RawSignal::Entry {
                         order_type: OrderType::Market,
@@ -2856,13 +3161,22 @@ impl BacktestRunner {
                 entry_profile_default,
                 entry_profile_routes,
                 entry_profile_resolutions: std::mem::take(&mut self.entry_profile_resolutions),
+                costs: self.config.costs.clone().into_iter().collect(),
+                unconverted_cost_events,
+                zero_spread_bar_quotes,
                 stale_quote_after_millis: future.stale_quote_after_ms,
                 pnl_epsilon: future.pnl_epsilon,
                 tags,
+                run_tags: self.config.run_tags.clone(),
+                position_tags: hook
+                    .portfolio_state()
+                    .map(|state| state.position_tags(&future_executor.fills))
+                    .unwrap_or_default(),
                 ..ExecutionMetadata::default()
             },
             fills: future_executor.fills.clone(),
             close_events: future_executor.close_events.clone(),
+            cost_events: future_executor.cost_events.clone(),
             completed_positions: future_executor.completed_positions.clone(),
             open_positions: portfolio.latest_open_positions().to_vec(),
             pending_orders,
@@ -2883,6 +3197,285 @@ impl BacktestRunner {
             artifacts,
             self.evaluation_options,
         ))
+    }
+
+    /// Run the hook's boundary for one batch and schedule what it generates.
+    ///
+    /// `decided_before_quotes` marks a boundary that ran before the batch's quotes settled, which is how stored bars are replayed: the strategy has seen only completed bars, so its orders may fill at the first quote of this batch instead of waiting for a later one.
+    #[allow(clippy::too_many_arguments)]
+    fn run_future_boundary<H, E>(
+        &mut self,
+        hook: &mut H,
+        batch_ts: NaiveDateTime,
+        primary_events: Vec<FeedEvent>,
+        boundary_excursions: &BTreeMap<String, crate::portfolio::CampaignExcursion>,
+        primary_quotes: &[PriceQuote],
+        batch_quotes: &BTreeMap<String, PriceQuote>,
+        profile: Option<&ManagementProfile>,
+        future: &FutureQuoteConfig,
+        decided_before_quotes: bool,
+        drawdown_fraction: Option<f64>,
+        scheduled: &mut VecDeque<ScheduledSignal>,
+        queued: &mut VecDeque<QueuedAction>,
+        lifecycle: &mut LifecycleLedger,
+        future_executor: &mut FutureExecutor,
+        portfolio: &mut PortfolioRecorder,
+        pricer: &ExecutionPricer,
+        conversion_quotes: &ConversionQuoteBook,
+    ) -> std::result::Result<(), FutureBatchReplayError<E>>
+    where
+        H: FutureReplayHook,
+    {
+        let strategy_batch = TimestampBatch {
+            ts: batch_ts,
+            events: primary_events,
+        };
+        let generated = {
+            let positions = BoundaryPositionFacts::new(boundary_excursions, future_executor);
+            if decided_before_quotes {
+                hook.on_pre_bar_boundary(
+                    &strategy_batch,
+                    &self.engine,
+                    lifecycle,
+                    &positions,
+                    &mut self.committed_feedback,
+                    &mut self.committed_feedback_events,
+                )
+            } else {
+                hook.on_boundary(
+                    &strategy_batch,
+                    &self.engine,
+                    lifecycle,
+                    &positions,
+                    &mut self.committed_feedback,
+                    &mut self.committed_feedback_events,
+                )
+            }
+            .ok_or(FutureBatchReplayError::Dynamic)?
+        };
+        if !generated.is_empty() {
+            let instances = generated
+                .iter()
+                .map(|scheduled| scheduled.instance)
+                .collect::<BTreeSet<_>>();
+            for instance in instances {
+                let generated_signals = generated
+                    .iter()
+                    .filter(|scheduled| scheduled.instance == instance)
+                    .map(|scheduled| scheduled.signal.clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) =
+                    validate_replay_config(&self.config, Some(future), &generated_signals)
+                {
+                    hook.reject_generated_configuration(instance, error);
+                    return Err(FutureBatchReplayError::Dynamic);
+                }
+            }
+        }
+        let generated = self.supervise_generated(
+            hook,
+            batch_ts,
+            generated,
+            decided_before_quotes,
+            drawdown_fraction,
+            scheduled,
+            queued,
+            lifecycle,
+            future_executor,
+        );
+        for mut generated_signal in generated {
+            if decided_before_quotes {
+                generated_signal.requires_later_quote = false;
+            }
+            if generated_signal.effective_ts <= batch_ts
+                && let Some(representative_quote) = primary_quotes.first()
+            {
+                self.schedule_future_signal(
+                    generated_signal,
+                    profile,
+                    representative_quote,
+                    batch_quotes,
+                    queued,
+                    lifecycle,
+                    future_executor,
+                    portfolio,
+                    pricer,
+                    conversion_quotes,
+                );
+            } else {
+                scheduled.push_back(generated_signal);
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle one bar's range after its open quote settled.
+    ///
+    /// Long exposure walks open, low, high and short exposure walks open, high, low, so each side meets its adverse extreme first. Along each leg the walk stops at every price where a stop, target, breakeven trigger, or pending order of that side would act, with a quote whose evaluated price equals that level, so the existing FutureQuote rules fill at the level itself. A stop that a later move of the same walk raises or lowers cannot fill in the same bar, because the walk never returns.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_future_bar_range(
+        &mut self,
+        bar: &BarExecutionPrices,
+        lifecycle: &mut LifecycleLedger,
+        future_executor: &mut FutureExecutor,
+        portfolio: &mut PortfolioRecorder,
+        pricer: &ExecutionPricer,
+        conversion_quotes: &ConversionQuoteBook,
+    ) -> u64 {
+        let mut failures = 0;
+        for side in [Side::Buy, Side::Sell] {
+            let legs = match side {
+                Side::Buy => [(bar.open, bar.low), (bar.low, bar.high)],
+                Side::Sell => [(bar.open, bar.high), (bar.high, bar.low)],
+            };
+            for (from, to) in legs {
+                failures += self.walk_future_bar_leg(
+                    bar,
+                    side,
+                    from,
+                    to,
+                    lifecycle,
+                    future_executor,
+                    portfolio,
+                    pricer,
+                    conversion_quotes,
+                );
+            }
+        }
+        failures
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_future_bar_leg(
+        &mut self,
+        bar: &BarExecutionPrices,
+        side: Side,
+        from: f64,
+        to: f64,
+        lifecycle: &mut LifecycleLedger,
+        future_executor: &mut FutureExecutor,
+        portfolio: &mut PortfolioRecorder,
+        pricer: &ExecutionPricer,
+        conversion_quotes: &ConversionQuoteBook,
+    ) -> u64 {
+        if !(from.is_finite() && to.is_finite()) || from == to {
+            return 0;
+        }
+        let rising = to > from;
+        let ahead = |mid: f64, cursor: f64| {
+            if rising {
+                mid > cursor && mid <= to
+            } else {
+                mid < cursor && mid >= to
+            }
+        };
+        let mut failures = 0;
+        let mut cursor = from;
+        // Every step moves strictly along the leg, and each stop only adds levels behind it or finitely many ahead of it, so the walk ends; the bound only guards against a malformed rule set.
+        for _ in 0..MAX_BAR_LEG_STEPS {
+            let next = self
+                .bar_trigger_levels(&bar.symbol, side, bar.half_spread)
+                .into_iter()
+                .filter(|(mid, _)| ahead(*mid, cursor))
+                .min_by(|left, right| {
+                    let order = left.0.total_cmp(&right.0);
+                    if rising { order } else { order.reverse() }
+                });
+            let Some((mid, quote_prices)) = next else {
+                break;
+            };
+            cursor = mid;
+            let quote = PriceQuote {
+                symbol: bar.symbol.clone(),
+                ts: bar.ts,
+                bid: quote_prices.0,
+                ask: quote_prices.1,
+            };
+            if ExecutionPricer::validate_quote(&quote).is_err() {
+                continue;
+            }
+            if self
+                .settle_future_quote(
+                    &quote,
+                    Some(side),
+                    lifecycle,
+                    future_executor,
+                    portfolio,
+                    pricer,
+                    conversion_quotes,
+                )
+                .is_err()
+            {
+                failures += 1;
+            }
+        }
+        let extreme = bar.quote_at_mid(to);
+        if ExecutionPricer::validate_quote(&extreme).is_ok()
+            && self
+                .settle_future_quote(
+                    &extreme,
+                    Some(side),
+                    lifecycle,
+                    future_executor,
+                    portfolio,
+                    pricer,
+                    conversion_quotes,
+                )
+                .is_err()
+        {
+            failures += 1;
+        }
+        failures
+    }
+
+    /// Each level at which a position of `side` on `symbol` could act, as the midpoint where the walk reaches it and the bid and ask of a quote whose compared price equals the level exactly.
+    fn bar_trigger_levels(
+        &self,
+        symbol: &str,
+        side: Side,
+        half_spread: f64,
+    ) -> Vec<(f64, (f64, f64))> {
+        let model = self.config.fill_model;
+        let spread = half_spread * 2.0;
+        let mut levels = Vec::new();
+        let ids = self
+            .engine
+            .manager
+            .pending_ids_by_symbol_sorted(symbol)
+            .into_iter()
+            .chain(self.engine.manager.open_ids_by_symbol_sorted(symbol));
+        for id in ids {
+            let Some(position) = self.engine.get_position(&id) else {
+                continue;
+            };
+            if position.data.side != side {
+                continue;
+            }
+            // A pending order compares its fill price and an open position its evaluation price.
+            let compared = match (position.data.status, model, side) {
+                (_, FillModel::MidPrice, _) => QuoteSide::Mid,
+                (_, FillModel::AskOnly, _) => QuoteSide::Ask,
+                (PositionStatus::Pending, FillModel::BidAsk, Side::Buy)
+                | (PositionStatus::Open, FillModel::BidAsk, Side::Sell) => QuoteSide::Ask,
+                _ => QuoteSide::Bid,
+            };
+            for level in position.future_trigger_levels() {
+                levels.push(match compared {
+                    QuoteSide::Bid => (level + half_spread, (level, level + spread)),
+                    QuoteSide::Ask => (level - half_spread, (level - spread, level)),
+                    // Keep the bar's spread when its midpoint lands exactly on the level; otherwise a zero-spread quote at the level, which the midpoint model prices identically.
+                    QuoteSide::Mid => {
+                        let (bid, ask) = (level - half_spread, level + half_spread);
+                        if (bid + ask) / 2.0 == level {
+                            (level, (bid, ask))
+                        } else {
+                            (level, (level, level))
+                        }
+                    }
+                });
+            }
+        }
+        levels
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2907,6 +3500,7 @@ impl BacktestRunner {
             if self
                 .settle_future_quote(
                     quote,
+                    None,
                     lifecycle,
                     future_executor,
                     portfolio,
@@ -2926,13 +3520,14 @@ impl BacktestRunner {
     fn settle_future_quote(
         &mut self,
         quote: &PriceQuote,
+        side: Option<Side>,
         lifecycle: &mut LifecycleLedger,
         future_executor: &mut FutureExecutor,
         portfolio: &mut PortfolioRecorder,
         pricer: &ExecutionPricer,
         conversion_quotes: &ConversionQuoteBook,
     ) -> Result<(), FutureTransactionError> {
-        let (prepared, failures) = self.prepare_triggering_pending(quote, pricer);
+        let (prepared, failures) = self.prepare_triggering_pending(quote, side, pricer);
         for (position_id, error) in failures {
             let action_id = format!("pending_execution:{position_id}");
             let mut disposition = ActionDisposition::rejected(action_id.clone(), error);
@@ -2976,9 +3571,14 @@ impl BacktestRunner {
             })
             .collect::<BTreeMap<_, _>>();
         let pip_size = self.pip_size(&quote.symbol);
-        let engine_transaction = self
-            .engine
-            .begin_on_price_future_effects_priced(quote, &prepared, pricer, pip_size)?;
+        let engine_transaction = match side {
+            Some(side) => self.engine.begin_on_price_future_effects_priced_for_side(
+                quote, &prepared, pricer, pip_size, side,
+            )?,
+            None => self
+                .engine
+                .begin_on_price_future_effects_priced(quote, &prepared, pricer, pip_size)?,
+        };
         let committed_effects = engine_transaction.effects().to_vec();
         if FutureExecutor::requires_processing(engine_transaction.effects())
             && let Err(error) = future_executor.process_future_effects_with_currency(
@@ -3019,10 +3619,10 @@ impl BacktestRunner {
         pricer: &ExecutionPricer,
         conversion_quotes: &ConversionQuoteBook,
     ) {
-        let explicit_action_id = scheduled.action_id.is_some();
+        let explicit_action_id = scheduled.explicit_action_id;
         let base_id = scheduled.resolved_action_id();
         let selected_profile = if scheduled.signal.is_entry() {
-            match self.select_entry_profile(&scheduled.signal, profile) {
+            match self.select_entry_profile(&scheduled.signal, profile, scheduled.instance) {
                 Ok(profile) => profile,
                 Err(error) => {
                     let reason = error.to_string();
@@ -3909,6 +4509,7 @@ impl BacktestRunner {
     fn prepare_triggering_pending(
         &self,
         quote: &PriceQuote,
+        side: Option<Side>,
         pricer: &ExecutionPricer,
     ) -> (Vec<PreparedPendingFill>, Vec<(String, String)>) {
         let ids = self
@@ -3921,6 +4522,9 @@ impl BacktestRunner {
             let Some(position) = self.engine.get_position(&id) else {
                 continue;
             };
+            if side.is_some_and(|side| position.data.side != side) {
+                continue;
+            }
             let Some(purpose) = position.pending_fill_purpose(quote, self.config.fill_model) else {
                 continue;
             };
@@ -4225,6 +4829,44 @@ fn effective_contract_sizes(config: &BacktestConfig) -> HashMap<String, f64> {
     contract_sizes
 }
 
+/// Reject cost specifications that cannot be applied deterministically to this run.
+fn validate_replay_costs(
+    config: &BacktestConfig,
+    future: Option<&FutureQuoteConfig>,
+) -> Result<(), String> {
+    let account_currency = future
+        .and_then(|future| future.currency_plan.as_ref())
+        .map(|plan| plan.account_currency().to_owned());
+    for (symbol, costs) in &config.costs {
+        if symbol.is_empty() {
+            return Err("cost symbol must not be empty".into());
+        }
+        costs
+            .validate()
+            .map_err(|error| format!("costs for {symbol} are invalid: {error}"))?;
+        if let Some(account_currency) = account_currency.as_deref() {
+            costs
+                .validate_against_account_currency(account_currency)
+                .map_err(|error| format!("costs for {symbol} are invalid: {error}"))?;
+        }
+        if costs.requires_point_size() && !config.symbol_specs.contains_key(symbol) {
+            return Err(format!(
+                "point-denominated swap for {symbol} requires a symbol specification for its digit count"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Price point size per symbol, derived from the digit count used by the symbol registry.
+fn effective_point_sizes(config: &BacktestConfig) -> HashMap<String, f64> {
+    config
+        .symbol_specs
+        .iter()
+        .map(|(symbol, spec)| (symbol.clone(), 10f64.powi(-i32::from(spec.digits))))
+        .collect()
+}
+
 fn is_monetary_sizing(policy: &SizingPolicy) -> bool {
     matches!(
         policy,
@@ -4245,6 +4887,46 @@ fn accept_legacy_quote(
     }
     last_quote_ts.insert(quote.symbol.clone(), quote.ts);
     true
+}
+
+/// Largest number of run tags one replay may carry.
+pub const MAX_RUN_TAGS: usize = 32;
+/// Largest byte length of one run-tag key or value.
+pub const MAX_RUN_TAG_BYTES: usize = 64;
+
+fn validate_run_tags(tags: &BTreeMap<String, String>) -> Result<(), String> {
+    if tags.len() > MAX_RUN_TAGS {
+        return Err(format!(
+            "run tags must not exceed {MAX_RUN_TAGS} entries, got {}",
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        if key.is_empty() || key.len() > MAX_RUN_TAG_BYTES {
+            return Err(format!(
+                "run tag key must be 1 to {MAX_RUN_TAG_BYTES} bytes, got '{key}'"
+            ));
+        }
+        if !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "run tag key must be ASCII alphanumeric, underscore, or hyphen, got '{key}'"
+            ));
+        }
+        if value.len() > MAX_RUN_TAG_BYTES {
+            return Err(format!(
+                "run tag value for '{key}' must not exceed {MAX_RUN_TAG_BYTES} bytes"
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!(
+                "run tag value for '{key}' must not contain control characters"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_replay_config(
@@ -4269,6 +4951,8 @@ fn validate_replay_config(
         }
     }
 
+    validate_run_tags(&config.run_tags)?;
+    validate_replay_costs(config, future)?;
     validate_instrument_manifest(config)?;
     for (symbol, spec) in &config.symbol_specs {
         validate_symbol_spec(symbol, spec)?;

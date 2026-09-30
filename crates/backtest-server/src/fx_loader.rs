@@ -7,14 +7,18 @@ use chrono::NaiveDateTime;
 #[cfg(test)]
 use data_preprocess::models::QueryOpts;
 use data_preprocess::{DataError, ParquetScanBounds, ParquetStore, Tick};
-use qs_backtest::currency::{ConversionRoute, RunCurrencyPlan, resolve_conversion_route};
+#[cfg(test)]
+use qs_backtest::currency::ConversionRoute;
+use qs_backtest::currency::RunCurrencyPlan;
 #[cfg(test)]
 use qs_backtest::data_feed::{SeriesRoles, VecFeed, ticks_to_feed_with_metadata};
 use qs_core::types::PriceQuote;
 use qs_symbols::SymbolRegistry;
 
 use crate::error::{BacktestServerError, Result};
-use crate::market_loader::{MarketSeriesDescription, MarketStreamDescription};
+#[cfg(test)]
+use qs_market_loader::plan_currency_routes;
+use qs_market_loader::{MarketSeriesDescription, MarketStreamDescription, plan_currency_streams};
 
 #[cfg(test)]
 pub(crate) struct LoadedFutureBundle {
@@ -67,22 +71,20 @@ pub(crate) fn describe_future_stream(
     let conversion_end = primary.conversion_end().ok_or_else(|| {
         BacktestServerError::InvalidRequest("primary market-data stream has no replay end".into())
     })?;
-    let pnl_currency_by_primary_symbol = primary_pnl_currencies(registry, &primary_symbol_set)?;
     let store = ParquetStore::open(data_dir)?;
     let datasets = discover_tick_datasets(data_dir, exchange, registry, is_cancelled)?;
     let available_symbols = datasets.keys().cloned().collect::<BTreeSet<_>>();
-    let routes = resolve_routes_to_account(
+    let currency = plan_currency_streams(
         registry,
-        &pnl_currency_by_primary_symbol,
         account_currency,
         exchange,
+        &primary_symbol_set,
         &available_symbols,
-    )?;
-    let conversion_symbols = routes
-        .values()
-        .flat_map(ConversionRoute::symbols)
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<_>>();
+    )
+    .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))?;
+    let pnl_currency_by_primary_symbol = currency.pnl_currency_by_primary_symbol;
+    let routes = currency.routes;
+    let conversion_symbols = currency.conversion_symbols;
 
     let mut warmup_quotes = Vec::with_capacity(conversion_symbols.len());
     for symbol in &conversion_symbols {
@@ -215,22 +217,20 @@ pub(crate) fn load_materialized_future_fixture(
             BacktestServerError::InvalidRequest("primary market-data feed is empty".into())
         })?;
 
-    let pnl_currency_by_primary_symbol = primary_pnl_currencies(registry, &primary_symbol_set)?;
     let store = ParquetStore::open(data_dir)?;
     let datasets = discover_tick_datasets(data_dir, exchange, registry, is_cancelled)?;
     let available_symbols = datasets.keys().cloned().collect::<BTreeSet<_>>();
-    let routes = resolve_routes_to_account(
+    let currency = plan_currency_streams(
         registry,
-        &pnl_currency_by_primary_symbol,
         account_currency,
         exchange,
+        &primary_symbol_set,
         &available_symbols,
-    )?;
-    let conversion_symbols = routes
-        .values()
-        .flat_map(ConversionRoute::symbols)
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<_>>();
+    )
+    .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))?;
+    let pnl_currency_by_primary_symbol = currency.pnl_currency_by_primary_symbol;
+    let routes = currency.routes;
+    let conversion_symbols = currency.conversion_symbols;
 
     let mut warmup_quotes = Vec::with_capacity(conversion_symbols.len());
     for symbol in &conversion_symbols {
@@ -326,28 +326,7 @@ pub(crate) fn load_materialized_future_fixture(
     })
 }
 
-fn primary_pnl_currencies(
-    registry: &SymbolRegistry,
-    primary_symbols: &BTreeSet<String>,
-) -> Result<BTreeMap<String, String>> {
-    primary_symbols
-        .iter()
-        .map(|symbol| {
-            let metadata = registry.currency_metadata(symbol).ok_or_else(|| {
-                BacktestServerError::InvalidRequest(format!(
-                    "primary symbol '{symbol}' has no explicit currency metadata"
-                ))
-            })?;
-            if metadata.pnl_currency.is_empty() {
-                return Err(BacktestServerError::InvalidRequest(format!(
-                    "primary symbol '{symbol}' has no explicit P&L currency"
-                )));
-            }
-            Ok((symbol.clone(), metadata.pnl_currency.clone()))
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn resolve_routes_to_account(
     registry: &SymbolRegistry,
     pnl_currency_by_primary_symbol: &BTreeMap<String, String>,
@@ -355,26 +334,15 @@ fn resolve_routes_to_account(
     exchange: &str,
     available_symbols: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ConversionRoute>> {
-    pnl_currency_by_primary_symbol
-        .values()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|source_currency| {
-            let route = resolve_conversion_route(
-                registry,
-                &source_currency,
-                account_currency,
-                available_symbols,
-            )
-            .map_err(|error| {
-                BacktestServerError::InvalidRequest(format!(
-                    "cannot resolve {source_currency} to {account_currency} on exchange '{exchange}': {error}"
-                ))
-            })?;
-            Ok((source_currency, route))
-        })
-        .collect()
+    plan_currency_routes(
+        registry,
+        account_currency,
+        exchange,
+        pnl_currency_by_primary_symbol.clone(),
+        available_symbols,
+    )
+    .map(|plan| plan.routes)
+    .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))
 }
 
 fn discover_tick_datasets(
@@ -502,7 +470,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use data_preprocess::Tick;
-    use qs_backtest::data_feed::{DataFeed, FallibleBatchFeed, MarketEvent};
+    use qs_backtest::data_feed::{FallibleBatchFeed, MarketEvent};
 
     fn ts(hour: u32, minute: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 1, 2)
@@ -717,7 +685,7 @@ lot_step_units = 1000
             ])
             .unwrap();
         let mut never_cancelled = || false;
-        let primary = crate::market_loader::describe_primary_market_stream(
+        let primary = qs_market_loader::describe_primary_market_stream(
             data_dir.to_str().unwrap(),
             "ctrader",
             &["usdjpy".into()],
@@ -810,7 +778,7 @@ lot_step_units = 1000
         .unwrap();
         assert_eq!(bundle.feed.total(), 2);
         assert_eq!(bundle.currency_plan.conversion_symbols().len(), 1);
-        while let Some(batch) = bundle.feed.next_batch() {
+        while let Some(batch) = qs_backtest::DataFeed::next_batch(&mut bundle.feed) {
             assert_eq!(batch.events.len(), 1);
             assert!(batch.events[0].metadata.roles.primary);
             assert!(batch.events[0].metadata.roles.conversion);

@@ -1,8 +1,8 @@
 # Roadmap
 
-The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and an in-process historical adapter that connects configured behavior to that replay path.
+The implemented foundation supports reusable historical strategy research and backtesting over the existing FutureQuote execution and accounting path, a reusable synchronous configured strategy core, and a historical adapter that connects configured behavior to that replay path, both in process and through the backtest service, which accepts configured strategy documents, management profiles, and parameter searches by request.
 
-> This roadmap does not schedule a live trading platform. It keeps reusable strategy behavior independent from historical replay so a future real-time adapter would not require duplicating strategy logic.
+> This roadmap does not schedule a live trading platform. The workspace now includes a broker-neutral execution contract library, but no broker adapter, live scheduler, account reconciliation, persistence, or operational recovery.
 
 ## Current foundation
 
@@ -79,9 +79,21 @@ The configured core now provides:
 - neutral conformance coverage and a custom material extension seam;
 - no content hash, digest, fingerprint, or content-derived strategy identity.
 
-The historical adapter binds complete logical source specifications to historical series, projects exact tick-count volume and caller-owned typed named inputs, supplies total trade-slot facts, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, rejects supplied management profiles, and reuses unprofiled Entry plus the existing FutureQuote economic path. Conformance verifies neutral lifecycle scenarios, direct-signal economic parity, and aligned-EOD materialized/streaming full-result parity. Server or RPC execution, live runtime orchestration, configured-state persistence, and configured-strategy composition with management profiles remain unavailable.
+The historical adapter binds complete logical source specifications to historical series built from ticks or accepted from counted or explicit unknown-count stored bars, projects optional volume and caller-owned typed named inputs, supplies total trade-slot facts including open-position time, excursion, and initial risk, preserves opaque command IDs through ordered effect/disposition feedback and a final feedback boundary, maps generic decisions and notes into historical output, and routes configured entries to management profiles through the same selection raw-signal replay uses, by entry class or run default, rejecting an unrouted class or a stop-ownership conflict before the run. Configured, portfolio, declared-space, and bounded structural searches are available through the existing typed backtest service. Live runtime orchestration and configured-state persistence remain unavailable.
 
-Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time adapter or live execution runtime is part of the current implementation goal.
+Direct Rust strategies will remain supported for custom algorithms that do not fit the configured model. The framework will not claim that every possible strategy can or should be represented as configuration. No real-time strategy-input adapter or live execution runtime is part of the current implementation goal. The implemented `qs-execution` library is the lower-level request/report contract a future runtime may consume; it is not itself a gateway.
+
+## Unified historical research
+
+The implemented research library provides a semantic-unit-aware named numeric catalog, source-clocked temporal/setup materials, confirmed-structure projection, depth-bounded canonical structural generation, document-driven configured candidates, optional caller-compiled direct factories, typed variants, heterogeneous portfolios, protected split access, bounded traces/cache/checkpoints, optional-count and ordered-quote data paths, delayed availability, configurable IANA calendars and exact enhanced quote statistics. Candidate generation and all economics reuse the existing compiler, FutureQuote replay, risk supervision, and evaluation rather than a mask-only or second accounting engine. It reports comparison data and incomplete budgets without choosing a winner.
+
+The service accepts configured calendar inputs with one full-day session by default or explicit named sessions, and the same server binary executes different supported strategy documents without registering strategy IDs. It accepts compatible checkpoints, configured and mixed portfolios, optional trusted direct factories by exact revision, resumable complete-run checkpoints after cancellation, and frozen selected reruns. Protected final requests authorize and record access before opening the selected market view. Calendar recipes, admitted-view cache authority and bounded query/resource policies remain explicit inputs. Production operators still choose resource limits and experiment inputs from their own measured workloads; the framework does not publish an automatic universal preset or profitability claim.
+
+## Broker-neutral execution contract
+
+`qs-execution` now provides a library-only boundary from strict `RawSignal` intent and caller-owned current facts to concrete quantity-bearing requests. It reuses core profile resolution and catalog-aware sizing, supports explicit automatic or entry-approval modes, and translates committed provider observations into the configured fact-plus-terminal feedback contract. Submission acceptance remains distinct from fills, acceptance-unknown work is not automatically retried, partial exposure is retained, and original-entered-size ratio closes are capped at the remaining quantity.
+
+The contract is exercised by a local scripted consumer without credentials, network access, account P&L, or a second fill engine. Preparation records its quote and sizing reference separately from later fills; a provider does not silently resize a submitted market request when execution price differs. Ongoing profile rules require an explicit provider or external runtime owner. Actual broker integrations and live orchestration remain outside the current roadmap.
 
 ## Design constraints
 
@@ -97,7 +109,7 @@ Configured strategy execution must preserve the current causal order:
 
 Emitting an Entry is not equivalent to a fill. Configured state must use committed execution feedback to distinguish requested, open, rejected, and closed lifecycle states.
 
-Before adapter readiness, causal materials advance but configured transitions, state assignments, decisions, notes, and signals do not. The first ready input evaluates the accumulated material state from unchanged configured state. EMA and ATR update only from new completed bars, crossing is a one-boundary pulse, and command feedback retains its originating correlation ID. Initial execution is limited to one configured instance, one primary symbol, and one active campaign. Missing arithmetic remains missing, comparisons with missing are false, required output cannot be missing, and every declared configured state must be reachable from the initial state or compilation fails.
+Before adapter readiness, causal materials advance but configured transitions, state assignments, decisions, notes, and signals do not. The first ready input evaluates the accumulated material state from unchanged configured state. Source-clocked primitives update only from their declared completed sample, temporal events are bounded pulses or explicit persistent state, and command feedback retains its originating correlation ID. Single and heterogeneous configured portfolios run through one account with explicit instance identity; no allocator silently redistributes requested risk. Legacy comparisons retain their compatibility Missing behavior, while the additive strict predicate path preserves invalidity through Boolean composition and entry requires valid true. Required output cannot be missing, and every declared configured state must be reachable from the initial state or compilation fails.
 
 ## What will be reused
 
@@ -108,7 +120,7 @@ The historical adapter reuses:
 - causal series, observations, annotations, and analyzers;
 - strict `RawSignal` validation;
 - replay instrument specifications;
-- unprofiled Entry resolution for the initial configured path;
+- Entry profile selection and resolution, shared with raw-signal replay;
 - FutureQuote slippage, pending, stop, target, scale-in, and close behavior;
 - account-currency sizing and conversion;
 - fills, lifecycle, MTM, drawdown, and `BacktestResult`;
@@ -134,10 +146,10 @@ Concrete private strategy configurations may be added later when there is a real
 - global mutable component registries;
 - dynamic plugins or behavior discovery;
 - deployment compilers or content-addressed strategy artifacts;
-- strategy configuration over RPC;
+- strategy code, custom materials, or analyzers received over RPC; a remotely submitted strategy document may use only materials registered in the server build;
 - ingestion-to-trading bridges;
-- multi-strategy portfolio allocation;
-- paper or live execution gateways;
+- multi-strategy portfolio allocation or optimization; portfolio supervision approves or rejects each instance's requests but never allocates capital between strategies;
+- paper or live execution gateways beyond the implemented provider-neutral request/report library;
 - restart-safe configured or live strategy state;
 - broker and exchange order adapters;
 - cryptocurrency economics beyond the current rejection guard;
@@ -158,6 +170,8 @@ The implementation now allows a developer to:
 6. reproduce equivalent direct-signal economic results;
 7. reuse one custom material across several configurations;
 8. preserve a boundary that a future real-time adapter can use without depending on `qs-backtest`;
-9. continue implementing direct Rust strategies without framework regression.
+9. continue implementing direct Rust strategies without framework regression;
+10. prepare and validate broker-neutral execution requests, approval state, and report feedback locally without a broker or live scheduler;
+11. run counted/unknown-count, direct, variant, mixed, temporal, cache, cancellation-resume, and protected-final research workflows from one neutral executable example.
 
-The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. See [Backtesting](backtesting.md) for current replay behavior and limitations.
+The historical adapter and the configured-strategy objective are complete for the approved in-process scope, including aligned-EOD materialized/streaming full-result parity and full workspace validation. The backtest service now also runs configured strategy documents, portfolios of configured instances under optional portfolio policies, and parameter searches received at runtime, reusing the same adapter, portfolio replay, and research batch. See [Backtesting](backtesting.md) for current replay behavior and limitations.

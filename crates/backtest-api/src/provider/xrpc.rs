@@ -7,14 +7,16 @@ use qs_service_xrpc::{
 use crate::{
     AddProfileRequest, AddProfileResponse, BacktestAdminClient, BacktestClient,
     BacktestClientError, BacktestDiscoveryClient, BacktestEvent, BacktestEventStream,
-    BacktestServiceProtocolError, BacktestStatusResponse, BacktestSyncClient,
-    CancelBacktestRequest, CancelBacktestResponse, DeleteResultArtifactRequest,
+    BacktestServiceProtocolError, BacktestStatusResponse, BacktestStrategyClient,
+    BacktestSyncClient, CancelBacktestRequest, CancelBacktestResponse, DeleteResultArtifactRequest,
     DeleteResultArtifactResponse, GetBacktestResultRequest, GetBacktestResultResponse,
     GetBacktestStatusRequest, GetResultArtifactChunkRequest, GetResultArtifactChunkResponse,
-    ListProfilesResponse, ListSymbolsRequest, ListSymbolsResponse, PingResponse,
-    ReloadProfilesResponse, RemoveProfileRequest, RemoveProfileResponse, RunBacktestMultiRequest,
-    RunBacktestMultiResponse, RunBacktestRequest, RunBacktestResponse, SubmitBacktestRequest,
-    SubmitBacktestResponse, WatchBacktestRequest,
+    GetSearchResultRequest, GetSearchResultResponse, ListProfilesResponse, ListSymbolsRequest,
+    ListSymbolsResponse, PingResponse, ReloadProfilesResponse, RemoveProfileRequest,
+    RemoveProfileResponse, RunBacktestMultiRequest, RunBacktestMultiResponse, RunBacktestRequest,
+    RunBacktestResponse, RunConfiguredStrategyRequest, RunPortfolioRequest, SubmitBacktestRequest,
+    SubmitBacktestResponse, SubmitConfiguredStrategyRequest, SubmitPortfolioRequest,
+    SubmitSearchRequest, WatchBacktestRequest,
 };
 
 /// Backtest connection facade. Its public contract is provider-neutral.
@@ -181,6 +183,74 @@ impl BacktestSyncClient for BacktestXrpcClient {
 }
 
 #[async_trait]
+impl BacktestStrategyClient for BacktestXrpcClient {
+    async fn run_configured_strategy(
+        &self,
+        request: RunConfiguredStrategyRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError> {
+        self.session
+            .call("run_configured_strategy", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn submit_configured_strategy(
+        &self,
+        request: SubmitConfiguredStrategyRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError> {
+        self.session
+            .call("submit_configured_strategy", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn run_portfolio(
+        &self,
+        request: RunPortfolioRequest,
+    ) -> Result<RunBacktestResponse, BacktestClientError> {
+        self.session
+            .call("run_portfolio", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn submit_portfolio(
+        &self,
+        request: SubmitPortfolioRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError> {
+        self.session
+            .call("submit_portfolio", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn submit_search(
+        &self,
+        request: SubmitSearchRequest,
+    ) -> Result<SubmitBacktestResponse, BacktestClientError> {
+        self.session
+            .call("submit_search", &request)
+            .await
+            .map_err(map_provider_error)
+    }
+
+    async fn search_result(
+        &self,
+        job_id: &str,
+    ) -> Result<GetSearchResultResponse, BacktestClientError> {
+        self.session
+            .call(
+                "get_search_result",
+                &GetSearchResultRequest {
+                    job_id: job_id.into(),
+                },
+            )
+            .await
+            .map_err(map_provider_error)
+    }
+}
+
+#[async_trait]
 impl BacktestDiscoveryClient for BacktestXrpcClient {
     async fn list_profiles(&self) -> Result<ListProfilesResponse, BacktestClientError> {
         self.session
@@ -270,6 +340,7 @@ mod tests {
                     close_on_finish: None,
                     fill_model: None,
                     sizing: None,
+                    costs: Default::default(),
                 },
             },
             future: FutureQuoteConfigMsg::default(),
@@ -297,6 +368,7 @@ mod tests {
                     close_on_finish: None,
                     fill_model: None,
                     sizing: None,
+                    costs: Default::default(),
                 },
             },
             future: FutureQuoteConfigMsg::default(),

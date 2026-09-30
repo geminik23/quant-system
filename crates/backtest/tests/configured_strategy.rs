@@ -1,6 +1,5 @@
 mod support;
 
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,17 +14,18 @@ use qs_backtest::{
     HistoricalVolumeProjection, ManagementProfile, MarketEvent, MissingIntervalPolicy,
     NamedInputProjectionContext, NamedInputProjectionError, ObservationStoreLimits,
     PendingOrderLifecycleState, PriceBasis, ProjectedNamedInput, SeriesId, SeriesRequirement,
-    StoplossMode, StrategyDescriptor, StrategyId, StrategyReplayError, StrategyReplayInputError,
-    StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
+    SourceBarFactKind, SourceBarFactProjector, StoplossMode, StrategyDescriptor, StrategyId,
+    StrategyReplayError, StrategyRetentionLimits, Timeframe, VecFeed, WarmupRequirement,
 };
 use qs_core::{OrderType, Side};
 use qs_strategy::{
     ActionTemplate, CompletedBarRequirement, ConfiguredActionKind, DecisionKind, DecisionTemplate,
     Expr, Literal, MATERIAL_BAR_FIELD, MATERIAL_CANCELLATION_APPLIED, MATERIAL_EMA,
-    MATERIAL_POSITION_PENDING, MaterialBuild, MaterialConfig, MaterialEvalContext,
-    MaterialEvaluator, MaterialFactory, MaterialLibrary, MaterialLookback, MaterialParams,
-    MaterialUpdateTrigger, NamedExpr, NoteKind, NoteTemplate, ScalarType, SourceId, StateConfig,
-    StrategyConfig, TransitionConfig, Value, ValueType,
+    MATERIAL_POSITION_PENDING, MATERIAL_SETUP_LONG_SINGLE_KEEP_FIRST, MATERIAL_STRICT_EMA,
+    MATERIAL_STRICT_SMA, MaterialArg, MaterialArgs, MaterialBuild, MaterialConfig,
+    MaterialEvalContext, MaterialEvaluator, MaterialFactory, MaterialLibrary, MaterialLookback,
+    MaterialParams, MaterialUpdateTrigger, NamedExpr, NoteKind, NoteTemplate, ScalarType, SourceId,
+    StateConfig, StrategyConfig, TransitionConfig, Value, ValueType,
 };
 use qs_symbols::SymbolSpec;
 use support::configured as shared;
@@ -62,13 +62,14 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
             params: MaterialParams::BarField {
                 source: source(),
                 field: qs_strategy::BarField::Close,
-            },
+            }
+            .into(),
         });
         materials.push(MaterialConfig {
             id: "ema".into(),
             key: MATERIAL_EMA.into(),
             inputs: vec![Expr::Material { id: "close".into() }],
-            params: MaterialParams::Ema { period },
+            params: MaterialParams::Ema { period }.into(),
         });
         Expr::Gt {
             left: Box::new(Expr::Bar {
@@ -106,6 +107,7 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
                 risk: expr_literal(Literal::Number(1.0)),
                 stoploss: expr_literal(Literal::Price(0.9)),
                 targets: vec![],
+                entry_class: None,
             }],
             notes: vec![],
         }]
@@ -125,6 +127,7 @@ fn strategy_config(enter: bool, ema_period: Option<u16>) -> StrategyConfig {
     StrategyConfig {
         strategy_id: "alpha".into(),
         title: "Neutral configured strategy".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -211,6 +214,54 @@ impl HistoricalNamedInputProjector for ReadyProjector {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SetupInputKind {
+    Reset,
+    Gap,
+    Breakout,
+    Retest,
+    Level,
+    Normalization,
+    Close,
+    Tolerance,
+    Ordinal,
+}
+struct SetupInputProjector(SetupInputKind);
+impl HistoricalNamedInputProjector for SetupInputProjector {
+    fn output_type(&self) -> ValueType {
+        ValueType::required(match self.0 {
+            SetupInputKind::Reset
+            | SetupInputKind::Gap
+            | SetupInputKind::Breakout
+            | SetupInputKind::Retest => ScalarType::Bool,
+            SetupInputKind::Level | SetupInputKind::Close | SetupInputKind::Tolerance => {
+                ScalarType::Price
+            }
+            SetupInputKind::Normalization => ScalarType::Number,
+            SetupInputKind::Ordinal => ScalarType::Integer,
+        })
+    }
+    fn project(
+        &self,
+        context: NamedInputProjectionContext<'_>,
+    ) -> Result<ProjectedNamedInput, NamedInputProjectionError> {
+        let ordinal = (context.observed_through - ts(0)).num_minutes();
+        let value = match self.0 {
+            SetupInputKind::Reset | SetupInputKind::Gap => Value::Bool(false),
+            SetupInputKind::Breakout => Value::Bool(ordinal == 3),
+            SetupInputKind::Retest => Value::Bool(ordinal == 4),
+            SetupInputKind::Level | SetupInputKind::Close => Value::Price(1.0),
+            SetupInputKind::Tolerance => Value::Price(0.0),
+            SetupInputKind::Normalization => Value::Number(2.0),
+            SetupInputKind::Ordinal => Value::Integer(ordinal),
+        };
+        Ok(ProjectedNamedInput {
+            value,
+            updated: !context.closed_bars.is_empty(),
+        })
+    }
+}
+
 struct FailingProjector;
 
 impl HistoricalNamedInputProjector for FailingProjector {
@@ -266,6 +317,7 @@ fn named_input_strategy() -> qs_strategy::ConfiguredStrategy {
     let config = StrategyConfig {
         strategy_id: "named".into(),
         title: "Named input".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -348,6 +400,7 @@ fn pending_adapter(
     let config = StrategyConfig {
         strategy_id: strategy_id.into(),
         title: "Pending management".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -375,6 +428,7 @@ fn pending_adapter(
                         risk: expr_literal(Literal::Number(1.0)),
                         stoploss: expr_literal(Literal::Price(0.4)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -426,6 +480,7 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
     let config = StrategyConfig {
         strategy_id: "pending_causal".into(),
         title: "Causal pending cancellation".into(),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -436,7 +491,8 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                 inputs: vec![],
                 params: MaterialParams::Position {
                     slot: "primary".into(),
-                },
+                }
+                .into(),
             },
             MaterialConfig {
                 id: "cancelled".into(),
@@ -445,7 +501,8 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                 params: MaterialParams::Feedback {
                     slot: "primary".into(),
                     action: ConfiguredActionKind::CancelPending,
-                },
+                }
+                .into(),
             },
         ],
         variables: vec![],
@@ -477,6 +534,7 @@ fn causal_pending_cancellation_adapter() -> BacktestConfiguredStrategyAdapter {
                         risk: expr_literal(Literal::Number(1.0)),
                         stoploss: expr_literal(Literal::Price(0.4)),
                         targets: vec![],
+                        entry_class: None,
                     }],
                     notes: vec![],
                 }],
@@ -766,10 +824,10 @@ struct AlwaysTrueFactory;
 impl MaterialFactory for AlwaysTrueFactory {
     fn build(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         input_types: &[ValueType],
     ) -> Result<MaterialBuild, String> {
-        if *params != MaterialParams::None || !input_types.is_empty() {
+        if !params.is_empty() || !input_types.is_empty() {
             return Err("always_true accepts no parameters or inputs".into());
         }
         Ok(MaterialBuild {
@@ -808,10 +866,10 @@ struct CausalCountingFactory {
 impl MaterialFactory for CausalCountingFactory {
     fn build(
         &self,
-        params: &MaterialParams,
+        params: &MaterialArgs,
         input_types: &[ValueType],
     ) -> Result<MaterialBuild, String> {
-        if *params != MaterialParams::None || !input_types.is_empty() {
+        if !params.is_empty() || !input_types.is_empty() {
             return Err("causal_counter accepts no parameters or inputs".into());
         }
         Ok(MaterialBuild {
@@ -829,7 +887,7 @@ impl MaterialFactory for CausalCountingFactory {
 
     fn update_trigger(
         &self,
-        _params: &MaterialParams,
+        _params: &MaterialArgs,
         _input_types: &[ValueType],
     ) -> Result<MaterialUpdateTrigger, String> {
         Ok(MaterialUpdateTrigger::Source(source()))
@@ -840,6 +898,7 @@ fn custom_strategy_config(id: &str) -> StrategyConfig {
     StrategyConfig {
         strategy_id: id.into(),
         title: format!("Custom material {id}"),
+        parameters: vec![],
         initial_state: "idle".into(),
         sources: vec![source()],
         trade_slots: vec!["primary".into()],
@@ -847,7 +906,7 @@ fn custom_strategy_config(id: &str) -> StrategyConfig {
             id: "always".into(),
             key: "always_true".into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         }],
         variables: vec![],
         states: vec![
@@ -937,6 +996,320 @@ fn configured_entry_uses_completed_bar_warmup_and_preserves_command_id() {
         "5:alpha|10:instance_a|command:1"
     );
     assert_eq!(result.replay.action_dispositions[0].signal_ts, Some(ts(1)));
+}
+
+#[test]
+fn strict_average_enters_only_after_its_completed_bar_history_is_ready() {
+    for key in [MATERIAL_STRICT_SMA, MATERIAL_STRICT_EMA] {
+        assert_strict_average_entry(key, &[1.0, 1.1, 1.2, 1.3, 1.4, 1.5], 3, 1.1);
+    }
+}
+
+#[test]
+fn strict_average_historical_entry_uses_nonmonotonic_seed_and_recursive_update() {
+    assert_strict_average_entry(MATERIAL_STRICT_SMA, &[1.2, 1.5, 1.1, 1.6, 1.3, 1.8], 4, 1.4);
+    assert_strict_average_entry(
+        MATERIAL_STRICT_EMA,
+        &[1.2, 1.5, 1.1, 1.6, 1.3, 1.8],
+        4,
+        43.0 / 30.0,
+    );
+}
+
+fn assert_strict_average_entry(
+    key: &str,
+    prices: &[f64],
+    entry_minute: i64,
+    expected_average: f64,
+) {
+    let mut document = strategy_config(true, None);
+    document.materials.push(MaterialConfig {
+        id: "average".into(),
+        key: key.into(),
+        inputs: vec![Expr::Bar {
+            source: source(),
+            field: qs_strategy::BarField::Close,
+        }],
+        params: MaterialArgs::new([
+            ("source", MaterialArg::Source(source())),
+            ("period", MaterialArg::Integer(3)),
+        ]),
+    });
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::Gt {
+            left: Box::new(Expr::Bar {
+                source: source(),
+                field: qs_strategy::BarField::Close,
+            }),
+            right: Box::new(Expr::Material {
+                id: "average".into(),
+            }),
+        }),
+    };
+    let condition = document.states[0].transitions[0].when.clone();
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::All {
+            items: vec![
+                condition,
+                Expr::Le {
+                    left: Box::new(Expr::Abs {
+                        value: Box::new(Expr::Sub {
+                            left: Box::new(Expr::Material {
+                                id: "average".into(),
+                            }),
+                            right: Box::new(expr_literal(Literal::Price(expected_average))),
+                        }),
+                    }),
+                    right: Box::new(expr_literal(Literal::Price(1e-12))),
+                },
+            ],
+        }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("alpha").unwrap(), "r1", "Alpha").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec(3, 32))],
+            vec![],
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(
+        prices
+            .iter()
+            .enumerate()
+            .map(|(minute, price)| MarketEvent::Tick {
+                symbol: SYMBOL.into(),
+                ts: ts(minute as i64),
+                bid: *price,
+                ask: price + 0.0002,
+            })
+            .collect(),
+    );
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.decisions.records.len(), 1);
+    assert_eq!(
+        result.decisions.records[0].emitted_signals()[0].ts(),
+        ts(entry_minute)
+    );
+
+    assert_eq!(adapter.configured_strategy().state_id(), "entered");
+}
+
+#[test]
+fn delayed_retest_historical_lifecycle_never_enters_on_the_capture_bar() {
+    let input = |name: &str, scalar| Expr::Input {
+        field: name.into(),
+        value_type: ValueType::required(scalar),
+    };
+    let mut document = strategy_config(true, None);
+    document.materials.push(MaterialConfig {
+        id: "setup".into(),
+        key: MATERIAL_SETUP_LONG_SINGLE_KEEP_FIRST.into(),
+        inputs: vec![
+            input("reset", ScalarType::Bool),
+            input("gap", ScalarType::Bool),
+            input("breakout", ScalarType::Bool),
+            input("retest", ScalarType::Bool),
+            input("level", ScalarType::Price),
+            input("normalization", ScalarType::Number),
+            input("close", ScalarType::Price),
+            input("tolerance", ScalarType::Price),
+            input("ordinal", ScalarType::Integer),
+        ],
+        params: MaterialArgs::new([
+            ("source", MaterialArg::Source(source())),
+            ("expiry", MaterialArg::Integer(3)),
+        ]),
+    });
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::Material { id: "setup".into() }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let kinds = [
+        ("reset", SetupInputKind::Reset),
+        ("gap", SetupInputKind::Gap),
+        ("breakout", SetupInputKind::Breakout),
+        ("retest", SetupInputKind::Retest),
+        ("level", SetupInputKind::Level),
+        ("normalization", SetupInputKind::Normalization),
+        ("close", SetupInputKind::Close),
+        ("tolerance", SetupInputKind::Tolerance),
+        ("ordinal", SetupInputKind::Ordinal),
+    ];
+    let bindings = kinds
+        .into_iter()
+        .map(|(name, kind)| {
+            ConfiguredNamedInputBinding::new(name, Box::new(SetupInputProjector(kind)))
+        })
+        .collect();
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("setup").unwrap(), "r1", "Setup").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec(1, 16))],
+            bindings,
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(
+        (0..7)
+            .map(|minute| MarketEvent::Tick {
+                symbol: SYMBOL.into(),
+                ts: ts(minute),
+                bid: 1.0 + minute as f64 * 0.001,
+                ask: 1.0002 + minute as f64 * 0.001,
+            })
+            .collect(),
+    );
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.decisions.records.len(), 1);
+    assert_eq!(result.decisions.records[0].emitted_signals()[0].ts(), ts(4));
+}
+
+#[test]
+fn source_bar_facts_preserve_actual_delayed_availability_without_backdating() {
+    let mut document = strategy_config(true, None);
+    document.states[0].transitions[0].when = Expr::Strict {
+        value: Box::new(Expr::All {
+            items: vec![
+                Expr::Gt {
+                    left: Box::new(Expr::Input {
+                        field: "available_at".into(),
+                        value_type: ValueType::optional(ScalarType::Timestamp),
+                    }),
+                    right: Box::new(Expr::Input {
+                        field: "close_time".into(),
+                        value_type: ValueType::optional(ScalarType::Timestamp),
+                    }),
+                },
+                Expr::Ge {
+                    left: Box::new(Expr::Input {
+                        field: "ordinal".into(),
+                        value_type: ValueType::optional(ScalarType::Integer),
+                    }),
+                    right: Box::new(expr_literal(Literal::Integer(1))),
+                },
+            ],
+        }),
+    };
+    let strategy = qs_strategy::ConfiguredStrategy::compile(
+        document,
+        &MaterialLibrary::builtins(),
+        "instance_a",
+        SYMBOL,
+    )
+    .unwrap();
+    let series_id = SeriesId::new("m5").unwrap();
+    let requirement = SeriesRequirement::new(
+        series_id.clone(),
+        SYMBOL,
+        Timeframe::minutes(5).unwrap(),
+        PriceBasis::Bid,
+        WarmupRequirement::bars(1).unwrap(),
+    )
+    .unwrap();
+    let spec = BarSeriesSpec::new(requirement, 16, 0, MissingIntervalPolicy::Skip).unwrap();
+    let named = vec![
+        ConfiguredNamedInputBinding::new(
+            "ordinal",
+            Box::new(SourceBarFactProjector::new(
+                series_id.clone(),
+                SourceBarFactKind::Ordinal,
+            )),
+        ),
+        ConfiguredNamedInputBinding::new(
+            "close_time",
+            Box::new(SourceBarFactProjector::new(
+                series_id.clone(),
+                SourceBarFactKind::CloseTime,
+            )),
+        ),
+        ConfiguredNamedInputBinding::new(
+            "available_at",
+            Box::new(SourceBarFactProjector::new(
+                series_id,
+                SourceBarFactKind::AvailableAt,
+            )),
+        ),
+    ];
+    let mut adapter = BacktestConfiguredStrategyAdapter::new(
+        strategy,
+        StrategyDescriptor::new(StrategyId::new("alpha").unwrap(), "r1", "Alpha").unwrap(),
+        ConfiguredHistoricalBindings::new(
+            vec![ConfiguredSourceBinding::new(source(), spec)],
+            named,
+            HistoricalVolumeProjection::TickCountExact,
+        ),
+        0,
+    )
+    .unwrap();
+    let mut feed = VecFeed::new(vec![
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(0),
+            bid: 1.0,
+            ask: 1.0002,
+        },
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(17),
+            bid: 1.2,
+            ask: 1.2002,
+        },
+        MarketEvent::Tick {
+            symbol: SYMBOL.into(),
+            ts: ts(22),
+            bid: 1.3,
+            ask: 1.3002,
+        },
+    ]);
+    let result = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+        .run_configured_strategy_future(
+            &mut feed,
+            &mut adapter,
+            analysis(),
+            StrategyRetentionLimits::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        result.decisions.records[0].emitted_signals()[0].ts(),
+        ts(17)
+    );
 }
 
 #[test]
@@ -1289,7 +1662,7 @@ fn no_op_updates_causal_material_and_repeats_deterministically() {
             id: "causal_count".into(),
             key: "causal_counter".into(),
             inputs: vec![],
-            params: MaterialParams::None,
+            params: MaterialParams::None.into(),
         });
         let configured =
             qs_strategy::ConfiguredStrategy::compile(strategy, &library, "instance_a", SYMBOL)
@@ -1532,31 +1905,10 @@ fn named_projector_bindings_reject_missing_duplicate_mismatch_and_undeclared_nam
     ));
 }
 
-struct PollTrackingFeed {
-    inner: VecFeed,
-    polls: Cell<usize>,
-}
-
-impl qs_backtest::DataFeed for PollTrackingFeed {
-    fn next_event(&mut self) -> Option<MarketEvent> {
-        self.polls.set(self.polls.get() + 1);
-        self.inner.next_event()
-    }
-
-    fn peek(&self) -> Option<&MarketEvent> {
-        self.inner.peek()
-    }
-}
-
 #[test]
-fn management_profile_is_rejected_before_feed_polling() {
-    let mut first_adapter = adapter(false, None, spec(1, 32)).unwrap();
-    let mut first_feed = PollTrackingFeed {
-        inner: feed(),
-        polls: Cell::new(0),
-    };
+fn supplied_management_profiles_no_longer_block_a_configured_run() {
     let profile = ManagementProfile {
-        name: "unsupported".into(),
+        name: "plain".into(),
         target_selection: None,
         use_targets: vec![],
         close_ratios: vec![],
@@ -1567,48 +1919,31 @@ fn management_profile_is_rejected_before_feed_polling() {
         let_remainder_run: false,
         entry_geometry: EntryGeometryPolicy::Strict,
     };
-    let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+    let mut default_adapter = adapter(true, None, spec(1, 32)).unwrap();
+    BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .run_configured_strategy_future(
-            &mut first_feed,
-            &mut first_adapter,
+            &mut feed(),
+            &mut default_adapter,
             analysis(),
             StrategyRetentionLimits::default(),
             Some(&profile),
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StrategyReplayError::Input(
-            StrategyReplayInputError::ConfiguredManagementProfileUnsupported
-        )
-    ));
-    assert_eq!(first_feed.polls.get(), 0);
+        .unwrap();
 
-    let mut adapter = adapter(false, None, spec(1, 32)).unwrap();
-    let mut feed = PollTrackingFeed {
-        inner: feed(),
-        polls: Cell::new(0),
-    };
+    let mut prepared_adapter = adapter(true, None, spec(1, 32)).unwrap();
     let prepared = qs_backtest::PreparedEntryProfiles::try_new(
         Some(profile),
         Vec::<(String, ManagementProfile)>::new(),
     )
     .unwrap();
-    let error = BacktestRunner::new_future(config(), FutureQuoteConfig::default())
+    BacktestRunner::new_future(config(), FutureQuoteConfig::default())
         .with_entry_profiles(prepared)
         .run_configured_strategy_future(
-            &mut feed,
-            &mut adapter,
+            &mut feed(),
+            &mut prepared_adapter,
             analysis(),
             StrategyRetentionLimits::default(),
             None,
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        StrategyReplayError::Input(
-            StrategyReplayInputError::ConfiguredManagementProfileUnsupported
-        )
-    ));
-    assert_eq!(feed.polls.get(), 0);
+        .unwrap();
 }

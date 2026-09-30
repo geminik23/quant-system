@@ -48,6 +48,9 @@ pub enum DataError {
     #[error("Invalid timeframe: {0}")]
     InvalidTimeframe(String),
 
+    #[error("invalid resample request: {0}")]
+    InvalidResample(String),
+
     #[error("Could not extract symbol from filename: {0}")]
     SymbolExtraction(String),
 

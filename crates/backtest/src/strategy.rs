@@ -4,16 +4,20 @@
 
 pub mod analysis;
 pub mod annotation;
+pub mod calendar;
 pub mod config;
 pub mod configured;
 pub mod context;
 pub mod domain;
 pub mod experiment;
 pub mod feedback;
+pub mod geometry;
 pub mod journal;
+pub mod portfolio;
 pub mod replay;
 pub mod runtime;
 pub mod series;
+pub mod session;
 
 pub use analysis::{
     AnalysisBoundary, AnalysisBoundaryOutput, AnalysisContext, AnalysisError, AnalysisPipeline,
@@ -28,17 +32,27 @@ pub use annotation::{
     AnnotationError, AnnotationId, AnnotationLimits, AnnotationTimeline, AnnotationUse,
     MAX_ANNOTATION_ID_BYTES, MAX_ANNOTATION_NOTE_BYTES, MAX_ANNOTATIONS, StrategyAnnotation,
 };
+pub use calendar::{
+    CalendarAdmissionLimits, CalendarBar, CalendarError, CalendarFeatureKind,
+    CalendarFeatureProjector, CalendarInputSpec, CalendarTimeBasis,
+    ConfiguredCalendarFeatureProjector, ConfiguredCalendarInput, ConfiguredTradingCalendar,
+    DEFAULT_CALENDAR_SESSION_ID, IanaTradingCalendar, LocalMarketIntervalSpec, MarketScheduleSpec,
+    NamedSessionSpec, OpeningRange, ResolvedSession, ResolvedSessionOccurrence, ResolvedTradingDay,
+    SessionOccurrenceId, SessionScheduleSpec, SessionSpanSpec, TradingCalendarSpec,
+    WeeklyMarketIntervalSpec,
+};
 pub use config::{
     MAX_DECISION_RECORDS, MAX_REASON_BYTES, MAX_SERIES_ID_BYTES, MAX_SIGNALS_PER_CALLBACK,
     MAX_WARMUP_BARS, PriceBasis, SeriesId, StrategyConfigError, StrategyRetentionLimits, Timeframe,
     WarmupRequirement,
 };
 pub use configured::{
-    BacktestConfiguredStrategyAdapter, ConfiguredHistoricalBindings, ConfiguredNamedInputBinding,
-    ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError, ConfiguredStrategyAdapterError,
-    ConfiguredStrategyAdapterPreflightError, HistoricalNamedInputProjector,
+    BacktestConfiguredStrategyAdapter, ConfiguredEntryProfileError, ConfiguredHistoricalBindings,
+    ConfiguredNamedInputBinding, ConfiguredSourceBinding, ConfiguredStrategyAdapterBuildError,
+    ConfiguredStrategyAdapterError, ConfiguredStrategyAdapterPreflightError,
+    ConfirmedSwingFactKind, ConfirmedSwingFactProjector, HistoricalNamedInputProjector,
     HistoricalVolumeProjection, NamedInputProjectionContext, NamedInputProjectionError,
-    ProjectedNamedInput,
+    ProjectedNamedInput, SourceBarFactKind, SourceBarFactProjector,
 };
 pub use context::StrategyContext;
 pub use domain::{
@@ -53,11 +67,18 @@ pub use experiment::{
     StrategyExperimentError,
 };
 pub use feedback::{StrategyFeedback, StrategyFeedbackEvent};
+pub use geometry::{SeriesGeometry, SeriesGeometryError};
 pub use journal::{
     JournalKind, MAX_CHART_REF_BYTES, MAX_EXPERIMENT_LABEL_BYTES, MAX_JOURNAL_PER_CALLBACK,
     MAX_JOURNAL_REASON_BYTES, MAX_JOURNAL_RECORDS, MAX_JOURNAL_VALUE_KEY_BYTES, MAX_JOURNAL_VALUES,
     StrategyJournalDraft, StrategyJournalError, StrategyJournalOutput, StrategyJournalRecord,
     StrategyJournalRecorder, StrategyJournalRetention, StrategyResearchLimits,
+};
+pub use portfolio::{
+    ConfiguredInstance, DirectPortfolioInstance, INSTANCE_POSITION_TAG, MAX_PORTFOLIO_INSTANCES,
+    MixedPortfolioBacktestResult, MixedPortfolioReplayError, PortfolioBacktestResult,
+    PortfolioInstanceOutput, PortfolioReplayError, SupervisorEvent, SupervisorHaltAction,
+    SupervisorOutput,
 };
 pub use replay::{StrategyReplayError, StrategyReplayInputError};
 pub use runtime::{
@@ -67,6 +88,7 @@ pub use series::{
     BarSeriesSpec, BarWindow, ClosedBar, HistoricalSeriesView, MAX_RETAINED_BARS,
     MissingIntervalPolicy, MultiTimeframeSeries, SeriesError, SeriesViewError, SeriesWarmupState,
 };
+pub use session::{FixedUtcSessionError, FixedUtcSessionProjector, MAX_SESSION_WINDOWS};
 
 use qs_core::types::Action;
 

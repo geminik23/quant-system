@@ -25,6 +25,7 @@ duckdb-backend = ["dep:duckdb"]
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

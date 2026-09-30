@@ -10,20 +10,34 @@ use crate::material::FeedbackObservation;
 use crate::{
     ActionTemplate, AssignmentConfig, CommandFact, CommandFeedback, CommandTerminalStatus,
     CompileError, CompletedBarRequirement, ConfiguredActionKind, ConfiguredStrategyRequirements,
-    DecisionKind, DecisionTemplate, EvaluationError, Expr, FeedbackField, MaterialConfig,
-    MaterialEvalContext, MaterialEvaluator, MaterialLibrary, MaterialLookback, MaterialParams,
-    MaterialUpdateTrigger, NamedExpr, NamedInputRequirement, NoteKind, NoteTemplate, ScalarType,
-    SourceId, StrategyConfig, StrategyInput, TradeSlotState, TransitionConfig, Value, ValueType,
+    DecisionKind, DecisionTemplate, EntryRequirement, EvaluationError, Expr, FeedbackField,
+    MaterialArg, MaterialArgs, MaterialConfig, MaterialEvalContext, MaterialEvaluator,
+    MaterialLibrary, MaterialLookback, MaterialUpdateTrigger, NamedExpr, NamedInputRequirement,
+    NoteKind, NoteTemplate, ParamKind, ScalarType, SourceId, StrategyConfig, StrategyInput,
+    TradeSlotState, TransitionConfig, Value, ValueType,
 };
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
 
 type TypedIndexMap = BTreeMap<String, (usize, ValueType)>;
 type LookbackMap = BTreeMap<SourceId, usize>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputScalar {
+    Bool(bool),
     Integer(i64),
     Number(f64),
     Price(f64),
+    Ratio(f64),
+    Percent(f64),
+    PricePerObservation(f64),
+    PricePerObservationSquared(f64),
+    RatioPerObservation(f64),
+    RatioPerObservationSquared(f64),
+    LogReturn(f64),
+    LogReturnVariance(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +95,7 @@ impl StrategyOutput {
 
 struct CompiledMaterial {
     id: String,
+    numeric_descriptor: Option<crate::NumericDescriptor>,
     inputs: Vec<CompiledExpr>,
     input_provenance: Vec<CompiledInputProvenance>,
     evaluator: Box<dyn MaterialEvaluator>,
@@ -129,6 +144,7 @@ enum CompiledAction {
         risk: CompiledExpr,
         stoploss: CompiledExpr,
         targets: Vec<CompiledExpr>,
+        entry_class: Option<String>,
     },
     Close {
         slot: String,
@@ -213,6 +229,7 @@ struct RequirementCollector {
     named_order: Vec<String>,
     named: BTreeMap<String, ValueType>,
     direct_lookbacks: LookbackMap,
+    count_required_sources: BTreeSet<SourceId>,
     needs_feedback: bool,
 }
 
@@ -222,6 +239,7 @@ impl RequirementCollector {
             named_order: Vec::new(),
             named: BTreeMap::new(),
             direct_lookbacks: BTreeMap::new(),
+            count_required_sources: BTreeSet::new(),
             needs_feedback: false,
         }
     }
@@ -284,6 +302,12 @@ impl ConfiguredStrategy {
         primary_symbol: impl Into<String>,
     ) -> Result<Self, CompileError> {
         validate_config_bounds(&config)?;
+        if !config.parameters.is_empty() {
+            return Err(CompileError::InvalidConfig {
+                path: "parameters".into(),
+                reason: "strategy parameters must be bound before compilation".into(),
+            });
+        }
         validate_id_at(&config.strategy_id, "strategy_id")?;
         crate::validate_text(&config.title, crate::MAX_TEXT_BYTES).map_err(|reason| {
             CompileError::InvalidConfig {
@@ -336,6 +360,7 @@ impl ConfiguredStrategy {
             .iter()
             .map(|material| Value::Missing(material.output_type.scalar))
             .collect();
+        let (entries, stop_managed_slots) = collect_action_requirements(&config);
         let requirements = ConfiguredStrategyRequirements {
             completed_bars: config
                 .sources
@@ -350,6 +375,7 @@ impl ConfiguredStrategy {
                         })
                 })
                 .collect(),
+            count_required_sources: collected.count_required_sources.into_iter().collect(),
             named_inputs: collected
                 .named_order
                 .iter()
@@ -360,6 +386,8 @@ impl ConfiguredStrategy {
                 .collect(),
             trade_slots: config.trade_slots.clone(),
             needs_command_feedback: collected.needs_feedback,
+            entries,
+            stop_managed_slots,
         };
         Ok(Self {
             strategy_id: config.strategy_id,
@@ -396,6 +424,26 @@ impl ConfiguredStrategy {
 
     pub fn primary_symbol(&self) -> &str {
         &self.primary_symbol
+    }
+
+    pub fn strategy_id(&self) -> &str {
+        &self.strategy_id
+    }
+
+    /// Instance identity; together with the strategy ID it scopes every generated campaign, trade, and command identifier.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Effective numeric contracts in dependency order, keyed by configured material ID.
+    /// Factories without a descriptor are omitted rather than assigned inferred semantics.
+    pub fn numeric_descriptors(&self) -> impl Iterator<Item = (&str, &crate::NumericDescriptor)> {
+        self.materials.iter().filter_map(|material| {
+            material
+                .numeric_descriptor
+                .as_ref()
+                .map(|descriptor| (material.id.as_str(), descriptor))
+        })
     }
 
     pub fn input_requirements(&self) -> &ConfiguredStrategyRequirements {
@@ -494,6 +542,27 @@ impl ConfiguredStrategy {
                         && !provenance.dynamic
                 })
                 .collect::<Vec<_>>();
+            let any_input_updates = self.materials[index]
+                .input_provenance
+                .iter()
+                .map(|provenance| {
+                    provenance
+                        .material_indexes
+                        .iter()
+                        .any(|dependency| material_updates[*dependency])
+                        || provenance
+                            .sources
+                            .iter()
+                            .any(|source| updated_sources.contains(source))
+                        || provenance.named_inputs.iter().any(|name| {
+                            input
+                                .values
+                                .iter()
+                                .find(|item| item.name == *name)
+                                .is_some_and(|item| item.updated)
+                        })
+                })
+                .collect::<Vec<_>>();
             let triggered = match &self.materials[index].update_trigger {
                 MaterialUpdateTrigger::EveryInput => true,
                 MaterialUpdateTrigger::Source(source) => updated_sources.contains(source),
@@ -503,6 +572,7 @@ impl ConfiguredStrategy {
                 MaterialUpdateTrigger::AllInputs => {
                     !input_updates.is_empty() && input_updates.iter().all(|updated| *updated)
                 }
+                MaterialUpdateTrigger::AnyInput => any_input_updates.iter().any(|updated| *updated),
             };
             if !triggered {
                 if self.materials[index].clear_pulse_when_idle {
@@ -525,6 +595,7 @@ impl ConfiguredStrategy {
             let context = MaterialEvalContext {
                 input,
                 input_updates: &input_updates,
+                any_input_updates: &any_input_updates,
                 feedback: &current_observations,
                 retained_feedback: &retained_observations,
             };
@@ -560,7 +631,7 @@ impl ConfiguredStrategy {
                     selected = Some(transition.clone());
                     break;
                 }
-                Value::Bool(false) => {}
+                Value::Bool(false) | Value::Missing(ScalarType::Bool) => {}
                 value => {
                     return Err(EvaluationError::TypeMismatch {
                         path: "transition.when".into(),
@@ -701,26 +772,6 @@ fn collect_requirements(
                 &mut collector,
             )?;
         }
-        match &material.params {
-            MaterialParams::BarField { source, .. } => {
-                require_source(
-                    sources,
-                    source,
-                    &format!("materials[{index}].params.source"),
-                )?;
-                collector.add_source(source, 1);
-            }
-            MaterialParams::Atr { source, period } => {
-                require_source(
-                    sources,
-                    source,
-                    &format!("materials[{index}].params.source"),
-                )?;
-                collector.add_source(source, usize::from(*period) + 1);
-            }
-            MaterialParams::Feedback { .. } => collector.needs_feedback = true,
-            _ => {}
-        }
     }
     for (state_index, state) in config.states.iter().enumerate() {
         for (transition_index, transition) in state.transitions.iter().enumerate() {
@@ -782,9 +833,12 @@ fn collect_expr_requirements(
 ) -> Result<(), CompileError> {
     match expression {
         Expr::Input { field, value_type } => collector.add_named(field, *value_type, path)?,
-        Expr::Bar { source, .. } => {
+        Expr::Bar { source, field } => {
             require_source(sources, source, path)?;
             collector.add_source(source, 1);
+            if *field == crate::BarField::Volume {
+                collector.count_required_sources.insert(source.clone());
+            }
         }
         Expr::Feedback { .. } => collector.needs_feedback = true,
         Expr::Eq { left, right }
@@ -808,6 +862,7 @@ fn collect_expr_requirements(
             }
         }
         Expr::Not { value }
+        | Expr::Strict { value }
         | Expr::Abs { value }
         | Expr::IsPresent { value }
         | Expr::IsMissing { value } => {
@@ -816,6 +871,37 @@ fn collect_expr_requirements(
         _ => {}
     }
     Ok(())
+}
+
+fn collect_action_requirements(config: &StrategyConfig) -> (Vec<EntryRequirement>, Vec<String>) {
+    let mut entries = BTreeSet::new();
+    let mut stop_managed_slots = BTreeSet::new();
+    for action in config
+        .states
+        .iter()
+        .flat_map(|state| &state.transitions)
+        .flat_map(|transition| &transition.actions)
+    {
+        match action {
+            ActionTemplate::Entry {
+                slot, entry_class, ..
+            } => {
+                entries.insert(EntryRequirement {
+                    slot: slot.clone(),
+                    entry_class: entry_class.clone(),
+                });
+            }
+            ActionTemplate::ModifyStoploss { slot, .. }
+            | ActionTemplate::MoveStoplossToEntry { slot } => {
+                stop_managed_slots.insert(slot.clone());
+            }
+            _ => {}
+        }
+    }
+    (
+        entries.into_iter().collect(),
+        stop_managed_slots.into_iter().collect(),
+    )
 }
 
 fn action_expressions(action: &ActionTemplate) -> Vec<&Expr> {
@@ -940,7 +1026,14 @@ fn compile_materials(
     let mut aggregate = BTreeMap::new();
     for original in order {
         let material = &configs[original];
-        validate_material_params(&material.params, trade_slots, sources, original)?;
+        let factory = library.factory(&material.key).unwrap();
+        validate_material_args(
+            &material.params,
+            factory.params(),
+            trade_slots,
+            sources,
+            original,
+        )?;
         let scope = ExprScope {
             variables,
             materials: &map,
@@ -958,29 +1051,43 @@ fn compile_materials(
             inputs.push(compiled_input);
             input_types.push(value_type);
         }
+        let mut numeric_descriptor = factory
+            .numeric_descriptor(&material.params, &input_types)
+            .map_err(|reason| CompileError::MaterialFactory {
+                path: format!("materials[{original}].descriptor"),
+                reason,
+            })?;
+        if let Some(descriptor) = &numeric_descriptor {
+            descriptor
+                .validate(&input_types)
+                .map_err(|reason| CompileError::MaterialFactory {
+                    path: format!("materials[{original}].descriptor"),
+                    reason,
+                })?;
+            let source = &descriptor.source_clock;
+            require_source(
+                sources,
+                source,
+                &format!("materials[{original}].descriptor.source_clock"),
+            )?;
+            if matches!(
+                descriptor.calculation,
+                crate::NumericCalculation::ObservedSma { .. }
+                    | crate::NumericCalculation::SmaSeededEma { .. }
+            ) && !matches!(inputs.as_slice(), [CompiledExpr::Bar(input_source, _)] if input_source == source)
+                && !matches!(inputs.as_slice(), [CompiledExpr::Input(_, _)])
+            {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("materials[{original}].inputs"),
+                    reason: "source-clocked scalar calculation requires direct clock bar data or a typed named input".into(),
+                });
+            }
+        }
         let provenance = inputs
             .iter()
             .map(CompiledExpr::provenance)
             .collect::<Vec<_>>();
-        if matches!(
-            material.key.as_str(),
-            crate::MATERIAL_CROSS_ABOVE | crate::MATERIAL_CROSS_BELOW
-        ) && inputs
-            .iter()
-            .any(|input| input.direct_material_index().is_none())
-        {
-            return Err(CompileError::InvalidConfig {
-                path: format!("materials[{original}].inputs"),
-                reason: "crossing inputs must be direct material references".into(),
-            });
-        }
-        if library.is_custom(&material.key) && !matches!(&material.params, MaterialParams::None) {
-            return Err(CompileError::InvalidConfig {
-                path: format!("materials[{original}].params"),
-                reason: "custom material factories are parameterless".into(),
-            });
-        }
-        let factory = library.factory(&material.key).unwrap();
+
         let trigger = factory
             .update_trigger(&material.params, &input_types)
             .map_err(|reason| CompileError::MaterialFactory {
@@ -988,6 +1095,14 @@ fn compile_materials(
                 reason,
             })?;
         validate_trigger(&trigger, &provenance, original)?;
+        if let Some(descriptor) = &numeric_descriptor
+            && !matches!(&trigger, MaterialUpdateTrigger::Source(source) if source == &descriptor.source_clock)
+        {
+            return Err(CompileError::InvalidConfig {
+                path: format!("materials[{original}].descriptor"),
+                reason: "numeric descriptor disagrees with the factory source trigger".into(),
+            });
+        }
         let build = factory
             .build(&material.params, &input_types)
             .map_err(|reason| CompileError::MaterialFactory {
@@ -1000,6 +1115,11 @@ fn compile_materials(
             crate::MAX_MATERIAL_STATE_BYTES,
         )?;
         let mut upstream = LookbackMap::new();
+        if let Some(descriptor) = &numeric_descriptor
+            && matches!(descriptor.inputs, crate::NumericInputs::Scalar(_))
+        {
+            merge_lookback(&mut upstream, descriptor.source_clock.clone(), 1);
+        }
         for item in &provenance {
             for source in &item.sources {
                 merge_lookback(&mut upstream, source.clone(), 1);
@@ -1009,11 +1129,26 @@ fn compile_materials(
             }
         }
         let lookbacks = apply_lookback_contract(build.lookback, upstream, original, sources)?;
+        if let Some(descriptor) = &mut numeric_descriptor {
+            let actual_lookback = lookbacks.get(&descriptor.source_clock).copied();
+            if build.output_type != descriptor.output_type
+                || build.max_state_bytes > descriptor.max_state_bytes
+                || lookbacks.len() != 1
+                || actual_lookback.is_none_or(|actual| actual < descriptor.required_lookback)
+            {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("materials[{original}].descriptor"),
+                    reason: "numeric descriptor disagrees with the factory output, state bound, or effective lookback".into(),
+                });
+            }
+            descriptor.required_lookback = actual_lookback.unwrap();
+        }
         merge_lookbacks(&mut aggregate, &lookbacks);
         let index = compiled.len();
         map.insert(material.id.clone(), (index, build.output_type));
         compiled.push(CompiledMaterial {
             id: material.id.clone(),
+            numeric_descriptor,
             inputs,
             input_provenance: provenance,
             evaluator: build.evaluator,
@@ -1034,17 +1169,26 @@ fn validate_trigger(
     provenance: &[CompiledInputProvenance],
     index: usize,
 ) -> Result<(), CompileError> {
-    if matches!(trigger, MaterialUpdateTrigger::AllInputs) {
-        if provenance.is_empty() {
+    if matches!(
+        trigger,
+        MaterialUpdateTrigger::AllInputs | MaterialUpdateTrigger::AnyInput
+    ) {
+        if provenance.is_empty()
+            || !provenance.iter().any(|item| {
+                !item.material_indexes.is_empty()
+                    || !item.sources.is_empty()
+                    || !item.named_inputs.is_empty()
+            })
+        {
             return Err(CompileError::InvalidConfig {
                 path: format!("materials[{index}].update_trigger"),
-                reason: "AllInputs requires at least one input".into(),
+                reason: "input-driven material requires at least one causal input leaf".into(),
             });
         }
         if provenance.iter().any(|item| item.dynamic) {
             return Err(CompileError::InvalidConfig {
                 path: format!("materials[{index}].update_trigger"),
-                reason: "AllInputs cannot use dynamic position, feedback, time, readiness, or variable dependencies".into(),
+                reason: "input-driven material cannot use dynamic position, feedback, time, readiness, or variable dependencies".into(),
             });
         }
     }
@@ -1099,36 +1243,81 @@ fn apply_lookback_contract(
                             .into(),
                 });
             }
-            for value in upstream.values_mut() {
-                *value = (*value).max(minimum);
+            if minimum > 0 {
+                for value in upstream.values_mut() {
+                    *value = value.checked_add(minimum - 1).ok_or_else(|| {
+                        CompileError::InvalidConfig {
+                            path: format!("materials[{index}].lookback"),
+                            reason: "composed material lookback overflowed".into(),
+                        }
+                    })?;
+                    check_bound(
+                        &format!("materials[{index}].lookback"),
+                        *value,
+                        crate::MAX_MATERIAL_LOOKBACK,
+                    )?;
+                }
             }
         }
     }
     Ok(upstream)
 }
 
-fn validate_material_params(
-    params: &MaterialParams,
+fn validate_material_args(
+    args: &MaterialArgs,
+    schema: &[crate::ParamSpec],
     trade_slots: &BTreeSet<String>,
     sources: &BTreeSet<SourceId>,
     index: usize,
 ) -> Result<(), CompileError> {
-    match params {
-        MaterialParams::BarField { source, .. } | MaterialParams::Atr { source, .. } => {
-            require_source(
-                sources,
-                source,
-                &format!("materials[{index}].params.source"),
-            )?;
+    let path = format!("materials[{index}].params");
+    check_bound(&path, args.len(), crate::MAX_MATERIAL_ARGS)?;
+    for (name, value) in args.iter() {
+        let Some(spec) = schema.iter().find(|spec| spec.name == name) else {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{name}"),
+                reason: "material argument is not declared by the factory".into(),
+            });
+        };
+        let valid = match (spec.kind, value) {
+            (ParamKind::Integer { min, max }, MaterialArg::Integer(value)) => {
+                *value >= min && *value <= max
+            }
+            (ParamKind::Number { min, max }, MaterialArg::Number(value)) => {
+                value.is_finite() && *value >= min && *value <= max
+            }
+            (ParamKind::Source, MaterialArg::Source(source)) => {
+                require_source(sources, source, &format!("{path}.{name}"))?;
+                true
+            }
+            (ParamKind::Slot, MaterialArg::Slot(slot)) => {
+                require_trade_slot(trade_slots, slot, &format!("{path}.{name}"))?;
+                true
+            }
+            (ParamKind::BarField, MaterialArg::BarField(_))
+            | (ParamKind::ActionKind, MaterialArg::ActionKind(_)) => true,
+            (_, MaterialArg::Param(_)) => {
+                return Err(CompileError::InvalidConfig {
+                    path: format!("{path}.{name}"),
+                    reason: "material parameter reference must be bound before compilation".into(),
+                });
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{name}"),
+                reason: "material argument does not match the factory schema or bounds".into(),
+            });
         }
-        MaterialParams::Position { slot } | MaterialParams::Feedback { slot, .. } => {
-            require_trade_slot(
-                trade_slots,
-                slot,
-                &format!("materials[{index}].params.slot"),
-            )?;
+    }
+    for spec in schema {
+        if spec.required && args.get(spec.name).is_none() {
+            return Err(CompileError::InvalidConfig {
+                path: format!("{path}.{}", spec.name),
+                reason: "required material argument is missing".into(),
+            });
         }
-        _ => {}
     }
     Ok(())
 }
@@ -1212,7 +1401,11 @@ fn compile_transition(
     let (when, when_type) = compile_expr(&config.when, scope, &format!("{path}.when"))?;
     require_type(
         when_type,
-        ValueType::required(ScalarType::Bool),
+        if matches!(config.when, Expr::Strict { .. }) {
+            ValueType::optional(ScalarType::Bool)
+        } else {
+            ValueType::required(ScalarType::Bool)
+        },
         &format!("{path}.when"),
     )?;
     let assignments = config
@@ -1298,15 +1491,24 @@ fn compile_named(
             }
             let (value, value_type) =
                 compile_expr(&item.value, scope, &format!("{path}[{index}].value"))?;
-            if value_type.optional
-                || !matches!(
-                    value_type.scalar,
-                    ScalarType::Integer | ScalarType::Number | ScalarType::Price
-                )
-            {
+            if !matches!(
+                value_type.scalar,
+                ScalarType::Bool
+                    | ScalarType::Integer
+                    | ScalarType::Number
+                    | ScalarType::Price
+                    | ScalarType::Ratio
+                    | ScalarType::Percent
+                    | ScalarType::PricePerObservation
+                    | ScalarType::PricePerObservationSquared
+                    | ScalarType::RatioPerObservation
+                    | ScalarType::RatioPerObservationSquared
+                    | ScalarType::LogReturn
+                    | ScalarType::LogReturnVariance
+            ) {
                 return Err(CompileError::InvalidConfig {
                     path: format!("{path}[{index}].value"),
-                    reason: "output values must be required Integer, Number, or Price".into(),
+                    reason: "output values must be numeric".into(),
                 });
             }
             Ok(CompiledNamedExpr {
@@ -1401,8 +1603,17 @@ fn compile_action(
             risk,
             stoploss,
             targets,
+            entry_class,
         } => {
             require_trade_slot(scope.trade_slots, slot, &format!("{path}.slot"))?;
+            if let Some(entry_class) = entry_class {
+                qs_core::validate_entry_class(entry_class).map_err(|error| {
+                    CompileError::InvalidIdentifier {
+                        path: format!("{path}.entry_class"),
+                        reason: error.to_string(),
+                    }
+                })?;
+            }
             let targets = targets
                 .iter()
                 .enumerate()
@@ -1418,6 +1629,7 @@ fn compile_action(
                 risk: required(risk, ScalarType::Number, "risk")?,
                 stoploss: optional(stoploss, ScalarType::Price, "stoploss")?,
                 targets,
+                entry_class: entry_class.clone(),
             }
         }
         ActionTemplate::Close { slot } => {
@@ -1467,6 +1679,7 @@ fn lower_action(
             risk,
             stoploss,
             targets,
+            entry_class,
         } => {
             if identity.slots.iter().any(|item| item.slot == *slot) {
                 return Err(EvaluationError::InvalidAction {
@@ -1528,7 +1741,7 @@ fn lower_action(
                     targets,
                     group: identity.campaign_id.clone(),
                     trade_id: Some(trade_id),
-                    entry_class: None,
+                    entry_class: entry_class.clone(),
                 },
                 slot.clone(),
             )
@@ -1675,15 +1888,16 @@ fn process_feedback(
 
         let completed = command_completed(&identity.commands[index]);
         if completed {
-            let successful =
-                identity.commands[index].terminal == Some(CommandTerminalStatus::Applied);
-            let release_slot = if successful {
-                matches!(
-                    binding.action,
-                    ConfiguredActionKind::Close | ConfiguredActionKind::CancelPending
-                )
-            } else {
-                binding.action == ConfiguredActionKind::Entry
+            let terminal = identity.commands[index].terminal;
+            let successful = terminal == Some(CommandTerminalStatus::Applied);
+            let release_slot = match binding.action {
+                // A close or cancellation that was skipped had nothing left to act on, which means the slot's position or order is already gone. Treating that as still reserved would strand the slot for the rest of the run, so a strategy whose protective stop fired could never trade again.
+                ConfiguredActionKind::Close | ConfiguredActionKind::CancelPending => {
+                    successful || terminal == Some(CommandTerminalStatus::Skipped)
+                }
+                // A failed entry never reserved anything the strategy can act on.
+                ConfiguredActionKind::Entry => !successful,
+                _ => false,
             };
             if release_slot {
                 release_trade_slot(identity, &binding.slot);
@@ -1857,11 +2071,30 @@ fn evaluate_outputs(
         .map(|item| {
             let value = item.value.eval(scope, "output.value")?;
             let value = match value {
+                Value::Bool(value) => OutputScalar::Bool(value),
                 Value::Integer(value) if value.unsigned_abs() <= (1_u64 << 53) => {
                     OutputScalar::Integer(value)
                 }
                 Value::Number(value) if value.is_finite() => OutputScalar::Number(value),
                 Value::Price(value) if value.is_finite() => OutputScalar::Price(value),
+                Value::Ratio(value) if value.is_finite() => OutputScalar::Ratio(value),
+                Value::Percent(value) if value.is_finite() => OutputScalar::Percent(value),
+                Value::PricePerObservation(value) if value.is_finite() => {
+                    OutputScalar::PricePerObservation(value)
+                }
+                Value::PricePerObservationSquared(value) if value.is_finite() => {
+                    OutputScalar::PricePerObservationSquared(value)
+                }
+                Value::RatioPerObservation(value) if value.is_finite() => {
+                    OutputScalar::RatioPerObservation(value)
+                }
+                Value::RatioPerObservationSquared(value) if value.is_finite() => {
+                    OutputScalar::RatioPerObservationSquared(value)
+                }
+                Value::LogReturn(value) if value.is_finite() => OutputScalar::LogReturn(value),
+                Value::LogReturnVariance(value) if value.is_finite() => {
+                    OutputScalar::LogReturnVariance(value)
+                }
                 Value::Integer(_) => {
                     return Err(EvaluationError::InvalidAction {
                         path: "output.value".into(),
@@ -1978,7 +2211,7 @@ fn validate_input(
                 reason: format!("duplicate trade slot {}", facts.slot),
             });
         }
-        validate_trade_slot_state(&facts.state)?;
+        validate_trade_slot_state(&facts.state, input.time)?;
     }
     for slot in &requirements.trade_slots {
         if !input.trade_slots.iter().any(|item| item.slot == *slot) {
@@ -1991,14 +2224,16 @@ fn validate_input(
 }
 
 fn validate_bar(bar: &crate::CompletedBar) -> Result<(), EvaluationError> {
-    if ![bar.open, bar.high, bar.low, bar.close, bar.volume]
+    if ![bar.open, bar.high, bar.low, bar.close]
         .into_iter()
         .all(f64::is_finite)
+        || bar
+            .volume
+            .is_some_and(|volume| !volume.is_finite() || volume < 0.0)
         || bar.open <= 0.0
         || bar.high <= 0.0
         || bar.low <= 0.0
         || bar.close <= 0.0
-        || bar.volume < 0.0
         || bar.high < bar.low
         || bar.high < bar.open.max(bar.close)
         || bar.low > bar.open.min(bar.close)
@@ -2011,7 +2246,10 @@ fn validate_bar(bar: &crate::CompletedBar) -> Result<(), EvaluationError> {
     Ok(())
 }
 
-fn validate_trade_slot_state(state: &TradeSlotState) -> Result<(), EvaluationError> {
+fn validate_trade_slot_state(
+    state: &TradeSlotState,
+    input_time: chrono::NaiveDateTime,
+) -> Result<(), EvaluationError> {
     let positive = |value: f64| value.is_finite() && value > 0.0;
     match state {
         TradeSlotState::Vacant => Ok(()),
@@ -2041,11 +2279,19 @@ fn validate_trade_slot_state(state: &TradeSlotState) -> Result<(), EvaluationErr
             entry_price,
             remaining_size,
             stoploss,
+            opened_at,
+            favorable_excursion,
+            adverse_excursion,
+            initial_risk,
             ..
         } => {
             if !positive(*entry_price)
                 || !positive(*remaining_size)
                 || stoploss.is_some_and(|value| !positive(value))
+                || *opened_at > input_time
+                || favorable_excursion.is_some_and(|value| !value.is_finite() || value < 0.0)
+                || adverse_excursion.is_some_and(|value| !value.is_finite() || value > 0.0)
+                || initial_risk.is_some_and(|value| !positive(value))
             {
                 Err(EvaluationError::Material {
                     material: "trade_slots".into(),
@@ -2092,6 +2338,7 @@ fn validate_reachable(states: &[CompiledState], initial: usize) -> Result<(), Co
 }
 
 fn validate_config_bounds(config: &StrategyConfig) -> Result<(), CompileError> {
+    check_bound("parameters", config.parameters.len(), crate::MAX_PARAMETERS)?;
     check_bound("sources", config.sources.len(), crate::MAX_SOURCES)?;
     check_bound("trade_slots", config.trade_slots.len(), crate::MAX_LEGS)?;
     check_bound("materials", config.materials.len(), crate::MAX_MATERIALS)?;
@@ -2102,6 +2349,11 @@ fn validate_config_bounds(config: &StrategyConfig) -> Result<(), CompileError> {
             &format!("materials[{index}].inputs"),
             material.inputs.len(),
             crate::MAX_MATERIAL_INPUTS,
+        )?;
+        check_bound(
+            &format!("materials[{index}].params"),
+            material.params.len(),
+            crate::MAX_MATERIAL_ARGS,
         )?;
     }
     for (state_index, state) in config.states.iter().enumerate() {
@@ -2247,7 +2499,18 @@ fn ensure_runtime_type(
         });
     }
     match value {
-        Value::Number(value) | Value::Price(value) if !value.is_finite() => {
+        Value::Number(value)
+        | Value::Price(value)
+        | Value::Ratio(value)
+        | Value::Percent(value)
+        | Value::PricePerObservation(value)
+        | Value::PricePerObservationSquared(value)
+        | Value::RatioPerObservation(value)
+        | Value::RatioPerObservationSquared(value)
+        | Value::LogReturn(value)
+        | Value::LogReturnVariance(value)
+            if !value.is_finite() =>
+        {
             Err(EvaluationError::NonFinite { path: path.into() })
         }
         Value::Text(value) => {

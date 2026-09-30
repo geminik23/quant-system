@@ -32,6 +32,36 @@ impl Drop for TempJsonl {
     }
 }
 
+struct TempToml {
+    path: PathBuf,
+}
+
+impl TempToml {
+    fn new(label: &str, contents: &str) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tg_backtest_cli_{label}_{}_{}.toml",
+            std::process::id(),
+            unique
+        ));
+        std::fs::write(&path, contents).unwrap();
+        Self { path }
+    }
+
+    fn as_str(&self) -> &str {
+        self.path.to_str().unwrap()
+    }
+}
+
+impl Drop for TempToml {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn run_tg_backtest(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tg_backtest"))
         .args(args)
@@ -384,5 +414,88 @@ fn invalid_mtm_output_combinations_fail_before_loading_input() {
     assert!(
         !full_inline_stderr.contains("No such file"),
         "validation should run before loading input: {full_inline_stderr}"
+    );
+}
+
+/// One entry signal, used by cases that only need the cost file to be reached.
+const ONE_ENTRY: &str = r#"{"action":"Entry","ts":"2026-01-15T10:00:00","symbol":"EURUSD","side":"Buy","order_type":"Market","price":null,"risk":1.0,"stoploss":null,"targets":[],"group":null,"trade_id":null}
+"#;
+
+fn run_with_costs(label: &str, costs: &str) -> Output {
+    let signals = TempJsonl::new(label, ONE_ENTRY);
+    let costs = TempToml::new(label, costs);
+    run_tg_backtest(&[
+        "--input",
+        signals.as_str(),
+        "--exchange",
+        "fixture",
+        "--symbol",
+        "EURUSD",
+        "--base-lot",
+        "0.1",
+        "--account-currency",
+        "USD",
+        "--costs-file",
+        costs.as_str(),
+        "--endpoint",
+        "shm://tg-backtest-cost-file-test",
+    ])
+}
+
+#[test]
+fn a_malformed_cost_file_is_rejected_before_connecting() {
+    let output = run_with_costs("bad_costs", "this is not toml\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("shm://"),
+        "the cost file must be rejected before any transport work: {stderr}"
+    );
+}
+
+#[test]
+fn a_cost_file_with_an_unknown_field_is_rejected() {
+    let output = run_with_costs(
+        "unknown_cost_field",
+        r#"[EURUSD]
+commission = { type = "PerLotPerSide", amount = 3.5, currency = "USD" }
+unexpected = true
+"#,
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn a_cost_entry_must_declare_commission_or_swap() {
+    let output = run_with_costs("empty_cost_entry", "[EURUSD]\n");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("declare neither commission nor swap"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_well_formed_cost_file_passes_argument_validation() {
+    let output = run_with_costs(
+        "good_costs",
+        r#"[EURUSD]
+commission = { type = "PerLotPerSide", amount = 3.5, currency = "USD" }
+swap = { amount = { unit = "Points", long = -6.1, short = 1.9 }, rollover = "22:00:00", triple_weekday = "Wed" }
+
+[BTCUSD]
+commission = { type = "NotionalRatePerSide", buy_rate = 0.005, sell_rate = 0.005 }
+"#,
+    );
+    // No server is running, so the run still fails, but it must fail on transport rather than on the cost file.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("declare neither commission nor swap"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_ascii_lowercase().contains("toml"),
+        "a valid cost file must not produce a parse error: {stderr}"
     );
 }

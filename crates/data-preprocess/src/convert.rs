@@ -4,7 +4,7 @@ use chrono::NaiveDateTime;
 use polars::prelude::*;
 
 use crate::error::Result;
-use crate::models::{Bar, Tick, Timeframe};
+use crate::models::{Bar, PriceBar, StoredTick, Tick, Timeframe};
 
 /// Convert a slice of Ticks into a Polars DataFrame.
 pub fn ticks_to_dataframe(ticks: &[Tick]) -> Result<DataFrame> {
@@ -66,6 +66,62 @@ pub fn dataframe_to_ticks(df: &DataFrame) -> Result<Vec<Tick>> {
         });
     }
     Ok(ticks)
+}
+
+pub fn stored_ticks_to_dataframe(ticks: &[StoredTick]) -> Result<DataFrame> {
+    for tick in ticks {
+        tick.validate()?;
+    }
+    let plain = ticks
+        .iter()
+        .map(|value| value.tick.clone())
+        .collect::<Vec<_>>();
+    let mut frame = ticks_to_dataframe(&plain)?;
+    frame.with_column(Column::new(
+        "source_ordinal".into(),
+        ticks
+            .iter()
+            .map(|value| value.source_ordinal)
+            .collect::<Vec<_>>(),
+    ))?;
+    frame.with_column(Column::new(
+        "source_identity".into(),
+        ticks
+            .iter()
+            .map(|value| value.source_identity.as_deref())
+            .collect::<Vec<_>>(),
+    ))?;
+    frame.with_column(Column::new(
+        "provider_sequence".into(),
+        ticks
+            .iter()
+            .map(|value| value.provider_sequence)
+            .collect::<Vec<_>>(),
+    ))?;
+    Ok(frame)
+}
+
+pub fn dataframe_to_stored_ticks(df: &DataFrame) -> Result<Vec<StoredTick>> {
+    let ticks = dataframe_to_ticks(df)?;
+    let ordinals = df.column("source_ordinal")?.u64()?;
+    let identities = df.column("source_identity")?.str()?;
+    let sequences = df.column("provider_sequence")?.u64()?;
+    ticks
+        .into_iter()
+        .enumerate()
+        .map(|(index, tick)| {
+            let value = StoredTick {
+                tick,
+                source_ordinal: ordinals
+                    .get(index)
+                    .ok_or_else(|| crate::DataError::Other("stored tick ordinal is null".into()))?,
+                source_identity: identities.get(index).map(str::to_owned),
+                provider_sequence: sequences.get(index),
+            };
+            value.validate()?;
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Convert a slice of Bars into a Polars DataFrame.
@@ -142,6 +198,110 @@ pub fn dataframe_to_bars(df: &DataFrame) -> Result<Vec<Bar>> {
         });
     }
     Ok(bars)
+}
+
+pub fn price_bars_to_dataframe(bars: &[PriceBar]) -> Result<DataFrame> {
+    for bar in bars {
+        bar.validate()?;
+    }
+    let timestamps = bars
+        .iter()
+        .map(|bar| bar.ts.and_utc().timestamp_micros())
+        .collect::<Vec<_>>();
+    let available = bars
+        .iter()
+        .map(|bar| bar.available_at.and_utc().timestamp_micros())
+        .collect::<Vec<_>>();
+    Ok(DataFrame::new(vec![
+        Column::new(
+            "exchange".into(),
+            bars.iter()
+                .map(|bar| bar.exchange.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "symbol".into(),
+            bars.iter()
+                .map(|bar| bar.symbol.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "timeframe".into(),
+            bars.iter()
+                .map(|bar| bar.timeframe.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new("ts".into(), &timestamps)
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?,
+        Column::new("available_at".into(), &available)
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?,
+        Column::new(
+            "open".into(),
+            bars.iter().map(|bar| bar.open).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "high".into(),
+            bars.iter().map(|bar| bar.high).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "low".into(),
+            bars.iter().map(|bar| bar.low).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "close".into(),
+            bars.iter().map(|bar| bar.close).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "tick_count".into(),
+            bars.iter().map(|bar| bar.tick_count).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "spread".into(),
+            bars.iter().map(|bar| bar.spread).collect::<Vec<_>>(),
+        ),
+    ])?)
+}
+
+pub fn dataframe_to_price_bars(df: &DataFrame) -> Result<Vec<PriceBar>> {
+    if df.column("tick_vol").is_ok() {
+        return Err(crate::DataError::Other(
+            "price-only frame conflicts with legacy tick_vol".into(),
+        ));
+    }
+    let exchanges = df.column("exchange")?.str()?;
+    let symbols = df.column("symbol")?.str()?;
+    let timeframes = df.column("timeframe")?.str()?;
+    let timestamps = df.column("ts")?.datetime()?;
+    let available = df.column("available_at")?.datetime()?;
+    let opens = df.column("open")?.f64()?;
+    let highs = df.column("high")?.f64()?;
+    let lows = df.column("low")?.f64()?;
+    let closes = df.column("close")?.f64()?;
+    let counts = df.column("tick_count")?.u64()?;
+    let spreads = df.column("spread")?.i32()?;
+    (0..df.height())
+        .map(|index| {
+            let value = PriceBar {
+                exchange: exchanges.get(index).unwrap_or("").into(),
+                symbol: symbols.get(index).unwrap_or("").into(),
+                timeframe: Timeframe::parse(timeframes.get(index).unwrap_or("1m"))?,
+                ts: micros_to_ndt(timestamps.get(index).ok_or_else(|| {
+                    crate::DataError::InvalidTimestamp("null price bar timestamp".into())
+                })?),
+                available_at: micros_to_ndt(available.get(index).ok_or_else(|| {
+                    crate::DataError::InvalidTimestamp("null availability timestamp".into())
+                })?),
+                open: opens.get(index).unwrap_or(0.0),
+                high: highs.get(index).unwrap_or(0.0),
+                low: lows.get(index).unwrap_or(0.0),
+                close: closes.get(index).unwrap_or(0.0),
+                tick_count: counts.get(index),
+                spread: spreads.get(index),
+            };
+            value.validate()?;
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Convert microsecond epoch to NaiveDateTime.

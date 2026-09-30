@@ -39,6 +39,17 @@ pub enum MarketEvent {
         low: f64,
         close: f64,
         volume: i64,
+        /// Symmetric bid/ask spread in price units observed while the bar formed.
+        ///
+        /// `None` means the spread is unknown, which keeps the historical zero-spread approximation for feeds that cannot supply it.
+        #[serde(default)]
+        spread: Option<f64>,
+        /// Length of the bar's bucket in seconds when the source knows it; a strategy series accepts a stored bar only when this matches its timeframe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeframe_seconds: Option<u64>,
+        /// Number of ticks the bar aggregated when the source recorded it, which a strategy series reports as the bar's tick count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick_count: Option<u64>,
     },
 }
 
@@ -61,11 +72,15 @@ impl MarketEvent {
 
     /// Convert the event into a [`PriceQuote`] suitable for the trade engine.
     ///
-    /// - For ticks this is straightforward (bid/ask).
-    /// - For bars the close price is used for both bid and ask (zero spread
-    ///   approximation).  A more sophisticated feed could model the spread
-    ///   separately.
+    /// A tick carries its own two-sided quote. A bar yields its closing quote, with its recorded spread applied symmetrically around the close; FutureQuote replay executes a bar through [`MarketEvent::bar_execution_prices`] instead, over its open, range, and close. A bar without a recorded spread keeps the zero-spread approximation; use [`MarketEvent::to_quote_with_spread_fallback`] to supply one.
     pub fn to_quote(&self) -> PriceQuote {
+        self.to_quote_with_spread_fallback(None)
+    }
+
+    /// Convert the event into a [`PriceQuote`], applying `fallback` when a bar has no recorded spread.
+    ///
+    /// `fallback` is expressed in price units and applied symmetrically around the bar close. It is ignored for ticks and for bars that already carry a spread.
+    pub fn to_quote_with_spread_fallback(&self, fallback: Option<f64>) -> PriceQuote {
         match self {
             MarketEvent::Tick {
                 symbol,
@@ -79,14 +94,63 @@ impl MarketEvent {
                 ask: *ask,
             },
             MarketEvent::Bar {
-                symbol, ts, close, ..
-            } => PriceQuote {
+                symbol,
+                ts,
+                close,
+                spread,
+                ..
+            } => {
+                let half = spread
+                    .or(fallback)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map_or(0.0, |value| value / 2.0);
+                PriceQuote {
+                    symbol: symbol.clone(),
+                    ts: *ts,
+                    bid: *close - half,
+                    ask: *close + half,
+                }
+            }
+        }
+    }
+
+    /// The execution view of a bar: its prices and half of the spread applied around each of them, using `fallback` when the bar records no spread. `None` for a tick.
+    pub fn bar_execution_prices(&self, fallback: Option<f64>) -> Option<BarExecutionPrices> {
+        match self {
+            MarketEvent::Tick { .. } => None,
+            MarketEvent::Bar {
+                symbol,
+                ts,
+                open,
+                high,
+                low,
+                close,
+                spread,
+                timeframe_seconds,
+                ..
+            } => Some(BarExecutionPrices {
                 symbol: symbol.clone(),
                 ts: *ts,
-                bid: *close,
-                ask: *close,
-            },
+                open: *open,
+                high: *high,
+                low: *low,
+                close: *close,
+                half_spread: spread
+                    .or(fallback)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map_or(0.0, |value| value / 2.0),
+                timeframe_seconds: *timeframe_seconds,
+            }),
         }
+    }
+
+    /// Whether this event is a bar that carries no usable spread.
+    pub fn is_zero_spread_bar(&self) -> bool {
+        matches!(
+            self,
+            MarketEvent::Bar { spread, .. }
+                if !spread.is_some_and(|value| value.is_finite() && value > 0.0)
+        )
     }
 
     /// Convert this event into a quote only when its executable bid/ask view is
@@ -94,6 +158,56 @@ impl MarketEvent {
     pub fn to_valid_quote(&self) -> Option<PriceQuote> {
         let quote = self.to_quote();
         ExecutionPricer::validate_quote(&quote).ok().map(|()| quote)
+    }
+}
+
+/// Prices a FutureQuote replay executes a bar against, read as midpoints with a symmetric half spread.
+///
+/// A bar is replayed in three steps stamped at its bucket open: a quote at `open`, a walk through the bar's range, and a quote at `close` used only for marking. The walk visits the adverse extreme first for each side, so long exposure sees `low` before `high` and short exposure sees `high` before `low`, which is the pessimistic order when the bar alone cannot say which came first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarExecutionPrices {
+    pub symbol: String,
+    pub ts: NaiveDateTime,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub half_spread: f64,
+    pub timeframe_seconds: Option<u64>,
+}
+
+impl BarExecutionPrices {
+    /// The bar ready for execution, or `None` when a price is not finite or a quote at its lowest price would not be positive.
+    ///
+    /// A range that does not contain the open and close is widened to contain them, because the bar did trade at both.
+    pub fn executable(mut self) -> Option<Self> {
+        let prices = [self.open, self.high, self.low, self.close, self.half_spread];
+        if prices.iter().any(|price| !price.is_finite()) {
+            return None;
+        }
+        self.high = self.high.max(self.open).max(self.close);
+        self.low = self.low.min(self.open).min(self.close);
+        (self.low - self.half_spread > 0.0).then_some(self)
+    }
+
+    /// Quote whose midpoint is `mid`, with the bar's spread.
+    pub fn quote_at_mid(&self, mid: f64) -> PriceQuote {
+        PriceQuote {
+            symbol: self.symbol.clone(),
+            ts: self.ts,
+            bid: mid - self.half_spread,
+            ask: mid + self.half_spread,
+        }
+    }
+
+    /// Quote at the bar's open, where fills waiting for the bar execute.
+    pub fn open_quote(&self) -> PriceQuote {
+        self.quote_at_mid(self.open)
+    }
+
+    /// Quote at the bar's close, which marks positions after the bar settled.
+    pub fn close_quote(&self) -> PriceQuote {
+        self.quote_at_mid(self.close)
     }
 }
 
@@ -126,6 +240,9 @@ pub struct EventMetadata {
     pub series_rank: u32,
     /// Physical source-row ordinal when supplied by a streaming source, otherwise the emitted event ordinal.
     pub row_sequence: u64,
+    /// Actual instant at which a stored sample became observable when it differs from its sample timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<NaiveDateTime>,
 }
 
 impl EventMetadata {
@@ -134,7 +251,13 @@ impl EventMetadata {
             roles,
             series_rank,
             row_sequence,
+            available_at: None,
         }
+    }
+
+    pub const fn with_available_at(mut self, available_at: NaiveDateTime) -> Self {
+        self.available_at = Some(available_at);
+        self
     }
 }
 
@@ -150,10 +273,23 @@ impl FeedEvent {
         Self { event, metadata }
     }
 
+    pub fn retained_bytes_upper_bound(&self) -> usize {
+        let symbol_capacity = match &self.event {
+            MarketEvent::Tick { symbol, .. } | MarketEvent::Bar { symbol, .. } => symbol.capacity(),
+        };
+        std::mem::size_of::<Self>().saturating_add(symbol_capacity)
+    }
+
+    pub fn available_at(&self) -> NaiveDateTime {
+        self.metadata
+            .available_at
+            .unwrap_or_else(|| self.event.ts())
+    }
+
     /// Ordering key used by deterministic feeds.
     pub fn ordering_key(&self) -> (NaiveDateTime, u32, u64) {
         (
-            self.event.ts(),
+            self.available_at(),
             self.metadata.series_rank,
             self.metadata.row_sequence,
         )
@@ -165,6 +301,7 @@ impl FeedEvent {
 pub struct SequencedMarketEvent {
     pub event: MarketEvent,
     pub source_row_ordinal: u64,
+    pub available_at: Option<NaiveDateTime>,
 }
 
 impl SequencedMarketEvent {
@@ -172,24 +309,36 @@ impl SequencedMarketEvent {
         Self {
             event,
             source_row_ordinal,
+            available_at: None,
         }
+    }
+
+    pub const fn with_available_at(mut self, available_at: NaiveDateTime) -> Self {
+        self.available_at = Some(available_at);
+        self
     }
 }
 
 /// Converts an event source item into an event and optional physical ordinal.
 pub trait EventSourceItem {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>);
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>);
 }
 
 impl EventSourceItem for MarketEvent {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>) {
-        (self, None)
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>) {
+        (self, None, None)
     }
 }
 
 impl EventSourceItem for SequencedMarketEvent {
-    fn into_event_and_ordinal(self) -> (MarketEvent, Option<u64>) {
-        (self.event, Some(self.source_row_ordinal))
+    fn into_event_ordinal_and_availability(
+        self,
+    ) -> (MarketEvent, Option<u64>, Option<NaiveDateTime>) {
+        (self.event, Some(self.source_row_ordinal), self.available_at)
     }
 }
 
@@ -325,12 +474,12 @@ where
                 None => return Ok(None),
             },
         };
-        let ts = first.event.ts();
+        let ts = first.available_at();
         let mut events = vec![first];
 
         loop {
             match self.pull_event()? {
-                Some(event) if event.event.ts() == ts => events.push(event),
+                Some(event) if event.available_at() == ts => events.push(event),
                 Some(event) => {
                     self.pending = Some(event);
                     break;
@@ -357,8 +506,8 @@ where
                 return Err(EventBatchFeedError::Source(error));
             }
         };
-        let (event, source_row_ordinal) = item.into_event_and_ordinal();
-        let current = event.ts();
+        let (event, source_row_ordinal, available_at) = item.into_event_ordinal_and_availability();
+        let current = available_at.unwrap_or_else(|| event.ts());
         if let Some(previous) = self.last_source_ts
             && current < previous
         {
@@ -377,10 +526,9 @@ where
             }
         };
         self.last_source_ts = Some(current);
-        Ok(Some(FeedEvent::new(
-            event,
-            EventMetadata::new(self.roles, self.series_rank, row_sequence),
-        )))
+        let metadata = EventMetadata::new(self.roles, self.series_rank, row_sequence);
+        let metadata = available_at.map_or(metadata, |value| metadata.with_available_at(value));
+        Ok(Some(FeedEvent::new(event, metadata)))
     }
 }
 
@@ -530,11 +678,11 @@ where
             });
         }
         for event in &batch.events {
-            if event.event.ts() != batch.ts {
+            if event.available_at() != batch.ts {
                 return Err(KWayMergeError::TimestampMismatch {
                     series_rank,
                     batch_ts: batch.ts,
-                    event_ts: event.event.ts(),
+                    event_ts: event.available_at(),
                 });
             }
         }
@@ -611,12 +759,12 @@ impl VecFeed {
 
     /// Return all remaining events at the next timestamp.
     pub fn next_timestamp_batch(&mut self) -> Option<TimestampBatch> {
-        let ts = self.events.get(self.index)?.event.ts();
+        let ts = self.events.get(self.index)?.available_at();
         let start = self.index;
         while self
             .events
             .get(self.index)
-            .is_some_and(|event| event.event.ts() == ts)
+            .is_some_and(|event| event.available_at() == ts)
         {
             self.index += 1;
         }
@@ -640,6 +788,14 @@ impl VecFeed {
     /// Reset the feed to the beginning.
     pub fn reset(&mut self) {
         self.index = 0;
+    }
+}
+
+impl FallibleBatchFeed for VecFeed {
+    type Error = std::convert::Infallible;
+
+    fn next_batch(&mut self) -> Result<Option<TimestampBatch>, Self::Error> {
+        Ok(self.next_timestamp_batch())
     }
 }
 
@@ -720,6 +876,12 @@ pub fn bars_to_feed_with_metadata(
                 low: bar.low,
                 close: bar.close,
                 volume: bar.volume,
+                spread: None,
+                timeframe_seconds: bar
+                    .timeframe
+                    .fixed_duration_seconds()
+                    .and_then(|seconds| u64::try_from(seconds).ok()),
+                tick_count: u64::try_from(bar.tick_vol).ok().filter(|count| *count > 0),
             };
             FeedEvent::new(
                 event,
@@ -841,6 +1003,9 @@ mod tests {
             low: 1.0830,
             close: 1.0855,
             volume: 1000,
+            spread: None,
+            timeframe_seconds: None,
+            tick_count: None,
         };
         let q = event.to_quote();
         // Bar uses close for both bid and ask
@@ -1026,6 +1191,9 @@ mod tests {
                     low: 0.9,
                     close: 1.1,
                     volume: 10,
+                    spread: None,
+                    timeframe_seconds: None,
+                    tick_count: None,
                 },
                 EventMetadata::new(SeriesRoles::PRIMARY, 0, 1),
             ),
@@ -1103,6 +1271,9 @@ mod tests {
             low: 0.9,
             close: 1.1,
             volume: 10,
+            spread: None,
+            timeframe_seconds: None,
+            tick_count: None,
         }]);
         let conversion = VecFeed::from_feed_events(vec![FeedEvent::new(
             MarketEvent::Tick {
@@ -1179,6 +1350,9 @@ mod tests {
                 low: 0.9,
                 close: 1.1,
                 volume: 10,
+                spread: None,
+                timeframe_seconds: None,
+                tick_count: None,
             },
             MarketEvent::Tick {
                 symbol: "EURUSD".into(),

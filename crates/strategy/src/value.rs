@@ -14,6 +14,14 @@ pub enum ScalarType {
     Integer,
     Number,
     Price,
+    Ratio,
+    Percent,
+    PricePerObservation,
+    PricePerObservationSquared,
+    RatioPerObservation,
+    RatioPerObservationSquared,
+    LogReturn,
+    LogReturnVariance,
     Timestamp,
     Duration,
     Text,
@@ -53,6 +61,14 @@ pub enum Value {
     Integer(i64),
     Number(f64),
     Price(f64),
+    Ratio(f64),
+    Percent(f64),
+    PricePerObservation(f64),
+    PricePerObservationSquared(f64),
+    RatioPerObservation(f64),
+    RatioPerObservationSquared(f64),
+    LogReturn(f64),
+    LogReturnVariance(f64),
     Timestamp(NaiveDateTime),
     Duration(Duration),
     Text(String),
@@ -67,6 +83,14 @@ impl Value {
             Self::Integer(_) => ScalarType::Integer,
             Self::Number(_) => ScalarType::Number,
             Self::Price(_) => ScalarType::Price,
+            Self::Ratio(_) => ScalarType::Ratio,
+            Self::Percent(_) => ScalarType::Percent,
+            Self::PricePerObservation(_) => ScalarType::PricePerObservation,
+            Self::PricePerObservationSquared(_) => ScalarType::PricePerObservationSquared,
+            Self::RatioPerObservation(_) => ScalarType::RatioPerObservation,
+            Self::RatioPerObservationSquared(_) => ScalarType::RatioPerObservationSquared,
+            Self::LogReturn(_) => ScalarType::LogReturn,
+            Self::LogReturnVariance(_) => ScalarType::LogReturnVariance,
             Self::Timestamp(_) => ScalarType::Timestamp,
             Self::Duration(_) => ScalarType::Duration,
             Self::Text(_) => ScalarType::Text,
@@ -80,10 +104,18 @@ impl Value {
 
     pub(crate) fn finite(self, path: &str) -> Result<Self, crate::EvaluationError> {
         match self {
-            Self::Number(value) if !value.is_finite() => {
-                Err(crate::EvaluationError::NonFinite { path: path.into() })
-            }
-            Self::Price(value) if !value.is_finite() => {
+            Self::Number(value)
+            | Self::Price(value)
+            | Self::Ratio(value)
+            | Self::Percent(value)
+            | Self::PricePerObservation(value)
+            | Self::PricePerObservationSquared(value)
+            | Self::RatioPerObservation(value)
+            | Self::RatioPerObservationSquared(value)
+            | Self::LogReturn(value)
+            | Self::LogReturnVariance(value)
+                if !value.is_finite() =>
+            {
                 Err(crate::EvaluationError::NonFinite { path: path.into() })
             }
             value => Ok(value),
@@ -105,6 +137,14 @@ pub enum Literal {
     Integer(i64),
     Number(f64),
     Price(f64),
+    Ratio(f64),
+    Percent(f64),
+    PricePerObservation(f64),
+    PricePerObservationSquared(f64),
+    RatioPerObservation(f64),
+    RatioPerObservationSquared(f64),
+    LogReturn(f64),
+    LogReturnVariance(f64),
     Timestamp(NaiveDateTime),
     DurationMillis(i64),
     Text(String),
@@ -119,6 +159,18 @@ impl Literal {
             Self::Integer(_) => ValueType::required(ScalarType::Integer),
             Self::Number(_) => ValueType::required(ScalarType::Number),
             Self::Price(_) => ValueType::required(ScalarType::Price),
+            Self::Ratio(_) => ValueType::required(ScalarType::Ratio),
+            Self::Percent(_) => ValueType::required(ScalarType::Percent),
+            Self::PricePerObservation(_) => ValueType::required(ScalarType::PricePerObservation),
+            Self::PricePerObservationSquared(_) => {
+                ValueType::required(ScalarType::PricePerObservationSquared)
+            }
+            Self::RatioPerObservation(_) => ValueType::required(ScalarType::RatioPerObservation),
+            Self::RatioPerObservationSquared(_) => {
+                ValueType::required(ScalarType::RatioPerObservationSquared)
+            }
+            Self::LogReturn(_) => ValueType::required(ScalarType::LogReturn),
+            Self::LogReturnVariance(_) => ValueType::required(ScalarType::LogReturnVariance),
             Self::Timestamp(_) => ValueType::required(ScalarType::Timestamp),
             Self::DurationMillis(_) => ValueType::required(ScalarType::Duration),
             Self::Text(_) => ValueType::required(ScalarType::Text),
@@ -133,6 +185,14 @@ impl Literal {
             Self::Integer(value) => Value::Integer(*value),
             Self::Number(value) => Value::Number(*value),
             Self::Price(value) => Value::Price(*value),
+            Self::Ratio(value) => Value::Ratio(*value),
+            Self::Percent(value) => Value::Percent(*value),
+            Self::PricePerObservation(value) => Value::PricePerObservation(*value),
+            Self::PricePerObservationSquared(value) => Value::PricePerObservationSquared(*value),
+            Self::RatioPerObservation(value) => Value::RatioPerObservation(*value),
+            Self::RatioPerObservationSquared(value) => Value::RatioPerObservationSquared(*value),
+            Self::LogReturn(value) => Value::LogReturn(*value),
+            Self::LogReturnVariance(value) => Value::LogReturnVariance(*value),
             Self::Timestamp(value) => Value::Timestamp(*value),
             Self::DurationMillis(value) => Value::Duration(Duration::milliseconds(*value)),
             Self::Text(value) => {
@@ -147,7 +207,18 @@ impl Literal {
             Self::Side(value) => Value::Side(*value),
         };
         match value {
-            Value::Number(number) | Value::Price(number) if !number.is_finite() => {
+            Value::Number(number)
+            | Value::Price(number)
+            | Value::Ratio(number)
+            | Value::Percent(number)
+            | Value::PricePerObservation(number)
+            | Value::PricePerObservationSquared(number)
+            | Value::RatioPerObservation(number)
+            | Value::RatioPerObservationSquared(number)
+            | Value::LogReturn(number)
+            | Value::LogReturnVariance(number)
+                if !number.is_finite() =>
+            {
                 Err(crate::CompileError::InvalidConfig {
                     path: "literal".into(),
                     reason: "number must be finite".into(),

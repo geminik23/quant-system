@@ -8,10 +8,11 @@ use qs_instruments::{
     InstrumentEconomics, InstrumentSpec, Money, QuantityRules, QuantityUnit,
 };
 use qs_symbols::SymbolSpec;
+use serde::Serialize;
 use thiserror::Error;
 
 /// Policy for computing the position size of one resolved entry signal.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum SizingPolicy {
     /// Scale a fixed lot quantity by the signal risk multiplier.
     FixedLot {
