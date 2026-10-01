@@ -152,7 +152,7 @@ Concrete private strategy configurations may be added later when there is a real
 - paper or live execution gateways beyond the implemented provider-neutral request/report library;
 - restart-safe configured or live strategy state;
 - broker and exchange order adapters;
-- cryptocurrency economics beyond the current rejection guard;
+- general cryptocurrency spot/inventory, inverse/perpetual, funding, margin, and liquidation models beyond the supported operator-configured lot-linear simulations;
 - model training and live inference;
 - Discord or screenshot integrations.
 

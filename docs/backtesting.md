@@ -91,6 +91,8 @@ The additive `admission_report` preserves exact in-window and retained counts pl
 
 This is an intentional default-behavior change. New request fields require a compatible server; older strict servers may reject them. Configured strategies, portfolios and research do not silently drop mandatory logical inputs under this raw-signal policy.
 
+Known effective-dated catalog limitations: a later instrument may be excluded before an earlier instrument's conversion failure advances the replay start, and a run without an explicit `to` may fail as a whole when final manifest resolution discovers an expired or changed specification. These paths were identified by source review and remain unresolved; dedicated reproductions have not yet been run.
+
 ## Replay semantics
 
 The production service uses deterministic FutureQuote replay.
