@@ -174,6 +174,7 @@ fn sample_run_request() -> BacktestRunSpec {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -285,6 +286,7 @@ fn replay_request() -> RunBacktestRequest {
             symbol: "EUR/USD".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "fixture".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -384,6 +386,7 @@ fn multi_request(single: &RunBacktestRequest) -> RunBacktestMultiRequest {
             symbol: request.symbol.clone(),
             symbols: request.symbols.clone(),
             all_symbols: request.all_symbols,
+            on_unavailable: request.on_unavailable,
             exchange: request.exchange.clone(),
             data_type: request.data_type.clone(),
             timeframe: request.timeframe.clone(),
@@ -492,6 +495,7 @@ fn active_symbol_request() -> RunBacktestRequest {
             symbol: "XAUUSD".into(),
             symbols: vec!["XAU/USD".into(), "GBPJPY".into()],
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "fixture".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -682,6 +686,7 @@ fn run_backtest_request_serde_roundtrip() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -1548,6 +1553,7 @@ fn filtered_entry_and_management_only_run_is_idle_without_market_data() {
             symbol: "XAUUSD".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "missing".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -1695,6 +1701,7 @@ fn future_quote_bar_result_records_reproducibility_metadata_and_intrabar_order()
             symbol: "EUR/USD".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "FIXTURE".into(),
             data_type: "bar".into(),
             timeframe: Some("1m".into()),
@@ -1989,6 +1996,7 @@ lot_step_units = 1
     state.data_dir = "/path/that/must/not/be/scanned/by/crypto-guard".into();
 
     let mut request = replay_request();
+    request.request.on_unavailable = UnavailableInstrumentPolicyMsg::Error;
     request.request.symbol = "BTC/USD".into();
     for signal in &mut request.request.raw_signals {
         if let RawSignalMsg::Entry { symbol, .. } = signal {
@@ -2155,6 +2163,7 @@ fn run_backtest_multi_request_serde_roundtrip() {
         symbol: "xauusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "bar".into(),
         timeframe: Some("1h".into()),
@@ -2739,6 +2748,7 @@ fn handler_run_backtest_invalid_data_type() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "invalid".into(),
         timeframe: None,
@@ -2770,6 +2780,7 @@ fn handler_run_backtest_bar_without_timeframe() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "bar".into(),
         timeframe: None,
@@ -2799,6 +2810,7 @@ fn handler_run_backtest_empty_signals() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -2846,6 +2858,7 @@ fn handler_run_backtest_no_data_returns_error() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -2863,6 +2876,8 @@ fn handler_run_backtest_no_data_returns_error() {
             costs: Default::default(),
         },
     };
+    let mut req = req;
+    req.on_unavailable = UnavailableInstrumentPolicyMsg::Error;
     let resp = run_for_test(&state, &req);
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("No market data found"));
@@ -2878,6 +2893,7 @@ fn handler_run_backtest_unknown_profile() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "invalid".into(),
         timeframe: None,
@@ -2907,6 +2923,7 @@ fn handler_run_backtest_multi_invalid_data_type_all_fail() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "wrong".into(),
         timeframe: None,
@@ -3373,6 +3390,7 @@ fn run_backtest_request_with_profile_def_serde() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -3418,6 +3436,7 @@ fn inline_profile_validation_error() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -3464,6 +3483,7 @@ fn backward_compat_no_profile_def() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -3865,6 +3885,7 @@ fn run_backtest_request_raw_signals_serde() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -4151,6 +4172,7 @@ fn run_backtest_multi_request_raw_signals_serde() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,
@@ -4191,6 +4213,7 @@ fn handler_run_backtest_empty_raw_signals_rejected() {
         symbol: "eurusd".into(),
         symbols: Vec::new(),
         all_symbols: false,
+        on_unavailable: Default::default(),
         exchange: "ctrader".into(),
         data_type: "tick".into(),
         timeframe: None,

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use chrono::NaiveDateTime;
 use qs_backtest::data_feed::FallibleBatchFeed;
 use qs_market_loader::{
-    CancellationCheck, MarketLoadLimits, SeriesDescriptor, describe_primary_market_stream,
+    CancellationCheck, MarketLoadLimits, SeriesDescriptor, SymbolPartitionResolver,
+    describe_primary_market_stream, describe_primary_market_stream_with_resolver,
     load_ordered_stored_ticks, load_ordered_stored_ticks_controlled, load_price_only_bars,
     load_price_only_bars_controlled,
 };
@@ -84,6 +85,49 @@ pub fn load_symbol_bars(
     load_symbol_events(data_dir, exchange, symbol, "bar", Some(timeframe), from, to)
 }
 
+/// Load ticks using caller-owned instrument aliases and source bindings.
+pub fn load_symbol_ticks_with_resolver(
+    resolver: &SymbolPartitionResolver<'_>,
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Result<SymbolEvents, ResearchError> {
+    load_symbol_events_impl(
+        data_dir,
+        exchange,
+        symbol,
+        "tick",
+        None,
+        from,
+        to,
+        Some(resolver),
+    )
+}
+
+/// Load stored bars using caller-owned instrument aliases and source bindings.
+pub fn load_symbol_bars_with_resolver(
+    resolver: &SymbolPartitionResolver<'_>,
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+) -> Result<SymbolEvents, ResearchError> {
+    load_symbol_events_impl(
+        data_dir,
+        exchange,
+        symbol,
+        "bar",
+        Some(timeframe),
+        from,
+        to,
+        Some(resolver),
+    )
+}
+
 fn load_symbol_events(
     data_dir: &str,
     exchange: &str,
@@ -93,19 +137,49 @@ fn load_symbol_events(
     from: Option<NaiveDateTime>,
     to: Option<NaiveDateTime>,
 ) -> Result<SymbolEvents, ResearchError> {
+    load_symbol_events_impl(
+        data_dir, exchange, symbol, data_type, timeframe, from, to, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_symbol_events_impl(
+    data_dir: &str,
+    exchange: &str,
+    symbol: &str,
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    resolver: Option<&SymbolPartitionResolver<'_>>,
+) -> Result<SymbolEvents, ResearchError> {
     let mut never_cancelled = || false;
     let symbols = [symbol.to_owned()];
-    let description = describe_primary_market_stream(
-        data_dir,
-        exchange,
-        &symbols,
-        data_type,
-        timeframe,
-        from,
-        to,
-        &mut never_cancelled,
-        &mut |_| {},
-    )?;
+    let description = match resolver {
+        Some(resolver) => describe_primary_market_stream_with_resolver(
+            resolver,
+            data_dir,
+            exchange,
+            &symbols,
+            data_type,
+            timeframe,
+            from,
+            to,
+            &mut never_cancelled,
+            &mut |_| {},
+        )?,
+        None => describe_primary_market_stream(
+            data_dir,
+            exchange,
+            &symbols,
+            data_type,
+            timeframe,
+            from,
+            to,
+            &mut never_cancelled,
+            &mut |_| {},
+        )?,
+    };
 
     let mut stream = description.open(Arc::new(|| false))?;
     let mut events = Vec::new();

@@ -39,6 +39,7 @@ pub(crate) struct ReplayPlan {
     active_symbols: Vec<String>,
     idle_explicit_symbols: Vec<String>,
     loading_start: Option<NaiveDateTime>,
+    admission_report: Option<crate::rpc_types::ReplayAdmissionReportMsg>,
 }
 
 impl ReplayPlan {
@@ -129,7 +130,22 @@ impl ReplayPlan {
             active_symbols,
             idle_explicit_symbols,
             loading_start,
+            admission_report: None,
         })
+    }
+
+    pub(crate) fn set_admission_report(
+        &mut self,
+        report: crate::rpc_types::ReplayAdmissionReportMsg,
+        excluded: &BTreeSet<String>,
+    ) {
+        self.idle_explicit_symbols
+            .retain(|symbol| !excluded.contains(symbol));
+        self.admission_report = Some(report);
+    }
+
+    pub(crate) fn admission_report(&self) -> Option<&crate::rpc_types::ReplayAdmissionReportMsg> {
+        self.admission_report.as_ref()
     }
 
     pub(crate) fn retained_signals(&self) -> &[RawSignal] {

@@ -4293,6 +4293,34 @@ impl BacktestRunner {
         pricer: &ExecutionPricer,
         conversion_quotes: &ConversionQuoteBook,
     ) -> bool {
+        if let Action::ScaleIn {
+            position_id, size, ..
+        } = &action
+        {
+            let valid = self
+                .engine
+                .get_position(position_id)
+                .and_then(|position| explicit_instrument_spec(&self.config, &position.data.symbol))
+                .is_none_or(|spec| {
+                    size.to_string().parse::<Decimal>().is_ok_and(|quantity| {
+                        quantity >= spec.quantity.minimum.get()
+                            && spec
+                                .quantity
+                                .maximum
+                                .is_none_or(|maximum| quantity <= maximum.get())
+                            && spec.quantity.grid.contains(quantity).unwrap_or(false)
+                    })
+                });
+            if !valid {
+                let mut disposition =
+                    ActionDisposition::rejected(action_id, "invalid_instrument_quantity");
+                disposition.action_kind = Some(action_kind);
+                disposition.signal_ts = Some(signal_ts);
+                disposition.effective_ts = Some(effective_ts);
+                self.record_disposition(lifecycle, disposition);
+                return false;
+            }
+        }
         if let Action::Open {
             trade_id: Some(trade_id),
             ..

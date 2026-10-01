@@ -31,7 +31,7 @@ Every Entry must contain a finite positive `risk` multiplier. It does not contai
 
 `--account-currency` is required when an Entry is present. Monetary risk sizing also requires a protective stop. `--market-entry-sizing-basis` selects `fill-price` or `signal-entry-price` for FutureQuote Market Entry quantity calculation; the default is `fill-price`, and `signal-entry-price` falls back to the fill when `Entry.price` is absent. `ScaleIn.size` remains a concrete final quantity and is not interpreted as an Entry risk multiplier.
 
-An Entry may carry an optional exact, case-sensitive `entry_class`. `tg_backtest --entry-profile-map routes.toml` maps classes to named or inline management profiles while `--profile` remains the default for unlabeled entries. Unknown classes, duplicate routes, malformed labels, and missing named profiles fail before market data is consumed; they never fall back silently. Accepted retained jobs freeze the resolved definitions, so later profile add, remove, or reload operations do not change the run.
+An Entry may carry an optional exact, case-sensitive `entry_class`. `tg_backtest --entry-profile-map routes.toml` maps classes to named or inline management profiles while `--profile` remains the default for unlabeled entries. Unknown classes on retained Entries, duplicate routes, malformed labels, and missing named profiles fail before replay; they never fall back silently. Data preparation determines which Entries are retained before class-route validation. Accepted retained jobs freeze the resolved definitions, so later profile add, remove, or reload operations do not change the run.
 
 See the [RawSignal reference](reference/raw-signal.md) for action shapes.
 
@@ -39,11 +39,57 @@ See the [RawSignal reference](reference/raw-signal.md) for action shapes.
 
 The server can load an optional strict instrument catalog through the `[instruments]` configuration section. A catalog contains exact asset metadata, broker- or exchange-qualified instrument identities, aliases, decimal price and quantity rules, effective intervals, and explicit economics descriptors. Its operator-assigned version identifies the immutable snapshot used for a run.
 
-When `catalog_path` is omitted, the server compiles supported `qs-symbols` FX, metal, commodity, and index rows into a guarded compatibility snapshot. This preserves existing sizing, P&L, and economic-guard metadata. Registry-backed cryptocurrency and unknown categories remain excluded before market-data access.
+When `catalog_path` is omitted, the server compiles supported `qs-symbols` FX, metal, commodity, and index rows into a guarded compatibility snapshot. Optional `linear_instruments` settings explicitly add or replace individual simulation specifications using the existing lot-linear accounting path. A full `catalog_path` and these compatibility-builder settings are alternative authorities and cannot be configured together. Bare registry cryptocurrency and unknown categories still have no executable compatibility economics; direct signal replay reports their exclusion by default rather than inventing a multiplier.
 
 `default_listing_venue` is an optional alias-resolution hint. Compatibility snapshots use `repository-default` when it is omitted. Explicit catalogs do not receive that implicit default, so one unique alias resolves directly and aliases shared by several venues fail as ambiguous unless the operator supplies the intended broker or exchange listing namespace. A platform such as CTrader is not a listing venue.
 
 Each service replay result can include a typed instrument manifest containing the catalog version, resolved instrument and specification revision, effective specification, and actual Parquet partition and symbol coordinates. Catalog-backed Entry metadata also records exact requested and adjusted quantity, adjustment direction, and post-rounding notional when notional rules are configured. Existing `exchange` request and storage fields remain data coordinates and are not reinterpreted as broker, exchange listing, platform, or execution identity.
+
+### Configurable linear simulations
+
+The server example includes BTCUSD and ETHUSD operator-selected simulations: one base asset per standard lot, contract multiplier `1`, quantity step/minimum `0.01` lot, maximum `10` lots, price step `0.01`, and display scale `2`. These are editable assumptions, not independently verified broker specifications. Exact decimal values are quoted strings. Quantities, monetary contract multipliers and storage precision are separate facts.
+
+```toml
+[[instruments.linear_instruments]]
+symbol = "BTCUSD"
+contract_multiplier = "1"
+price_step = "0.01"
+display_scale = 2
+quantity_step = "0.01"
+minimum = "0.01"
+maximum = "10"
+```
+
+For another supported linear contract, change the values or add another registered symbol row; a new product-specific Rust calculator is not needed. A different payout/inventory model still requires executable support, not only a catalog identifier. Linear settings derive base/quote/settlement metadata from the symbol registry. Full catalogs must agree with the current registry-backed settlement/conversion metadata; incompatible currency declarations are rejected. No margin reservation, leverage simulation, liquidation or perpetual funding is implied. Commission and swap retain their existing optional configuration and are off by default.
+
+Maximum quantity limits an individual Entry or ScaleIn request, not total account exposure. Entry sizing floors/caps using the pinned rules; an explicit ScaleIn quantity that violates its grid/minimum/maximum is rejected, not silently resized. Specifications and actual physical coordinates are recorded in the result manifest.
+
+### Data-name resolution
+
+Registry aliases apply to primary tick/bar and conversion data resolution. For example, a canonical US100 run may read `symbol=USTEC` and still emit/report `us100`. Multiple physical datasets that normalize to one symbol are not selected by first-wins. To choose an intended physical dataset, use the server's source-specific setting:
+
+```toml
+[instruments.source_symbols]
+us100 = "USTEC"
+```
+
+This maps names only; it does not invert prices or select an economic listing venue. Invalid required bindings remain errors. The loader records the chosen coordinates as stored-series bindings. Existing exact-coordinate library loader APIs remain available; resolver-aware APIs accept caller-owned aliases/bindings.
+
+## Partial and strict signal replay
+
+Direct RawSignal single, retained-job and multi-profile runs default to `on_unavailable = "skip"`. The CLI exposes `--on-unavailable skip|error`; the omitted policy is skip even for older requests received by the new server.
+
+- `--all-symbols` derives targets from in-window Entries. It is selection, not a data discovery or support flag.
+- `--symbols`/`--symbol` select targets explicitly. Other Entry signals and their directly associated management are excluded as `not_selected`, including in strict mode.
+- Missing primary data, no valid quotes in the applicable window, unknown/unsupported instruments, ambiguous inferred mappings, or unavailable conversion dependencies exclude the affected selected instrument in skip mode.
+- `--on-unavailable error` rejects preparation for such selected-instrument failures and reports the reasons before replay.
+- Invalid configuration, corrupt storage, IO/permission errors, malformed signals and cancellation are not swallowed by skip. Runtime errors are not converted into retroactive asset removal.
+- Excluded trade-ID/symbol management is removed; group and account-wide operations remain applicable to retained positions. Ambiguous retained/excluded trade IDs are rejected.
+- All-excluded nonempty input returns a server zero-trade result with an admission report. A quote/entry that never fills remains an execution disposition, not a preparation exclusion.
+
+The additive `admission_report` preserves exact in-window and retained counts plus per-instrument reasons and Entry/management counts. Evidence is bounded to 64 instrument rows, 256 total references and 64 references per row; omitted rows/counts are explicit. `input_index` identifies the submitted RawSignal array, not a Telegram message or original JSONL line; long optional trade IDs are omitted rather than fabricated. Reports remain in inline, compact and artifact delivery and in reproducibility metadata. Retained jobs reuse admitted descriptors/configuration and profile snapshots.
+
+This is an intentional default-behavior change. New request fields require a compatible server; older strict servers may reject them. Configured strategies, portfolios and research do not silently drop mandatory logical inputs under this raw-signal policy.
 
 ## Replay semantics
 

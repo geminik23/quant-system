@@ -14,6 +14,29 @@ pub enum BacktestServerError {
     #[error("Symbol not found: '{0}'")]
     SymbolNotFound(String),
 
+    #[error("instrument '{symbol}' unavailable ({reason:?}): {details}")]
+    InstrumentUnavailable {
+        symbol: String,
+        reason: crate::rpc_types::InstrumentExclusionReasonMsg,
+        details: String,
+    },
+
+    #[error("instrument '{symbol}' is inactive at {at}: {details}")]
+    InactiveInstrument {
+        symbol: String,
+        at: chrono::DateTime<chrono::Utc>,
+        details: String,
+    },
+
+    #[error("no valid conversion tick for '{symbol}' strictly before {start}")]
+    ConversionWarmupUnavailable {
+        symbol: String,
+        start: chrono::NaiveDateTime,
+    },
+
+    #[error("replay admission rejected: {0}")]
+    AdmissionRejected(String),
+
     #[error("Profile not found: '{0}'")]
     ProfileNotFound(String),
 

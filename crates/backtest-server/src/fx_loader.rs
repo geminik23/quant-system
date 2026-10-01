@@ -1,6 +1,7 @@
 //! Server-side currency planning and conversion tick loading.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::path::Path;
 
 use chrono::NaiveDateTime;
@@ -16,9 +17,13 @@ use qs_core::types::PriceQuote;
 use qs_symbols::SymbolRegistry;
 
 use crate::error::{BacktestServerError, Result};
+use crate::rpc_types::InstrumentExclusionReasonMsg;
 #[cfg(test)]
 use qs_market_loader::plan_currency_routes;
-use qs_market_loader::{MarketSeriesDescription, MarketStreamDescription, plan_currency_streams};
+use qs_market_loader::{
+    MarketSeriesDescription, MarketStreamDescription, SymbolPartitionResolver,
+    discover_tick_partitions, plan_currency_streams,
+};
 
 #[cfg(test)]
 pub(crate) struct LoadedFutureBundle {
@@ -26,6 +31,7 @@ pub(crate) struct LoadedFutureBundle {
     pub currency_plan: RunCurrencyPlan,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct LoadedFutureStream {
     pub description: MarketStreamDescription,
     pub currency_plan: RunCurrencyPlan,
@@ -37,11 +43,39 @@ struct TickDataset {
     symbol: String,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn describe_future_stream(
     data_dir: &str,
     exchange: &str,
     registry: &SymbolRegistry,
+    account_currency: &str,
+    primary_symbols: &[String],
+    primary_data_type: &str,
+    replay_start: Option<NaiveDateTime>,
+    primary: MarketStreamDescription,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<LoadedFutureStream> {
+    describe_future_stream_with_resolver(
+        data_dir,
+        exchange,
+        registry,
+        &SymbolPartitionResolver::new(registry),
+        account_currency,
+        primary_symbols,
+        primary_data_type,
+        replay_start,
+        primary,
+        is_cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn describe_future_stream_with_resolver(
+    data_dir: &str,
+    exchange: &str,
+    registry: &SymbolRegistry,
+    resolver: &SymbolPartitionResolver<'_>,
     account_currency: &str,
     primary_symbols: &[String],
     primary_data_type: &str,
@@ -72,7 +106,28 @@ pub(crate) fn describe_future_stream(
         BacktestServerError::InvalidRequest("primary market-data stream has no replay end".into())
     })?;
     let store = ParquetStore::open(data_dir)?;
-    let datasets = discover_tick_datasets(data_dir, exchange, registry, is_cancelled)?;
+    let candidates = if primary_symbols.iter().all(|symbol| {
+        registry
+            .currency_metadata(symbol)
+            .is_some_and(|metadata| metadata.pnl_currency == account_currency)
+    }) {
+        BTreeMap::new()
+    } else {
+        discover_tick_partitions(data_dir, exchange, resolver, is_cancelled)?
+    };
+    let datasets = candidates
+        .into_iter()
+        .filter_map(|(canonical, physical)| match physical.as_slice() {
+            [(exchange, symbol)] => Some((
+                canonical,
+                TickDataset {
+                    exchange: exchange.clone(),
+                    symbol: symbol.clone(),
+                },
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let available_symbols = datasets.keys().cloned().collect::<BTreeSet<_>>();
     let currency = plan_currency_streams(
         registry,
@@ -167,6 +222,103 @@ pub(crate) fn describe_future_stream(
         description: primary,
         currency_plan,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_conversion_data(
+    data_dir: &str,
+    exchange: &str,
+    registry: &SymbolRegistry,
+    resolver: &SymbolPartitionResolver<'_>,
+    domain: &crate::instrument_catalog::InstrumentDomain,
+    account_currency: &str,
+    symbol: &str,
+    start: NaiveDateTime,
+    through: Option<NaiveDateTime>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<()> {
+    if registry
+        .currency_metadata(symbol)
+        .is_some_and(|metadata| metadata.pnl_currency == account_currency)
+    {
+        return Ok(());
+    }
+    let candidates = discover_tick_partitions(data_dir, exchange, resolver, is_cancelled)?;
+    let available = candidates
+        .iter()
+        .filter(|(_, physical)| physical.len() == 1)
+        .map(|(canonical, _)| canonical.clone())
+        .collect();
+    let primary = BTreeSet::from([symbol.to_owned()]);
+    let unavailable = |details: String| BacktestServerError::InstrumentUnavailable {
+        symbol: symbol.into(),
+        reason: InstrumentExclusionReasonMsg::NoConversionData,
+        details,
+    };
+    let plan = match plan_currency_streams(
+        registry,
+        account_currency,
+        exchange,
+        &primary,
+        &available,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let known = candidates.keys().cloned().collect();
+            if let Ok(potential) =
+                plan_currency_streams(registry, account_currency, exchange, &primary, &known)
+            {
+                for conversion in potential.conversion_symbols {
+                    let physical = &candidates[&conversion];
+                    if physical.is_empty() {
+                        return Err(BacktestServerError::MarketLoad(
+                            qs_market_loader::MarketLoadError::InvalidSeries(format!(
+                                "configured conversion dataset for '{conversion}' is absent"
+                            )),
+                        ));
+                    }
+                    if physical.len() > 1 {
+                        return Err(BacktestServerError::InstrumentUnavailable {
+                            symbol: symbol.into(),
+                            reason: InstrumentExclusionReasonMsg::AmbiguousMapping,
+                            details: format!(
+                                "conversion symbol '{conversion}' has multiple datasets: {physical:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+            return Err(unavailable(error.to_string()));
+        }
+    };
+    if plan.conversion_symbols.is_empty() {
+        return Ok(());
+    }
+    let store = ParquetStore::open(data_dir)?;
+    for conversion in plan.conversion_symbols {
+        ensure_not_cancelled(is_cancelled)?;
+        match domain.resolve_manifest(std::slice::from_ref(&conversion), start, through) {
+            Ok(_) => {}
+            Err(BacktestServerError::InstrumentUnavailable { details, .. }) => {
+                return Err(unavailable(format!(
+                    "conversion instrument '{conversion}': {details}"
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+        let (exchange, physical) = &candidates[&conversion][0];
+        if store
+            .latest_valid_tick_before_cancellable(exchange, physical, start, &mut *is_cancelled)
+            .map_err(map_data_error)?
+            .is_none()
+        {
+            return Err(BacktestServerError::ConversionWarmupUnavailable {
+                symbol: conversion,
+                start,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +497,7 @@ fn resolve_routes_to_account(
     .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))
 }
 
+#[cfg(test)]
 fn discover_tick_datasets(
     data_dir: &str,
     exchange: &str,
@@ -384,6 +537,7 @@ fn discover_tick_datasets(
     Ok(datasets)
 }
 
+#[cfg(test)]
 fn contains_parquet_file(directory: &Path, is_cancelled: &mut dyn FnMut() -> bool) -> Result<bool> {
     ensure_not_cancelled(is_cancelled)?;
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -402,6 +556,7 @@ fn contains_parquet_file(directory: &Path, is_cancelled: &mut dyn FnMut() -> boo
     Ok(false)
 }
 
+#[cfg(test)]
 fn resolve_tick_exchange(
     data_dir: &str,
     requested: &str,

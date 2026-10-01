@@ -4,6 +4,7 @@
 //! Clients submit signals, a management profile, and a date range; the server
 //! loads Parquet data, runs the backtest, and returns serialized results.
 
+mod admission;
 pub mod artifact_store;
 pub mod config;
 pub mod convert;

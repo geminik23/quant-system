@@ -95,6 +95,42 @@ pub fn config_from_msg(
     })
 }
 
+/// Build monetary configuration from pinned specifications instead of legacy quantity scales.
+pub fn config_from_msg_with_manifest(
+    msg: &BacktestConfigMsg,
+    registry: &SymbolRegistry,
+    manifest: qs_backtest::ReplayInstrumentManifest,
+) -> crate::error::Result<BacktestConfig> {
+    let mut config = config_from_msg(msg, registry, &[])?;
+    for (symbol, artifact) in &manifest.instruments {
+        if registry.currency_metadata(symbol).is_some_and(|metadata| {
+            metadata.pnl_currency != artifact.spec.economics.settlement_asset.as_str()
+        }) {
+            return Err(BacktestServerError::Config(format!(
+                "catalog settlement currency for '{symbol}' disagrees with conversion metadata"
+            )));
+        }
+        let multiplier = artifact
+            .spec
+            .economics
+            .contract_multiplier
+            .to_string()
+            .parse::<f64>()
+            .map_err(|error| BacktestServerError::InvalidRequest(error.to_string()))?;
+        if !multiplier.is_finite() || multiplier <= 0.0 {
+            return Err(BacktestServerError::InvalidRequest(format!(
+                "invalid contract multiplier for '{symbol}'"
+            )));
+        }
+        config.contract_sizes.insert(symbol.clone(), multiplier);
+        if let Some(spec) = registry.spec(symbol) {
+            config.symbol_specs.insert(symbol.clone(), spec.clone());
+        }
+    }
+    config.instrument_manifest = Some(manifest);
+    Ok(config)
+}
+
 /// Convert the wire cost specification into validated per-symbol costs.
 ///
 /// Values are validated here so an invalid specification is rejected at the request boundary rather than during replay. The run's account currency is not known at this point, so the currency agreement check stays with replay configuration validation.
@@ -744,6 +780,11 @@ pub fn profile_to_msg(p: &ManagementProfile) -> ManagementProfileMsg {
 /// Convert the full backtest result into its wire-safe message form.
 pub fn result_to_msg(r: &BacktestResult) -> BacktestResultMsg {
     BacktestResultMsg {
+        admission_report: r
+            .execution_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.tags.get("data.admission_report"))
+            .and_then(|encoded| serde_json::from_str(encoded).ok()),
         strategy: None,
         portfolio: None,
         initial_balance: r.initial_balance,

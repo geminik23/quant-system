@@ -547,6 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             symbol: args.symbol.clone(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: args.exchange.clone(),
             data_type: args.data_type.clone(),
             timeframe: args.timeframe.clone(),

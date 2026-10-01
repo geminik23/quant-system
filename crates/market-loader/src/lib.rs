@@ -23,11 +23,13 @@ use qs_strategy::{ScalarType, Value, ValueType};
 use qs_symbols::SymbolRegistry;
 
 mod error;
+mod symbol_resolution;
 
 pub use data_preprocess::{
     CountCapability, PriceBins, QuoteStatistics, SeriesDescriptor, StoredPriceBasis, StoredTick,
 };
 pub use error::{MarketLoadError, Result};
+pub use symbol_resolution::{SymbolPartitionResolver, discover_tick_partitions};
 
 pub type CancellationCheck = Arc<dyn Fn() -> bool>;
 type EventSource = Box<dyn FnMut() -> Result<Option<SequencedMarketEvent>>>;
@@ -849,6 +851,41 @@ impl MarketStreamDescription {
         }
     }
 
+    /// Combine independently admitted primary series in canonical order.
+    pub fn merge_primary(
+        descriptions: Vec<Self>,
+        requested_to: Option<NaiveDateTime>,
+    ) -> Result<Self> {
+        let mut series = Vec::new();
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        for description in descriptions {
+            if description.requested_to != requested_to {
+                return Err(MarketLoadError::InvalidSeries(
+                    "primary description bounds disagree".into(),
+                ));
+            }
+            starts.extend(description.primary_start);
+            ends.extend(description.primary_eod);
+            series.extend(description.series);
+        }
+        series.sort_by(|left, right| left.canonical_symbol.cmp(&right.canonical_symbol));
+        if series
+            .windows(2)
+            .any(|pair| pair[0].canonical_symbol == pair[1].canonical_symbol)
+        {
+            return Err(MarketLoadError::InvalidSeries(
+                "duplicate primary series".into(),
+            ));
+        }
+        Ok(Self::new(
+            series,
+            starts.into_iter().min(),
+            ends.into_iter().max(),
+            requested_to,
+        ))
+    }
+
     pub fn primary_start(&self) -> Option<NaiveDateTime> {
         self.primary_start
     }
@@ -973,6 +1010,71 @@ pub fn describe_primary_market_stream(
     is_cancelled: &mut dyn FnMut() -> bool,
     progress: &mut dyn FnMut(u64),
 ) -> Result<MarketStreamDescription> {
+    describe_primary_market_stream_impl(
+        data_dir,
+        exchange,
+        symbols,
+        data_type,
+        timeframe,
+        from,
+        to,
+        None,
+        is_cancelled,
+        progress,
+    )
+}
+
+/// Describe canonical replay symbols using aliases and optional source bindings.
+#[allow(clippy::too_many_arguments)]
+pub fn describe_primary_market_stream_with_resolver(
+    resolver: &SymbolPartitionResolver<'_>,
+    data_dir: &str,
+    exchange: &str,
+    symbols: &[String],
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<MarketStreamDescription> {
+    let symbols = symbols
+        .iter()
+        .map(|symbol| resolver.canonical_source_symbol(symbol))
+        .collect::<Vec<_>>();
+    let mut unique = std::collections::BTreeSet::new();
+    if symbols.iter().any(|symbol| !unique.insert(symbol)) {
+        return Err(MarketLoadError::InvalidSeries(
+            "duplicate canonical primary symbol".into(),
+        ));
+    }
+    describe_primary_market_stream_impl(
+        data_dir,
+        exchange,
+        &symbols,
+        data_type,
+        timeframe,
+        from,
+        to,
+        Some(resolver),
+        is_cancelled,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn describe_primary_market_stream_impl(
+    data_dir: &str,
+    exchange: &str,
+    symbols: &[String],
+    data_type: &str,
+    timeframe: Option<&str>,
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    resolver: Option<&SymbolPartitionResolver<'_>>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<MarketStreamDescription> {
     ensure_not_cancelled_mut(is_cancelled)?;
     if symbols.is_empty() {
         return Ok(MarketStreamDescription::new(Vec::new(), None, None, to));
@@ -1002,14 +1104,23 @@ pub fn describe_primary_market_stream(
         let (description, first, last) = if data_type == "tick" {
             let disk_exchange =
                 resolve_partition_value(data_dir, "ticks", "exchange", exchange, "", is_cancelled)?;
-            let disk_symbol = resolve_partition_value(
-                data_dir,
-                "ticks",
-                "symbol",
-                canonical_symbol,
-                &format!("exchange={disk_exchange}"),
-                is_cancelled,
-            )?;
+            let disk_symbol = match resolver {
+                Some(resolver) => resolver.resolve(
+                    data_dir,
+                    "ticks",
+                    &disk_exchange,
+                    canonical_symbol,
+                    is_cancelled,
+                )?,
+                None => resolve_partition_value(
+                    data_dir,
+                    "ticks",
+                    "symbol",
+                    canonical_symbol,
+                    &format!("exchange={disk_exchange}"),
+                    is_cancelled,
+                )?,
+            };
             let scan = ParquetTickScan::describe_cancellable(
                 data_dir,
                 &disk_exchange,
@@ -1039,14 +1150,23 @@ pub fn describe_primary_market_stream(
             })?;
             let disk_exchange =
                 resolve_partition_value(data_dir, "bars", "exchange", exchange, "", is_cancelled)?;
-            let disk_symbol = resolve_partition_value(
-                data_dir,
-                "bars",
-                "symbol",
-                canonical_symbol,
-                &format!("exchange={disk_exchange}"),
-                is_cancelled,
-            )?;
+            let disk_symbol = match resolver {
+                Some(resolver) => resolver.resolve(
+                    data_dir,
+                    "bars",
+                    &disk_exchange,
+                    canonical_symbol,
+                    is_cancelled,
+                )?,
+                None => resolve_partition_value(
+                    data_dir,
+                    "bars",
+                    "symbol",
+                    canonical_symbol,
+                    &format!("exchange={disk_exchange}"),
+                    is_cancelled,
+                )?,
+            };
             let disk_timeframe = resolve_partition_value(
                 data_dir,
                 "bars",
@@ -1233,9 +1353,15 @@ fn resolve_partition_value(
     let mut matches = Vec::new();
 
     ensure_not_cancelled_mut(is_cancelled)?;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(MarketLoadError::Data(DataError::Io(error))),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
             ensure_not_cancelled_mut(is_cancelled)?;
+            let entry = entry.map_err(DataError::Io)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let Some(value) = name.strip_prefix(&prefix) else {

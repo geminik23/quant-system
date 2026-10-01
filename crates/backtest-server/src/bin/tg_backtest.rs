@@ -31,6 +31,13 @@ use qs_symbols::SymbolRegistry;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum UnavailableMode {
+    #[default]
+    Skip,
+    Error,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ReportMode {
     Standard,
@@ -193,6 +200,10 @@ struct Args {
     /// Derive all backtest symbols from Entry signals in the parsed JSONL.
     #[arg(long, default_value_t = false)]
     all_symbols: bool,
+
+    /// Skip and report unavailable instruments, or reject the complete selected run.
+    #[arg(long, value_enum, default_value_t = UnavailableMode::Skip)]
+    on_unavailable: UnavailableMode,
 
     /// Exchange / data source name (e.g. icmarkets, oanda).
     #[arg(long)]
@@ -1897,6 +1908,31 @@ fn present_result(
     args: &Args,
     output_written: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(report) = &result.admission_report
+        && !report.excluded_instruments.is_empty()
+    {
+        print_header("Excluded Signals");
+        for item in &report.excluded_instruments {
+            println!(
+                "  {}: {:?}, entries={}, management={} - {}",
+                item.symbol,
+                item.reason,
+                item.skipped_entries,
+                item.skipped_management,
+                item.details
+            );
+        }
+        if report.omitted_instruments != 0 {
+            println!(
+                "  {} additional instruments omitted from detail: entries={}, management={}",
+                report.omitted_instruments, report.omitted_entries, report.omitted_management
+            );
+        }
+        println!(
+            "  Retained {} of {} in-window signals",
+            report.retained_signals, report.input_signals
+        );
+    }
     let currency = result_currency_code(result, args);
     match args.report {
         ReportMode::Standard => {
@@ -2074,6 +2110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             symbol: request_symbol,
             symbols: request_symbols,
             all_symbols: args.all_symbols,
+            on_unavailable: match args.on_unavailable {
+                UnavailableMode::Skip => UnavailableInstrumentPolicyMsg::Skip,
+                UnavailableMode::Error => UnavailableInstrumentPolicyMsg::Error,
+            },
             exchange: args.exchange.clone(),
             data_type: args.data_type.clone(),
             timeframe: args.timeframe.clone(),

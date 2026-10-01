@@ -511,9 +511,71 @@ impl Default for ProviderEvaluationOptionsMsg {
 
 // ── Run Backtest ────────────────────────────────────────────────────────────
 
+/// Handling of selected instruments that cannot be prepared for replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableInstrumentPolicyMsg {
+    #[default]
+    Skip,
+    Error,
+}
+
+/// Why an instrument's signals were excluded before replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentExclusionReasonMsg {
+    NotSelected,
+    UnknownInstrument,
+    UnsupportedEconomics,
+    NoMarketData,
+    NoConversionData,
+    AmbiguousMapping,
+}
+
+/// Original input coordinates for one excluded signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedSignalRefMsg {
+    pub input_index: usize,
+    pub ts: String,
+    pub action: String,
+    pub trade_id: Option<String>,
+}
+
+/// Bounded evidence for an instrument excluded during preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedInstrumentMsg {
+    pub symbol: String,
+    pub reason: InstrumentExclusionReasonMsg,
+    pub details: String,
+    pub skipped_entries: usize,
+    pub skipped_management: usize,
+    pub signal_references: Vec<ExcludedSignalRefMsg>,
+    pub omitted_signal_references: usize,
+}
+
+/// Preparation decisions, separate from parser outcomes and execution dispositions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayAdmissionReportMsg {
+    #[serde(default)]
+    pub omitted_instruments: usize,
+    #[serde(default)]
+    pub omitted_entries: usize,
+    #[serde(default)]
+    pub omitted_management: usize,
+    pub policy: UnavailableInstrumentPolicyMsg,
+    pub input_signals: usize,
+    pub retained_signals: usize,
+    pub excluded_instruments: Vec<ExcludedInstrumentMsg>,
+}
+
 /// Execution scope and inputs for one backtest run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestRunSpec {
+    #[serde(default)]
+    pub on_unavailable: UnavailableInstrumentPolicyMsg,
     pub symbol: String,
     #[serde(default)]
     pub symbols: Vec<String>,
@@ -572,6 +634,8 @@ pub struct SubmitBacktestRequest {
 /// Execution scope and inputs for a multi-profile comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestMultiRunSpec {
+    #[serde(default)]
+    pub on_unavailable: UnavailableInstrumentPolicyMsg,
     pub symbol: String,
     #[serde(default)]
     pub symbols: Vec<String>,
@@ -1189,6 +1253,8 @@ pub struct GetSearchResultResponse {
 /// Serializable mirror of `BacktestResult` for wire transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResultMsg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_report: Option<ReplayAdmissionReportMsg>,
     /// Strategy document, sources, decisions, and notes when the run executed a configured strategy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<ConfiguredStrategyOutputMsg>,
@@ -1967,6 +2033,8 @@ enum StrictRawSignalMsg {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictBacktestRunSpec {
+    #[serde(default)]
+    on_unavailable: UnavailableInstrumentPolicyMsg,
     symbol: String,
     #[serde(default)]
     symbols: Vec<String>,
@@ -2004,6 +2072,8 @@ struct StrictEntryProfileRouteMsg {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictBacktestMultiRunSpec {
+    #[serde(default)]
+    on_unavailable: UnavailableInstrumentPolicyMsg,
     symbol: String,
     #[serde(default)]
     symbols: Vec<String>,

@@ -1,7 +1,9 @@
 //! Server configuration loaded from TOML.
 
+use qs_instruments::PositiveDecimal;
 use qs_service::ServiceEndpoint;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// Top-level server configuration.
 #[derive(Debug, Deserialize)]
@@ -82,6 +84,7 @@ pub struct SymbolsSection {
 
 /// Instrument catalog and stored-series identity settings.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstrumentsSection {
     /// Optional strict instrument catalog document. The symbol registry is adapted when omitted.
     #[serde(default)]
@@ -92,6 +95,25 @@ pub struct InstrumentsSection {
     /// Identity of the historical market-data source bound to current partitions.
     #[serde(default = "default_market_data_source")]
     pub market_data_source: String,
+    /// Explicit lot-linear simulation specifications added to the compatibility catalog.
+    #[serde(default)]
+    pub linear_instruments: Vec<LinearInstrumentConfig>,
+    /// Canonical symbols mapped to physical symbol partitions for this data source.
+    #[serde(default)]
+    pub source_symbols: BTreeMap<String, String>,
+}
+
+/// Operator-authored linear USD or other quote-currency contract rules.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinearInstrumentConfig {
+    pub symbol: String,
+    pub contract_multiplier: PositiveDecimal,
+    pub price_step: PositiveDecimal,
+    pub display_scale: u8,
+    pub quantity_step: PositiveDecimal,
+    pub minimum: PositiveDecimal,
+    pub maximum: PositiveDecimal,
 }
 
 impl Default for InstrumentsSection {
@@ -100,6 +122,8 @@ impl Default for InstrumentsSection {
             catalog_path: None,
             default_listing_venue: None,
             market_data_source: default_market_data_source(),
+            linear_instruments: Vec::new(),
+            source_symbols: BTreeMap::new(),
         }
     }
 }

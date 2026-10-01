@@ -29,11 +29,12 @@ use qs_research::{
     ResearchAdmissionLimits, ResearchError, ResearchPlan, SearchCheckpoint, StrategyFamily,
     StructuralCandidate, StructuralOperators, StructuralResourceLimits, StructuralSearchSpec,
     TraceLimits, TraceRecord, UncertaintyAssessment, WindowPlan, batch_data_range_with_limits,
-    load_symbol_bars, load_symbol_ticks, run_batch_controlled_with_experiment_resume,
-    run_direct_factory_batch_controlled_resume, run_execution_variants_controlled,
-    run_heterogeneous_portfolios_controlled, run_mixed_heterogeneous_portfolios,
-    selected_candidate_data_range, validate_bar_window_alignment_with_limits,
-    validate_batch_with_limits,
+    load_symbol_bars_with_resolver as load_symbol_bars,
+    load_symbol_ticks_with_resolver as load_symbol_ticks,
+    run_batch_controlled_with_experiment_resume, run_direct_factory_batch_controlled_resume,
+    run_execution_variants_controlled, run_heterogeneous_portfolios_controlled,
+    run_mixed_heterogeneous_portfolios, selected_candidate_data_range,
+    validate_bar_window_alignment_with_limits, validate_batch_with_limits,
 };
 use qs_risk::{CorrelationGroup, PortfolioSupervisor, RiskPolicy};
 use qs_strategy::{
@@ -596,8 +597,12 @@ fn execute_configured_run(
         total_symbols: 1,
         ..BacktestProgress::default()
     });
+    let resolver = state
+        .instrument_domain
+        .symbol_resolver(&state.symbol_registry);
     let mut cancelled = || cancellation.is_cancelled();
     let mut primary = describe_primary_market_stream(
+        &resolver,
         &state.data_dir,
         &run.exchange,
         &symbols,
@@ -620,6 +625,7 @@ fn execute_configured_run(
         &state.data_dir,
         &run.exchange,
         &state.symbol_registry,
+        &resolver,
         &account_currency,
         &symbols,
         &run.data_type,
@@ -1188,8 +1194,12 @@ fn execute_portfolio_run(
         total_symbols,
         ..BacktestProgress::default()
     });
+    let resolver = state
+        .instrument_domain
+        .symbol_resolver(&state.symbol_registry);
     let mut cancelled = || cancellation.is_cancelled();
     let mut primary = describe_primary_market_stream(
+        &resolver,
         &state.data_dir,
         &run.exchange,
         &symbols,
@@ -1212,6 +1222,7 @@ fn execute_portfolio_run(
         &state.data_dir,
         &run.exchange,
         &state.symbol_registry,
+        &resolver,
         &account_currency,
         &symbols,
         &run.data_type,
@@ -2483,6 +2494,9 @@ fn execute_search(
         ensure_not_cancelled(Some(cancellation))?;
         let loaded = match search.data_type.as_str() {
             "bar" => load_symbol_bars(
+                &state
+                    .instrument_domain
+                    .symbol_resolver(&state.symbol_registry),
                 &state.data_dir,
                 &search.exchange,
                 symbol,
@@ -2492,10 +2506,16 @@ fn execute_search(
             )
             .map_err(research_error)?,
             "ordered_tick" => {
+                let (disk_exchange, disk_symbol) = state
+                    .instrument_domain
+                    .symbol_resolver(&state.symbol_registry)
+                    .resolve_tick_source(&state.data_dir, &search.exchange, symbol, &mut || {
+                        cancellation.is_cancelled()
+                    })?;
                 let stream = open_ordered_stored_tick_stream(
                     &state.data_dir,
-                    &search.exchange,
-                    symbol,
+                    &disk_exchange,
+                    &disk_symbol,
                     symbol,
                     data_preprocess::ParquetScanBounds::new(Some(from), Some(to)),
                     search.market_load_limits,
@@ -2529,6 +2549,9 @@ fn execute_search(
                 collect_enhanced_stream(stream, search.market_load_limits, cancellation)?
             }
             _ => load_symbol_ticks(
+                &state
+                    .instrument_domain
+                    .symbol_resolver(&state.symbol_registry),
                 &state.data_dir,
                 &search.exchange,
                 symbol,
