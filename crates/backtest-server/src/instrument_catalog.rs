@@ -464,8 +464,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use qs_instruments::{
-        Decimal, DecimalGrid, InstrumentAssets, InstrumentEconomics, InstrumentSpec, PriceRules,
-        QuantityRules,
+        Decimal, DecimalGrid, InstrumentAssets, InstrumentEconomics, InstrumentSpec,
+        PositiveDecimal, PriceRules, QuantityRules,
     };
 
     use super::*;
@@ -528,6 +528,91 @@ lot_step_units = 100000
             )
             .unwrap_err();
         assert!(error.to_string().contains("cannot resolve instrument"));
+    }
+
+    #[test]
+    fn example_catalog_loads_explicit_forex_and_cryptocurrency_specs_without_fallback() {
+        let package_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let registry = SymbolRegistry::load(package_dir.join("../symbols/symbols.toml")).unwrap();
+        let domain = InstrumentDomain::load(
+            &InstrumentsSection {
+                catalog_path: Some(
+                    package_dir
+                        .join("instrument-catalog.example.toml")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..InstrumentsSection::default()
+            },
+            &registry,
+        )
+        .unwrap();
+        let at = "2026-01-01T00:00:00".parse().unwrap();
+        let manifest = domain
+            .resolve_manifest(
+                &["eurusd".into(), "btcusd".into(), "ethusd".into()],
+                at,
+                None,
+            )
+            .unwrap();
+        assert_eq!(manifest.instruments.len(), 3);
+        for (symbol, multiplier, model, market) in [
+            (
+                "eurusd",
+                "100000",
+                EconomicsModelId::FX_QUOTE_LINEAR_V1,
+                MarketKind::FX_CFD,
+            ),
+            (
+                "btcusd",
+                "1",
+                EconomicsModelId::CFD_QUOTE_LINEAR_V1,
+                MarketKind::LINEAR_EXPOSURE,
+            ),
+            (
+                "ethusd",
+                "1",
+                EconomicsModelId::CFD_QUOTE_LINEAR_V1,
+                MarketKind::LINEAR_EXPOSURE,
+            ),
+        ] {
+            let artifact = &manifest.instruments[symbol];
+            assert_eq!(
+                artifact.resolved.instrument.listing_venue.as_str(),
+                "example"
+            );
+            assert_eq!(artifact.resolved.instrument.market_kind.as_str(), market);
+            assert_eq!(artifact.spec.economics.pnl_model.as_str(), model);
+            assert_eq!(
+                artifact.spec.economics.quantity_unit,
+                QuantityUnit::StandardLot
+            );
+            assert_eq!(
+                artifact.spec.economics.contract_multiplier,
+                multiplier.parse::<PositiveDecimal>().unwrap()
+            );
+            assert_eq!(
+                artifact.spec.quantity.grid.step,
+                "0.01".parse::<PositiveDecimal>().unwrap()
+            );
+        }
+        let config = crate::convert::config_from_msg_with_manifest(
+            &serde_json::from_str::<crate::rpc_types::BacktestConfigMsg>("{}").unwrap(),
+            &registry,
+            manifest,
+        )
+        .unwrap();
+        assert_eq!(config.contract_sizes["eurusd"], 100000.0);
+        assert_eq!(config.contract_sizes["btcusd"], 1.0);
+        assert_eq!(config.contract_sizes["ethusd"], 1.0);
+        assert!(registry.spec("gbpusd").is_some());
+        assert!(matches!(
+            domain.resolve_manifest(&["gbpusd".into()], at, None),
+            Err(BacktestServerError::InstrumentUnavailable {
+                reason: InstrumentExclusionReasonMsg::UnknownInstrument,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -45,6 +45,20 @@ When `catalog_path` is omitted, the server compiles supported `qs-symbols` FX, m
 
 Each service replay result can include a typed instrument manifest containing the catalog version, resolved instrument and specification revision, effective specification, and actual Parquet partition and symbol coordinates. Catalog-backed Entry metadata also records exact requested and adjusted quantity, adjustment direction, and post-rounding notional when notional rules are configured. Existing `exchange` request and storage fields remain data coordinates and are not reinterpreted as broker, exchange listing, platform, or execution identity.
 
+### Authoring an explicit catalog
+
+See the [instrument catalog example](../crates/backtest-server/instrument-catalog.example.toml) for Forex and lot-linear cryptocurrency specifications, including assets, listing identity, effective intervals, exact grids, quantity limits and economics.
+
+From the workspace root, enable it in your server configuration:
+
+```toml
+[instruments]
+catalog_path = "crates/backtest-server/instrument-catalog.example.toml"
+market_data_source = "local-parquet"
+```
+
+Remove all `[[instruments.linear_instruments]]` sections when enabling `catalog_path`. Relative paths are resolved from the server process working directory. The example declares only EURUSD, BTCUSD and ETHUSD under a neutral listing namespace; it is not a complete registry catalog or verified broker specification. Add every required trading and conversion instrument for your run. Missing catalog instruments are not automatically filled from `symbols.toml`; the registry still supplies name normalization and current conversion metadata.
+
 ### Configurable linear simulations
 
 The server example includes BTCUSD and ETHUSD operator-selected simulations: one base asset per standard lot, contract multiplier `1`, quantity step/minimum `0.01` lot, maximum `10` lots, price step `0.01`, and display scale `2`. These are editable assumptions, not independently verified broker specifications. Exact decimal values are quoted strings. Quantities, monetary contract multipliers and storage precision are separate facts.

@@ -26,7 +26,10 @@ registry_path = "crates/symbols/symbols.toml"
 [instruments]
 # Optional strict instrument catalog document. When omitted, supported entries in the
 # qs-symbols registry compile into an immutable compatibility catalog.
-# catalog_path = "instrument-catalog.toml"
+# The included catalog is a small EURUSD/cryptocurrency example, not a full registry catalog.
+# When enabling it, remove all linear_instruments sections below and add required conversion instruments.
+# Relative paths are resolved from the server process working directory.
+# catalog_path = "crates/backtest-server/instrument-catalog.example.toml"
 # Optional broker, exchange, or repository-owned alias-resolution default. A trading platform
 # such as CTrader is not a listing venue. Explicit catalogs may omit this when aliases are unique.
 # Compatibility catalogs use repository-default when it is omitted.

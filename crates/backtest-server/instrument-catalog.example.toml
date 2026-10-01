@@ -1,0 +1,109 @@
+# Authoritative instrument catalog example, not verified broker specifications.
+# From the workspace root, set this path in the server configuration:
+# [instruments]
+# catalog_path = "crates/backtest-server/instrument-catalog.example.toml"
+# Remove all [[instruments.linear_instruments]] sections when using catalog_path.
+# Only EURUSD, BTCUSD and ETHUSD are declared; other symbols do not fall back to the registry.
+# Add every required trading and currency-conversion instrument before using a wider universe.
+# The listing venue is an example namespace, not a market-data partition or execution venue.
+# Exact decimal values are strings; omitted valid_until means no end to the effective interval.
+# Catalog version identifies these specifications independently of the workspace release version.
+
+schema_version = 1
+version = "example-1"
+
+[[assets]]
+asset = "EUR"
+kind = "fiat"
+display_code = "EUR"
+
+[[assets]]
+asset = "USD"
+kind = "fiat"
+display_code = "USD"
+
+[[assets]]
+asset = "BTC"
+kind = "crypto"
+display_code = "BTC"
+
+[[assets]]
+asset = "ETH"
+kind = "crypto"
+display_code = "ETH"
+
+# Forex simulation: one standard lot represents 100000 units of the base currency.
+[[instruments]]
+revision = "1.0.0"
+status = "trading"
+aliases = ["EURUSD"]
+instrument = { listing_venue = "example", market_kind = "fx_cfd", listing = "EURUSD" }
+effective = { valid_from = "1970-01-01T00:00:00Z" }
+assets = { base = "EUR", quote = "USD", settlement = "USD" }
+
+[instruments.price]
+grid = { origin = "0", step = "0.00001" }
+display_scale = 5
+
+[instruments.quantity]
+grid = { origin = "0", step = "0.01" }
+minimum = "0.01"
+maximum = "100"
+storage_scale = 2
+
+[instruments.economics]
+pnl_model = "fx_quote_linear_v1"
+quantity_unit = "standard_lot"
+contract_multiplier = "100000"
+settlement_asset = "USD"
+
+# Cryptocurrency simulations: one standard lot represents one base asset.
+# Gross P&L is price difference times lot quantity times contract_multiplier.
+# No funding, margin or liquidation model is declared.
+[[instruments]]
+revision = "1.0.0"
+status = "trading"
+aliases = ["BTCUSD"]
+instrument = { listing_venue = "example", market_kind = "linear_exposure", listing = "BTCUSD" }
+effective = { valid_from = "1970-01-01T00:00:00Z" }
+assets = { base = "BTC", quote = "USD", settlement = "USD" }
+
+[instruments.price]
+grid = { origin = "0", step = "0.01" }
+display_scale = 2
+
+[instruments.quantity]
+grid = { origin = "0", step = "0.01" }
+minimum = "0.01"
+maximum = "10"
+storage_scale = 2
+
+[instruments.economics]
+pnl_model = "cfd_quote_linear_v1"
+quantity_unit = "standard_lot"
+contract_multiplier = "1"
+settlement_asset = "USD"
+
+[[instruments]]
+revision = "1.0.0"
+status = "trading"
+aliases = ["ETHUSD"]
+instrument = { listing_venue = "example", market_kind = "linear_exposure", listing = "ETHUSD" }
+effective = { valid_from = "1970-01-01T00:00:00Z" }
+assets = { base = "ETH", quote = "USD", settlement = "USD" }
+
+[instruments.price]
+grid = { origin = "0", step = "0.01" }
+display_scale = 2
+
+[instruments.quantity]
+grid = { origin = "0", step = "0.01" }
+minimum = "0.01"
+maximum = "10"
+storage_scale = 2
+
+[instruments.economics]
+pnl_model = "cfd_quote_linear_v1"
+quantity_unit = "standard_lot"
+contract_multiplier = "1"
+settlement_asset = "USD"
