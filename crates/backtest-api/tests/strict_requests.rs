@@ -197,6 +197,7 @@ fn run_requests_support_parser_free_direct_construction() {
             symbol: "EURUSD".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "fixture".into(),
             data_type: "tick".into(),
             timeframe: None,

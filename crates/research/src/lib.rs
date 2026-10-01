@@ -38,8 +38,9 @@ pub use factory::{
 pub use family::StrategyFamily;
 pub use geometry::SeriesGeometry;
 pub use loader::{
-    load_symbol_bars, load_symbol_ordered_ticks, load_symbol_ordered_ticks_controlled,
-    load_symbol_price_bars, load_symbol_price_bars_controlled, load_symbol_ticks,
+    load_symbol_bars, load_symbol_bars_with_resolver, load_symbol_ordered_ticks,
+    load_symbol_ordered_ticks_controlled, load_symbol_price_bars,
+    load_symbol_price_bars_controlled, load_symbol_ticks, load_symbol_ticks_with_resolver,
 };
 pub use plan::{PortfolioPlan, ResearchAdmissionLimits, ResearchPlan};
 pub use projectors::{

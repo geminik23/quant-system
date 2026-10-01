@@ -21,6 +21,13 @@ pub enum MarketLoadError {
         data_type: String,
     },
 
+    /// More than one physical dataset identifies the requested replay symbol.
+    #[error("ambiguous market-data symbol {symbol}: {candidates:?}")]
+    AmbiguousSymbol {
+        symbol: String,
+        candidates: Vec<String>,
+    },
+
     /// The caller's cancellation check fired while opening or draining a stream.
     #[error("Market data loading cancelled")]
     Cancelled,

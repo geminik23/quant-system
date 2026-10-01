@@ -40,19 +40,22 @@ use qs_backtest::runner::{
 use qs_symbols::SymbolRegistry;
 use tokio::sync::watch;
 
+use crate::admission::{PreparedReplay, prepare_replay};
 use crate::artifact_store::ArtifactStore;
+#[cfg(test)]
+use crate::convert::raw_signal_from_msg;
 use crate::convert::{
     account_currency_from_msg, config_from_msg, evaluation_options_from_msg_for_symbols,
-    future_config_from_msg, profile_from_msg, raw_signal_from_msg, result_to_msg,
-    validate_future_quote_scalars,
+    future_config_from_msg, profile_from_msg, result_to_msg, validate_future_quote_scalars,
 };
 use crate::error::{BacktestServerError, Result};
-use crate::fx_loader::describe_future_stream;
+use crate::fx_loader::describe_future_stream_with_resolver as describe_future_stream;
 use crate::instrument_catalog::InstrumentDomain;
 use crate::replay_plan::{ReplayPlan, RequestedSymbolScope};
 use crate::rpc_types::*;
 use qs_market_loader::{
-    CancellationCheck, MarketStreamDescription, MarketStreamError, describe_primary_market_stream,
+    CancellationCheck, MarketStreamDescription, MarketStreamError,
+    describe_primary_market_stream_with_resolver as describe_primary_market_stream,
 };
 
 /// Shared state accessible by all client handlers.
@@ -99,6 +102,7 @@ impl StrategyServiceState {
 pub struct AcceptedBacktestJobInput {
     request: RunBacktestRequest,
     profiles: PreparedEntryProfiles,
+    prepared: PreparedReplay,
 }
 
 /// Validated input a retained job runs once its worker starts.
@@ -744,7 +748,16 @@ fn execute_backtest_with_future(
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
 ) -> Result<BacktestResult> {
-    execute_backtest_with_future_controlled(state, req, future, evaluation, None, None, &mut |_| {})
+    execute_backtest_with_future_controlled(
+        state,
+        req,
+        future,
+        evaluation,
+        None,
+        None,
+        None,
+        &mut |_| {},
+    )
 }
 
 fn ensure_not_cancelled(cancellation: Option<&JobCancellationToken>) -> Result<()> {
@@ -768,12 +781,14 @@ fn map_streaming_replay_error(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_backtest_with_future_controlled(
     state: &ServerState,
     req: &BacktestRunSpec,
     future: &FutureQuoteConfigMsg,
     evaluation: &ProviderEvaluationOptionsMsg,
     prepared_profiles: Option<&PreparedEntryProfiles>,
+    prepared_input: Option<&PreparedReplay>,
     cancellation: Option<&JobCancellationToken>,
     progress: &mut dyn FnMut(BacktestProgress),
 ) -> Result<BacktestResult> {
@@ -781,19 +796,16 @@ fn execute_backtest_with_future_controlled(
     validate_request(req)?;
     validate_future_quote_scalars(future)?;
 
-    let from = parse_optional_datetime(&req.from)?;
-    let to = parse_optional_datetime(&req.to)?;
-    let plan = build_replay_plan(
-        state,
-        &req.symbol,
-        &req.symbols,
-        req.all_symbols,
-        &req.raw_signals,
-        from,
-        to,
-        future.signal_latency_ms,
-    )?;
-    validate_replay_sizing(req, &plan)?;
+    let owned_input;
+    let prepared = match prepared_input {
+        Some(prepared) => prepared,
+        None => {
+            owned_input = prepare_replay(state, req, future, cancellation)?;
+            &owned_input
+        }
+    };
+    let plan = &prepared.plan;
+    validate_replay_sizing(req, plan)?;
     let owned_profiles;
     let prepared_profiles = match prepared_profiles {
         Some(profiles) => profiles,
@@ -808,15 +820,7 @@ fn execute_backtest_with_future_controlled(
         &state.symbol_registry,
         plan.requested_symbols(),
     )?;
-    let mut config = config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols())?;
-    if let Some(loading_start) = plan.loading_start() {
-        config.instrument_manifest = Some(state.instrument_domain.resolve_manifest(
-            plan.active_symbols(),
-            loading_start,
-            to,
-        )?);
-    }
-    let account_currency = account_currency_from_msg(future)?;
+    let config = prepared.config.clone();
     let exchange = req.exchange.to_lowercase();
     tracing::info!(
         "run_backtest: requested_symbols={:?} active_symbols={:?} idle_symbols={:?} loading_start={:?} exchange={} data_type={}",
@@ -846,70 +850,9 @@ fn execute_backtest_with_future_controlled(
         plan.active_symbols().len()
     );
     let mut result = {
-        let mut cancelled = || cancellation.is_some_and(JobCancellationToken::is_cancelled);
-        let primary = describe_primary_market_stream(
-            &state.data_dir,
-            &exchange,
-            plan.active_symbols(),
-            &req.data_type,
-            req.timeframe.as_deref(),
-            plan.loading_start(),
-            to,
-            &mut cancelled,
-            &mut |processed_symbols| {
-                progress(BacktestProgress {
-                    stage: "loading_data".into(),
-                    processed_symbols,
-                    total_symbols,
-                    total_signals,
-                    ..BacktestProgress::default()
-                });
-            },
-        )?;
-        let mut primary = primary;
-        primary.apply_bar_point_sizes(&bar_point_sizes(
-            &state.symbol_registry,
-            plan.active_symbols(),
-        ));
-        progress(BacktestProgress {
-            stage: "loading_conversion_data".into(),
-            processed_symbols: total_symbols,
-            total_symbols,
-            total_signals,
-            ..BacktestProgress::default()
-        });
-        let bundle = describe_future_stream(
-            &state.data_dir,
-            &exchange,
-            &state.symbol_registry,
-            &account_currency,
-            plan.active_symbols(),
-            &req.data_type,
-            plan.loading_start(),
-            primary,
-            &mut cancelled,
-        )?;
+        let bundle = &prepared.bundle;
         let primary_eod = bundle.description.primary_eod();
-        let mut instrument_symbols = plan.active_symbols().to_vec();
-        instrument_symbols.extend(bundle.currency_plan.conversion_symbols().iter().cloned());
-        instrument_symbols.sort();
-        instrument_symbols.dedup();
-        if let Some(loading_start) = plan.loading_start() {
-            let mut manifest = state.instrument_domain.resolve_manifest(
-                &instrument_symbols,
-                loading_start,
-                primary_eod.or(to),
-            )?;
-            state.instrument_domain.attach_stored_series(
-                &mut manifest,
-                bundle.description.stored_series_coordinates(),
-            )?;
-            bundle
-                .description
-                .validate_stored_series_bindings(&manifest)?;
-            config.instrument_manifest = Some(manifest);
-        }
-        let future_config = future_config_from_msg(future, bundle.currency_plan)?;
+        let future_config = prepared.future.clone();
         let cancellation_token = cancellation.cloned();
         let stream_cancellation: CancellationCheck = Arc::new(move || {
             cancellation_token
@@ -961,7 +904,7 @@ fn execute_backtest_with_future_controlled(
         &mut result,
         state,
         req,
-        &plan,
+        plan,
         future,
         profile.as_ref(),
         prepared_profiles,
@@ -1001,6 +944,12 @@ fn attach_future_reproducibility_metadata(
         "data.requested_to".into(),
         req.to.clone().unwrap_or_else(|| "unbounded".into()),
     );
+    if let Some(report) = plan.admission_report() {
+        tags.insert(
+            "data.admission_report".into(),
+            serde_json::to_string(report).expect("bounded admission report"),
+        );
+    }
     tags.insert("data.symbols".into(), plan.active_symbols().join(","));
     tags.insert(
         "data.requested_symbols".into(),
@@ -1188,28 +1137,13 @@ fn execute_backtest_multi_with_future(
             .collect();
     }
 
-    let from = match parse_optional_datetime(&req.from) {
-        Ok(value) => value,
+    let metadata_request = single_request_from_multi(req);
+    let prepared = match prepare_replay(state, &metadata_request, future, None) {
+        Ok(prepared) => prepared,
         Err(error) => return profile_error_results(req, error.to_string()),
     };
-    let to = match parse_optional_datetime(&req.to) {
-        Ok(value) => value,
-        Err(error) => return profile_error_results(req, error.to_string()),
-    };
-    let plan = match build_replay_plan(
-        state,
-        &req.symbol,
-        &req.symbols,
-        req.all_symbols,
-        &req.raw_signals,
-        from,
-        to,
-        future.signal_latency_ms,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => return profile_error_results(req, error.to_string()),
-    };
-    if let Err(error) = validate_replay_sizing_for_config(&req.config, &plan) {
+    let plan = &prepared.plan;
+    if let Err(error) = validate_replay_sizing_for_config(&req.config, plan) {
         return profile_error_results(req, error.to_string());
     }
     let evaluation_options = match evaluation_options_from_msg_for_symbols(
@@ -1231,99 +1165,12 @@ fn execute_backtest_multi_with_future(
                 .collect();
         }
     };
-    let mut config =
-        match config_from_msg(&req.config, &state.symbol_registry, plan.active_symbols()) {
-            Ok(config) => config,
-            Err(error) => {
-                return profile_error_results(req, error.to_string());
-            }
-        };
-    if let Some(loading_start) = plan.loading_start() {
-        match state
-            .instrument_domain
-            .resolve_manifest(plan.active_symbols(), loading_start, to)
-        {
-            Ok(manifest) => config.instrument_manifest = Some(manifest),
-            Err(error) => return profile_error_results(req, error.to_string()),
-        }
-    }
-    let account_currency = match account_currency_from_msg(future) {
-        Ok(account_currency) => account_currency,
-        Err(error) => {
-            return profile_error_results(req, error.to_string());
-        }
-    };
-    let exchange = req.exchange.to_lowercase();
+    let config = &prepared.config;
 
     {
-        let mut never_cancelled = || false;
-        let primary = match describe_primary_market_stream(
-            &state.data_dir,
-            &exchange,
-            plan.active_symbols(),
-            &data_type,
-            req.timeframe.as_deref(),
-            plan.loading_start(),
-            to,
-            &mut never_cancelled,
-            &mut |_| {},
-        ) {
-            Ok(mut primary) => {
-                primary.apply_bar_point_sizes(&bar_point_sizes(
-                    &state.symbol_registry,
-                    plan.active_symbols(),
-                ));
-                primary
-            }
-            Err(error) => return profile_error_results(req, error.to_string()),
-        };
-        let bundle = match describe_future_stream(
-            &state.data_dir,
-            &exchange,
-            &state.symbol_registry,
-            &account_currency,
-            plan.active_symbols(),
-            &data_type,
-            plan.loading_start(),
-            primary,
-            &mut never_cancelled,
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => return profile_error_results(req, error.to_string()),
-        };
+        let bundle = &prepared.bundle;
         let primary_eod = bundle.description.primary_eod();
-        let mut instrument_symbols = plan.active_symbols().to_vec();
-        instrument_symbols.extend(bundle.currency_plan.conversion_symbols().iter().cloned());
-        instrument_symbols.sort();
-        instrument_symbols.dedup();
-        if let Some(loading_start) = plan.loading_start() {
-            let mut manifest = match state.instrument_domain.resolve_manifest(
-                &instrument_symbols,
-                loading_start,
-                primary_eod.or(to),
-            ) {
-                Ok(manifest) => manifest,
-                Err(error) => return profile_error_results(req, error.to_string()),
-            };
-            if let Err(error) = state.instrument_domain.attach_stored_series(
-                &mut manifest,
-                bundle.description.stored_series_coordinates(),
-            ) {
-                return profile_error_results(req, error.to_string());
-            }
-            if let Err(error) = bundle
-                .description
-                .validate_stored_series_bindings(&manifest)
-            {
-                return profile_error_results(req, error.to_string());
-            }
-            config.instrument_manifest = Some(manifest);
-        }
-        let future_config = match future_config_from_msg(future, bundle.currency_plan) {
-            Ok(config) => config,
-            Err(error) => return profile_error_results(req, error.to_string()),
-        };
-        let metadata_request = single_request_from_multi(req);
+        let future_config = &prepared.future;
 
         let registry = state.profile_registry.read().unwrap();
         let routes = match req
@@ -1372,13 +1219,13 @@ fn execute_backtest_multi_with_future(
                         plan.retained_signals(),
                         &bundle.description,
                         primary_eod,
-                        &config,
-                        &future_config,
+                        config,
+                        future_config,
                         future,
                         Some(&evaluation_options),
                         state,
                         &metadata_request,
-                        &plan,
+                        plan,
                     )
                 });
                 match run_result {
@@ -1405,6 +1252,7 @@ fn single_request_from_multi(req: &BacktestMultiRunSpec) -> BacktestRunSpec {
         symbol: req.symbol.clone(),
         symbols: req.symbols.clone(),
         all_symbols: req.all_symbols,
+        on_unavailable: req.on_unavailable,
         exchange: req.exchange.clone(),
         data_type: req.data_type.clone(),
         timeframe: req.timeframe.clone(),
@@ -1483,6 +1331,7 @@ fn run_profile_streaming(
 
 // ── Signal Conversion ───────────────────────────────────────────────────────
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_replay_plan(
     state: &ServerState,
@@ -1509,7 +1358,7 @@ fn build_replay_plan(
     )
 }
 
-fn resolve_requested_symbol_scope(
+pub(crate) fn resolve_requested_symbol_scope(
     registry: &SymbolRegistry,
     symbol: &str,
     symbols: &[String],
@@ -1862,7 +1711,7 @@ fn normalize_symbol(registry: &SymbolRegistry, raw: &str) -> String {
 }
 
 /// Parse an ISO datetime string into NaiveDateTime.
-fn parse_datetime(s: &str) -> Result<NaiveDateTime> {
+pub(crate) fn parse_datetime(s: &str) -> Result<NaiveDateTime> {
     // Try multiple common formats.
     let formats = [
         "%Y-%m-%dT%H:%M:%S%.f",
@@ -2070,41 +1919,19 @@ pub fn handle_submit_backtest(
         let request = &req.request.request;
         validate_future_quote_scalars(&req.request.future)?;
         validate_request(request)?;
-        let from = parse_optional_datetime(&request.from)?;
-        let to = parse_optional_datetime(&request.to)?;
-        let plan = build_replay_plan(
-            state,
-            &request.symbol,
-            &request.symbols,
-            request.all_symbols,
-            &request.raw_signals,
-            from,
-            to,
-            req.request.future.signal_latency_ms,
-        )?;
-        validate_replay_sizing(request, &plan)?;
-        account_currency_from_msg(&req.request.future)?;
-        let mut config = config_from_msg(
-            &request.config,
-            &state.symbol_registry,
-            plan.active_symbols(),
-        )?;
-        if let Some(loading_start) = plan.loading_start() {
-            config.instrument_manifest = Some(state.instrument_domain.resolve_manifest(
-                plan.active_symbols(),
-                loading_start,
-                to,
-            )?);
-        }
+        let prepared = prepare_replay(state, request, &req.request.future, None)?;
+        validate_replay_sizing(request, &prepared.plan)?;
         evaluation_options_from_msg_for_symbols(
             &req.request.evaluation,
             &state.symbol_registry,
-            plan.requested_symbols(),
+            prepared.plan.requested_symbols(),
         )?;
-        let profiles = resolve_prepared_entry_profiles(state, request, plan.retained_signals())?;
+        let profiles =
+            resolve_prepared_entry_profiles(state, request, prepared.plan.retained_signals())?;
         Ok(AcceptedBacktestJobInput {
             request: req.request.clone(),
             profiles,
+            prepared,
         })
     })();
     let accepted = match validation {
@@ -2347,7 +2174,11 @@ fn run_job_and_store_inner(
     job_id: String,
     accepted: AcceptedBacktestJobInput,
 ) {
-    let AcceptedBacktestJobInput { request, profiles } = accepted;
+    let AcceptedBacktestJobInput {
+        request,
+        profiles,
+        prepared,
+    } = accepted;
     let RunBacktestRequest {
         request: req,
         future,
@@ -2361,6 +2192,7 @@ fn run_job_and_store_inner(
             &future,
             &evaluation,
             Some(&profiles),
+            Some(&prepared),
             Some(cancellation),
             &mut |progress| update_job_progress(state, job_id, progress),
         )
@@ -2694,6 +2526,7 @@ mod tests {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "ctrader".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -2720,6 +2553,7 @@ mod tests {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "ctrader".into(),
             data_type: "invalid".into(),
             timeframe: None,
@@ -2758,6 +2592,7 @@ mod tests {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "ctrader".into(),
             data_type: "bar".into(),
             timeframe: None,
@@ -2796,6 +2631,7 @@ mod tests {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "ctrader".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -2834,6 +2670,7 @@ mod tests {
             symbol: "eurusd".into(),
             symbols: Vec::new(),
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "ctrader".into(),
             data_type: "tick".into(),
             timeframe: None,
@@ -3295,6 +3132,7 @@ lot_step_units = 1
             symbol: "XAUUSD".into(),
             symbols: vec![],
             all_symbols: false,
+            on_unavailable: Default::default(),
             exchange: "icmarkets".into(),
             data_type: "tick".into(),
             timeframe: None,

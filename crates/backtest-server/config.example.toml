@@ -33,6 +33,29 @@ registry_path = "crates/symbols/symbols.toml"
 # default_listing_venue = "ic-markets"
 # Identity of the historical data source. This is separate from listing and execution venues.
 market_data_source = "local-parquet"
+# Optional physical dataset selection when several aliases identify the same symbol.
+# [instruments.source_symbols]
+# us100 = "USTEC"
+
+# Operator-selected linear simulations, not verified broker specifications.
+# Use these instead of catalog_path; ordinary guarded registry instruments are retained.
+[[instruments.linear_instruments]]
+symbol = "BTCUSD"
+contract_multiplier = "1"
+price_step = "0.01"
+display_scale = 2
+quantity_step = "0.01"
+minimum = "0.01"
+maximum = "10"
+
+[[instruments.linear_instruments]]
+symbol = "ETHUSD"
+contract_multiplier = "1"
+price_step = "0.01"
+display_scale = 2
+quantity_step = "0.01"
+minimum = "0.01"
+maximum = "10"
 
 [profiles]
 # Path to the qs-backtest management profiles TOML.

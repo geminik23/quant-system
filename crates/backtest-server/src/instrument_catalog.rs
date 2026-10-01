@@ -8,15 +8,18 @@ use qs_backtest::{
     resolve_legacy_economics,
 };
 use qs_instruments::{
-    AssetId, AssetKind, AssetSpec, CatalogDocument, EconomicsModelId, EffectiveInterval,
-    InstrumentAlias, InstrumentCatalogSnapshot, InstrumentId, InstrumentResolutionContext,
-    InstrumentSelector, ListingStatus, ListingVenueId, MarketDataSourceId, MarketKind,
-    QuantityUnit, StoredSeriesBinding,
+    AssetId, AssetKind, AssetSpec, CatalogDocument, Decimal, DecimalGrid, EconomicsModelId,
+    EffectiveInterval, InstrumentAlias, InstrumentAssets, InstrumentCatalogSnapshot,
+    InstrumentEconomics, InstrumentId, InstrumentResolutionContext, InstrumentResolutionError,
+    InstrumentSelector, InstrumentSpec, ListingStatus, ListingVenueId, MarketDataSourceId,
+    MarketKind, PriceRules, QuantityRules, QuantityUnit, StoredSeriesBinding,
 };
 use qs_symbols::{SymbolCurrencyMetadata, SymbolRegistry, SymbolSpec};
 
-use crate::config::InstrumentsSection;
+use crate::config::{InstrumentsSection, LinearInstrumentConfig};
 use crate::error::{BacktestServerError, Result};
+use crate::rpc_types::InstrumentExclusionReasonMsg;
+use qs_market_loader::SymbolPartitionResolver;
 
 const CATALOG_SCHEMA_VERSION: u32 = 1;
 const COMPATIBILITY_LISTING_VENUE: &str = "repository-default";
@@ -28,6 +31,7 @@ pub struct InstrumentDomain {
     snapshot: Arc<InstrumentCatalogSnapshot>,
     default_listing_venue: Option<ListingVenueId>,
     data_source: MarketDataSourceId,
+    source_symbols: BTreeMap<String, String>,
 }
 
 impl InstrumentDomain {
@@ -40,6 +44,35 @@ impl InstrumentDomain {
             .map_err(|error| BacktestServerError::Config(error.to_string()))?;
         let data_source = MarketDataSourceId::new(&config.market_data_source)
             .map_err(|error| BacktestServerError::Config(error.to_string()))?;
+        if config.catalog_path.is_some() && !config.linear_instruments.is_empty() {
+            return Err(BacktestServerError::Config(
+                "catalog_path and linear_instruments are alternative specification authorities"
+                    .into(),
+            ));
+        }
+        let mut source_symbols = BTreeMap::new();
+        let mut physical = BTreeSet::new();
+        for (symbol, source) in &config.source_symbols {
+            let canonical = registry.normalize(symbol).ok_or_else(|| {
+                BacktestServerError::Config(format!("unknown source binding symbol '{symbol}'"))
+            })?;
+            if source.is_empty()
+                || source.contains(['/', '\\'])
+                || source == "."
+                || source == ".."
+                || registry
+                    .normalize(source)
+                    .is_some_and(|target| target != canonical)
+                || !physical.insert(source.to_ascii_lowercase())
+                || source_symbols
+                    .insert(canonical.into(), source.clone())
+                    .is_some()
+            {
+                return Err(BacktestServerError::Config(format!(
+                    "invalid or duplicate source binding for '{symbol}'"
+                )));
+            }
+        }
         let (snapshot, default_listing_venue) = match &config.catalog_path {
             Some(path) => {
                 let content = fs::read_to_string(path).map_err(|error| {
@@ -65,7 +98,7 @@ impl InstrumentDomain {
                         .expect("valid built-in compatibility listing venue")
                 });
                 (
-                    compatibility_snapshot(registry, &listing_venue)?,
+                    compatibility_snapshot(registry, &listing_venue, &config.linear_instruments)?,
                     Some(listing_venue),
                 )
             }
@@ -74,6 +107,7 @@ impl InstrumentDomain {
             snapshot: Arc::new(snapshot),
             default_listing_venue,
             data_source,
+            source_symbols,
         })
     }
 
@@ -87,6 +121,13 @@ impl InstrumentDomain {
 
     pub fn data_source(&self) -> &MarketDataSourceId {
         &self.data_source
+    }
+
+    pub fn symbol_resolver<'a>(
+        &'a self,
+        registry: &'a SymbolRegistry,
+    ) -> SymbolPartitionResolver<'a> {
+        SymbolPartitionResolver::with_source_symbols(registry, &self.source_symbols)
     }
 
     pub fn resolve_manifest(
@@ -121,25 +162,21 @@ impl InstrumentDomain {
             let resolved = self
                 .snapshot
                 .resolve(&selector, &context, at)
-                .map_err(|error| {
-                    BacktestServerError::InvalidRequest(format!(
-                        "cannot resolve instrument '{symbol}': {error}"
-                    ))
-                })?;
+                .map_err(|error| resolution_error(symbol, error, at))?;
             validate_replay_spec(symbol, &resolved.spec)?;
             if let Some(through) = through {
                 let end = self
                     .snapshot
                     .resolve(&selector, &context, through)
-                    .map_err(|error| {
-                        BacktestServerError::InvalidRequest(format!(
-                            "cannot resolve instrument '{symbol}' at replay end: {error}"
-                        ))
-                    })?;
+                    .map_err(|error| resolution_error(symbol, error, through))?;
                 if end.reference != resolved.reference {
-                    return Err(BacktestServerError::InvalidRequest(format!(
-                        "instrument '{symbol}' changes specification during the requested replay range"
-                    )));
+                    return Err(BacktestServerError::InstrumentUnavailable {
+                        symbol: symbol.clone(),
+                        reason: InstrumentExclusionReasonMsg::UnsupportedEconomics,
+                        details:
+                            "instrument changes specification during the requested replay range"
+                                .into(),
+                    });
                 }
             }
             instruments.insert(
@@ -188,9 +225,35 @@ impl InstrumentDomain {
     }
 }
 
+fn resolution_error(
+    symbol: &str,
+    error: InstrumentResolutionError,
+    at: DateTime<Utc>,
+) -> BacktestServerError {
+    let details = format!("cannot resolve instrument '{symbol}': {error}");
+    match error {
+        InstrumentResolutionError::Inactive { .. } => BacktestServerError::InactiveInstrument {
+            symbol: symbol.into(),
+            at,
+            details,
+        },
+        InstrumentResolutionError::Ambiguous { .. } => BacktestServerError::InstrumentUnavailable {
+            symbol: symbol.into(),
+            reason: InstrumentExclusionReasonMsg::AmbiguousMapping,
+            details,
+        },
+        _ => BacktestServerError::InstrumentUnavailable {
+            symbol: symbol.into(),
+            reason: InstrumentExclusionReasonMsg::UnknownInstrument,
+            details,
+        },
+    }
+}
+
 fn compatibility_snapshot(
     registry: &SymbolRegistry,
     listing_venue: &ListingVenueId,
+    linear_instruments: &[LinearInstrumentConfig],
 ) -> Result<InstrumentCatalogSnapshot> {
     let effective = EffectiveInterval::new(
         SPEC_VALID_FROM
@@ -221,6 +284,97 @@ fn compatibility_snapshot(
                 .map_err(|error| BacktestServerError::Config(error.to_string()))?,
         );
     }
+    let mut configured = BTreeSet::new();
+    for rules in linear_instruments {
+        let canonical = registry.normalize(&rules.symbol).ok_or_else(|| {
+            BacktestServerError::Config(format!("unknown linear instrument '{}'", rules.symbol))
+        })?;
+        if !configured.insert(canonical.to_owned()) {
+            return Err(BacktestServerError::Config(format!(
+                "duplicate linear instrument '{canonical}'"
+            )));
+        }
+        let symbol = registry
+            .spec(canonical)
+            .expect("normalized registered symbol");
+        let currencies = registry.currency_metadata(canonical).ok_or_else(|| {
+            BacktestServerError::Config(format!("missing currencies for '{canonical}'"))
+        })?;
+        register_assets(&mut assets, symbol, currencies)?;
+        let settlement = AssetId::new(&currencies.pnl_currency)
+            .map_err(|error| BacktestServerError::Config(error.to_string()))?;
+        let spec = InstrumentSpec {
+            revision: "1.0.0"
+                .parse()
+                .map_err(|error: qs_instruments::IdentifierError| {
+                    BacktestServerError::Config(error.to_string())
+                })?,
+            instrument: InstrumentId::new(
+                listing_venue.clone(),
+                MarketKind::new(MarketKind::LINEAR_EXPOSURE)
+                    .map_err(|error| BacktestServerError::Config(error.to_string()))?,
+                canonical
+                    .parse()
+                    .map_err(|error: qs_instruments::IdentifierError| {
+                        BacktestServerError::Config(error.to_string())
+                    })?,
+            ),
+            effective,
+            status: ListingStatus::Trading,
+            assets: InstrumentAssets {
+                base: currencies
+                    .base_currency
+                    .as_deref()
+                    .map(AssetId::new)
+                    .transpose()
+                    .map_err(|error| BacktestServerError::Config(error.to_string()))?,
+                quote: currencies
+                    .quote_currency
+                    .as_deref()
+                    .map(AssetId::new)
+                    .transpose()
+                    .map_err(|error| BacktestServerError::Config(error.to_string()))?,
+                settlement: settlement.clone(),
+                fee_assets: BTreeSet::new(),
+            },
+            price: PriceRules {
+                grid: DecimalGrid::new(Decimal::ZERO, rules.price_step),
+                display_scale: rules.display_scale,
+            },
+            quantity: QuantityRules {
+                grid: DecimalGrid::new(Decimal::ZERO, rules.quantity_step),
+                minimum: rules.minimum,
+                maximum: Some(rules.maximum),
+                storage_scale: rules
+                    .quantity_step
+                    .get()
+                    .scale()
+                    .max(rules.minimum.get().scale())
+                    .max(rules.maximum.get().scale()),
+            },
+            notional: None,
+            economics: InstrumentEconomics {
+                pnl_model: EconomicsModelId::new(EconomicsModelId::CFD_QUOTE_LINEAR_V1)
+                    .map_err(|error| BacktestServerError::Config(error.to_string()))?,
+                quantity_unit: QuantityUnit::StandardLot,
+                contract_multiplier: rules.contract_multiplier,
+                settlement_asset: settlement,
+                fee_model: None,
+                funding_model: None,
+                margin_model: None,
+            },
+            aliases: BTreeSet::from([InstrumentAlias::new(canonical)
+                .map_err(|error| BacktestServerError::Config(error.to_string()))?]),
+        };
+        spec.validate()
+            .map_err(|error| BacktestServerError::Config(error.to_string()))?;
+        instruments.retain(|existing| {
+            !existing
+                .aliases
+                .contains(&InstrumentAlias::new(canonical).expect("validated alias"))
+        });
+        instruments.push(spec);
+    }
     InstrumentCatalogSnapshot::compile(CatalogDocument {
         schema_version: CATALOG_SCHEMA_VERSION,
         version: REGISTRY_CATALOG_VERSION.into(),
@@ -244,6 +398,7 @@ fn register_assets(
         let asset =
             AssetId::new(value).map_err(|error| BacktestServerError::Config(error.to_string()))?;
         let kind = match symbol.category.as_str() {
+            "crypto" if currencies.base_currency.as_deref() == Some(value) => AssetKind::Crypto,
             "metal" | "commodity" if currencies.base_currency.as_deref() == Some(value) => {
                 AssetKind::Commodity
             }
@@ -277,22 +432,28 @@ fn market_kind(symbol: &SymbolSpec) -> Result<MarketKind> {
 
 fn validate_replay_spec(symbol: &str, spec: &qs_instruments::InstrumentSpec) -> Result<()> {
     if spec.status != ListingStatus::Trading {
-        return Err(BacktestServerError::InvalidRequest(format!(
-            "instrument '{symbol}' is not in trading status"
-        )));
+        return Err(BacktestServerError::InstrumentUnavailable {
+            symbol: symbol.into(),
+            reason: InstrumentExclusionReasonMsg::UnsupportedEconomics,
+            details: "instrument is not in trading status".into(),
+        });
     }
     if spec.economics.quantity_unit != QuantityUnit::StandardLot {
-        return Err(BacktestServerError::InvalidRequest(format!(
-            "unsupported quantity unit for instrument '{symbol}'"
-        )));
+        return Err(BacktestServerError::InstrumentUnavailable {
+            symbol: symbol.into(),
+            reason: InstrumentExclusionReasonMsg::UnsupportedEconomics,
+            details: "unsupported quantity unit".into(),
+        });
     }
     let model = spec.economics.pnl_model.as_str();
     if model != EconomicsModelId::FX_QUOTE_LINEAR_V1
         && model != EconomicsModelId::CFD_QUOTE_LINEAR_V1
     {
-        return Err(BacktestServerError::InvalidRequest(format!(
-            "unsupported P&L model for instrument '{symbol}': {model}"
-        )));
+        return Err(BacktestServerError::InstrumentUnavailable {
+            symbol: symbol.into(),
+            reason: InstrumentExclusionReasonMsg::UnsupportedEconomics,
+            details: format!("unsupported P&L model: {model}"),
+        });
     }
     Ok(())
 }
@@ -443,6 +604,7 @@ lot_step_units = 100000
             catalog_path: Some(path.to_string_lossy().into_owned()),
             default_listing_venue: None,
             market_data_source: "test-parquet".into(),
+            ..InstrumentsSection::default()
         };
 
         let domain = InstrumentDomain::load(&config, &registry()).unwrap();
