@@ -2,7 +2,7 @@
 
 A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The synchronized `0.4.1` packages are published on crates.io. Current source includes subsequent instrument-admission and service cost-key corrections that are not part of those published archives.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The workspace is preparing the synchronized `0.4.2` release. The published `0.4.1` packages do not include the subsequent instrument-admission and service cost-key corrections in current source; `0.4.2` publication has not been performed as part of this version update.
 
 It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 

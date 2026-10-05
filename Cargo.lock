@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "qs-backtest-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64",
  "chrono",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "qs-data-preprocess"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "clap",
@@ -3698,7 +3698,7 @@ dependencies = [
 
 [[package]]
 name = "qs-execution"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "futures",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "qs-instruments"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "serde",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3750,7 +3750,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-data-api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3763,7 +3763,7 @@ dependencies = [
 
 [[package]]
 name = "qs-market-loader"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "qs-backtest",
@@ -3777,7 +3777,7 @@ dependencies = [
 
 [[package]]
 name = "qs-research"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "qs-backtest",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "qs-risk"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "quant-system-core",
@@ -3806,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3814,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "qs-service-xrpc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "futures",
  "nanoid",
@@ -3828,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "qs-signal-parser"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "base64",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "qs-strategy"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "quant-system-core",
@@ -3864,7 +3864,7 @@ dependencies = [
 
 [[package]]
 name = "qs-symbols"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3874,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "quant-system-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "nanoid",
