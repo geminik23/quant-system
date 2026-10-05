@@ -106,6 +106,274 @@ fn effective_catalog_start_is_reconsidered_after_earlier_unknown_entry_is_exclud
     assert!((result.total_pnl - 10.0).abs() < 1e-9);
 }
 
+fn install_catalog(fixture: &mut Fixture, specs: Vec<qs_instruments::InstrumentSpec>) {
+    use qs_instruments::{AssetKind, AssetSpec, CatalogDocument};
+    let document = CatalogDocument {
+        schema_version: 1,
+        version: "dated-fixture".into(),
+        assets: ["USD", "JPY"]
+            .into_iter()
+            .map(|name| AssetSpec {
+                asset: name.parse().unwrap(),
+                kind: AssetKind::Fiat,
+                display_code: name.into(),
+                storage_scale: None,
+            })
+            .collect(),
+        instruments: specs,
+    };
+    let path = fixture.root.join("dated-catalog.toml");
+    std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+    let domain = InstrumentDomain::load(
+        &InstrumentsSection {
+            catalog_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        &fixture.state.symbol_registry,
+    )
+    .unwrap();
+    Arc::get_mut(&mut fixture.state).unwrap().instrument_domain = domain;
+}
+
+fn dated_conversion_fixture(global_start: bool) -> (Fixture, RunBacktestRequest) {
+    let mut fixture = Fixture::new(&[("USDJPY", 150.0, 151.0)], rules());
+    insert_quote(&fixture, "USTEC", ts(11), 100.0);
+    insert_quote(&fixture, "USTEC", ts(13), 110.0);
+    let manifest = fixture
+        .state
+        .instrument_domain
+        .resolve_manifest(&["us100".into(), "usdjpy".into()], ts(0), Some(ts(14)))
+        .unwrap();
+    let specs = manifest
+        .instruments
+        .into_iter()
+        .map(|(symbol, mut artifact)| {
+            if symbol == "us100" {
+                artifact.spec.effective =
+                    qs_instruments::EffectiveInterval::new(ts(5).and_utc(), None).unwrap();
+            }
+            artifact.spec
+        })
+        .collect();
+    install_catalog(&mut fixture, specs);
+    let mut later = entry("US100", "later", "Buy");
+    if let RawSignalMsg::Entry { ts: timestamp, .. } = &mut later {
+        *timestamp = ts(10).to_string();
+    }
+    let mut req = request(vec![entry("USDJPY", "early", "Buy"), later]);
+    req.request.to = Some(ts(14).to_string());
+    req.request.config.sizing = Some(SizingPolicyMsg::FixedLot { lots: 1.0 });
+    if let RawSignalMsg::CloseAll { ts: timestamp } = req.request.raw_signals.last_mut().unwrap() {
+        *timestamp = ts(12).to_string();
+    }
+    if global_start {
+        req.request.raw_signals.insert(
+            0,
+            RawSignalMsg::CloseAll {
+                ts: ts(0).to_string(),
+            },
+        );
+    }
+    (fixture, req)
+}
+
+#[test]
+fn effective_start_retries_after_conversion_exclusion() {
+    let (fixture, req) = dated_conversion_fixture(false);
+    let result = run(&fixture, &req);
+    assert_eq!(result.total_positions, 1);
+    assert_eq!(result.positions[0].symbol, "us100");
+    assert!((result.total_pnl - 10.0).abs() < 1e-9);
+    let report = result.admission_report.as_ref().unwrap();
+    assert_eq!(report.excluded_instruments.len(), 1);
+    assert_eq!(report.excluded_instruments[0].symbol, "usdjpy");
+    assert_eq!(
+        report.excluded_instruments[0].reason,
+        InstrumentExclusionReasonMsg::NoConversionData
+    );
+    let submitted = handle_submit_backtest(
+        &fixture.state,
+        &SubmitBacktestRequest {
+            request: req.clone(),
+        },
+    );
+    assert!(submitted.success, "{:?}", submitted.error);
+    let id = submitted.job_id.unwrap();
+    run_job_and_store(fixture.state.clone(), id.clone());
+    let jobs = fixture.state.jobs.lock().unwrap();
+    let stored = jobs[&id].result.as_ref().unwrap();
+    assert_eq!(stored.admission_report, result.admission_report);
+    assert_eq!(stored.total_pnl, result.total_pnl);
+}
+
+#[test]
+fn retained_global_signal_keeps_effective_start_early() {
+    let (fixture, req) = dated_conversion_fixture(true);
+    let result = run(&fixture, &req);
+    assert_eq!(result.total_positions, 0);
+    let report = result.admission_report.unwrap();
+    assert_eq!(report.excluded_instruments.len(), 2);
+    assert_eq!(report.retained_signals, 2);
+}
+
+fn open_ended_fixture(rollover: bool) -> (Fixture, RunBacktestRequest) {
+    let mut fixture = Fixture::new(
+        &[("US100", 100.0, 110.0), ("XAUUSD", 2000.0, 2001.0)],
+        rules(),
+    );
+    let manifest = fixture
+        .state
+        .instrument_domain
+        .resolve_manifest(&["us100".into(), "xauusd".into()], ts(0), Some(ts(4)))
+        .unwrap();
+    let mut specs = Vec::new();
+    for (symbol, artifact) in manifest.instruments {
+        let mut spec = artifact.spec;
+        if symbol == "us100" {
+            spec.effective = qs_instruments::EffectiveInterval::new(
+                spec.effective.valid_from,
+                Some(ts(2).and_utc()),
+            )
+            .unwrap();
+            if rollover {
+                let mut next = spec.clone();
+                next.revision = "2.0.0".parse().unwrap();
+                next.effective =
+                    qs_instruments::EffectiveInterval::new(ts(2).and_utc(), None).unwrap();
+                specs.push(next);
+            }
+        }
+        specs.push(spec);
+    }
+    let document = qs_instruments::CatalogDocument {
+        schema_version: 1,
+        version: "ending-fixture".into(),
+        assets: ["USD", "XAU"]
+            .into_iter()
+            .map(|name| qs_instruments::AssetSpec {
+                asset: name.parse().unwrap(),
+                kind: if name == "USD" {
+                    qs_instruments::AssetKind::Fiat
+                } else {
+                    qs_instruments::AssetKind::Commodity
+                },
+                display_code: name.into(),
+                storage_scale: None,
+            })
+            .collect(),
+        instruments: specs,
+    };
+
+    let path = fixture.root.join("ending-catalog.toml");
+    std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+    let domain = InstrumentDomain::load(
+        &InstrumentsSection {
+            catalog_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        &fixture.state.symbol_registry,
+    )
+    .unwrap();
+    Arc::get_mut(&mut fixture.state).unwrap().instrument_domain = domain;
+
+    let mut req = request(vec![
+        entry("US100", "ending", "Buy"),
+        entry("XAUUSD", "valid", "Buy"),
+    ]);
+    req.request.to = None;
+    req.request.raw_signals.insert(
+        2,
+        RawSignalMsg::ModifyStoploss {
+            ts: ts(1).to_string(),
+            position: PositionRefMsg::ByTradeId {
+                trade_id: "ending".into(),
+            },
+            price: 95.0,
+        },
+    );
+    (fixture, req)
+}
+
+#[test]
+fn open_ended_expiry_uses_skip_and_strict_report() {
+    let (fixture, mut req) = open_ended_fixture(false);
+    let result = run(&fixture, &req);
+    assert_eq!(result.total_positions, 1);
+    assert_eq!(result.positions[0].symbol, "xauusd");
+    assert!((result.total_pnl - 10.0).abs() < 1e-9);
+    let report = result.admission_report.unwrap();
+    assert_eq!(report.excluded_instruments.len(), 1);
+    assert_eq!(report.excluded_instruments[0].symbol, "us100");
+    assert_eq!(report.excluded_instruments[0].skipped_management, 1);
+    let single = req.request.clone();
+    let profile: ManagementProfileMsg = serde_json::from_value(
+        serde_json::json!({"name":"neutral","use_targets":[],"close_ratios":[]}),
+    )
+    .unwrap();
+    let response = handle_run_backtest_multi(
+        &fixture.state,
+        &RunBacktestMultiRequest {
+            request: BacktestMultiRunSpec {
+                on_unavailable: single.on_unavailable,
+                symbol: single.symbol,
+                symbols: single.symbols,
+                all_symbols: single.all_symbols,
+                exchange: single.exchange,
+                data_type: single.data_type,
+                timeframe: single.timeframe,
+                from: single.from,
+                to: single.to,
+                raw_signals: single.raw_signals,
+                profiles: vec![
+                    ProfileRef::Inline(profile.clone()),
+                    ProfileRef::Inline(profile),
+                ],
+                entry_profile_routes: single.entry_profile_routes,
+                config: single.config,
+            },
+            future: req.future.clone(),
+            evaluation: req.evaluation.clone(),
+            result_delivery: ResultDeliveryMsg::Inline,
+        },
+    );
+    assert!(response.success, "{:?}", response.error);
+    for result in response.results {
+        assert_eq!(
+            result.result.unwrap().admission_report.as_ref(),
+            Some(&report)
+        );
+    }
+    req.request.on_unavailable = UnavailableInstrumentPolicyMsg::Error;
+    let submitted = handle_submit_backtest(&fixture.state, &SubmitBacktestRequest { request: req });
+    assert!(!submitted.success);
+    assert!(submitted.job_id.is_none());
+    assert!(submitted.error.unwrap().contains("excluded_instruments"));
+    assert!(fixture.state.jobs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn open_ended_all_expired_terminates_with_report() {
+    let (fixture, mut req) = open_ended_fixture(false);
+    req.request.raw_signals.retain(
+        |signal| !matches!(signal, RawSignalMsg::Entry { symbol, .. } if symbol == "XAUUSD"),
+    );
+    let result = run(&fixture, &req);
+    assert_eq!(result.total_positions, 0);
+    assert_eq!(result.admission_report.unwrap().retained_signals, 1);
+}
+
+#[test]
+fn open_ended_revision_change_is_reported_without_switching_specs() {
+    let (fixture, req) = open_ended_fixture(true);
+    let result = run(&fixture, &req);
+    assert_eq!(result.total_positions, 1);
+    let report = result.admission_report.unwrap();
+    assert_eq!(
+        report.excluded_instruments[0].reason,
+        InstrumentExclusionReasonMsg::UnsupportedEconomics
+    );
+}
+
 fn insert_quote(fixture: &Fixture, symbol: &str, at: NaiveDateTime, price: f64) {
     ParquetStore::open(&fixture.root)
         .unwrap()

@@ -166,7 +166,9 @@ pub(crate) fn prepare_replay(
                             unavailable(&error).expect("inactive reason"),
                         );
                     }
-                    continue;
+                    if added.contains_key(symbol) {
+                        continue;
+                    }
                 }
                 Err(error) => {
                     if let Some((mut reason, mut details)) = unavailable(&error) {
@@ -216,10 +218,6 @@ pub(crate) fn prepare_replay(
             excluded.extend(added);
             continue;
         }
-        if !inactive.is_empty() {
-            excluded.extend(inactive);
-            continue;
-        }
         let conversion_end = descriptions
             .iter()
             .filter_map(MarketStreamDescription::primary_eod)
@@ -230,6 +228,25 @@ pub(crate) fn prepare_replay(
             let start = at.expect("active Entry has a loading start");
             if to.is_some_and(|end| start > end) {
                 continue;
+            }
+            if to.is_none() {
+                let specification_start = if inactive.contains_key(symbol) {
+                    instrument_loading_start(symbol, &retained, future.signal_latency_ms)
+                        .expect("instrument Entry")
+                } else {
+                    start
+                };
+                if let Err(error) = state.instrument_domain.resolve_manifest(
+                    std::slice::from_ref(symbol),
+                    specification_start,
+                    conversion_end,
+                ) {
+                    if let Some(reason) = unavailable(&error) {
+                        added.insert(symbol.clone(), reason);
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
             match check_conversion_data(
                 &state.data_dir,
@@ -312,8 +329,10 @@ pub(crate) fn prepare_replay(
             excluded.extend(added);
             continue;
         }
-        if !deferred.is_empty() {
-            excluded.extend(deferred);
+        // Only finalize start-dependent failures after all other exclusions can move the bounds.
+        inactive.extend(deferred);
+        if !inactive.is_empty() {
+            excluded.extend(inactive);
             continue;
         }
         let primary = MarketStreamDescription::merge_primary(descriptions, to)?;

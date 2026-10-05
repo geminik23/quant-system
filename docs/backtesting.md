@@ -105,7 +105,7 @@ The additive `admission_report` preserves exact in-window and retained counts pl
 
 This is an intentional default-behavior change. New request fields require a compatible server; older strict servers may reject them. Configured strategies, portfolios and research do not silently drop mandatory logical inputs under this raw-signal policy.
 
-Known effective-dated catalog limitations: a later instrument may be excluded before an earlier instrument's conversion failure advances the replay start, and a run without an explicit `to` may fail as a whole when final manifest resolution discovers an expired or changed specification. These paths were identified by source review and remain unresolved; dedicated reproductions have not yet been run.
+Current source rechecks start-dependent specification and conversion availability after other instrument exclusions change the retained input. Retained group/account-wide management can keep the loading start early; an instrument is not admitted by ignoring those signals. When `to` is omitted, primary specifications are also checked through the actual shared primary EOD before admission is finalized. Expired or changed specifications follow instrument-local skip/report or report-bearing strict rejection; execution still does not switch specifications during a run. These corrections are not included in the published `0.4.1` archives.
 
 ## Replay semantics
 
@@ -131,6 +131,8 @@ Bars cannot reconstruct the real intrabar price path. The adverse-extreme-first 
 ## Trading costs
 
 Commission and overnight swap are optional and off by default. A run without a cost specification produces exactly the artifacts it produced before costs existed.
+
+Known service-boundary limitation: current wire configuration converts cost keys to uppercase, while service replay uses lowercase canonical symbols. A configured cost can therefore appear in execution metadata without being charged. This was reproduced for both raw-signal and configured-strategy service runs; do not treat those results as cost-inclusive merely because a cost specification was accepted. The library cost arithmetic is separate and requires cost keys matching its replay symbols. This boundary issue is not resolved by the instrument-admission corrections.
 
 Each symbol may declare:
 
