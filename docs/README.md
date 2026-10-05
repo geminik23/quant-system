@@ -12,6 +12,7 @@ Use this index to enter the workspace by goal rather than by crate name.
 | Normalize and durably apply source events | [Signal ingestion](signal-ingestion.md) |
 | Run the CTrader quote service | [Market data](market-data.md) |
 | Understand crate, execution, and service ownership | [Architecture](architecture.md) |
+| Check implemented capabilities and current limitations | [Current capabilities and boundaries](current-boundaries.md) |
 | Review intended project direction | [Roadmap](roadmap.md) |
 | Construct strict signal JSONL | [RawSignal reference](reference/raw-signal.md) |
 

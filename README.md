@@ -2,7 +2,7 @@
 
 A Rust workspace for deterministic historical replay and real-time market-data infrastructure.
 
-`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The synchronized `0.4.1` packages are published on crates.io. Current source includes subsequent instrument-admission corrections that are not part of those published archives.
+`quant-system` is intended for Rust developers and quantitative researchers who want to import historical market data, replay normalized trading actions against explicit instrument specifications, embed trading-domain and backtest libraries, or operate a local CTrader quote service. The synchronized `0.4.1` packages are published on crates.io. Current source includes subsequent instrument-admission and service cost-key corrections that are not part of those published archives.
 
 It is not a complete automated trading platform. It does not currently execute live broker orders, provide restart-safe live strategy orchestration, or implement general cryptocurrency economics.
 
@@ -92,23 +92,13 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 
 ## Current boundaries
 
-- Bars are replayed with the spread recorded while the bar formed, or with a configured per-symbol fallback; a bar that supplies neither executes at a zero spread and the run counts how often that happened. Waiting orders fill at a bar's open, stops, targets, and pending orders inside its range fill at their level with each side meeting its adverse extreme first, and the close only marks. The real intrabar order is unknown, so use ticks when the ordering of stop, target, and management events matters.
-- Source-neutral ingestion is available as embeddable library APIs for JSONL, Telegram, and authenticated webhook sources. A webhook `202 Accepted` response confirms admission only; it does not confirm normalization, committed-batch publication, or trading activity. Hosted application processing is not restart-safe, and the committed-batch trading bridge is not implemented.
-- `qs-strategy` provides a reusable synchronous configured strategy core with typed parameter templates, factory-declared material schemas, branch pruning, bounded logical bar sources, derived source-specific input requirements, a named causal numeric catalog with semantic units and strict validity, source-clocked temporal/setup materials, typed bounded expressions, deterministic material and finite-state evaluation, total vacant/pending/open trade-slot facts including open-position time, excursion, and initial risk, calendar materials, generic decisions and notes, and validated command-correlated strict `RawSignal` values, where an Entry may carry an optional entry class for adapter-owned profile routing. It remains library-only and owns no historical feeds, services, live runtime, persistence, or management-profile composition.
-- `qs-backtest` provides validated historical strategy contracts and a configured-strategy adapter over the existing FutureQuote scheduler. The adapter performs complete logical-source binding from ticks or stored bars, named-input projection, total trade-slot projection, ordered command provenance and feedback, and profile selection shared with raw-signal replay. Document-driven historical calendar inputs default to one `full_day` analytical session for an explicitly selected timezone and support explicitly configured named sessions, independent day/week aggregates, actual reveal times, bounded history and strict coverage. Calendar sessions do not automatically restrict Entries, close positions, or change swap, sizing, or risk-reset behavior.
-- Configured historical execution is available through materialized and streaming in-process library APIs. Current conformance verifies neutral no-op, EMA crossover, EMA/ATR lifecycle, declared parameter binding, parameterized custom materials, compositional rolling indicators, pending cancellation, direct-signal economic parity, aligned-EOD materialized/streaming parity, final feedback handling, and strict research-output deserialization.
-- FutureQuote Market Entry sizing can use the actual fill price or an explicit signal Entry price, with fill-price default and fallback. The option changes quantity calculation only; profile resolution, actual fills, P&L, MTM, and actual risk remain execution-price based, while pending order quantity remains fixed at placement.
-- Direct RawSignal replay can map optional exact Entry classes to immutable per-run management-profile snapshots. Profiles can scale the directional signal-stop distance and generate targets from multiples of the final grid-adjusted stop distance; pending levels and quantity remain frozen at placement.
-- `qs-execution` is a runtime-neutral library boundary that prepares concrete Market, Limit, Stop, full-close, original-entered-size ratio-close, pending-cancel, and stop-modification requests from strict `RawSignal` intent and caller-supplied current facts. It provides explicit automatic or entry-approval gating, separates accepted submission from committed reports, and projects validated fills, cancellation, modification, rejection, and failure observations into existing configured command feedback. Its local scripted example requires no credentials or network. It owns no broker adapter, connection, scheduler, persistence, P&L, or recovery, and preparation-time quantity is not silently resized when a later fill price differs.
-- `qs-backtest` replays several configured strategy instances against one account, and `qs-risk` supplies a synchronous portfolio supervisor that approves or rejects new exposure under position-count limits, correlation-group risk caps, a daily loss halt, and a drawdown kill switch, without ever blocking risk reduction.
-- Current service cost configuration has a symbol-key mismatch that can prevent charges despite recorded settings; see the [trading-cost limitation](docs/backtesting.md#trading-costs) before treating a service result as cost-inclusive.
-- The backtest service accepts strict `RawSignal` runs, configured strategy documents, portfolios, and parameter or bounded structural searches as retained jobs. Supported strategy rules, parameters, calendars, and sessions are supplied as documents rather than registered strategy IDs. The optional trusted direct-Rust path remains server-compiled code selected by exact name/revision; its shipped no-op entry is conformance evidence, not a production strategy catalog, and arbitrary code/plugin upload remains prohibited. Compatible checkpoints retain complete runs, and protected selected reruns authorize final access before the service opens the selected market view.
-- Actual live order submission, a live strategy scheduler, restart-safe strategy state, account reconciliation, and broker order adapters are not included. The broker-neutral `qs-execution` contract does not claim those operational capabilities.
-- Direct signal replay skips and reports unavailable selected instruments by default; `--on-unavailable error` requests strict failure. Existing aliases connect canonical names to stored datasets without renaming them. Configurable lot-linear BTCUSD/ETHUSD simulation specifications are available through the server's `linear_instruments` settings; they are operator assumptions, not certified broker contracts. Bare registry crypto rows still have no executable compatibility economics. General spot/inventory, inverse/perpetual, funding, margin, and liquidation models remain unsupported.
-- Shipped backtest clients use provider-neutral retained-job, artifact, synchronous-execution, and discovery capabilities through the typed xrpc facade; RPC method names and provider error mapping remain inside the API provider module.
-- Market-data snapshots and streams use service quote-observation timestamps rather than unavailable CTrader source timestamps. Reconnect invalidates prior-session quote cache entries, source-state events carry transition timestamps, and the combined event stream exposes detected receiver lag or subscription rejection without claiming replay or exactly-once delivery.
-- Internal service TCP endpoints have no built-in authentication or TLS and are restricted to loopback by default.
-- Historical import accepts the documented MetaTrader-style tab-delimited tick and bar formats, not arbitrary CSV layouts.
+- Historical replay and strategy research are available; live broker submission and restart-safe live orchestration are not included.
+- Bar replay approximates intrabar order. Use ticks when stop, target, and management ordering matters.
+- Ingestion admission is not committed normalization or trading activity; the committed-batch trading bridge is not implemented.
+- BTCUSD/ETHUSD linear simulations use operator assumptions, not certified broker contracts or general cryptocurrency economics.
+- Internal TCP services have no built-in authentication or TLS and default to loopback.
+
+See [Current capabilities and boundaries](docs/current-boundaries.md) for detailed strategy, replay, cost, ingestion, market-data, and execution contracts.
 
 ## Documentation
 
@@ -118,16 +108,28 @@ CTrader FIX -> Market Data Service -> snapshots, subscriptions, and alerts
 - [Signal ingestion](docs/signal-ingestion.md)
 - [Market data](docs/market-data.md)
 - [Architecture](docs/architecture.md)
+- [Current capabilities and boundaries](docs/current-boundaries.md)
 - [Roadmap](docs/roadmap.md)
 - [RawSignal reference](docs/reference/raw-signal.md)
 
 ## Development
+
+Start with the owning package's regression tests. For a backtest service change:
+
+```bash
+cargo test -p qs-backtest-server --all-targets --locked
+cargo clippy -p qs-backtest-server --all-targets --locked -- -D warnings
+```
+
+Run broader workspace checks when the change crosses ownership boundaries or before release:
 
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace --all-features --all-targets
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 ```
+
+Long historical tick replays are dedicated workload acceptance, not part of these automated regression commands. Use bounded representative replays to validate adapter wiring during development, and reserve full-period runs for an explicitly scheduled acceptance with recorded source, data and resource budgets. A shorter window or bar replay must not be reported as the original full-period tick result.
 
 ## License
 

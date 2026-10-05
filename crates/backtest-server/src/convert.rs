@@ -79,7 +79,7 @@ pub fn config_from_msg(
         symbol_specs.insert(symbol.clone(), spec.clone());
     }
     let sizing = msg.sizing.as_ref().map(sizing_from_msg).transpose()?;
-    let costs = costs_from_msg(&msg.costs)?;
+    let costs = costs_from_msg(&msg.costs, registry)?;
     Ok(BacktestConfig {
         initial_balance,
         close_on_finish: msg.close_on_finish.unwrap_or(true),
@@ -136,6 +136,7 @@ pub fn config_from_msg_with_manifest(
 /// Values are validated here so an invalid specification is rejected at the request boundary rather than during replay. The run's account currency is not known at this point, so the currency agreement check stays with replay configuration validation.
 fn costs_from_msg(
     msg: &std::collections::BTreeMap<String, InstrumentCostsMsg>,
+    registry: &SymbolRegistry,
 ) -> crate::error::Result<std::collections::HashMap<String, InstrumentCosts>> {
     let mut costs = std::collections::HashMap::with_capacity(msg.len());
     for (symbol, entry) in msg {
@@ -155,7 +156,17 @@ fn costs_from_msg(
         converted.validate().map_err(|error| {
             BacktestServerError::InvalidRequest(format!("costs for {symbol} are invalid: {error}"))
         })?;
-        costs.insert(symbol.to_uppercase(), converted);
+        let canonical = registry.normalize_or_passthrough(symbol);
+        if canonical.is_empty() {
+            return Err(BacktestServerError::InvalidRequest(
+                "cost symbol must not be empty after normalization".into(),
+            ));
+        }
+        if costs.insert(canonical.clone(), converted).is_some() {
+            return Err(BacktestServerError::InvalidRequest(format!(
+                "duplicate cost specification for canonical symbol '{canonical}'"
+            )));
+        }
     }
     Ok(costs)
 }
@@ -1349,6 +1360,55 @@ mod tests {
         assert!((cfg.initial_balance - 10_000.0).abs() < f64::EPSILON);
         assert!(cfg.close_on_finish);
         assert_eq!(cfg.fill_model, FillModel::BidAsk);
+    }
+
+    #[test]
+    fn wire_cost_keys_follow_signal_symbol_normalization() {
+        let registry = SymbolRegistry::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../symbols/symbols.toml"),
+        )
+        .unwrap();
+        for key in ["EURUSD", "eurusd", "EUR/USD"] {
+            let msg = BacktestConfigMsg {
+                initial_balance: None,
+                close_on_finish: None,
+                fill_model: None,
+                sizing: None,
+                costs: [(
+                    key.into(),
+                    InstrumentCostsMsg {
+                        commission: Some(CommissionModelMsg::PerLotPerSide {
+                            amount: 3.5,
+                            currency: "USD".into(),
+                        }),
+                        swap: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            };
+            let config = config_from_msg(&msg, &registry, &[]).unwrap();
+            assert_eq!(config.costs.len(), 1);
+            assert!(config.costs.contains_key("eurusd"));
+        }
+    }
+
+    #[test]
+    fn duplicate_canonical_cost_keys_are_rejected() {
+        let msg = BacktestConfigMsg {
+            initial_balance: None,
+            close_on_finish: None,
+            fill_model: None,
+            sizing: None,
+            costs: [
+                ("EURUSD".into(), InstrumentCostsMsg::default()),
+                ("eurusd".into(), InstrumentCostsMsg::default()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let error = config_from_msg(&msg, &SymbolRegistry::empty(), &[]).unwrap_err();
+        assert!(error.to_string().contains("duplicate cost specification"));
     }
 
     #[test]

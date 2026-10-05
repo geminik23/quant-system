@@ -132,7 +132,7 @@ Bars cannot reconstruct the real intrabar price path. The adverse-extreme-first 
 
 Commission and overnight swap are optional and off by default. A run without a cost specification produces exactly the artifacts it produced before costs existed.
 
-Known service-boundary limitation: current wire configuration converts cost keys to uppercase, while service replay uses lowercase canonical symbols. A configured cost can therefore appear in execution metadata without being charged. This was reproduced for both raw-signal and configured-strategy service runs; do not treat those results as cost-inclusive merely because a cost specification was accepted. The library cost arithmetic is separate and requires cost keys matching its replay symbols. This boundary issue is not resolved by the instrument-admission corrections.
+Current source normalizes service cost keys with the same symbol registry rules used by signals, including case and aliases, and rejects multiple entries that normalize to the same canonical symbol. This fixes the uppercase cost-key/lowercase replay-symbol mismatch that could record a configured cost without charging it. The published `0.4.1` archives do not include this correction. Direct library callers still supply cost keys matching their own replay symbols.
 
 Each symbol may declare:
 

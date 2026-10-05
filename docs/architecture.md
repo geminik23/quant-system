@@ -2,6 +2,8 @@
 
 The workspace separates synchronous trading logic, historical replay, storage, logical service contracts, transport providers, source parsing, and venue-specific integrations.
 
+For implemented capabilities and operational limits, see [Current capabilities and boundaries](current-boundaries.md).
+
 ## Layer map
 
 ```text

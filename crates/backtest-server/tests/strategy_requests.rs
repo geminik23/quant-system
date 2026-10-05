@@ -421,6 +421,40 @@ fn service_run_matches_the_in_process_run_and_returns_the_strategy_output() {
 }
 
 #[test]
+fn configured_service_costs_match_fill_quantity_and_net_pnl() {
+    let fixture = fixture();
+    let mut request = run_request(document_value(&bound_document()));
+    request.request.config.sizing = Some(SizingPolicyMsg::FixedLot { lots: 0.1 });
+    request.request.config.costs.insert(
+        "EURUSD".into(),
+        InstrumentCostsMsg {
+            commission: Some(CommissionModelMsg::PerLotPerSide {
+                amount: 3.5,
+                currency: "USD".into(),
+            }),
+            swap: None,
+        },
+    );
+    let response = handle_run_configured_strategy(&fixture.state, &request);
+    assert!(response.success, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert!(result.total_positions > 0);
+    let expected_commission = result
+        .positions
+        .iter()
+        .map(|p| p.original_size * 7.0)
+        .sum::<f64>();
+    assert!((result.total_commission - expected_commission).abs() < 1e-9);
+    assert!((result.gross_pnl.unwrap() - result.total_commission - result.total_pnl).abs() < 1e-9);
+    assert_eq!(result.total_swap, 0.0);
+    assert!(
+        result.future.unwrap().execution_metadata["costs"]
+            .get("eurusd")
+            .is_some()
+    );
+}
+
+#[test]
 fn document_driven_calendar_input_runs_without_a_registered_strategy_factory() {
     let fixture = fixture();
     let document = document_requiring_calendar_input();

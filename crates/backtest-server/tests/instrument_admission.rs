@@ -720,6 +720,48 @@ fn run(fixture: &Fixture, request: &RunBacktestRequest) -> BacktestResultMsg {
 }
 
 #[test]
+fn service_cost_keys_charge_commission_and_rollover_in_retained_replay() {
+    let fixture = Fixture::new(&[("EURUSD", 1.1000, 1.1010)], rules());
+    let mut req = request(vec![entry("EURUSD", "cost-audit", "Buy")]);
+    req.request.config.costs.insert(
+        "EUR/USD".into(),
+        InstrumentCostsMsg {
+            commission: Some(CommissionModelMsg::PerLotPerSide {
+                amount: 0.7,
+                currency: "USD".into(),
+            }),
+            swap: Some(SwapScheduleMsg {
+                amount: SwapAmountMsg::Currency {
+                    long: -2.0,
+                    short: -2.0,
+                    currency: "USD".into(),
+                },
+                rollover: "10:00:02".into(),
+                triple_weekday: "Mon".into(),
+                skipped_weekdays: vec!["Sat".into(), "Sun".into()],
+            }),
+        },
+    );
+    let expected = run(&fixture, &req);
+    assert_eq!(expected.total_positions, 1);
+    assert!((expected.total_commission - 0.14).abs() < 1e-9);
+    assert!((expected.total_swap - 0.2).abs() < 1e-9);
+    assert!((expected.total_pnl - 9.66).abs() < 1e-9);
+    let metadata = &expected.future.as_ref().unwrap().execution_metadata;
+    assert!(metadata["costs"].get("eurusd").is_some());
+    assert!(metadata["costs"].get("EUR/USD").is_none());
+    let submitted = handle_submit_backtest(&fixture.state, &SubmitBacktestRequest { request: req });
+    assert!(submitted.success, "{:?}", submitted.error);
+    let id = submitted.job_id.unwrap();
+    run_job_and_store(fixture.state.clone(), id.clone());
+    let jobs = fixture.state.jobs.lock().unwrap();
+    let result = jobs[&id].result.as_ref().unwrap();
+    assert_eq!(result.total_commission, expected.total_commission);
+    assert_eq!(result.total_swap, expected.total_swap);
+    assert_eq!(result.total_pnl, expected.total_pnl);
+}
+
+#[test]
 fn configured_bitcoin_and_ether_execute_linear_long_and_short_pnl() {
     let fixture = Fixture::new(
         &[("BTCUSD", 60000.0, 61000.0), ("ETHUSD", 2000.0, 2100.0)],

@@ -2405,8 +2405,8 @@ fn config_msg_converts_per_symbol_costs() {
     let cfg = convert_costs(costs).unwrap();
     assert_eq!(cfg.costs.len(), 2);
 
-    // Symbols are normalized to the canonical upper-case form used elsewhere in the run.
-    let eurusd = &cfg.costs["EURUSD"];
+    // Symbol keys follow replay identity while currency codes remain uppercase.
+    let eurusd = &cfg.costs["eurusd"];
     assert!(matches!(
         eurusd.commission,
         Some(qs_backtest::CommissionModel::PerLotPerSide { amount, ref currency })
@@ -2424,7 +2424,7 @@ fn config_msg_converts_per_symbol_costs() {
         vec![chrono::Weekday::Sat, chrono::Weekday::Sun]
     );
 
-    assert!(cfg.costs["BTCUSD"].swap.is_none());
+    assert!(cfg.costs["btcusd"].swap.is_none());
 }
 
 #[test]
